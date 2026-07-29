@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createServer as createTcpServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -168,6 +170,80 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     assert.equal(authenticated.state.settings.memoryEnabled, true);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    const resolved = path.resolve(temporaryRoot);
+    assert.ok(resolved.startsWith(path.resolve(os.tmpdir()) + path.sep));
+    await rm(resolved, { recursive: true, force: true });
+  }
+});
+
+test("an SSH failure is not overwritten by a later close event", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-ssh-error-test-"));
+  process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
+  process.env.EASYWORK_SKILL_DIR = path.join(temporaryRoot, "skill");
+  const { createEasyWorkServer } = await import(
+    `../gateway/server.mjs?ssh-error-test=${Date.now()}`
+  );
+  const { server } = await createEasyWorkServer();
+  const interruptedSshServer = createTcpServer((socket) => socket.destroy());
+  let acceptedConnections = 0;
+  interruptedSshServer.on("connection", () => {
+    acceptedConnections += 1;
+  });
+  await new Promise((resolve) => interruptedSshServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const gatewayAddress = server.address();
+  const sshAddress = interruptedSshServer.address();
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const privateKeyPem = privateKey.export({ format: "pem", type: "pkcs1" }).toString();
+  const events = [];
+  let socket;
+
+  try {
+    await new Promise((resolve, reject) => {
+      socket = new WebSocket(`ws://127.0.0.1:${gatewayAddress.port}/ws`);
+      const timer = setTimeout(() => {
+        socket.close();
+        reject(new Error("SSH failure websocket timed out"));
+      }, 4_000);
+      socket.on("open", () => {
+        socket.send(
+          JSON.stringify({
+            type: "ssh.connect",
+            host: "127.0.0.1",
+            port: sshAddress.port,
+            username: "test-user",
+            privateKey: privateKeyPem,
+          }),
+        );
+      });
+      socket.on("message", (raw) => {
+        const event = JSON.parse(String(raw));
+        events.push(event);
+        if (event.type === "connection.status" && event.status === "error") {
+          setTimeout(() => {
+            clearTimeout(timer);
+            resolve();
+          }, 200);
+        }
+      });
+      socket.on("error", reject);
+    });
+
+    assert.equal(acceptedConnections, 1);
+    const errorIndex = events.findIndex(
+      (event) => event.type === "connection.status" && event.status === "error",
+    );
+    assert.ok(errorIndex >= 0);
+    assert.equal(
+      events
+        .slice(errorIndex + 1)
+        .some((event) => event.type === "connection.status" && event.status === "disconnected"),
+      false,
+    );
+  } finally {
+    socket?.close();
+    await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => interruptedSshServer.close(resolve));
     const resolved = path.resolve(temporaryRoot);
     assert.ok(resolved.startsWith(path.resolve(os.tmpdir()) + path.sep));
     await rm(resolved, { recursive: true, force: true });

@@ -780,7 +780,7 @@ export default function EasyWorkApp() {
       const type = String(payload.type ?? "");
       if (type === "connection.status") {
         const status = String(payload.status ?? "disconnected") as ConnectionState["status"];
-        setConnection({
+        const nextConnection: ConnectionState = {
           status,
           label: String(payload.label ?? "连接状态已更新"),
           host: payload.host ? String(payload.host) : undefined,
@@ -788,7 +788,10 @@ export default function EasyWorkApp() {
           latency: typeof payload.latency === "number" ? payload.latency : undefined,
           fingerprint: payload.fingerprint ? String(payload.fingerprint) : undefined,
           demo: Boolean(payload.demo),
-        });
+        };
+        setConnection((current) =>
+          status === "disconnected" && current.status === "error" ? current : nextConnection,
+        );
         if (status === "connected") setSshModalOpen(false);
         return;
       }
@@ -3546,7 +3549,10 @@ function SshModal({
           </label>
         </div>
         {connection.status === "error" && !connection.fingerprint && (
-          <div className="form-error">{connection.label}</div>
+          <div className="form-error" role="alert" aria-live="polite">
+            <strong>连接失败</strong>
+            <span>{connection.label}</span>
+          </div>
         )}
         {connection.fingerprint && (
           <div className="host-key-confirm">

@@ -1681,12 +1681,15 @@ async function connectSsh(socket, session, actor, payload) {
   const client = new SshClient();
   session.demo = false;
   session.client = client;
+  let connectionPublished = false;
+  let failureExpectedClose = false;
 
   await new Promise((resolve, reject) => {
     let settled = false;
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      failureExpectedClose = true;
       client.end();
       reject(error);
     };
@@ -1704,9 +1707,9 @@ async function connectSsh(socket, session, actor, payload) {
       })
       .once("ready", async () => {
         if (settled) return;
-        settled = true;
         try {
           const homeResult = await remoteExec(client, 'printf "%s" "$HOME"');
+          if (settled) return;
           session.home = homeResult.stdout.trim();
           session.host = host;
           session.username = username;
@@ -1714,12 +1717,14 @@ async function connectSsh(socket, session, actor, payload) {
             knownHosts[`${host}:${port}`] = observedFingerprint;
             await writeJson(knownHostsPath, knownHosts);
           }
+          settled = true;
           resolve();
         } catch (error) {
-          reject(error);
+          fail(error);
         }
       })
-      .once("error", (error) => {
+      .on("error", (error) => {
+        if (settled) return;
         if (
           observedFingerprint &&
           !payload.trustHost &&
@@ -1737,11 +1742,13 @@ async function connectSsh(socket, session, actor, payload) {
       .on("close", () => {
         if (session.client === client) {
           session.client = null;
-          wsSend(socket, {
-            type: "connection.status",
-            status: "disconnected",
-            label: "SSH 连接已关闭",
-          });
+          if (connectionPublished && !failureExpectedClose) {
+            wsSend(socket, {
+              type: "connection.status",
+              status: "disconnected",
+              label: "SSH 连接已关闭",
+            });
+          }
         }
       })
       .connect({
@@ -1762,6 +1769,9 @@ async function connectSsh(socket, session, actor, payload) {
       });
   });
 
+  if (session.client !== client) {
+    throw new Error("SSH 连接在登录完成前已关闭");
+  }
   wsSend(socket, {
     type: "connection.status",
     status: "connected",
@@ -1771,7 +1781,32 @@ async function connectSsh(socket, session, actor, payload) {
     latency: Date.now() - startedAt,
     fingerprint: observedFingerprint,
   });
+  connectionPublished = true;
   wsSend(socket, { type: "agent.list", agents: await scanRemoteAgents(session) });
+}
+
+function describeSshError(caught) {
+  const message = caught instanceof Error ? caught.message : "远端操作失败";
+  if (caught?.fingerprint) return message;
+  if (/all configured authentication methods failed|authentication failed|permission denied/i.test(message)) {
+    return "SSH 认证失败，请检查用户名、私钥、私钥密码和动态验证码";
+  }
+  if (/cannot parse privatekey|unsupported key format|bad passphrase|encrypted private.*passphrase/i.test(message)) {
+    return "无法使用此 SSH 私钥，请检查文件格式和私钥密码";
+  }
+  if (/timed out|timeout/i.test(message)) {
+    return "SSH 连接超时，请检查网络、VPN、登录节点和端口";
+  }
+  if (/enotfound|getaddrinfo/i.test(message)) {
+    return "找不到登录节点，请检查主机地址和本机网络";
+  }
+  if (/econnrefused|connection refused/i.test(message)) {
+    return "登录节点拒绝连接，请检查主机、端口或平台服务状态";
+  }
+  if (/econnreset|connection lost|before handshake|socket hang up/i.test(message)) {
+    return "SSH 连接被远端关闭，请检查网络或平台登录要求";
+  }
+  return `SSH 连接失败：${message}`;
 }
 
 function attachWebSocketServer(server) {
@@ -1871,8 +1906,15 @@ function attachWebSocketServer(server) {
           });
         }
       } catch (caught) {
-        const message = caught instanceof Error ? caught.message : "远端操作失败";
+        const message =
+          payload.type === "ssh.connect"
+            ? describeSshError(caught)
+            : caught instanceof Error
+              ? caught.message
+              : "远端操作失败";
         if (payload.type === "ssh.connect") {
+          const diagnostic = caught instanceof Error ? caught.message.replace(/\s+/g, " ").trim() : "unknown";
+          console.warn(`[EasyWork SSH] connection failed: ${diagnostic}`);
           wsSend(socket, {
             type: "connection.status",
             status: "error",

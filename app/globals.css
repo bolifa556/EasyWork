@@ -4663,6 +4663,18 @@ body {
   color: var(--red);
 }
 
+.ssh-form .form-error {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.ssh-form .form-error strong {
+  font-weight: 600;
+}
+
 .avatar-editor {
   gap: 14px;
 }
