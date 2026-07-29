@@ -50,6 +50,11 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /type Mode = "chat" \| "work"/);
   assert.match(app, /type: "work\.run"/);
   assert.match(app, /\/api\/bootstrap/);
+  assert.match(app, /DEVICE_TOKEN_STORAGE_KEY/);
+  assert.match(app, /beginConversation/);
+  assert.match(app, /ConversationRow/);
+  assert.match(app, /转换为\{mode === "chat" \? "工作" : "聊天"\}模式/);
+  assert.doesNotMatch(app, /const EMPTY_CONVERSATION_ID/);
   assert.match(app, /Embedding API/);
   assert.match(app, /project-only/);
   assert.match(css, /grid-template-columns:\s*var\(--left-width\).*var\(--right-width\)/);
@@ -60,6 +65,9 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /Access-Control-Allow-Private-Network/);
   assert.match(gateway, /\/api\/settings\/provider\/models/);
   assert.match(gateway, /\.easywork\/bin\/opencode/);
+  assert.match(gateway, /SSH_RECONNECT_GRACE_MS/);
+  assert.match(gateway, /deviceToken/);
+  assert.match(gateway, /--no-modify-path/);
   assert.match(gateway, /agentSessions:\s*new Map/);
 
   await assert.rejects(access(new URL("../app/_sites-preview/", import.meta.url)));

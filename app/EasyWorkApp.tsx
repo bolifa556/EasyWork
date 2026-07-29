@@ -18,6 +18,7 @@ import {
   File,
   FileArchive,
   FileText,
+  Ellipsis,
   Folder,
   FolderLock,
   Gauge,
@@ -60,7 +61,7 @@ import {
 } from "react";
 
 type Mode = "chat" | "work";
-type ViewName = "chat" | "library" | "skills" | "memory";
+type ViewName = "chat" | "project" | "library" | "skills" | "memory";
 type StepStatus = "pending" | "running" | "done" | "error";
 type EventStatus = "pending" | "running" | "done" | "error";
 
@@ -175,6 +176,13 @@ type AppSettings = {
     hybridEnabled: boolean;
     rerankEnabled: boolean;
   };
+  ssh: {
+    host: string;
+    port: number;
+    username: string;
+    keyName: string;
+    configured: boolean;
+  };
 };
 
 type EasyWorkState = {
@@ -213,11 +221,47 @@ type AgentItem = {
   status: "ready" | "missing" | "installing" | "needs-adapter";
   adapter: "opencode" | "plain";
   managed?: boolean;
+  detail?: string;
 };
 
 let GATEWAY_HTTP =
   process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL ??
   (typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+
+const DEVICE_TOKEN_STORAGE_KEY = "easywork.device-token.v1";
+const DEVICE_TOKEN_EVENT = "easywork:device-token";
+
+function readDeviceToken() {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem(DEVICE_TOKEN_STORAGE_KEY) || "";
+}
+
+function storeDeviceToken(token?: string) {
+  if (typeof window === "undefined" || !token) return;
+  window.localStorage.setItem(DEVICE_TOKEN_STORAGE_KEY, token);
+  window.dispatchEvent(new Event(DEVICE_TOKEN_EVENT));
+}
+
+function clearDeviceToken() {
+  if (typeof window === "undefined") return;
+  window.localStorage.removeItem(DEVICE_TOKEN_STORAGE_KEY);
+  window.dispatchEvent(new Event(DEVICE_TOKEN_EVENT));
+}
+
+function gatewayFetch(
+  path: string,
+  init: RequestInit = {},
+  baseUrl = GATEWAY_HTTP,
+) {
+  const headers = new Headers(init.headers);
+  const token = readDeviceToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  return fetch(`${baseUrl}${path}`, {
+    ...init,
+    credentials: "include",
+    headers,
+  });
+}
 
 const gatewayCandidates = () => {
   const configured = process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL;
@@ -234,61 +278,9 @@ const now = () => new Date().toISOString();
 const uid = (prefix: string) =>
   `${prefix}_${typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}_${Math.random().toString(16).slice(2)}`}`;
 
-const EMPTY_CONVERSATION_ID = "chat_welcome";
-
 const DEFAULT_STATE: EasyWorkState = {
-  projects: [
-    {
-      id: "project_research",
-      name: "集群实验复现",
-      icon: "R",
-      memoryMode: "project-only",
-      createdAt: "2026-07-27T09:20:00.000Z",
-    },
-    {
-      id: "project_course",
-      name: "课程助教",
-      icon: "C",
-      memoryMode: "default",
-      createdAt: "2026-07-25T13:00:00.000Z",
-    },
-  ],
-  conversations: [
-    {
-      id: EMPTY_CONVERSATION_ID,
-      title: "新聊天",
-      mode: "chat",
-      messages: [],
-      updatedAt: now(),
-    },
-    {
-      id: "chat_cuda",
-      title: "CUDA 环境排查",
-      mode: "work",
-      projectId: "project_research",
-      messages: [],
-      updatedAt: "2026-07-29T11:34:00.000Z",
-      work: {
-        agentId: "opencode",
-        workspace: "~/workspace/reproduction",
-      },
-    },
-    {
-      id: "chat_paper",
-      title: "论文方法梳理",
-      mode: "chat",
-      projectId: "project_research",
-      messages: [],
-      updatedAt: "2026-07-28T08:12:00.000Z",
-    },
-    {
-      id: "chat_slurm",
-      title: "Slurm 提交脚本",
-      mode: "chat",
-      messages: [],
-      updatedAt: "2026-07-26T18:05:00.000Z",
-    },
-  ],
+  projects: [],
+  conversations: [],
   skills: [
     {
       id: "skill_cluster",
@@ -318,70 +310,9 @@ const DEFAULT_STATE: EasyWorkState = {
       updatedAt: "2026-07-27T10:00:00.000Z",
     },
   ],
-  files: [
-    {
-      id: "file_ssh",
-      name: "SSH权限开放参考操作.docx",
-      size: 15863,
-      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      status: "ready",
-      chunks: 12,
-      updatedAt: "2026-07-30T00:04:00.000Z",
-    },
-    {
-      id: "file_notes",
-      name: "实验复现记录.md",
-      size: 24890,
-      type: "text/markdown",
-      status: "ready",
-      chunks: 18,
-      updatedAt: "2026-07-29T16:20:00.000Z",
-    },
-    {
-      id: "file_dataset",
-      name: "数据字段说明.csv",
-      size: 8260,
-      type: "text/csv",
-      status: "keyword-only",
-      chunks: 7,
-      updatedAt: "2026-07-27T09:44:00.000Z",
-    },
-  ],
-  memories: [
-    {
-      id: "memory_1",
-      content: "用户常在中科大本科生算力平台工作，登录入口为 107.ustc.edu.cn。",
-      scope: "global",
-      kind: "profile",
-      source: "SSH 登录讨论",
-      confidence: 0.96,
-      enabled: true,
-      updatedAt: "2026-07-29T12:40:00.000Z",
-    },
-    {
-      id: "memory_2",
-      content: "执行会改动文件的任务前，先说明工作目录与回滚方式。",
-      scope: "global",
-      kind: "workflow",
-      source: "用户明确要求",
-      confidence: 1,
-      enabled: true,
-      updatedAt: "2026-07-28T08:20:00.000Z",
-    },
-    {
-      id: "memory_3",
-      content: "集群实验复现项目只允许引用本项目聊天、文件和项目记忆。",
-      scope: "project",
-      projectId: "project_research",
-      kind: "goal",
-      source: "项目设置",
-      confidence: 1,
-      enabled: true,
-      updatedAt: "2026-07-27T09:20:00.000Z",
-    },
-  ],
-  memorySummary:
-    "你主要在高校算力集群上进行研究与开发，偏好先检查资源和工作目录，再执行可能产生改动的操作。你重视可复现性，希望任务过程有清晰步骤、结果与来源。",
+  files: [],
+  memories: [],
+  memorySummary: "",
   settings: {
     memoryEnabled: true,
     referenceHistory: true,
@@ -402,8 +333,79 @@ const DEFAULT_STATE: EasyWorkState = {
       hybridEnabled: true,
       rerankEnabled: false,
     },
+    ssh: {
+      host: "107.ustc.edu.cn",
+      port: 22,
+      username: "",
+      keyName: "",
+      configured: false,
+    },
   },
 };
+
+const LEGACY_DEMO_PROJECT_IDS = new Set(["project_research", "project_course"]);
+const LEGACY_DEMO_CONVERSATION_IDS = new Set([
+  "chat_welcome",
+  "chat_cuda",
+  "chat_paper",
+  "chat_slurm",
+]);
+const LEGACY_DEMO_FILE_IDS = new Set(["file_ssh", "file_notes", "file_dataset"]);
+const LEGACY_DEMO_MEMORY_IDS = new Set(["memory_1", "memory_2", "memory_3"]);
+
+function mergeStoredState(
+  current: EasyWorkState,
+  incoming: Partial<EasyWorkState>,
+): EasyWorkState {
+  const conversations = Array.isArray(incoming.conversations)
+    ? incoming.conversations.filter(
+        (conversation) =>
+          !LEGACY_DEMO_CONVERSATION_IDS.has(conversation.id) ||
+          conversation.messages.length > 0,
+      )
+    : current.conversations;
+  const referencedProjects = new Set(
+    conversations.map((conversation) => conversation.projectId).filter(Boolean),
+  );
+  const projects = Array.isArray(incoming.projects)
+    ? incoming.projects.filter(
+        (project) =>
+          !LEGACY_DEMO_PROJECT_IDS.has(project.id) || referencedProjects.has(project.id),
+      )
+    : current.projects;
+  const files = Array.isArray(incoming.files)
+    ? incoming.files.filter((file) => !LEGACY_DEMO_FILE_IDS.has(file.id))
+    : current.files;
+  const memories = Array.isArray(incoming.memories)
+    ? incoming.memories.filter((memory) => !LEGACY_DEMO_MEMORY_IDS.has(memory.id))
+    : current.memories;
+
+  return {
+    ...current,
+    ...incoming,
+    projects,
+    conversations,
+    files,
+    memories,
+    memorySummary: memories.length ? incoming.memorySummary : "",
+    settings: {
+      ...current.settings,
+      ...(incoming.settings ?? {}),
+      provider: {
+        ...current.settings.provider,
+        ...(incoming.settings?.provider ?? {}),
+      },
+      embedding: {
+        ...current.settings.embedding,
+        ...(incoming.settings?.embedding ?? {}),
+      },
+      ssh: {
+        ...current.settings.ssh,
+        ...(incoming.settings?.ssh ?? {}),
+      },
+    },
+  };
+}
 
 const DEFAULT_ACTOR: Actor = {
   id: "guest",
@@ -523,10 +525,87 @@ function StatusGlyph({ status }: { status: StepStatus }) {
   );
 }
 
+function ConversationRow({
+  conversation,
+  active,
+  projects,
+  menuOpen,
+  onSelect,
+  onToggleMenu,
+  onMove,
+  onDelete,
+}: {
+  conversation: Conversation;
+  active: boolean;
+  projects: Project[];
+  menuOpen: boolean;
+  onSelect: () => void;
+  onToggleMenu: () => void;
+  onMove: (projectId?: string) => void;
+  onDelete: () => void;
+}) {
+  const destinations = projects.filter((project) => project.id !== conversation.projectId);
+  return (
+    <div className={`chat-row${active ? " active" : ""}`}>
+      <button className="chat-row-main" type="button" onClick={onSelect}>
+        <span className={`mode-dot ${conversation.mode}`} />
+        <span>{conversation.title}</span>
+      </button>
+      <button
+        className="chat-row-menu-button"
+        type="button"
+        aria-label={`打开“${conversation.title}”的对话选项`}
+        aria-expanded={menuOpen}
+        onClick={(event) => {
+          event.stopPropagation();
+          onToggleMenu();
+        }}
+      >
+        <Ellipsis size={16} />
+      </button>
+      {menuOpen && (
+        <div className="conversation-menu" role="menu">
+          {!!destinations.length && (
+            <>
+              <span className="conversation-menu-label">移动到项目</span>
+              {destinations.map((project) => (
+                <button
+                  type="button"
+                  role="menuitem"
+                  key={project.id}
+                  onClick={() => onMove(project.id)}
+                >
+                  <span className="menu-project-avatar">{project.icon}</span>
+                  {project.name}
+                </button>
+              ))}
+            </>
+          )}
+          {conversation.projectId && (
+            <button type="button" role="menuitem" onClick={() => onMove(undefined)}>
+              <Folder size={15} />
+              移出项目
+            </button>
+          )}
+          {(destinations.length > 0 || conversation.projectId) && (
+            <span className="conversation-menu-separator" />
+          )}
+          <button className="danger" type="button" role="menuitem" onClick={onDelete}>
+            <Trash2 size={15} />
+            删除
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function EasyWorkApp() {
   const [state, setState] = useState<EasyWorkState>(DEFAULT_STATE);
   const [actor, setActor] = useState<Actor>(DEFAULT_ACTOR);
-  const [activeConversationId, setActiveConversationId] = useState(EMPTY_CONVERSATION_ID);
+  const [activeConversationId, setActiveConversationId] = useState("");
+  const [activeProjectId, setActiveProjectId] = useState("");
+  const [draftProjectId, setDraftProjectId] = useState<string | undefined>();
   const [mode, setMode] = useState<Mode>("chat");
   const [view, setView] = useState<ViewName>("chat");
   const [draft, setDraft] = useState("");
@@ -552,6 +631,7 @@ export default function EasyWorkApp() {
   >("checking");
   const [gatewayEndpoint, setGatewayEndpoint] = useState("");
   const [gatewayProbe, setGatewayProbe] = useState(0);
+  const [deviceToken, setDeviceToken] = useState("");
   const [agents, setAgents] = useState<AgentItem[]>(DEFAULT_AGENTS);
   const [activeAgentId, setActiveAgentId] = useState("opencode");
   const [sending, setSending] = useState(false);
@@ -564,6 +644,10 @@ export default function EasyWorkApp() {
   const [memoryInstruction, setMemoryInstruction] = useState("");
   const [editingMemoryId, setEditingMemoryId] = useState("");
   const [editingMemoryText, setEditingMemoryText] = useState("");
+  const [conversationMenuId, setConversationMenuId] = useState("");
+  const [conversationPendingDelete, setConversationPendingDelete] =
+    useState<Conversation | null>(null);
+  const [modeMenuOpen, setModeMenuOpen] = useState(false);
 
   const socketRef = useRef<WebSocket | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -579,8 +663,16 @@ export default function EasyWorkApp() {
   );
 
   const activeProject = useMemo(
-    () => state.projects.find((item) => item.id === activeConversation?.projectId),
-    [activeConversation?.projectId, state.projects],
+    () =>
+      state.projects.find(
+        (item) => item.id === (activeConversation?.projectId ?? draftProjectId),
+      ),
+    [activeConversation?.projectId, draftProjectId, state.projects],
+  );
+
+  const projectPage = useMemo(
+    () => state.projects.find((item) => item.id === activeProjectId),
+    [activeProjectId, state.projects],
   );
 
   const activeAgent = agents.find((item) => item.id === activeAgentId) ?? agents[0];
@@ -795,9 +887,31 @@ export default function EasyWorkApp() {
         if (status === "connected") setSshModalOpen(false);
         return;
       }
+      if (type === "ssh.profile" && payload.profile) {
+        const profile = payload.profile as AppSettings["ssh"];
+        setState((current) => ({
+          ...current,
+          settings: {
+            ...current.settings,
+            ssh: { ...current.settings.ssh, ...profile },
+          },
+        }));
+        return;
+      }
       if (type === "agent.list") {
         const incoming = Array.isArray(payload.agents) ? (payload.agents as AgentItem[]) : [];
         if (incoming.length) setAgents(incoming);
+        return;
+      }
+      if (type === "agent.install.progress") {
+        const detail = String(payload.label ?? "正在安装");
+        setAgents((current) =>
+          current.map((agent) =>
+            agent.id === "opencode"
+              ? { ...agent, status: "installing", detail }
+              : agent,
+          ),
+        );
         return;
       }
       if (type === "error") {
@@ -945,18 +1059,38 @@ export default function EasyWorkApp() {
   }, []);
 
   useEffect(() => {
+    const syncDeviceToken = () => setDeviceToken(readDeviceToken());
+    syncDeviceToken();
+    window.addEventListener(DEVICE_TOKEN_EVENT, syncDeviceToken);
+    return () => window.removeEventListener(DEVICE_TOKEN_EVENT, syncDeviceToken);
+  }, []);
+
+  useEffect(() => {
+    const closeFloatingMenus = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (!target.closest(".chat-row, .conversation-mode-menu")) {
+        setConversationMenuId("");
+        setModeMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeFloatingMenus);
+    return () => document.removeEventListener("pointerdown", closeFloatingMenus);
+  }, []);
+
+  useEffect(() => {
     let disposed = false;
     const bootstrap = async () => {
       setGatewayStatus("checking");
       for (const candidate of gatewayCandidates()) {
         try {
-          const response = await fetch(`${candidate}/api/bootstrap`, {
-            credentials: "include",
+          const response = await gatewayFetch("/api/bootstrap", {
             signal: AbortSignal.timeout(2_500),
-          });
+          }, candidate);
           if (!response.ok) continue;
           const payload = (await response.json()) as {
             actor?: Actor;
+            deviceToken?: string;
             state?: Partial<EasyWorkState>;
           };
           if (!payload.actor) continue;
@@ -965,23 +1099,9 @@ export default function EasyWorkApp() {
           setGatewayEndpoint(candidate);
           setGatewayStatus("connected");
           setActor(payload.actor);
+          storeDeviceToken(payload.deviceToken);
           if (payload.state) {
-            setState((current) => ({
-              ...current,
-              ...payload.state,
-              settings: {
-                ...current.settings,
-                ...(payload.state?.settings ?? {}),
-                provider: {
-                  ...current.settings.provider,
-                  ...(payload.state?.settings?.provider ?? {}),
-                },
-                embedding: {
-                  ...current.settings.embedding,
-                  ...(payload.state?.settings?.embedding ?? {}),
-                },
-              },
-            }));
+            setState((current) => mergeStoredState(current, payload.state ?? {}));
           }
           return;
         } catch {
@@ -1004,6 +1124,7 @@ export default function EasyWorkApp() {
     const url = new URL(GATEWAY_HTTP);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = "/ws";
+    if (deviceToken) url.searchParams.set("deviceToken", deviceToken);
     const socket = new WebSocket(url);
     let disposed = false;
     socketRef.current = socket;
@@ -1028,14 +1149,13 @@ export default function EasyWorkApp() {
       socket.close();
       socketRef.current = null;
     };
-  }, [gatewayStatus, handleSocketEvent]);
+  }, [deviceToken, gatewayStatus, handleSocketEvent]);
 
   useEffect(() => {
     if (gatewayStatus !== "connected") return;
     const timer = window.setTimeout(() => {
-      void fetch(`${GATEWAY_HTTP}/api/state`, {
+      void gatewayFetch("/api/state", {
         method: "PUT",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ state }),
       }).catch(() => undefined);
@@ -1047,47 +1167,36 @@ export default function EasyWorkApp() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [activeConversation?.messages.length]);
 
-  useEffect(() => {
-    const cleanupGuest = () => {
-      if (!actor.authenticated && navigator.sendBeacon) {
-        navigator.sendBeacon(`${GATEWAY_HTTP}/api/guest/close`);
-      }
-    };
-    window.addEventListener("pagehide", cleanupGuest);
-    return () => window.removeEventListener("pagehide", cleanupGuest);
-  }, [actor.authenticated]);
-
   const selectConversation = (conversation: Conversation) => {
     setActiveConversationId(conversation.id);
+    setDraftProjectId(undefined);
+    setActiveProjectId(conversation.projectId ?? "");
     setMode(conversation.mode);
     setView("chat");
+    setConversationMenuId("");
+    setModeMenuOpen(false);
     setSidebarOpen(false);
     window.setTimeout(() => textareaRef.current?.focus(), 0);
   };
 
-  const createConversation = (projectId?: string, nextMode: Mode = mode) => {
-    const conversation: Conversation = {
-      id: uid("chat"),
-      title: "新聊天",
-      mode: nextMode,
-      projectId,
-      messages: [],
-      updatedAt: now(),
-      work:
-        nextMode === "work"
-          ? {
-              agentId: activeAgentId,
-              workspace: "~/.easywork/tasks",
-            }
-          : undefined,
-    };
-    setState((current) => ({
-      ...current,
-      conversations: [conversation, ...current.conversations],
-    }));
-    setActiveConversationId(conversation.id);
+  const beginConversation = (projectId?: string, nextMode: Mode = "chat") => {
+    setActiveConversationId("");
+    setDraftProjectId(projectId);
+    setActiveProjectId(projectId ?? "");
     setMode(nextMode);
     setView("chat");
+    setConversationMenuId("");
+    setModeMenuOpen(false);
+    setSidebarOpen(false);
+    window.setTimeout(() => textareaRef.current?.focus(), 0);
+  };
+
+  const openProject = (projectId: string) => {
+    setActiveProjectId(projectId);
+    setActiveConversationId("");
+    setDraftProjectId(undefined);
+    setView("project");
+    setConversationMenuId("");
     setSidebarOpen(false);
   };
 
@@ -1104,7 +1213,7 @@ export default function EasyWorkApp() {
       projects: [...current.projects, project],
     }));
     setProjectModalOpen(false);
-    createConversation(project.id);
+    openProject(project.id);
   };
 
   const changeMode = (nextMode: Mode) => {
@@ -1121,7 +1230,38 @@ export default function EasyWorkApp() {
               }
             : conversation.work,
       }));
+      showToast(`已转换为${nextMode === "work" ? "工作" : "聊天"}模式`);
     }
+    setModeMenuOpen(false);
+  };
+
+  const moveConversation = (conversationId: string, projectId?: string) => {
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      projectId,
+      updatedAt: now(),
+    }));
+    setConversationMenuId("");
+    showToast(projectId ? "对话已移动到项目" : "对话已移出项目");
+  };
+
+  const deleteConversation = (conversationId: string) => {
+    const deleted = state.conversations.find(
+      (conversation) => conversation.id === conversationId,
+    );
+    setState((current) => ({
+      ...current,
+      conversations: current.conversations.filter(
+        (conversation) => conversation.id !== conversationId,
+      ),
+    }));
+    if (activeConversationId === conversationId) {
+      if (deleted?.projectId) openProject(deleted.projectId);
+      else beginConversation();
+    }
+    setConversationPendingDelete(null);
+    setConversationMenuId("");
+    showToast("对话已删除");
   };
 
   const submitMessage = async () => {
@@ -1134,10 +1274,17 @@ export default function EasyWorkApp() {
     }
 
     const conversation = activeConversation;
-    if (!conversation) {
-      createConversation(undefined, mode);
-      return;
-    }
+    const conversationId = conversation?.id ?? uid("chat");
+    const projectId = conversation?.projectId ?? draftProjectId;
+    const conversationProject = state.projects.find((project) => project.id === projectId);
+    const work =
+      conversation?.work ??
+      (mode === "work"
+        ? {
+            agentId: activeAgentId,
+            workspace: "~/.easywork/tasks",
+          }
+        : undefined);
 
     const runId = uid("run");
     const userMessage: Message = {
@@ -1159,14 +1306,40 @@ export default function EasyWorkApp() {
       runId: mode === "work" ? runId : undefined,
     };
 
-    updateConversation(conversation.id, (current) => ({
-      ...current,
-      title:
-        current.title === "新聊天" ? content.slice(0, 26) : current.title,
-      mode,
-      updatedAt: now(),
-      messages: [...current.messages, userMessage, assistantMessage],
-    }));
+    setState((current) => {
+      const existing = current.conversations.find((item) => item.id === conversationId);
+      if (!existing) {
+        const created: Conversation = {
+          id: conversationId,
+          title: content.slice(0, 26),
+          mode,
+          projectId,
+          messages: [userMessage, assistantMessage],
+          updatedAt: now(),
+          work,
+        };
+        return {
+          ...current,
+          conversations: [created, ...current.conversations],
+        };
+      }
+      return {
+        ...current,
+        conversations: current.conversations.map((item) =>
+          item.id === conversationId
+            ? {
+                ...item,
+                title: item.messages.length ? item.title : content.slice(0, 26),
+                mode,
+                updatedAt: now(),
+                messages: [...item.messages, userMessage, assistantMessage],
+              }
+            : item,
+        ),
+      };
+    });
+    setActiveConversationId(conversationId);
+    setDraftProjectId(undefined);
     setDraft("");
     setSkillsPopover(false);
     setSending(true);
@@ -1177,39 +1350,38 @@ export default function EasyWorkApp() {
         socket.send(
           JSON.stringify({
             type: "work.run",
-            conversationId: conversation.id,
+            conversationId,
             runId,
             prompt: content,
             skills: selectedSkills,
             agentId: activeAgentId,
-            projectId: conversation.projectId,
-            memoryMode: activeProject?.memoryMode ?? "default",
-            workspace: conversation.work?.workspace ?? "~/.easywork/tasks",
+            projectId,
+            memoryMode: conversationProject?.memoryMode ?? "default",
+            workspace: work?.workspace ?? "~/.easywork/tasks",
           }),
         );
       } else {
-        simulateWorkRun(conversation.id, runId, content);
+        simulateWorkRun(conversationId, runId, content);
       }
       return;
     }
 
     try {
-      const response = await fetch(`${GATEWAY_HTTP}/api/chat`, {
+      const response = await gatewayFetch("/api/chat", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          conversationId: conversation.id,
+          conversationId,
           prompt: content,
           skillIds: selectedSkills,
-          projectId: conversation.projectId,
-          memoryMode: activeProject?.memoryMode ?? "default",
+          projectId,
+          memoryMode: conversationProject?.memoryMode ?? "default",
         }),
       });
       if (!response.ok) throw new Error("LLM request failed");
       const payload = (await response.json()) as { content?: string };
       updateMessage(
-        conversation.id,
+        conversationId,
         (message) => message.id === assistantMessage.id,
         (message) => ({
           ...message,
@@ -1220,7 +1392,7 @@ export default function EasyWorkApp() {
       );
     } catch {
       updateMessage(
-        conversation.id,
+        conversationId,
         (message) => message.id === assistantMessage.id,
         (message) => ({
           ...message,
@@ -1295,7 +1467,10 @@ export default function EasyWorkApp() {
     host: string;
     port: number;
     username: string;
-    privateKey: string;
+    privateKey?: string;
+    privateKeyName?: string;
+    useSavedKey?: boolean;
+    rememberKey?: boolean;
     passphrase?: string;
     otp?: string;
     trustHost?: boolean;
@@ -1385,9 +1560,8 @@ export default function EasyWorkApp() {
       setState((current) => ({ ...current, files: [item, ...current.files] }));
       try {
         const contentBase64 = await fileToBase64(file);
-        const response = await fetch(`${GATEWAY_HTTP}/api/files`, {
+        const response = await gatewayFetch("/api/files", {
           method: "POST",
-          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             id: item.id,
@@ -1461,9 +1635,8 @@ export default function EasyWorkApp() {
           type: file.type,
         })),
       );
-      await fetch(`${GATEWAY_HTTP}/api/skills`, {
+      await gatewayFetch("/api/skills", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: newSkill.id,
@@ -1481,15 +1654,17 @@ export default function EasyWorkApp() {
 
   const deleteGuestData = async () => {
     try {
-      await fetch(`${GATEWAY_HTTP}/api/guest`, {
+      await gatewayFetch("/api/guest", {
         method: "DELETE",
-        credentials: "include",
       });
     } catch {
       // Gateway may already be gone; clearing local UI still honors the visible action.
     }
     setState(DEFAULT_STATE);
-    setActiveConversationId(EMPTY_CONVERSATION_ID);
+    setActiveConversationId("");
+    setActiveProjectId("");
+    setDraftProjectId(undefined);
+    setView("chat");
     showToast("访客临时数据已清除");
   };
 
@@ -1499,10 +1674,13 @@ export default function EasyWorkApp() {
   });
 
   const projectConversations = (projectId: string) =>
-    visibleConversations.filter((conversation) => conversation.projectId === projectId);
+    visibleConversations.filter(
+      (conversation) =>
+        conversation.projectId === projectId && conversation.messages.length > 0,
+    );
 
   const generalConversations = visibleConversations.filter(
-    (conversation) => !conversation.projectId,
+    (conversation) => !conversation.projectId && conversation.messages.length > 0,
   );
 
   const visibleLibraryFiles = state.files.filter((file) =>
@@ -1585,9 +1763,8 @@ export default function EasyWorkApp() {
       ...current,
       files: current.files.filter((file) => file.id !== fileId),
     }));
-    await fetch(`${GATEWAY_HTTP}/api/files/${encodeURIComponent(fileId)}`, {
+    await gatewayFetch(`/api/files/${encodeURIComponent(fileId)}`, {
       method: "DELETE",
-      credentials: "include",
     }).catch(() => undefined);
     showToast("文件及其索引已删除");
   };
@@ -1598,9 +1775,8 @@ export default function EasyWorkApp() {
       ...current,
       skills: current.skills.filter((skill) => skill.id !== skillId),
     }));
-    await fetch(`${GATEWAY_HTTP}/api/skills/${encodeURIComponent(skillId)}`, {
+    await gatewayFetch(`/api/skills/${encodeURIComponent(skillId)}`, {
       method: "DELETE",
-      credentials: "include",
     }).catch(() => undefined);
     showToast("已删除上传的技能");
   };
@@ -1640,7 +1816,7 @@ export default function EasyWorkApp() {
         </div>
 
         <div className="sidebar-primary">
-          <button className="new-chat-button" type="button" onClick={() => createConversation()}>
+          <button className="new-chat-button" type="button" onClick={() => beginConversation()}>
             <Plus size={17} />
             <span>新聊天</span>
           </button>
@@ -1707,61 +1883,58 @@ export default function EasyWorkApp() {
           </div>
           <div className="project-list">
             {state.projects.map((project) => (
-              <div className="project-block" key={project.id}>
+              <div
+                className={`project-list-item${
+                  view === "project" && project.id === activeProjectId ? " active" : ""
+                }`}
+                key={project.id}
+              >
                 <button
                   className="project-row"
                   type="button"
-                  onClick={() => createConversation(project.id)}
+                  onClick={() => openProject(project.id)}
                 >
                   <span className="project-avatar">{project.icon}</span>
-                  <span>
-                    <strong>{project.name}</strong>
-                    <small>
-                      {project.memoryMode === "project-only" ? "项目内记忆" : "默认记忆"}
-                    </small>
-                  </span>
-                  <Plus size={14} />
+                  <strong>{project.name}</strong>
                 </button>
-                <div className="project-chats">
-                  {projectConversations(project.id).map((conversation) => (
-                    <button
-                      className={`chat-row${
-                        conversation.id === activeConversationId && view === "chat"
-                          ? " active"
-                          : ""
-                      }`}
-                      type="button"
-                      key={conversation.id}
-                      onClick={() => selectConversation(conversation)}
-                    >
-                      <span className={`mode-dot ${conversation.mode}`} />
-                      <span>{conversation.title}</span>
-                    </button>
-                  ))}
-                </div>
+                <button
+                  className="project-new-chat"
+                  type="button"
+                  aria-label={`在“${project.name}”中新建聊天`}
+                  onClick={() => beginConversation(project.id)}
+                >
+                  <Plus size={15} />
+                </button>
               </div>
             ))}
           </div>
 
           <div className="section-label chat-section-label">
             <span>聊天</span>
-            <button type="button" onClick={() => createConversation()} aria-label="新建聊天">
+            <button type="button" onClick={() => beginConversation()} aria-label="新建聊天">
               <Plus size={15} />
             </button>
           </div>
           <div className="general-chats">
             {generalConversations.map((conversation) => (
-              <button
-                className={`chat-row${
-                  conversation.id === activeConversationId && view === "chat" ? " active" : ""
-                }`}
-                type="button"
+              <ConversationRow
                 key={conversation.id}
-                onClick={() => selectConversation(conversation)}
-              >
-                <span className={`mode-dot ${conversation.mode}`} />
-                <span>{conversation.title}</span>
-              </button>
+                conversation={conversation}
+                active={conversation.id === activeConversationId && view === "chat"}
+                projects={state.projects}
+                menuOpen={conversationMenuId === conversation.id}
+                onSelect={() => selectConversation(conversation)}
+                onToggleMenu={() =>
+                  setConversationMenuId((current) =>
+                    current === conversation.id ? "" : conversation.id,
+                  )
+                }
+                onMove={(projectId) => moveConversation(conversation.id, projectId)}
+                onDelete={() => {
+                  setConversationPendingDelete(conversation);
+                  setConversationMenuId("");
+                }}
+              />
             ))}
           </div>
         </div>
@@ -1821,6 +1994,10 @@ export default function EasyWorkApp() {
                   </span>
                 )}
               </div>
+            ) : view === "project" ? (
+              <div className="conversation-heading">
+                <strong>{projectPage?.name ?? "项目"}</strong>
+              </div>
             ) : (
               <div className="conversation-heading">
                 <strong>
@@ -1836,24 +2013,51 @@ export default function EasyWorkApp() {
 
           {view === "chat" ? (
             <div className="topbar-center">
-              <div className="mode-switch" role="group" aria-label="对话模式">
-                <button
-                  className={mode === "chat" ? "active" : ""}
-                  type="button"
-                  onClick={() => changeMode("chat")}
-                >
-                  <MessageCircle size={14} />
-                  聊天
-                </button>
-                <button
-                  className={mode === "work" ? "active" : ""}
-                  type="button"
-                  onClick={() => changeMode("work")}
-                >
-                  <Terminal size={14} />
-                  工作
-                </button>
-              </div>
+              {activeConversation ? (
+                <div className="conversation-mode-menu">
+                  <button
+                    className={`conversation-mode-badge ${mode}`}
+                    type="button"
+                    aria-expanded={modeMenuOpen}
+                    onClick={() => setModeMenuOpen((current) => !current)}
+                  >
+                    {mode === "chat" ? <MessageCircle size={14} /> : <Terminal size={14} />}
+                    {mode === "chat" ? "聊天" : "工作"}
+                    <ChevronDown size={13} />
+                  </button>
+                  {modeMenuOpen && (
+                    <div className="mode-convert-popover">
+                      <span>对话类型</span>
+                      <button
+                        type="button"
+                        onClick={() => changeMode(mode === "chat" ? "work" : "chat")}
+                      >
+                        {mode === "chat" ? <Terminal size={15} /> : <MessageCircle size={15} />}
+                        转换为{mode === "chat" ? "工作" : "聊天"}模式
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="mode-switch" role="group" aria-label="选择新对话类型">
+                  <button
+                    className={mode === "chat" ? "active" : ""}
+                    type="button"
+                    onClick={() => changeMode("chat")}
+                  >
+                    <MessageCircle size={14} />
+                    聊天
+                  </button>
+                  <button
+                    className={mode === "work" ? "active" : ""}
+                    type="button"
+                    onClick={() => changeMode("work")}
+                  >
+                    <Terminal size={14} />
+                    工作
+                  </button>
+                </div>
+              )}
             </div>
           ) : <div className="topbar-center" />}
 
@@ -2153,6 +2357,70 @@ export default function EasyWorkApp() {
           </section>
         )}
 
+        {view === "project" && projectPage && (
+          <section className="workspace-page project-page">
+            <div className="page-intro project-page-intro">
+              <div className="project-page-title">
+                <span className="project-page-avatar">{projectPage.icon}</span>
+                <div>
+                  <h1>{projectPage.name}</h1>
+                  <p>
+                    {projectPage.memoryMode === "project-only"
+                      ? "仅使用本项目的聊天、文件和记忆"
+                      : "使用默认记忆范围"}
+                  </p>
+                </div>
+              </div>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => beginConversation(projectPage.id)}
+              >
+                <Plus size={16} />
+                新聊天
+              </button>
+            </div>
+            <div className="content-card project-conversations-card">
+              <div className="card-toolbar">
+                <div>
+                  <h2>对话</h2>
+                  <span>{projectConversations(projectPage.id).length}</span>
+                </div>
+              </div>
+              <div className="project-conversation-list">
+                {projectConversations(projectPage.id).map((conversation) => (
+                  <ConversationRow
+                    key={conversation.id}
+                    conversation={conversation}
+                    active={false}
+                    projects={state.projects}
+                    menuOpen={conversationMenuId === conversation.id}
+                    onSelect={() => selectConversation(conversation)}
+                    onToggleMenu={() =>
+                      setConversationMenuId((current) =>
+                        current === conversation.id ? "" : conversation.id,
+                      )
+                    }
+                    onMove={(projectId) => moveConversation(conversation.id, projectId)}
+                    onDelete={() => {
+                      setConversationPendingDelete(conversation);
+                      setConversationMenuId("");
+                    }}
+                  />
+                ))}
+                {!projectConversations(projectPage.id).length && (
+                  <div className="project-empty-state">
+                    <p>还没有对话</p>
+                    <button type="button" onClick={() => beginConversation(projectPage.id)}>
+                      开始新聊天
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
+
         {view === "library" && (
           <section className="workspace-page library-page">
             <div className="page-intro">
@@ -2251,6 +2519,16 @@ export default function EasyWorkApp() {
                     </span>
                   </div>
                 ))}
+                {!visibleLibraryFiles.length && (
+                  <div className="data-empty-state">
+                    <p>{fileSearch ? "没有匹配的文件" : "还没有文件"}</p>
+                    {!fileSearch && (
+                      <button type="button" onClick={() => fileInputRef.current?.click()}>
+                        上传文件
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           </section>
@@ -2393,7 +2671,7 @@ export default function EasyWorkApp() {
                   </div>
                 </div>
                 <p className="summary-text">
-                  {state.memorySummary ??
+                  {state.memorySummary ||
                     "当前还没有摘要。点击“刷新摘要”可根据生效记忆重新生成。"}
                 </p>
                 <div className="summary-edit">
@@ -2626,6 +2904,14 @@ export default function EasyWorkApp() {
                   </button>
                 </article>
               ))}
+              {!visibleMemories.length && (
+                <div className="data-empty-state memory-empty-state">
+                  <p>{memoryFilter === "all" ? "还没有记忆" : "该范围内没有记忆"}</p>
+                  <button type="button" onClick={addMemory}>
+                    添加记忆
+                  </button>
+                </div>
+              )}
             </div>
           </section>
         )}
@@ -2771,6 +3057,29 @@ export default function EasyWorkApp() {
         </aside>
       )}
 
+      {conversationPendingDelete && (
+        <Modal title="删除对话？" onClose={() => setConversationPendingDelete(null)}>
+          <div className="delete-conversation-dialog">
+            <p>“{conversationPendingDelete.title}”将从聊天记录中删除。</p>
+            <div className="modal-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setConversationPendingDelete(null)}
+              >
+                取消
+              </button>
+              <button
+                className="danger-button"
+                type="button"
+                onClick={() => deleteConversation(conversationPendingDelete.id)}
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
       {projectModalOpen && (
         <ProjectModal
           onClose={() => setProjectModalOpen(false)}
@@ -2795,6 +3104,8 @@ export default function EasyWorkApp() {
           connection={connection}
           gatewayStatus={gatewayStatus}
           gatewayEndpoint={gatewayEndpoint}
+          profile={state.settings.ssh}
+          canRemember={actor.authenticated}
           onClose={() => setSshModalOpen(false)}
           onDemo={connectDemo}
           onConnect={connectSsh}
@@ -2835,9 +3146,8 @@ export default function EasyWorkApp() {
               settings: { ...current.settings, embedding: publicEmbedding },
             }));
             try {
-              await fetch(`${GATEWAY_HTTP}/api/settings/embedding`, {
+              await gatewayFetch("/api/settings/embedding", {
                 method: "PUT",
-                credentials: "include",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(embedding),
               });
@@ -2970,39 +3280,28 @@ function ProfileModal({
     setBusy(true);
     setError("");
     try {
-      const response = await fetch(`${GATEWAY_HTTP}/api/auth/${kind}`, {
+      const response = await gatewayFetch(`/api/auth/${kind}`, {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password, displayName: name }),
       });
-      const payload = (await response.json()) as { actor?: Actor; error?: string };
+      const payload = (await response.json()) as {
+        actor?: Actor;
+        deviceToken?: string;
+        error?: string;
+      };
       if (!response.ok || !payload.actor) throw new Error(payload.error || "认证失败");
+      storeDeviceToken(payload.deviceToken);
       onActor(payload.actor);
-      const bootstrapResponse = await fetch(`${GATEWAY_HTTP}/api/bootstrap`, {
-        credentials: "include",
-      });
+      const bootstrapResponse = await gatewayFetch("/api/bootstrap");
       if (bootstrapResponse.ok) {
         const bootstrap = (await bootstrapResponse.json()) as {
+          deviceToken?: string;
           state?: Partial<EasyWorkState>;
         };
+        storeDeviceToken(bootstrap.deviceToken);
         if (bootstrap.state) {
-          onState((current) => ({
-            ...current,
-            ...bootstrap.state,
-            settings: {
-              ...current.settings,
-              ...(bootstrap.state?.settings ?? {}),
-              provider: {
-                ...current.settings.provider,
-                ...(bootstrap.state?.settings?.provider ?? {}),
-              },
-              embedding: {
-                ...current.settings.embedding,
-                ...(bootstrap.state?.settings?.embedding ?? {}),
-              },
-            },
-          }));
+          onState((current) => mergeStoredState(current, bootstrap.state ?? {}));
         }
       }
       setTab("profile");
@@ -3018,9 +3317,8 @@ function ProfileModal({
     const nextActor = { ...actor, displayName: name || actor.displayName, avatar };
     onActor(nextActor);
     try {
-      await fetch(`${GATEWAY_HTTP}/api/profile`, {
+      await gatewayFetch("/api/profile", {
         method: "PATCH",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ displayName: nextActor.displayName, avatar }),
       });
@@ -3031,6 +3329,10 @@ function ProfileModal({
   };
 
   const saveProvider = async () => {
+    if (/^https?:\/\//i.test(provider.apiKey.trim())) {
+      setModelError("API Key 不能填写 API URL");
+      return;
+    }
     const nextProvider = {
       name: "OpenAI Compatible",
       baseUrl: provider.baseUrl,
@@ -3038,31 +3340,36 @@ function ProfileModal({
       protocol: "auto" as const,
       configured: Boolean(provider.apiKey || provider.configured),
     };
-    onState((current) => ({
-      ...current,
-      settings: { ...current.settings, provider: nextProvider },
-    }));
+    setModelError("");
     try {
-      await fetch(`${GATEWAY_HTTP}/api/settings/provider`, {
+      const response = await gatewayFetch("/api/settings/provider", {
         method: "PUT",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(provider),
       });
-    } catch {
-      // The configuration remains useful for the UI demo.
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      if (!response.ok) throw new Error(payload.error || "模型 API 保存失败");
+      onState((current) => ({
+        ...current,
+        settings: { ...current.settings, provider: nextProvider },
+      }));
+      onToast("模型 API 已保存");
+      onClose();
+    } catch (caught) {
+      setModelError(caught instanceof Error ? caught.message : "模型 API 保存失败");
     }
-    onToast("模型 API 已保存");
-    onClose();
   };
 
   const detectProviderModels = async () => {
+    if (/^https?:\/\//i.test(provider.apiKey.trim())) {
+      setModelError("API Key 不能填写 API URL");
+      return;
+    }
     setModelDetecting(true);
     setModelError("");
     try {
-      const response = await fetch(`${GATEWAY_HTTP}/api/settings/provider/models`, {
+      const response = await gatewayFetch("/api/settings/provider/models", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(provider),
       });
@@ -3228,11 +3535,15 @@ function ProfileModal({
               className="text-danger-button"
               type="button"
               onClick={async () => {
-                await fetch(`${GATEWAY_HTTP}/api/auth/logout`, {
+                const response = await gatewayFetch("/api/auth/logout", {
                   method: "POST",
-                  credentials: "include",
                 }).catch(() => undefined);
-                onActor(DEFAULT_ACTOR);
+                const payload = response?.ok
+                  ? ((await response.json()) as { actor?: Actor; deviceToken?: string })
+                  : {};
+                clearDeviceToken();
+                storeDeviceToken(payload.deviceToken);
+                onActor(payload.actor ?? DEFAULT_ACTOR);
                 onState(DEFAULT_STATE);
                 onClose();
               }}
@@ -3261,9 +3572,10 @@ function ProfileModal({
           </label>
           <label className="field">
             <span>API Key</span>
-            <input
-              type="password"
-              autoComplete="off"
+              <input
+                type="password"
+                autoComplete="new-password"
+                spellCheck={false}
               value={provider.apiKey}
               onChange={(event) => setProvider((current) => ({ ...current, apiKey: event.target.value }))}
               placeholder={provider.configured ? "已保存；留空表示不修改" : "sk-…"}
@@ -3322,6 +3634,8 @@ function SshModal({
   connection,
   gatewayStatus,
   gatewayEndpoint,
+  profile,
+  canRemember,
   onClose,
   onDemo,
   onConnect,
@@ -3331,13 +3645,18 @@ function SshModal({
   connection: ConnectionState;
   gatewayStatus: "checking" | "connected" | "unavailable";
   gatewayEndpoint: string;
+  profile: AppSettings["ssh"];
+  canRemember: boolean;
   onClose: () => void;
   onDemo: () => void;
   onConnect: (payload: {
     host: string;
     port: number;
     username: string;
-    privateKey: string;
+    privateKey?: string;
+    privateKeyName?: string;
+    useSavedKey?: boolean;
+    rememberKey?: boolean;
     passphrase?: string;
     otp?: string;
     trustHost?: boolean;
@@ -3345,11 +3664,12 @@ function SshModal({
   onDisconnect: () => void;
   onRetry: () => void;
 }) {
-  const [host, setHost] = useState("107.ustc.edu.cn");
-  const [port, setPort] = useState("22");
-  const [username, setUsername] = useState("");
+  const [host, setHost] = useState(profile.host || "107.ustc.edu.cn");
+  const [port, setPort] = useState(String(profile.port || 22));
+  const [username, setUsername] = useState(profile.username || "");
   const [privateKey, setPrivateKey] = useState("");
   const [privateKeyName, setPrivateKeyName] = useState("");
+  const [useSavedKey, setUseSavedKey] = useState(profile.configured);
   const [pasteKeyOpen, setPasteKeyOpen] = useState(false);
   const [passphrase, setPassphrase] = useState("");
   const [otp, setOtp] = useState("");
@@ -3445,7 +3765,10 @@ function SshModal({
             host,
             port: Number(port) || 22,
             username,
-            privateKey,
+            privateKey: privateKey || undefined,
+            privateKeyName: privateKeyName || profile.keyName || undefined,
+            useSavedKey,
+            rememberKey: canRemember && Boolean(privateKey),
             passphrase: passphrase || undefined,
             otp: otp || undefined,
             trustHost,
@@ -3479,10 +3802,29 @@ function SshModal({
         </label>
         <div className="field key-picker-field">
           <span>SSH 私钥</span>
+          {profile.configured && (
+            <button
+              className={`saved-key-choice${useSavedKey ? " selected" : ""}`}
+              type="button"
+              onClick={() => {
+                setUseSavedKey(true);
+                setPrivateKey("");
+                setPrivateKeyName("");
+                setPasteKeyOpen(false);
+              }}
+            >
+              <ShieldCheck size={16} />
+              <span>
+                <strong>{profile.keyName || "已保存的私钥"}</strong>
+                <small>使用账号中保存的私钥</small>
+              </span>
+              {useSavedKey && <Check size={15} />}
+            </button>
+          )}
           <div className="key-picker-actions">
             <label className="secondary-button">
               <Upload size={15} />
-              选择文件
+              {profile.configured ? "更换文件" : "选择文件"}
               <input
                 type="file"
                 hidden
@@ -3493,6 +3835,7 @@ function SshModal({
                   reader.onload = () => {
                     setPrivateKey(String(reader.result ?? ""));
                     setPrivateKeyName(file.name);
+                    setUseSavedKey(false);
                     setPasteKeyOpen(false);
                   };
                   reader.readAsText(file);
@@ -3505,9 +3848,10 @@ function SshModal({
               onClick={() => {
                 setPasteKeyOpen((value) => !value);
                 setPrivateKeyName("");
+                if (!pasteKeyOpen) setUseSavedKey(false);
               }}
             >
-              {pasteKeyOpen ? "收起" : "粘贴私钥"}
+              {pasteKeyOpen ? "收起" : profile.configured ? "粘贴新私钥" : "粘贴私钥"}
             </button>
           </div>
           {privateKeyName && (
@@ -3520,7 +3864,10 @@ function SshModal({
             <textarea
               className="private-key-paste"
               value={privateKey}
-              onChange={(event) => setPrivateKey(event.target.value)}
+              onChange={(event) => {
+                setPrivateKey(event.target.value);
+                setUseSavedKey(false);
+              }}
               placeholder="粘贴 id_ed25519 私钥"
               rows={4}
               autoComplete="off"
@@ -3572,7 +3919,9 @@ function SshModal({
           </div>
         )}
         <p className="security-line">
-          私钥、密码和验证码仅进入本机网关内存。
+          {canRemember
+            ? "连接成功后，用户名和私钥会加密保存到账号；私钥密码和验证码不会保存。"
+            : "私钥、密码和验证码仅进入本机网关内存。登录后可保存连接信息。"}
         </p>
         <div className="modal-actions spread">
           <button className="secondary-button" type="button" onClick={onDemo}>
@@ -3585,7 +3934,7 @@ function SshModal({
               connection.status === "connecting" ||
               !host ||
               !username ||
-              !privateKey ||
+              (!privateKey && !useSavedKey) ||
               Boolean(connection.fingerprint && !trustHost)
             }
           >
@@ -3685,11 +4034,11 @@ function AgentModal({
             <span className={`agent-state ${agent.status}`}>
               {agent.status === "ready"
                 ? agent.version ?? "可用"
-                : agent.status === "missing"
-                  ? "未安装"
-                  : agent.status === "installing"
-                    ? "安装中…"
-                  : "需配置适配器"}
+                   : agent.status === "missing"
+                   ? "未安装"
+                   : agent.status === "installing"
+                     ? agent.detail ?? "安装中…"
+                   : "需配置适配器"}
             </span>
             {agent.id === activeAgentId && agent.status === "ready" && (
               <CheckCircle2 size={17} />
@@ -3749,9 +4098,8 @@ function EmbeddingModal({
     setDetecting(true);
     setDetectError("");
     try {
-      const response = await fetch(`${GATEWAY_HTTP}/api/settings/embedding/models`, {
+      const response = await gatewayFetch("/api/settings/embedding/models", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(draft),
       });

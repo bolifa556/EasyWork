@@ -27,6 +27,7 @@ const HOST = process.env.EASYWORK_GATEWAY_HOST || "127.0.0.1";
 const PORT = Number(process.env.EASYWORK_GATEWAY_PORT || 8789);
 const BODY_LIMIT = 36 * 1024 * 1024;
 const SESSION_MAX_AGE = 60 * 60 * 24 * 30;
+const SSH_RECONNECT_GRACE_MS = 2 * 60 * 1000;
 const BUILTIN_SKILLS = {
   skill_cluster: path.join(SKILL_ROOT, "built-in", "cluster-ops"),
   skill_paper: path.join(SKILL_ROOT, "built-in", "paper-reading"),
@@ -34,6 +35,7 @@ const BUILTIN_SKILLS = {
 };
 
 const activeSockets = new Set();
+const sshSessionPool = new Map();
 let sessionSecret;
 let encryptionKey;
 
@@ -120,6 +122,24 @@ function verifySession(token) {
   return userId;
 }
 
+function requestSessionToken(req) {
+  const authorization = String(req.headers.authorization || "");
+  if (/^Bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^Bearer\s+/i, "").trim();
+  }
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    return url.searchParams.get("deviceToken") || "";
+  } catch {
+    return "";
+  }
+}
+
+function issueDeviceToken(actor) {
+  const expires = Date.now() + SESSION_MAX_AGE * 1000;
+  return signSession(actor.id, expires);
+}
+
 async function ensureFile(filePath, bytes = 32) {
   try {
     return await readFile(filePath);
@@ -201,9 +221,9 @@ function actorSkillDirectory(actor) {
 async function resolveActor(req, res, createGuest = true) {
   const cookies = cookieMap(req.headers.cookie);
   const users = await readJson(path.join(DATA_ROOT, "users.json"), []);
-  const userId = verifySession(cookies.ew_session);
-  if (userId) {
-    const record = users.find((item) => item.id === userId);
+  const signedActorId = verifySession(requestSessionToken(req) || cookies.ew_session);
+  if (signedActorId) {
+    const record = users.find((item) => item.id === signedActorId);
     if (record) {
       return {
         id: record.id,
@@ -214,9 +234,11 @@ async function resolveActor(req, res, createGuest = true) {
       };
     }
   }
-  let guestId = /^[a-f0-9-]{20,}$/i.test(cookies.ew_guest || "")
-    ? cookies.ew_guest
-    : "";
+  let guestId = /^[a-f0-9-]{20,}$/i.test(signedActorId || "")
+    ? signedActorId
+    : /^[a-f0-9-]{20,}$/i.test(cookies.ew_guest || "")
+      ? cookies.ew_guest
+      : "";
   if (!guestId && createGuest) {
     guestId = crypto.randomUUID();
     res.setHeader("Set-Cookie", cookie("ew_guest", guestId, req, { maxAge: SESSION_MAX_AGE }));
@@ -233,6 +255,7 @@ async function getSecrets(actor) {
   return {
     providerApiKey: decryptString(stored.providerApiKey),
     embeddingApiKey: decryptString(stored.embeddingApiKey),
+    sshPrivateKey: decryptString(stored.sshPrivateKey),
   };
 }
 
@@ -245,6 +268,9 @@ async function updateSecrets(actor, patch) {
   }
   if (typeof patch.embeddingApiKey === "string" && patch.embeddingApiKey) {
     next.embeddingApiKey = encryptString(patch.embeddingApiKey);
+  }
+  if (typeof patch.sshPrivateKey === "string" && patch.sshPrivateKey) {
+    next.sshPrivateKey = encryptString(patch.sshPrivateKey);
   }
   await writeJson(secretPath, next);
 }
@@ -270,6 +296,11 @@ async function stateForClient(actor) {
   if (state?.settings?.embedding) {
     state.settings.embedding.configured = Boolean(secrets.embeddingApiKey);
   }
+  if (secrets.sshPrivateKey || state?.settings?.ssh) {
+    state.settings ||= {};
+    state.settings.ssh ||= {};
+    state.settings.ssh.configured = Boolean(secrets.sshPrivateKey);
+  }
   return state;
 }
 
@@ -293,7 +324,7 @@ function applyCors(req, res) {
   const origin = allowedOrigin(req.headers.origin);
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Private-Network", "true");
   res.setHeader("Vary", "Origin, Access-Control-Request-Private-Network");
@@ -389,7 +420,16 @@ function apiUrl(baseUrl, endpoint) {
   return `${String(baseUrl || "").replace(/\/+$/, "")}/${endpoint.replace(/^\/+/, "")}`;
 }
 
+function assertApiKeyShape(apiKey) {
+  if (/^https?:\/\//i.test(String(apiKey || "").trim())) {
+    const error = new Error("API Key 不能填写 URL");
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
 async function listProviderModels(baseUrl, apiKey) {
+  assertApiKeyShape(apiKey);
   const response = await fetch(apiUrl(baseUrl, "models"), {
     headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
     signal: AbortSignal.timeout(30_000),
@@ -754,6 +794,7 @@ function modelRequest(protocol, model, context, test = false) {
 }
 
 async function callChatProvider(provider, apiKey, context, { test = false } = {}) {
+  assertApiKeyShape(apiKey);
   const protocols =
     provider.protocol === "responses" || provider.protocol === "chat-completions"
       ? [provider.protocol]
@@ -867,7 +908,11 @@ async function handleHttp(req, res) {
       const actor = await resolveActor(req, res);
       await mkdir(actorDirectory(actor), { recursive: true });
       await mkdir(actorSkillDirectory(actor), { recursive: true });
-      sendJson(res, 200, { actor, state: await stateForClient(actor) });
+      sendJson(res, 200, {
+        actor,
+        deviceToken: issueDeviceToken(actor),
+        state: await stateForClient(actor),
+      });
       return;
     }
 
@@ -932,13 +977,26 @@ async function handleHttp(req, res) {
           email: record.email,
           avatar: record.avatar || undefined,
         },
+        deviceToken: session,
       });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/auth/logout") {
-      res.setHeader("Set-Cookie", cookie("ew_session", "", req, { maxAge: 0 }));
-      sendJson(res, 200, { ok: true });
+      const guestActor = {
+        id: crypto.randomUUID(),
+        authenticated: false,
+        displayName: "未登录",
+      };
+      res.setHeader("Set-Cookie", [
+        cookie("ew_session", "", req, { maxAge: 0 }),
+        cookie("ew_guest", guestActor.id, req, { maxAge: SESSION_MAX_AGE }),
+      ]);
+      sendJson(res, 200, {
+        ok: true,
+        actor: guestActor,
+        deviceToken: issueDeviceToken(guestActor),
+      });
       return;
     }
 
@@ -1238,6 +1296,10 @@ function wsSend(socket, payload) {
   if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(payload));
 }
 
+function sessionSend(session, payload) {
+  for (const socket of session.sockets || []) wsSend(socket, payload);
+}
+
 function remoteExec(client, command, options = {}) {
   return new Promise((resolve, reject) => {
     client.exec(command, { pty: options.pty || false }, (error, stream) => {
@@ -1301,7 +1363,10 @@ function providerConfigForOpenCode(provider) {
     $schema: "https://opencode.ai/config.json",
     provider: {
       easywork: {
-        npm: "@ai-sdk/openai-compatible",
+        npm:
+          provider.protocol === "responses"
+            ? "@ai-sdk/openai"
+            : "@ai-sdk/openai-compatible",
         name: "EasyWork API",
         options: {
           baseURL: provider.baseUrl,
@@ -1356,7 +1421,7 @@ async function scanRemoteAgents(session) {
   return agents;
 }
 
-async function installOpenCode(session, actor) {
+async function installOpenCode(session, actor, onProgress = () => undefined) {
   if (!session.client) throw new Error("SSH 尚未连接");
   const state = await getState(actor);
   const provider = state?.settings?.provider || {};
@@ -1364,25 +1429,44 @@ async function installOpenCode(session, actor) {
   if (!provider.baseUrl || !provider.model || !secrets.providerApiKey) {
     throw new Error("请先在个人资料中配置模型 API，再安装远端 Agent");
   }
+  if (!["responses", "chat-completions"].includes(provider.protocol)) {
+    onProgress("detect", "检测模型接口");
+    const detected = await callChatProvider(provider, secrets.providerApiKey, "", {
+      test: true,
+    });
+    provider.protocol = detected.protocol;
+    state.settings.provider = provider;
+    await saveState(actor, state);
+  }
+  onProgress("prepare", "准备安装目录");
   await remoteExec(
     session.client,
     'mkdir -p "$HOME/.easywork/bin" "$HOME/.easywork/config" "$HOME/.easywork/tasks" "$HOME/.easywork/runtime"',
   );
+  onProgress("download", "下载 OpenCode");
   await remoteExec(
     session.client,
     [
-      'curl -fsSL https://opencode.ai/install -o "$HOME/.easywork/install-opencode.sh"',
-      'OPENCODE_INSTALL_DIR="$HOME/.easywork/bin" bash "$HOME/.easywork/install-opencode.sh"',
-      'rm -f "$HOME/.easywork/install-opencode.sh"',
+      "set -eu",
+      'EW_INSTALLER="$HOME/.easywork/install-opencode.sh"',
+      'trap \'rm -f "$EW_INSTALLER"\' EXIT',
+      'if [ ! -x "$HOME/.opencode/bin/opencode" ]; then',
+      '  curl --connect-timeout 15 --max-time 90 --retry 2 -fsSL https://opencode.ai/install -o "$EW_INSTALLER"',
+      '  if command -v timeout >/dev/null 2>&1; then timeout 300 bash "$EW_INSTALLER" --no-modify-path; else bash "$EW_INSTALLER" --no-modify-path; fi',
+      "fi",
+      'test -x "$HOME/.opencode/bin/opencode"',
+      'cp "$HOME/.opencode/bin/opencode" "$HOME/.easywork/bin/opencode"',
+      'chmod 755 "$HOME/.easywork/bin/opencode"',
       '"$HOME/.easywork/bin/opencode" --version',
-    ].join(" && "),
-    { pty: true },
+    ].join("\n"),
   );
+  onProgress("configure", "写入模型配置");
   await remoteSftpWrite(
     session.client,
     `${session.home}/.easywork/config/opencode.json`,
     `${JSON.stringify(providerConfigForOpenCode(provider), null, 2)}\n`,
   );
+  onProgress("verify", "验证 Agent");
   return scanRemoteAgents(session);
 }
 
@@ -1635,12 +1719,19 @@ async function closeSshSession(session) {
   }
   session.client = null;
   session.activeStream = null;
+  session.activeRun = null;
+  session.status = "disconnected";
+  session.demo = false;
 }
 
 async function connectSsh(socket, session, actor, payload) {
   await closeSshSession(session);
   if (payload.demo) {
     session.demo = true;
+    session.status = "connected";
+    session.host = "demo.easywork.local";
+    session.username = "demo";
+    session.latency = 18;
     wsSend(socket, {
       type: "connection.status",
       status: "connected",
@@ -1669,7 +1760,8 @@ async function connectSsh(socket, session, actor, payload) {
 
   const host = String(payload.host || "").trim();
   const username = String(payload.username || "").trim();
-  const privateKey = String(payload.privateKey || "");
+  const storedSecrets = payload.useSavedKey ? await getSecrets(actor) : {};
+  const privateKey = String(payload.privateKey || storedSecrets.sshPrivateKey || "");
   const port = Number(payload.port || 22);
   if (!host || !username || !privateKey) throw new Error("主机、用户名和私钥不能为空");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("SSH 端口无效");
@@ -1680,6 +1772,7 @@ async function connectSsh(socket, session, actor, payload) {
   const startedAt = Date.now();
   const client = new SshClient();
   session.demo = false;
+  session.status = "connecting";
   session.client = client;
   let connectionPublished = false;
   let failureExpectedClose = false;
@@ -1743,7 +1836,8 @@ async function connectSsh(socket, session, actor, payload) {
         if (session.client === client) {
           session.client = null;
           if (connectionPublished && !failureExpectedClose) {
-            wsSend(socket, {
+            session.status = "disconnected";
+            sessionSend(session, {
               type: "connection.status",
               status: "disconnected",
               label: "SSH 连接已关闭",
@@ -1782,6 +1876,42 @@ async function connectSsh(socket, session, actor, payload) {
     fingerprint: observedFingerprint,
   });
   connectionPublished = true;
+  session.status = "connected";
+  session.port = port;
+  session.latency = Date.now() - startedAt;
+  session.fingerprint = observedFingerprint;
+  if (
+    actor.authenticated &&
+    (payload.useSavedKey || (payload.rememberKey && payload.privateKey))
+  ) {
+    try {
+      if (payload.privateKey) {
+        await updateSecrets(actor, { sshPrivateKey: String(payload.privateKey) });
+      }
+      const state = await getState(actor);
+      state.settings ||= {};
+      const currentSsh = state.settings.ssh || {};
+      state.settings.ssh = {
+        host,
+        port,
+        username,
+        keyName: String(
+          payload.privateKeyName || currentSsh.keyName || "SSH 私钥",
+        ).slice(0, 160),
+        configured: true,
+      };
+      await saveState(actor, state);
+      wsSend(socket, {
+        type: "ssh.profile",
+        profile: state.settings.ssh,
+      });
+    } catch {
+      wsSend(socket, {
+        type: "error",
+        error: "SSH 已连接，但账号连接配置未能保存",
+      });
+    }
+  }
   wsSend(socket, { type: "agent.list", agents: await scanRemoteAgents(session) });
 }
 
@@ -1832,18 +1962,67 @@ function attachWebSocketServer(server) {
       setHeader() {},
     };
     const actor = await resolveActor(req, responseShim, false);
-    const session = {
-      socketId: crypto.randomUUID(),
-      client: null,
-      demo: false,
-      home: "",
-      host: "",
-      username: "",
-      activeStream: null,
-      activeRun: null,
-      agentSessions: new Map(),
-    };
+    const sessionKey = `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
+    let session = sshSessionPool.get(sessionKey);
+    if (!session) {
+      session = {
+        socketId: crypto.randomUUID(),
+        client: null,
+        demo: false,
+        status: "disconnected",
+        home: "",
+        host: "",
+        port: 22,
+        username: "",
+        latency: undefined,
+        fingerprint: "",
+        activeStream: null,
+        activeRun: null,
+        agentSessions: new Map(),
+        sockets: new Set(),
+        disconnectTimer: null,
+      };
+      sshSessionPool.set(sessionKey, session);
+    }
+    if (session.disconnectTimer) {
+      clearTimeout(session.disconnectTimer);
+      session.disconnectTimer = null;
+    }
+    session.sockets.add(socket);
     activeSockets.add(socket);
+    if (session.status === "connected") {
+      wsSend(socket, {
+        type: "connection.status",
+        status: "connected",
+        label: session.demo ? "演示登录节点在线" : "算力平台登录节点在线",
+        host: session.host,
+        username: session.username,
+        latency: session.latency,
+        fingerprint: session.fingerprint || undefined,
+        demo: session.demo,
+        resumed: true,
+      });
+      if (session.demo) {
+        wsSend(socket, {
+          type: "agent.list",
+          agents: [
+            {
+              id: "opencode",
+              name: "OpenCode",
+              path: "~/.easywork/bin/opencode",
+              version: "demo",
+              status: "ready",
+              adapter: "opencode",
+              managed: true,
+            },
+          ],
+        });
+      } else {
+        scanRemoteAgents(session)
+          .then((agents) => wsSend(socket, { type: "agent.list", agents }))
+          .catch(() => undefined);
+      }
+    }
     socket.on("message", async (raw) => {
       let payload;
       try {
@@ -1864,7 +2043,7 @@ function attachWebSocketServer(server) {
         }
         if (payload.type === "ssh.disconnect") {
           await closeSshSession(session);
-          wsSend(socket, {
+          sessionSend(session, {
             type: "connection.status",
             status: "disconnected",
             label: "已主动断开",
@@ -1876,7 +2055,7 @@ function attachWebSocketServer(server) {
           return;
         }
         if (payload.type === "agent.install") {
-          wsSend(socket, {
+          sessionSend(session, {
             type: "agent.list",
             agents: [
               {
@@ -1889,7 +2068,14 @@ function attachWebSocketServer(server) {
               },
             ],
           });
-          wsSend(socket, { type: "agent.list", agents: await installOpenCode(session, actor) });
+          const agents = await installOpenCode(session, actor, (stage, label) => {
+            sessionSend(session, {
+              type: "agent.install.progress",
+              stage,
+              label,
+            });
+          });
+          sessionSend(session, { type: "agent.list", agents });
           return;
         }
         if (payload.type === "work.run") {
@@ -1950,9 +2136,19 @@ function attachWebSocketServer(server) {
         }
       }
     });
-    socket.on("close", async () => {
+    socket.on("close", () => {
       activeSockets.delete(socket);
-      await closeSshSession(session).catch(() => undefined);
+      session.sockets.delete(socket);
+      if (!session.sockets.size && !session.disconnectTimer) {
+        session.disconnectTimer = setTimeout(() => {
+          session.disconnectTimer = null;
+          if (session.sockets.size) return;
+          void closeSshSession(session)
+            .catch(() => undefined)
+            .finally(() => sshSessionPool.delete(sessionKey));
+        }, SSH_RECONNECT_GRACE_MS);
+        session.disconnectTimer.unref?.();
+      }
     });
   });
   return wss;
