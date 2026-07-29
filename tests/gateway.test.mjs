@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -173,3 +174,106 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
   }
 });
 
+test("gateway detects models, auto-selects a compatible chat protocol, and permits local access", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-model-test-"));
+  process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
+  process.env.EASYWORK_SKILL_DIR = path.join(temporaryRoot, "skill");
+
+  const providerServer = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    if (req.method === "GET" && req.url === "/v1/models") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          data: [
+            { id: "chat-model" },
+            { id: "text-embedding-test" },
+          ],
+        }),
+      );
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/responses") {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "responses unsupported" } }));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          choices: [{ message: { content: "OK" } }],
+        }),
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((resolve) => providerServer.listen(0, "127.0.0.1", resolve));
+  const providerAddress = providerServer.address();
+  const providerBase = `http://127.0.0.1:${providerAddress.port}/v1`;
+
+  const { createEasyWorkServer } = await import(
+    `../gateway/server.mjs?models=${Date.now()}`
+  );
+  const { server } = await createEasyWorkServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const base = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const preflight = await fetch(`${base}/api/health`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://easywork.example",
+        "Access-Control-Request-Private-Network": "true",
+      },
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(
+      preflight.headers.get("access-control-allow-private-network"),
+      "true",
+    );
+
+    const modelsResponse = await fetch(`${base}/api/settings/provider/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseUrl: providerBase, apiKey: "test-key" }),
+    });
+    assert.equal(modelsResponse.status, 200);
+    assert.deepEqual((await modelsResponse.json()).models, ["chat-model"]);
+
+    const embeddingResponse = await fetch(`${base}/api/settings/embedding/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseUrl: providerBase, apiKey: "test-key" }),
+    });
+    assert.equal(embeddingResponse.status, 200);
+    assert.deepEqual((await embeddingResponse.json()).models, [
+      "text-embedding-test",
+    ]);
+
+    const testResponse = await fetch(`${base}/api/settings/provider/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseUrl: providerBase,
+        apiKey: "test-key",
+        model: "chat-model",
+        protocol: "auto",
+      }),
+    });
+    assert.equal(testResponse.status, 200);
+    assert.equal((await testResponse.json()).protocol, "chat-completions");
+  } finally {
+    await Promise.all([
+      new Promise((resolve) => server.close(resolve)),
+      new Promise((resolve) => providerServer.close(resolve)),
+    ]);
+    const resolved = path.resolve(temporaryRoot);
+    assert.ok(resolved.startsWith(path.resolve(os.tmpdir()) + path.sep));
+    await rm(resolved, { recursive: true, force: true });
+  }
+});

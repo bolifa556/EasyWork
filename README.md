@@ -17,7 +17,14 @@ npm run gateway
 npm run dev
 ```
 
-打开 `http://localhost:3000`。前端默认连接 `http://localhost:8789`；也可以在构建前通过 `NEXT_PUBLIC_EASYWORK_GATEWAY_URL` 指定网关地址。
+打开 `http://localhost:3000`。开发服务器会把同源 `/api` 与 `/ws` 转发到
+`http://localhost:8789`；也可以在构建前通过
+`NEXT_PUBLIC_EASYWORK_GATEWAY_URL` 指定独立网关地址。
+
+Windows 也可以直接双击 `frp\start.cmd`。它会同时启动网页、网关和 FRP，
+并把 npm/Vite/Wrangler/日志缓存放到当前电脑独立的
+`.cache\devices\<电脑名>\`。`data\`、`skill\` 等持久数据仍会同步；
+Syncthing 设置见 `sync\README.md`。
 
 ## 功能
 
@@ -51,4 +58,3 @@ npm run lint
 ```
 
 生产托管版本提供完整界面与演示模式。真实 SSH 需要在能访问算力平台的机器上运行本地网关，并使用本地开发地址或将前端网关地址指向受保护的 HTTPS/WSS 网关。
-

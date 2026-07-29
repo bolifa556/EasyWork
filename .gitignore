@@ -41,6 +41,7 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/.cache/
 
 # EasyWork local gateway state and transient previews
 /data/
@@ -49,3 +50,5 @@ next-env.d.ts
 /.dev-server.*.log
 /.gateway.*.log
 /.reference-chat.png
+/frp/frpc.local.toml
+/frp/*.log

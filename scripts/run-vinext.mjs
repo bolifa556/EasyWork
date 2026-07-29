@@ -12,7 +12,8 @@ const child = spawn(executable, [cli, action, ...process.argv.slice(3)], {
   env: {
     ...process.env,
     WRANGLER_LOG_PATH:
-      process.env.WRANGLER_LOG_PATH ?? path.join(".wrangler", "wrangler.log"),
+      process.env.WRANGLER_LOG_PATH ??
+      path.join(".cache", "wrangler", "wrangler.log"),
   },
   stdio: "inherit",
   shell: false,

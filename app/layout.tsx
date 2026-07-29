@@ -5,9 +5,16 @@ import "./globals.css";
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
   const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host");
+  const isLoopbackHost =
+    host?.startsWith("localhost") ||
+    host?.startsWith("127.") ||
+    host?.startsWith("[::1]");
+  const isIpAddressHost =
+    /^(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?$/.test(host ?? "") ||
+    /^\[[0-9a-f:]+\](?::\d+)?$/i.test(host ?? "");
   const protocol =
     requestHeaders.get("x-forwarded-proto") ??
-    (host?.startsWith("localhost") ? "http" : "https");
+    (isLoopbackHost || isIpAddressHost ? "http" : "https");
   const origin = `${protocol}://${host ?? "localhost:3000"}`;
   const imageUrl = new URL("/og.png", origin).toString();
   const title = "EasyWork — 对话连接算力";

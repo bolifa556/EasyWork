@@ -10,9 +10,11 @@
     "build": "node scripts/run-vinext.mjs build",
     "start": "node scripts/run-vinext.mjs start",
     "gateway": "node gateway/server.mjs",
+    "frp": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File frp/start.ps1",
+    "sync:setup": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File sync/install.ps1",
     "test:gateway": "node --test tests/gateway.test.mjs",
     "test": "npm run build && node --test tests/rendered-html.test.mjs tests/gateway.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .cache --ignore-pattern outputs --ignore-pattern work",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

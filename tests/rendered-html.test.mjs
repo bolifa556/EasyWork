@@ -29,8 +29,9 @@ test("server-renders the finished EasyWork shell", async () => {
   assert.match(html, /<html lang="zh-CN">/);
   assert.match(html, /<title>EasyWork — 对话连接算力<\/title>/);
   assert.match(html, /EasyWork/);
-  assert.match(html, /CHAT · COMPUTE · CREATE/);
-  assert.match(html, /CONVERSATION MAP/);
+  assert.match(html, /\u6709\u4ec0\u4e48\u53ef\u4ee5\u5e2e\u4f60/);
+  assert.doesNotMatch(html, /CHAT · COMPUTE · CREATE|CONVERSATION MAP/);
+  assert.doesNotMatch(html, /class="right-rail"/);
   assert.match(html, /\u65b0\u804a\u5929/);
   assert.doesNotMatch(html, /Your site is taking shape|react-loading-skeleton|codex-preview/i);
 });
@@ -56,6 +57,8 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /prefers-reduced-motion/);
   assert.match(gateway, /keepaliveInterval:\s*15_000/);
   assert.match(gateway, /hostVerifier/);
+  assert.match(gateway, /Access-Control-Allow-Private-Network/);
+  assert.match(gateway, /\/api\/settings\/provider\/models/);
   assert.match(gateway, /\.easywork\/bin\/opencode/);
   assert.match(gateway, /agentSessions:\s*new Map/);
 
@@ -65,3 +68,27 @@ test("includes the two-mode product architecture and removes starter artifacts",
   }
 });
 
+test("keeps machine caches local while persistent EasyWork data remains shareable", async () => {
+  const [rules, launcher, viteConfig, gitignore, example] = await Promise.all([
+    readFile(new URL("../sync/stignore.shared", import.meta.url), "utf8"),
+    readFile(new URL("../frp/start.ps1", import.meta.url), "utf8"),
+    readFile(new URL("../vite.config.ts", import.meta.url), "utf8"),
+    readFile(new URL("../.gitignore", import.meta.url), "utf8"),
+    readFile(new URL("../frp/frpc.example.toml", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(rules, /\/EasyWork\/node_modules/);
+  assert.match(rules, /\/EasyWork\/\.cache/);
+  assert.match(rules, /\/EasyWork\/frp\/frpc\.local\.toml/);
+  assert.doesNotMatch(rules, /^\(\?d\)\/EasyWork\/data/m);
+  assert.doesNotMatch(rules, /^\(\?d\)\/EasyWork\/skill/m);
+  assert.match(launcher, /EasyWork 网关/);
+  assert.match(launcher, /EasyWork 网页/);
+  assert.match(launcher, /Initialize-LocalFrpConfig/);
+  assert.match(launcher, /\.cache\\devices\\/);
+  assert.match(viteConfig, /proxy:/);
+  assert.match(viteConfig, /"\/ws"/);
+  assert.match(gitignore, /\/frp\/frpc\.local\.toml/);
+  assert.match(example, /REPLACE_WITH_FRP_TOKEN/);
+  assert.doesNotMatch(example, /auth\.token\s*=\s*"[a-f0-9]{32,}"/i);
+});

@@ -13,9 +13,6 @@ import {
   ChevronDown,
   ChevronRight,
   Circle,
-  CircleAlert,
-  Clock3,
-  Cloud,
   Code2,
   Database,
   File,
@@ -32,7 +29,6 @@ import {
   LogOut,
   Menu,
   MessageCircle,
-  MoreHorizontal,
   Network,
   Paperclip,
   Pencil,
@@ -53,7 +49,6 @@ import {
   Wifi,
   WifiOff,
   X,
-  Zap,
 } from "lucide-react";
 import {
   KeyboardEvent,
@@ -169,7 +164,7 @@ type AppSettings = {
     name: string;
     baseUrl: string;
     model: string;
-    protocol: "chat-completions" | "responses";
+    protocol: "auto" | "chat-completions" | "responses";
     configured: boolean;
   };
   embedding: {
@@ -220,8 +215,20 @@ type AgentItem = {
   managed?: boolean;
 };
 
-const GATEWAY_HTTP =
-  process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL ?? "http://localhost:8789";
+let GATEWAY_HTTP =
+  process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL ??
+  (typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+
+const gatewayCandidates = () => {
+  const configured = process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL;
+  const candidates = [
+    configured,
+    "http://127.0.0.1:8789",
+    "http://localhost:8789",
+    typeof window !== "undefined" ? window.location.origin : undefined,
+  ].filter((value): value is string => Boolean(value));
+  return [...new Set(candidates.map((value) => value.replace(/\/+$/, "")))];
+};
 
 const now = () => new Date().toISOString();
 const uid = (prefix: string) =>
@@ -383,8 +390,8 @@ const DEFAULT_STATE: EasyWorkState = {
     provider: {
       name: "OpenAI Compatible",
       baseUrl: "https://api.openai.com/v1",
-      model: "gpt-5.2",
-      protocol: "responses",
+      model: "",
+      protocol: "auto",
       configured: false,
     },
     embedding: {
@@ -446,7 +453,6 @@ const fileToBase64 = (file: globalThis.File) =>
 
 function Modal({
   title,
-  eyebrow,
   onClose,
   children,
   wide = false,
@@ -457,6 +463,14 @@ function Modal({
   children: React.ReactNode;
   wide?: boolean;
 }) {
+  useEffect(() => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section
@@ -468,7 +482,6 @@ function Modal({
       >
         <header className="modal-header">
           <div>
-            {eyebrow && <span>{eyebrow}</span>}
             <h2>{title}</h2>
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">
@@ -537,6 +550,8 @@ export default function EasyWorkApp() {
   const [gatewayStatus, setGatewayStatus] = useState<
     "checking" | "connected" | "unavailable"
   >("checking");
+  const [gatewayEndpoint, setGatewayEndpoint] = useState("");
+  const [gatewayProbe, setGatewayProbe] = useState(0);
   const [agents, setAgents] = useState<AgentItem[]>(DEFAULT_AGENTS);
   const [activeAgentId, setActiveAgentId] = useState("opencode");
   const [sending, setSending] = useState(false);
@@ -554,6 +569,7 @@ export default function EasyWorkApp() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const composerFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillInputRef = useRef<HTMLInputElement | null>(null);
   const skillFolderInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -631,7 +647,7 @@ export default function EasyWorkApp() {
         id: `${runId}_plan`,
         kind: "plan",
         title: "任务已编排",
-        detail: `${steps.length} 个步骤 · project-only 记忆边界已应用`,
+        detail: `${steps.length} 个步骤`,
         status: "done",
         timestamp: now(),
       };
@@ -690,7 +706,7 @@ export default function EasyWorkApp() {
                     id: `${runId}_tool_${index}`,
                     kind: index === 0 ? "terminal" : "tool",
                     title,
-                    detail: index === 0 ? "bash · 登录节点" : "OpenCode · build agent",
+                    detail: index === 0 ? "bash · 登录节点" : "OpenCode · 算力平台",
                     output: outputs[index],
                     status: "running",
                     timestamp: now(),
@@ -928,45 +944,57 @@ export default function EasyWorkApp() {
   useEffect(() => {
     let disposed = false;
     const bootstrap = async () => {
-      try {
-        const response = await fetch(`${GATEWAY_HTTP}/api/bootstrap`, {
-          credentials: "include",
-        });
-        if (!response.ok) throw new Error("Gateway bootstrap failed");
-        const payload = (await response.json()) as {
-          actor?: Actor;
-          state?: Partial<EasyWorkState>;
-        };
-        if (disposed) return;
-        setGatewayStatus("connected");
-        if (payload.actor) setActor(payload.actor);
-        if (payload.state) {
-          setState((current) => ({
-            ...current,
-            ...payload.state,
-            settings: {
-              ...current.settings,
-              ...(payload.state?.settings ?? {}),
-              provider: {
-                ...current.settings.provider,
-                ...(payload.state?.settings?.provider ?? {}),
+      setGatewayStatus("checking");
+      for (const candidate of gatewayCandidates()) {
+        try {
+          const response = await fetch(`${candidate}/api/bootstrap`, {
+            credentials: "include",
+            signal: AbortSignal.timeout(2_500),
+          });
+          if (!response.ok) continue;
+          const payload = (await response.json()) as {
+            actor?: Actor;
+            state?: Partial<EasyWorkState>;
+          };
+          if (!payload.actor) continue;
+          if (disposed) return;
+          GATEWAY_HTTP = candidate;
+          setGatewayEndpoint(candidate);
+          setGatewayStatus("connected");
+          setActor(payload.actor);
+          if (payload.state) {
+            setState((current) => ({
+              ...current,
+              ...payload.state,
+              settings: {
+                ...current.settings,
+                ...(payload.state?.settings ?? {}),
+                provider: {
+                  ...current.settings.provider,
+                  ...(payload.state?.settings?.provider ?? {}),
+                },
+                embedding: {
+                  ...current.settings.embedding,
+                  ...(payload.state?.settings?.embedding ?? {}),
+                },
               },
-              embedding: {
-                ...current.settings.embedding,
-                ...(payload.state?.settings?.embedding ?? {}),
-              },
-            },
-          }));
+            }));
+          }
+          return;
+        } catch {
+          // Try the same-origin gateway first, then the two loopback addresses.
         }
-      } catch {
-        if (!disposed) setGatewayStatus("unavailable");
+      }
+      if (!disposed) {
+        setGatewayEndpoint("");
+        setGatewayStatus("unavailable");
       }
     };
     void bootstrap();
     return () => {
       disposed = true;
     };
-  }, []);
+  }, [gatewayProbe]);
 
   useEffect(() => {
     if (gatewayStatus !== "connected") return;
@@ -974,6 +1002,7 @@ export default function EasyWorkApp() {
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = "/ws";
     const socket = new WebSocket(url);
+    let disposed = false;
     socketRef.current = socket;
     socket.onmessage = (event) => {
       try {
@@ -984,12 +1013,15 @@ export default function EasyWorkApp() {
     };
     socket.onclose = () => {
       socketRef.current = null;
+      if (disposed) return;
       setConnection({
         status: "disconnected",
-        label: "Work 网关已断开",
+        label: "本机网关已断开",
       });
+      setGatewayStatus("unavailable");
     };
     return () => {
+      disposed = true;
       socket.close();
       socketRef.current = null;
     };
@@ -1184,20 +1216,12 @@ export default function EasyWorkApp() {
         }),
       );
     } catch {
-      const skillNames = state.skills
-        .filter((skill) => selectedSkills.includes(skill.id))
-        .map((skill) => skill.name);
       updateMessage(
         conversation.id,
         (message) => message.id === assistantMessage.id,
         (message) => ({
           ...message,
-          content:
-            `这是当前界面的离线演示回复。你问的是“${content}”。` +
-            (skillNames.length
-              ? ` 本轮已选择技能：${skillNames.join("、")}。`
-              : "") +
-            " 在个人资料的“模型 API”中保存兼容接口后，这里会改为真实 LLM 回复；聊天系统提示词来自 prompts/chat-system.md。",
+          content: "暂时无法连接模型服务，请检查本机网关与模型 API 设置。",
         }),
       );
     } finally {
@@ -1275,7 +1299,8 @@ export default function EasyWorkApp() {
   }) => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      showToast("本地 Work 网关未运行，请先启动后再连接");
+      setGatewayProbe((current) => current + 1);
+      showToast("正在重新检测本机网关");
       return;
     }
     setConnection({ status: "connecting", label: "正在进行 SSH 握手…" });
@@ -1405,6 +1430,7 @@ export default function EasyWorkApp() {
     }
     showToast(`已接收 ${files.length} 个文件`);
     if (fileInputRef.current) fileInputRef.current.value = "";
+    if (composerFileInputRef.current) composerFileInputRef.current.value = "";
   };
 
   const handleSkillUpload = async (files: FileList | null) => {
@@ -1494,6 +1520,28 @@ export default function EasyWorkApp() {
     showToast("记忆摘要已根据当前生效记忆刷新");
   };
 
+  const addMemory = () => {
+    const id = uid("memory");
+    setState((current) => ({
+      ...current,
+      memories: [
+        {
+          id,
+          content: "",
+          scope: "global",
+          kind: "preference",
+          source: "手动添加",
+          confidence: 1,
+          enabled: true,
+          updatedAt: now(),
+        },
+        ...current.memories,
+      ],
+    }));
+    setEditingMemoryId(id);
+    setEditingMemoryText("");
+  };
+
   const applyMemoryInstruction = () => {
     const instruction = memoryInstruction.trim();
     if (!instruction) return;
@@ -1555,7 +1603,11 @@ export default function EasyWorkApp() {
   };
 
   return (
-    <div className="easywork-app">
+    <div
+      className={`easywork-app${
+        view === "chat" && mode === "work" ? " with-task-rail" : ""
+      }`}
+    >
       <button
         className={`mobile-scrim${sidebarOpen || rightRailOpen ? " visible" : ""}`}
         type="button"
@@ -1572,7 +1624,6 @@ export default function EasyWorkApp() {
             <span className="brand-mark">E</span>
             <span className="brand-copy">
               <strong>EasyWork</strong>
-              <small>CHAT · COMPUTE · CREATE</small>
             </span>
           </button>
           <button
@@ -1589,7 +1640,6 @@ export default function EasyWorkApp() {
           <button className="new-chat-button" type="button" onClick={() => createConversation()}>
             <Plus size={17} />
             <span>新聊天</span>
-            <kbd>⌘ K</kbd>
           </button>
           <button
             className={`sidebar-nav-item${view === "library" ? " active" : ""}`}
@@ -1601,7 +1651,6 @@ export default function EasyWorkApp() {
           >
             <Library size={17} />
             <span>文件库</span>
-            <small>{state.files.length}</small>
           </button>
           <button
             className={`sidebar-nav-item${view === "skills" ? " active" : ""}`}
@@ -1613,7 +1662,6 @@ export default function EasyWorkApp() {
           >
             <Sparkles size={17} />
             <span>技能</span>
-            <small>{state.skills.length}</small>
           </button>
           <button
             className={`sidebar-nav-item${view === "memory" ? " active" : ""}`}
@@ -1625,7 +1673,6 @@ export default function EasyWorkApp() {
           >
             <Brain size={17} />
             <span>记忆</span>
-            <small>{state.memories.filter((item) => item.enabled).length}</small>
           </button>
         </div>
 
@@ -1686,7 +1733,6 @@ export default function EasyWorkApp() {
                     >
                       <span className={`mode-dot ${conversation.mode}`} />
                       <span>{conversation.title}</span>
-                      <MoreHorizontal size={14} />
                     </button>
                   ))}
                 </div>
@@ -1712,7 +1758,6 @@ export default function EasyWorkApp() {
               >
                 <span className={`mode-dot ${conversation.mode}`} />
                 <span>{conversation.title}</span>
-                <MoreHorizontal size={14} />
               </button>
             ))}
           </div>
@@ -1766,19 +1811,12 @@ export default function EasyWorkApp() {
             {view === "chat" ? (
               <div className="conversation-heading">
                 <strong>{activeConversation?.title ?? "新聊天"}</strong>
-                <span>
-                  {activeProject ? (
-                    <>
-                      <FolderLock size={12} />
-                      {activeProject.name}
-                    </>
-                  ) : (
-                    <>
-                      <MessageCircle size={12} />
-                      个人聊天
-                    </>
-                  )}
-                </span>
+                {activeProject && (
+                  <span>
+                    <FolderLock size={13} />
+                    {activeProject.name}
+                  </span>
+                )}
               </div>
             ) : (
               <div className="conversation-heading">
@@ -1789,13 +1827,6 @@ export default function EasyWorkApp() {
                       ? "技能"
                       : "记忆"}
                 </strong>
-                <span>
-                  {view === "library"
-                    ? "知识检索与文件管理"
-                    : view === "skills"
-                      ? "可复用的工作方式"
-                      : "可检查、可纠正、可删除"}
-                </span>
               </div>
             )}
           </div>
@@ -1821,23 +1852,7 @@ export default function EasyWorkApp() {
                 </button>
               </div>
             </div>
-          ) : (
-            <div className="topbar-center view-summary">
-              {view === "library" && (
-                <>
-                  <span>{state.files.length} 个文件</span>
-                  <i />
-                  <span>
-                    {state.settings.embedding.configured ? "语义检索已启用" : "关键词检索"}
-                  </span>
-                </>
-              )}
-              {view === "skills" && <span>{state.skills.length} 个可用技能</span>}
-              {view === "memory" && (
-                <span>{state.memories.filter((memory) => memory.enabled).length} 条生效记忆</span>
-              )}
-            </div>
-          )}
+          ) : <div className="topbar-center" />}
 
           <div className="topbar-actions">
             {view === "chat" && mode === "work" && (
@@ -1866,14 +1881,16 @@ export default function EasyWorkApp() {
                 </button>
               </>
             )}
-            <button
-              className="icon-button mobile-activity-button"
-              type="button"
-              onClick={() => setRightRailOpen(true)}
-              aria-label="打开任务轨迹"
-            >
-              <Activity size={17} />
-            </button>
+            {view === "chat" && mode === "work" && (
+              <button
+                className="icon-button mobile-activity-button"
+                type="button"
+                onClick={() => setRightRailOpen(true)}
+                aria-label="打开任务轨迹"
+              >
+                <Activity size={17} />
+              </button>
+            )}
           </div>
         </header>
 
@@ -1882,46 +1899,11 @@ export default function EasyWorkApp() {
             <div className="messages-scroll">
               {!activeConversation?.messages.length ? (
                 <div className="empty-chat">
-                  <span className={`empty-orb ${mode}`}>
-                    {mode === "chat" ? <Sparkles size={24} /> : <Terminal size={24} />}
-                  </span>
                   <div>
-                    <p>{mode === "chat" ? "自然对话" : "远端工作环境"}</p>
-                    <h1>
-                      {mode === "chat" ? "今天想一起完成什么？" : "把算力平台交给 Agent"}
-                    </h1>
-                    <span>
-                      {mode === "chat"
-                        ? "我会结合你选择的技能、记忆和知识库内容回答。"
-                        : "连接 SSH 后，问题会被编排成步骤，并在同一个 agent task 中持续执行。"}
-                    </span>
-                  </div>
-                  <div className="suggestion-grid">
-                    {(mode === "chat"
-                      ? [
-                          ["整理一份实验计划", "使用项目文件和记忆拆解里程碑"],
-                          ["解释一个技术概念", "用清晰例子说明原理和边界"],
-                          ["从文件库查答案", "混合关键词与语义检索"],
-                        ]
-                      : [
-                          ["查看可用内存", "在登录节点执行只读资源检查"],
-                          ["扫描当前 Agent", "查找用户目录中已安装的 CLI agent"],
-                          ["检查训练环境", "编排依赖、GPU 与路径检查流程"],
-                        ]
-                    ).map(([title, subtitle]) => (
-                      <button
-                        type="button"
-                        key={title}
-                        onClick={() => {
-                          setDraft(title);
-                          textareaRef.current?.focus();
-                        }}
-                      >
-                        <span>{title}</span>
-                        <small>{subtitle}</small>
-                        <ArrowRight size={15} />
-                      </button>
-                    ))}
+                    <h1>{mode === "chat" ? "有什么可以帮你？" : "在算力平台上开始工作"}</h1>
+                    {mode === "work" && (
+                      <p>连接 SSH 后，Agent 会在同一任务中规划并执行步骤。</p>
+                    )}
                   </div>
                   {mode === "work" && connection.status !== "connected" && (
                     <button className="inline-connect" type="button" onClick={() => setSshModalOpen(true)}>
@@ -2051,9 +2033,20 @@ export default function EasyWorkApp() {
                 />
                 <div className="composer-toolbar">
                   <div className="composer-tools">
-                    <button type="button" aria-label="添加附件">
+                    <button
+                      type="button"
+                      aria-label="添加附件"
+                      onClick={() => composerFileInputRef.current?.click()}
+                    >
                       <Paperclip size={16} />
                     </button>
+                    <input
+                      ref={composerFileInputRef}
+                      hidden
+                      multiple
+                      type="file"
+                      onChange={(event) => void handleLibraryUpload(event.target.files)}
+                    />
                     <div className="skills-trigger-wrap">
                       <button
                         className={selectedSkills.length ? "selected" : ""}
@@ -2150,7 +2143,7 @@ export default function EasyWorkApp() {
               </div>
               <p>
                 {mode === "work"
-                  ? "Agent 可能在远端执行命令或修改文件；关键操作请检查右侧任务轨迹。"
+                  ? "Agent 可在远端执行命令和修改文件，请核对任务轨迹。"
                   : "EasyWork 可能会出错，请核对重要信息。"}
               </p>
             </div>
@@ -2161,12 +2154,8 @@ export default function EasyWorkApp() {
           <section className="workspace-page library-page">
             <div className="page-intro">
               <div>
-                <span className="page-kicker">KNOWLEDGE LIBRARY</span>
-                <h1>让文件真正参与回答</h1>
-                <p>
-                  文件按结构切块，先做关键词与语义双路召回，再用 RRF 融合；小型知识库可直接使用，
-                  数据量增长后可切换到 Qdrant 等向量服务。
-                </p>
+                <h1>文件库</h1>
+                <p>上传资料，在聊天中检索并引用。</p>
               </div>
               <div className="page-actions">
                 <button
@@ -2192,48 +2181,6 @@ export default function EasyWorkApp() {
                   type="file"
                   onChange={(event) => void handleLibraryUpload(event.target.files)}
                 />
-              </div>
-            </div>
-
-            <div className="pipeline-strip">
-              <div>
-                <span className="pipeline-icon">
-                  <FileText size={17} />
-                </span>
-                <span>
-                  <strong>解析与切块</strong>
-                  <small>标题感知 · 800 tokens 上限</small>
-                </span>
-              </div>
-              <ArrowRight size={15} />
-              <div>
-                <span className="pipeline-icon">
-                  <Search size={17} />
-                </span>
-                <span>
-                  <strong>混合召回</strong>
-                  <small>BM25 + Dense Embedding</small>
-                </span>
-              </div>
-              <ArrowRight size={15} />
-              <div>
-                <span className="pipeline-icon">
-                  <Zap size={17} />
-                </span>
-                <span>
-                  <strong>融合与重排</strong>
-                  <small>RRF · 可选 Reranker</small>
-                </span>
-              </div>
-              <ArrowRight size={15} />
-              <div>
-                <span className="pipeline-icon">
-                  <MessageCircle size={17} />
-                </span>
-                <span>
-                  <strong>带来源回答</strong>
-                  <small>保留文件与块级出处</small>
-                </span>
               </div>
             </div>
 
@@ -2310,11 +2257,8 @@ export default function EasyWorkApp() {
           <section className="workspace-page skills-page">
             <div className="page-intro">
               <div>
-                <span className="page-kicker">REUSABLE CAPABILITIES</span>
-                <h1>把好方法保存成技能</h1>
-                <p>
-                  每个技能都位于独立目录，并以 SKILL.md 描述使用方式。上传后可在任意对话的输入框下方选择。
-                </p>
+                <h1>技能</h1>
+                <p>上传技能后，可在输入框下方按需选择。</p>
               </div>
               <div className="page-actions">
                 <button
@@ -2415,12 +2359,8 @@ export default function EasyWorkApp() {
           <section className="workspace-page memory-page">
             <div className="page-intro">
               <div>
-                <span className="page-kicker">CONTROLLABLE MEMORY</span>
-                <h1>记住有用的，也能解释为什么</h1>
-                <p>
-                  EasyWork 将“记忆摘要”和“聊天历史检索”分开管理。每条记忆保留范围、来源与置信度，
-                  项目内记忆不会越过项目边界。
-                </p>
+                <h1>记忆</h1>
+                <p>查看、修改或删除 EasyWork 保存的信息。</p>
               </div>
               <div className="page-actions">
                 <button
@@ -2434,24 +2374,7 @@ export default function EasyWorkApp() {
                 <button
                   className="primary-button"
                   type="button"
-                  onClick={() =>
-                    setState((current) => ({
-                      ...current,
-                      memories: [
-                        {
-                          id: uid("memory"),
-                          content: "点击编辑这条新记忆。",
-                          scope: "global",
-                          kind: "preference",
-                          source: "手动添加",
-                          confidence: 1,
-                          enabled: true,
-                          updatedAt: now(),
-                        },
-                        ...current.memories,
-                      ],
-                    }))
-                  }
+                  onClick={addMemory}
                 >
                   <Plus size={16} />
                   添加记忆
@@ -2463,13 +2386,8 @@ export default function EasyWorkApp() {
               <div className="content-card memory-summary-card">
                 <div className="card-heading">
                   <div>
-                    <span>MEMORY SUMMARY</span>
                     <h2>记忆摘要</h2>
                   </div>
-                  <span className="updated-badge">
-                    <Clock3 size={13} />
-                    2 小时前更新
-                  </span>
                 </div>
                 <p className="summary-text">
                   {state.memorySummary ??
@@ -2710,13 +2628,11 @@ export default function EasyWorkApp() {
         )}
       </main>
 
-      <aside className={`right-rail${rightRailOpen ? " mobile-open" : ""}`}>
-        {view === "chat" ? (
-          <>
+      {view === "chat" && mode === "work" && (
+        <aside className={`right-rail${rightRailOpen ? " mobile-open" : ""}`}>
             <header className="right-rail-header">
               <div>
-                <span>{mode === "work" ? "TASK TRACE" : "CONVERSATION MAP"}</span>
-                <h2>{mode === "work" ? "任务轨迹" : "提问记录"}</h2>
+                <h2>任务轨迹</h2>
               </div>
               <div>
                 {activeConversation?.messages.filter((message) => message.role === "user").length ?? 0}
@@ -2731,8 +2647,7 @@ export default function EasyWorkApp() {
               </button>
             </header>
 
-            {mode === "work" && (
-              <div className={`remote-status-card ${connection.status}`}>
+            <div className={`remote-status-card ${connection.status}`}>
                 <div className="remote-status-top">
                   <span>
                     <i />
@@ -2743,7 +2658,7 @@ export default function EasyWorkApp() {
                 <strong>
                   {connection.status === "connected"
                     ? `${connection.username ?? "demo"}@${connection.host ?? "login-node"}`
-                    : "连接后保持到页面关闭"}
+                    : "尚未连接"}
                 </strong>
                 <div className="remote-meta">
                   <span>
@@ -2755,8 +2670,7 @@ export default function EasyWorkApp() {
                     {activeConversation?.work?.workspace ?? "~/.easywork/tasks"}
                   </span>
                 </div>
-              </div>
-            )}
+            </div>
 
             <div className="trace-list">
               {activeConversation?.messages
@@ -2823,9 +2737,7 @@ export default function EasyWorkApp() {
                             </div>
                           ) : (
                             <p className="trace-no-plan">
-                              {mode === "chat"
-                                ? "普通聊天不执行远端工作流。"
-                                : "任务开始后，编排步骤会实时显示在这里。"}
+                              任务开始后，步骤会显示在这里。
                             </p>
                           )}
                           {message.trace?.result && (
@@ -2841,15 +2753,7 @@ export default function EasyWorkApp() {
                 })}
               {!activeConversation?.messages.some((message) => message.role === "user") && (
                 <div className="right-empty">
-                  <span>
-                    <Activity size={20} />
-                  </span>
-                  <strong>还没有提问</strong>
-                  <p>
-                    {mode === "work"
-                      ? "发起工作后，这里会实时展示计划、进度与结果。"
-                      : "你的问题会组成一张可跳转的对话地图。"}
-                  </p>
+                  <p>任务开始后，这里会显示执行进度。</p>
                 </div>
               )}
             </div>
@@ -2861,16 +2765,8 @@ export default function EasyWorkApp() {
                   : "使用默认记忆范围"}
               </span>
             </footer>
-          </>
-        ) : (
-          <ContextRail
-            view={view}
-            state={state}
-            gatewayStatus={gatewayStatus}
-            onEmbedding={() => setEmbeddingModalOpen(true)}
-          />
-        )}
-      </aside>
+        </aside>
+      )}
 
       {projectModalOpen && (
         <ProjectModal
@@ -2895,10 +2791,12 @@ export default function EasyWorkApp() {
         <SshModal
           connection={connection}
           gatewayStatus={gatewayStatus}
+          gatewayEndpoint={gatewayEndpoint}
           onClose={() => setSshModalOpen(false)}
           onDemo={connectDemo}
           onConnect={connectSsh}
           onDisconnect={disconnectSsh}
+          onRetry={() => setGatewayProbe((current) => current + 1)}
         />
       )}
       {agentModalOpen && (
@@ -2953,144 +2851,6 @@ export default function EasyWorkApp() {
   );
 }
 
-function ContextRail({
-  view,
-  state,
-  gatewayStatus,
-  onEmbedding,
-}: {
-  view: ViewName;
-  state: EasyWorkState;
-  gatewayStatus: "checking" | "connected" | "unavailable";
-  onEmbedding: () => void;
-}) {
-  return (
-    <>
-      <header className="right-rail-header context-header">
-        <div>
-          <span>CONTEXT</span>
-          <h2>
-            {view === "library" ? "检索设置" : view === "skills" ? "技能规范" : "记忆边界"}
-          </h2>
-        </div>
-      </header>
-      <div className="context-rail-body">
-        {view === "library" && (
-          <>
-            <div className="rail-card">
-              <span className="rail-card-icon">
-                <Database size={18} />
-              </span>
-              <div>
-                <strong>混合检索</strong>
-                <p>精确术语走关键词，语义相近问题走向量召回，再用 RRF 融合排序。</p>
-              </div>
-              <span className={`mini-status ${state.settings.embedding.configured ? "on" : "off"}`}>
-                {state.settings.embedding.configured ? "已启用" : "待配置"}
-              </span>
-            </div>
-            <button className="rail-action" type="button" onClick={onEmbedding}>
-              <Settings2 size={16} />
-              配置 Embedding API
-              <ChevronRight size={15} />
-            </button>
-            <div className="rail-metrics">
-              <div>
-                <span>文件</span>
-                <strong>{state.files.length}</strong>
-              </div>
-              <div>
-                <span>文本块</span>
-                <strong>{state.files.reduce((sum, file) => sum + file.chunks, 0)}</strong>
-              </div>
-            </div>
-            <div className="rail-note">
-              <CircleAlert size={15} />
-              <p>
-                Embedding 不是上传文件的硬性前提；未配置时仍可用 BM25/关键词检索，但对同义表达的召回会较弱。
-              </p>
-            </div>
-          </>
-        )}
-        {view === "skills" && (
-          <>
-            <div className="rail-card">
-              <span className="rail-card-icon">
-                <FileText size={18} />
-              </span>
-              <div>
-                <strong>目录约定</strong>
-                <p>每个技能一个目录，入口文件为 SKILL.md，可附带 scripts、references 与 assets。</p>
-              </div>
-            </div>
-            <div className="folder-tree">
-              <span>
-                <Folder size={14} /> skill/
-              </span>
-              <span>
-                <Folder size={14} /> users/&#123;user_id&#125;/
-              </span>
-              <span>
-                <Folder size={14} /> cluster-ops/
-              </span>
-              <b>
-                <FileText size={13} /> SKILL.md
-              </b>
-              <b>
-                <Folder size={13} /> scripts/
-              </b>
-            </div>
-            <div className="rail-note">
-              <ShieldCheck size={15} />
-              <p>上传时会拒绝路径穿越和可疑绝对路径；技能默认只在明确选择的对话轮次中生效。</p>
-            </div>
-          </>
-        )}
-        {view === "memory" && (
-          <>
-            <div className="rail-card">
-              <span className="rail-card-icon">
-                <Brain size={18} />
-              </span>
-              <div>
-                <strong>分层记忆</strong>
-                <p>显式偏好、自动摘要、聊天片段和项目记忆分别保存，检索时按范围合并。</p>
-              </div>
-            </div>
-            <div className="memory-scope-stack">
-              <span>
-                <i className="scope-global" />
-                全局摘要
-                <small>{state.memories.filter((item) => item.scope === "global").length}</small>
-              </span>
-              <span>
-                <i className="scope-project" />
-                项目记忆
-                <small>{state.memories.filter((item) => item.scope === "project").length}</small>
-              </span>
-              <span>
-                <i className="scope-history" />
-                历史检索
-                <small>{state.settings.referenceHistory ? "开启" : "关闭"}</small>
-              </span>
-            </div>
-            <div className="rail-note">
-              <ShieldCheck size={15} />
-              <p>项目创建时选择“仅限项目内记忆”后，该项目永远不会读取全局或其他项目的聊天。</p>
-            </div>
-          </>
-        )}
-      </div>
-      <footer className="right-rail-footer">
-        <span>
-          {gatewayStatus === "connected" ? <Cloud size={13} /> : <HardDrive size={13} />}
-          {gatewayStatus === "connected" ? "本地数据网关在线" : "当前为界面演示状态"}
-        </span>
-      </footer>
-    </>
-  );
-}
-
 function ProjectModal({
   onClose,
   onCreate,
@@ -3132,7 +2892,7 @@ function ProjectModal({
             </span>
             <span>
               <strong>默认记忆</strong>
-              <small>可使用全局记忆，并优先参考本项目聊天和文件。</small>
+              <small>使用全局记忆和本项目内容。</small>
             </span>
             <span className="radio-dot" />
           </label>
@@ -3148,15 +2908,11 @@ function ProjectModal({
             </span>
             <span>
               <strong>仅限项目内记忆</strong>
-              <small>不读取全局记忆或项目外聊天；适合敏感、长期或独立工作。</small>
+              <small>只使用本项目的聊天、文件和记忆。</small>
             </span>
             <span className="radio-dot" />
           </label>
         </fieldset>
-        <div className="modal-note">
-          <CircleAlert size={15} />
-          <p>为避免边界在已有聊天中发生变化，“仅限项目内记忆”创建后不可切换为默认记忆。</p>
-        </div>
         <div className="modal-actions">
           <button className="secondary-button" type="button" onClick={onClose}>
             取消
@@ -3201,10 +2957,11 @@ function ProfileModal({
     ...state.settings.provider,
     apiKey: "",
   });
-  const [providerTesting, setProviderTesting] = useState(false);
-  const [providerTestState, setProviderTestState] = useState<
-    "idle" | "ok" | "error"
-  >("idle");
+  const [detectedModels, setDetectedModels] = useState<string[]>(
+    state.settings.provider.model ? [state.settings.provider.model] : [],
+  );
+  const [modelDetecting, setModelDetecting] = useState(false);
+  const [modelError, setModelError] = useState("");
 
   const authenticate = async (kind: "login" | "register") => {
     setBusy(true);
@@ -3272,10 +3029,10 @@ function ProfileModal({
 
   const saveProvider = async () => {
     const nextProvider = {
-      name: provider.name,
+      name: "OpenAI Compatible",
       baseUrl: provider.baseUrl,
       model: provider.model,
-      protocol: provider.protocol,
+      protocol: "auto" as const,
       configured: Boolean(provider.apiKey || provider.configured),
     };
     onState((current) => ({
@@ -3296,22 +3053,31 @@ function ProfileModal({
     onClose();
   };
 
-  const testProvider = async () => {
-    setProviderTesting(true);
-    setProviderTestState("idle");
+  const detectProviderModels = async () => {
+    setModelDetecting(true);
+    setModelError("");
     try {
-      const response = await fetch(`${GATEWAY_HTTP}/api/settings/provider/test`, {
+      const response = await fetch(`${GATEWAY_HTTP}/api/settings/provider/models`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(provider),
       });
-      if (!response.ok) throw new Error("test failed");
-      setProviderTestState("ok");
-    } catch {
-      setProviderTestState("error");
+      const payload = (await response.json()) as { models?: string[]; error?: string };
+      if (!response.ok || !payload.models?.length) {
+        throw new Error(payload.error || "没有检测到可用模型");
+      }
+      setDetectedModels(payload.models);
+      setProvider((current) => ({
+        ...current,
+        model: payload.models?.includes(current.model)
+          ? current.model
+          : payload.models?.[0] ?? "",
+      }));
+    } catch (caught) {
+      setModelError(caught instanceof Error ? caught.message : "模型检测失败");
     } finally {
-      setProviderTesting(false);
+      setModelDetecting(false);
     }
   };
 
@@ -3409,8 +3175,7 @@ function ProfileModal({
           <div className="guest-data-card">
             <HardDrive size={17} />
             <div>
-              <strong>当前是访客会话</strong>
-              <p>聊天保存在独立临时目录；页面关闭后由网关清理，也可以现在手动删除。</p>
+              <strong>访客数据保存在临时目录</strong>
             </div>
             <button type="button" onClick={() => void onDeleteGuest()}>
               删除
@@ -3455,13 +3220,6 @@ function ProfileModal({
             <span>邮箱</span>
             <input value={actor.email ?? ""} disabled />
           </label>
-          <div className="storage-path-card">
-            <FolderLock size={17} />
-            <span>
-              <strong>独立用户目录</strong>
-              <small>data/users/{actor.id.slice(0, 8)}/ · skill/users/{actor.id.slice(0, 8)}/</small>
-            </span>
-          </div>
           <div className="modal-actions spread">
             <button
               className="text-danger-button"
@@ -3488,52 +3246,16 @@ function ProfileModal({
 
       {actor.authenticated && tab === "api" && (
         <div className="modal-form api-form">
-          <div className="api-security-note">
-            <ShieldCheck size={17} />
-            <p>
-              API Key 由本地网关加密保存，前端不会读回明文；发送到远端 Agent 时默认只在 SSH 会话期间有效。
-            </p>
-          </div>
           <label className="field">
-            <span>提供商名称</span>
-            <input
-              value={provider.name}
-              onChange={(event) => setProvider((current) => ({ ...current, name: event.target.value }))}
-            />
-          </label>
-          <label className="field">
-            <span>API Base URL</span>
+            <span>API URL</span>
             <input
               value={provider.baseUrl}
-              onChange={(event) => setProvider((current) => ({ ...current, baseUrl: event.target.value }))}
+              onChange={(event) =>
+                setProvider((current) => ({ ...current, baseUrl: event.target.value }))
+              }
               placeholder="https://api.example.com/v1"
             />
           </label>
-          <div className="field-grid">
-            <label className="field">
-              <span>模型</span>
-              <input
-                value={provider.model}
-                onChange={(event) => setProvider((current) => ({ ...current, model: event.target.value }))}
-                placeholder="model-id"
-              />
-            </label>
-            <label className="field">
-              <span>协议</span>
-              <select
-                value={provider.protocol}
-                onChange={(event) =>
-                  setProvider((current) => ({
-                    ...current,
-                    protocol: event.target.value as AppSettings["provider"]["protocol"],
-                  }))
-                }
-              >
-                <option value="responses">Responses API</option>
-                <option value="chat-completions">Chat Completions</option>
-              </select>
-            </label>
-          </div>
           <label className="field">
             <span>API Key</span>
             <input
@@ -3544,24 +3266,46 @@ function ProfileModal({
               placeholder={provider.configured ? "已保存；留空表示不修改" : "sk-…"}
             />
           </label>
-          <div className="modal-actions">
+          <div className="model-picker">
+            <label className="field">
+              <span>模型</span>
+              <select
+                value={provider.model}
+                onChange={(event) =>
+                  setProvider((current) => ({ ...current, model: event.target.value }))
+                }
+                disabled={!detectedModels.length}
+              >
+                {!detectedModels.length && <option value="">请先检测模型</option>}
+                {detectedModels.map((model) => (
+                  <option value={model} key={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            </label>
             <button
               className="secondary-button"
               type="button"
-              onClick={() => void testProvider()}
+              onClick={() => void detectProviderModels()}
+              disabled={modelDetecting || !provider.baseUrl || (!provider.apiKey && !provider.configured)}
             >
-              {providerTesting ? (
+              {modelDetecting ? (
                 <LoaderCircle className="spin" size={15} />
               ) : (
-                <Zap size={15} />
+                <RefreshCw size={15} />
               )}
-              {providerTestState === "ok"
-                ? "连接正常"
-                : providerTestState === "error"
-                  ? "连接失败"
-                  : "测试连接"}
+              {modelDetecting ? "检测中" : "检测模型"}
             </button>
-            <button className="primary-button" type="button" onClick={() => void saveProvider()}>
+          </div>
+          {modelError && <div className="form-error">{modelError}</div>}
+          <div className="modal-actions">
+            <button
+              className="primary-button"
+              type="button"
+              disabled={!provider.baseUrl || !provider.model}
+              onClick={() => void saveProvider()}
+            >
               保存 API
             </button>
           </div>
@@ -3574,13 +3318,16 @@ function ProfileModal({
 function SshModal({
   connection,
   gatewayStatus,
+  gatewayEndpoint,
   onClose,
   onDemo,
   onConnect,
   onDisconnect,
+  onRetry,
 }: {
   connection: ConnectionState;
   gatewayStatus: "checking" | "connected" | "unavailable";
+  gatewayEndpoint: string;
   onClose: () => void;
   onDemo: () => void;
   onConnect: (payload: {
@@ -3593,24 +3340,26 @@ function SshModal({
     trustHost?: boolean;
   }) => void;
   onDisconnect: () => void;
+  onRetry: () => void;
 }) {
   const [host, setHost] = useState("107.ustc.edu.cn");
   const [port, setPort] = useState("22");
   const [username, setUsername] = useState("");
   const [privateKey, setPrivateKey] = useState("");
+  const [privateKeyName, setPrivateKeyName] = useState("");
+  const [pasteKeyOpen, setPasteKeyOpen] = useState(false);
   const [passphrase, setPassphrase] = useState("");
   const [otp, setOtp] = useState("");
   const [trustHost, setTrustHost] = useState(false);
-  const [guideOpen, setGuideOpen] = useState(false);
 
   if (connection.status === "connected") {
     return (
-      <Modal title="算力平台连接" eyebrow="SSH SESSION" onClose={onClose}>
+      <Modal title="算力平台连接" onClose={onClose}>
         <div className="connected-panel">
           <span className="connected-hero">
             <Wifi size={24} />
           </span>
-          <h3>SSH 会话正在保持</h3>
+          <h3>SSH 已连接</h3>
           <p>
             {connection.username}@{connection.host}
           </p>
@@ -3618,10 +3367,6 @@ function SshModal({
             <span>
               <strong>{connection.latency ?? "—"} ms</strong>
               <small>往返延迟</small>
-            </span>
-            <span>
-              <strong>{connection.demo ? "演示" : "ED25519"}</strong>
-              <small>认证方式</small>
             </span>
             <span>
               <strong>15 s</strong>
@@ -3651,53 +3396,90 @@ function SshModal({
     );
   }
 
-  return (
-    <Modal title="连接算力平台" eyebrow="SSH LOGIN" onClose={onClose} wide>
-      <div className="ssh-layout">
-        <form
-          className="modal-form ssh-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            onConnect({
-              host,
-              port: Number(port) || 22,
-              username,
-              privateKey,
-              passphrase: passphrase || undefined,
-              otp: otp || undefined,
-              trustHost,
-            });
-          }}
-        >
-          <div className="ssh-target-grid">
-            <label className="field host-field">
-              <span>登录节点</span>
-              <input value={host} onChange={(event) => setHost(event.target.value)} />
-            </label>
-            <label className="field port-field">
-              <span>端口</span>
-              <input value={port} inputMode="numeric" onChange={(event) => setPort(event.target.value)} />
-            </label>
+  if (gatewayStatus !== "connected") {
+    return (
+      <Modal title="连接算力平台" onClose={onClose}>
+        <div className="gateway-unavailable-panel">
+          <span className="gateway-state-icon">
+            {gatewayStatus === "checking" ? (
+              <LoaderCircle className="spin" size={22} />
+            ) : (
+              <WifiOff size={22} />
+            )}
+          </span>
+          <h3>{gatewayStatus === "checking" ? "正在检测本机网关" : "本机网关未连接"}</h3>
+          <p>
+            {gatewayStatus === "checking"
+              ? "请稍候。"
+              : "请在项目目录运行 frp/start.ps1，启动后重新检测。"}
+          </p>
+          <div className="modal-actions">
+            <button className="secondary-button" type="button" onClick={onDemo}>
+              演示连接
+            </button>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={onRetry}
+              disabled={gatewayStatus === "checking"}
+            >
+              <RefreshCw size={15} />
+              重新检测
+            </button>
           </div>
-          <label className="field">
-            <span>用户名</span>
-            <input
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              placeholder="通常为小写学号"
-            />
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal title="连接算力平台" onClose={onClose}>
+      <form
+        className="modal-form ssh-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onConnect({
+            host,
+            port: Number(port) || 22,
+            username,
+            privateKey,
+            passphrase: passphrase || undefined,
+            otp: otp || undefined,
+            trustHost,
+          });
+        }}
+      >
+        <div className="gateway-online-line">
+          <CheckCircle2 size={15} />
+          本机网关已连接
+          {gatewayEndpoint && (
+            <span>{gatewayEndpoint.replace(/^https?:\/\//, "").replace(/\/+$/, "")}</span>
+          )}
+        </div>
+        <div className="ssh-target-grid">
+          <label className="field host-field">
+            <span>登录节点</span>
+            <input value={host} onChange={(event) => setHost(event.target.value)} />
           </label>
-          <label className="field key-field">
-            <span>私钥</span>
-            <textarea
-              value={privateKey}
-              onChange={(event) => setPrivateKey(event.target.value)}
-              placeholder="粘贴 id_ed25519 私钥，或从本机选择文件"
-              rows={4}
-            />
-            <label className="file-inside-button">
-              <Upload size={14} />
-              选择私钥文件
+          <label className="field port-field">
+            <span>端口</span>
+            <input value={port} inputMode="numeric" onChange={(event) => setPort(event.target.value)} />
+          </label>
+        </div>
+        <label className="field">
+          <span>用户名</span>
+          <input
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            placeholder="小写学号"
+          />
+        </label>
+        <div className="field key-picker-field">
+          <span>SSH 私钥</span>
+          <div className="key-picker-actions">
+            <label className="secondary-button">
+              <Upload size={15} />
+              选择文件
               <input
                 type="file"
                 hidden
@@ -3705,130 +3487,111 @@ function SshModal({
                   const file = event.target.files?.[0];
                   if (!file) return;
                   const reader = new FileReader();
-                  reader.onload = () => setPrivateKey(String(reader.result ?? ""));
+                  reader.onload = () => {
+                    setPrivateKey(String(reader.result ?? ""));
+                    setPrivateKeyName(file.name);
+                    setPasteKeyOpen(false);
+                  };
                   reader.readAsText(file);
                 }}
               />
             </label>
-          </label>
-          <div className="field-grid">
-            <label className="field">
-              <span>私钥短密码</span>
-              <input
-                type="password"
-                value={passphrase}
-                onChange={(event) => setPassphrase(event.target.value)}
-                placeholder="如未设置可留空"
-              />
-            </label>
-            <label className="field">
-              <span>6 位动态验证码</span>
-              <input
-                value={otp}
-                inputMode="numeric"
-                maxLength={6}
-                onChange={(event) => setOtp(event.target.value.replace(/\D/g, ""))}
-                placeholder="Authenticator"
-              />
-            </label>
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => {
+                setPasteKeyOpen((value) => !value);
+                setPrivateKeyName("");
+              }}
+            >
+              {pasteKeyOpen ? "收起" : "粘贴私钥"}
+            </button>
           </div>
-          {connection.fingerprint && (
-            <label className="trust-host">
+          {privateKeyName && (
+            <div className="selected-key-file">
+              <Check size={14} />
+              {privateKeyName}
+            </div>
+          )}
+          {pasteKeyOpen && (
+            <textarea
+              className="private-key-paste"
+              value={privateKey}
+              onChange={(event) => setPrivateKey(event.target.value)}
+              placeholder="粘贴 id_ed25519 私钥"
+              rows={4}
+              autoComplete="off"
+            />
+          )}
+        </div>
+        <div className="field-grid">
+          <label className="field">
+            <span>私钥密码</span>
+            <input
+              type="password"
+              value={passphrase}
+              onChange={(event) => setPassphrase(event.target.value)}
+              placeholder="可选"
+            />
+          </label>
+          <label className="field">
+            <span>动态验证码</span>
+            <input
+              value={otp}
+              inputMode="numeric"
+              maxLength={6}
+              onChange={(event) => setOtp(event.target.value.replace(/\D/g, ""))}
+              placeholder="6 位验证码"
+            />
+          </label>
+        </div>
+        {connection.status === "error" && !connection.fingerprint && (
+          <div className="form-error">{connection.label}</div>
+        )}
+        {connection.fingerprint && (
+          <div className="host-key-confirm">
+            <span>
+              <ShieldCheck size={16} />
+              <strong>确认主机指纹</strong>
+            </span>
+            <code>{connection.fingerprint}</code>
+            <label>
               <input
                 type="checkbox"
                 checked={trustHost}
                 onChange={(event) => setTrustHost(event.target.checked)}
               />
-              <span>
-                <strong>信任此主机指纹</strong>
-                <code>{connection.fingerprint}</code>
-              </span>
+              我已核对并信任此主机
             </label>
-          )}
-          <div className="api-security-note">
-            <ShieldCheck size={17} />
-            <p>私钥、短密码和动态验证码只进入本机 Work 网关内存，不写入浏览器或账户目录。</p>
           </div>
-          <div className="modal-actions spread">
-            <button className="secondary-button" type="button" onClick={onDemo}>
-              <Sparkles size={15} />
-              体验演示连接
-            </button>
-            <button
-              className="primary-button"
-              type="submit"
-              disabled={
-                connection.status === "connecting" ||
-                gatewayStatus !== "connected" ||
-                !host ||
-                !username ||
-                !privateKey
-              }
-            >
-              {connection.status === "connecting" ? (
-                <LoaderCircle className="spin" size={16} />
-              ) : (
-                <KeyRound size={16} />
-              )}
-              {connection.status === "connecting" ? connection.label : "连接 SSH"}
-            </button>
-          </div>
-          {gatewayStatus === "unavailable" && (
-            <p className="gateway-warning">
-              本地 Work 网关未连接。仍可使用“体验演示连接”检查界面流程。
-            </p>
-          )}
-        </form>
-
-        <aside className="ssh-guide">
-          <div className="ssh-guide-heading">
-            <span>
-              <BookOpen size={16} />
-              首次登录准备
-            </span>
-            <button type="button" onClick={() => setGuideOpen((value) => !value)}>
-              {guideOpen ? "收起" : "展开"}
-              <ChevronDown size={13} />
-            </button>
-          </div>
-          <div className={`ssh-guide-body${guideOpen ? " expanded" : ""}`}>
-            <ol>
-              <li>
-                <span>1</span>
-                <div>
-                  <strong>生成 ED25519 密钥</strong>
-                  <code>ssh-keygen -t ed25519 -C &quot;your_email@example.com&quot;</code>
-                  <small>对应文件是 id_ed25519 与 id_ed25519.pub。</small>
-                </div>
-              </li>
-              <li>
-                <span>2</span>
-                <div>
-                  <strong>在校园网内添加公钥</strong>
-                  <code>cat id_ed25519.pub &gt;&gt; ~/.ssh/authorized_keys</code>
-                  <small>远端目录权限 700，authorized_keys 权限 600。</small>
-                </div>
-              </li>
-              <li>
-                <span>3</span>
-                <div>
-                  <strong>配置动态验证码</strong>
-                  <code>google-authenticator</code>
-                  <small>扫描二维码并安全保存一次性备用码。</small>
-                </div>
-              </li>
-            </ol>
-            <div className="doc-correction">
-              <CircleAlert size={14} />
-              <p>
-                参考文档前面使用 <code>ed25519</code>，后文却写成 <code>id_rsa</code>；
-                这里已按命令实际产物统一为 <code>id_ed25519</code>。
-              </p>
-            </div>
-            <span className="alternate-host">备用地址：114.214.255.132:22</span>
-          </div>
-        </aside>
-      </div>
+        )}
+        <p className="security-line">
+          私钥、密码和验证码仅进入本机网关内存。
+        </p>
+        <div className="modal-actions spread">
+          <button className="secondary-button" type="button" onClick={onDemo}>
+            演示连接
+          </button>
+          <button
+            className="primary-button"
+            type="submit"
+            disabled={
+              connection.status === "connecting" ||
+              !host ||
+              !username ||
+              !privateKey ||
+              Boolean(connection.fingerprint && !trustHost)
+            }
+          >
+            {connection.status === "connecting" ? (
+              <LoaderCircle className="spin" size={16} />
+            ) : (
+              <KeyRound size={16} />
+            )}
+            {connection.status === "connecting" ? connection.label : "连接 SSH"}
+          </button>
+        </div>
+      </form>
     </Modal>
   );
 }
@@ -3856,7 +3619,7 @@ function AgentModal({
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   return (
-    <Modal title="选择 CLI Agent" eyebrow="REMOTE AGENT" onClose={onClose}>
+    <Modal title="选择 Agent" onClose={onClose}>
       <div className="agent-toolbar">
         <button className="secondary-button" type="button" onClick={onScan}>
           <RefreshCw size={15} />
@@ -3922,7 +3685,9 @@ function AgentModal({
                     ? "安装中…"
                   : "需配置适配器"}
             </span>
-            {agent.id === activeAgentId && <CheckCircle2 size={17} />}
+            {agent.id === activeAgentId && agent.status === "ready" && (
+              <CheckCircle2 size={17} />
+            )}
           </button>
         ))}
       </div>
@@ -3932,11 +3697,8 @@ function AgentModal({
             <DownloadGlyph />
           </span>
           <div>
-            <strong>安装推荐 Agent</strong>
-            <p>
-              OpenCode 将安装到 <code>~/.easywork/bin</code>，配置写入
-              <code>~/.easywork/config</code>。
-            </p>
+            <strong>安装 OpenCode</strong>
+            <p>安装位置：<code>~/.easywork/bin</code></p>
           </div>
           <button
             className="primary-button"
@@ -3948,10 +3710,6 @@ function AgentModal({
           </button>
         </div>
       )}
-      <div className="modal-note">
-        <ShieldCheck size={15} />
-        <p>自动扫描只检查常见可执行文件位置；其他 Agent 可通过命令模板适配，不会由网页直接实现其工具调用。</p>
-      </div>
     </Modal>
   );
 }
@@ -3976,73 +3734,50 @@ function EmbeddingModal({
   ) => void | Promise<void>;
 }) {
   const [draft, setDraft] = useState({ ...settings.embedding, apiKey: "" });
-  const [testing, setTesting] = useState(false);
-  const [testState, setTestState] = useState<"idle" | "ok" | "error">("idle");
-  const testConnection = async () => {
-    setTesting(true);
-    setTestState("idle");
+  const [detectedModels, setDetectedModels] = useState<string[]>(
+    settings.embedding.model ? [settings.embedding.model] : [],
+  );
+  const [detecting, setDetecting] = useState(false);
+  const [detectError, setDetectError] = useState("");
+  const detectModels = async () => {
+    setDetecting(true);
+    setDetectError("");
     try {
-      const response = await fetch(`${GATEWAY_HTTP}/api/settings/embedding/test`, {
+      const response = await fetch(`${GATEWAY_HTTP}/api/settings/embedding/models`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(draft),
       });
-      if (!response.ok) throw new Error("test failed");
-      setTestState("ok");
-    } catch {
-      setTestState(draft.apiKey || draft.configured ? "ok" : "error");
+      const payload = (await response.json()) as { models?: string[]; error?: string };
+      if (!response.ok || !payload.models?.length) {
+        throw new Error(payload.error || "没有检测到 Embedding 模型");
+      }
+      setDetectedModels(payload.models);
+      setDraft((current) => ({
+        ...current,
+        model: payload.models?.includes(current.model)
+          ? current.model
+          : payload.models?.[0] ?? "",
+        dimensions: "",
+      }));
+    } catch (caught) {
+      setDetectError(caught instanceof Error ? caught.message : "模型检测失败");
     } finally {
-      setTesting(false);
+      setDetecting(false);
     }
   };
   return (
-    <Modal title="Embedding API" eyebrow="SEMANTIC RETRIEVAL" onClose={onClose}>
+    <Modal title="Embedding API" onClose={onClose}>
       <div className="modal-form embedding-form">
-        <div className="embedding-choice">
-          <span className={draft.hybridEnabled ? "active" : ""}>
-            <Network size={18} />
-            <strong>混合检索</strong>
-            <small>关键词 + 向量 + RRF</small>
-          </span>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={draft.hybridEnabled}
-              onChange={() =>
-                setDraft((current) => ({
-                  ...current,
-                  hybridEnabled: !current.hybridEnabled,
-                }))
-              }
-            />
-            <span />
-          </label>
-        </div>
         <label className="field">
-          <span>API Base URL</span>
+          <span>API URL</span>
           <input
             value={draft.baseUrl}
             onChange={(event) => setDraft((current) => ({ ...current, baseUrl: event.target.value }))}
+            placeholder="https://api.example.com/v1"
           />
         </label>
-        <div className="field-grid">
-          <label className="field">
-            <span>Embedding 模型</span>
-            <input
-              value={draft.model}
-              onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))}
-            />
-          </label>
-          <label className="field">
-            <span>向量维度</span>
-            <input
-              value={draft.dimensions}
-              inputMode="numeric"
-              onChange={(event) => setDraft((current) => ({ ...current, dimensions: event.target.value }))}
-            />
-          </label>
-        </div>
         <label className="field">
           <span>API Key</span>
           <input
@@ -4052,42 +3787,52 @@ function EmbeddingModal({
             placeholder={draft.configured ? "已保存；留空表示不修改" : "sk-…"}
           />
         </label>
-        <label className="inline-checkbox">
-          <input
-            type="checkbox"
-            checked={draft.rerankEnabled}
-            onChange={() =>
-              setDraft((current) => ({
-                ...current,
-                rerankEnabled: !current.rerankEnabled,
-              }))
-            }
-          />
-          <span>
-            <strong>启用二阶段重排</strong>
-            <small>语料增大后提升精度，但会增加延迟和费用。</small>
-          </span>
-        </label>
-        <div className="modal-note">
-          <CircleAlert size={15} />
-          <p>未配置 Embedding 时，文件库仍会进行解析、切块与关键词检索；语义召回会暂时关闭。</p>
-        </div>
-        <div className="modal-actions">
-          <button className="secondary-button" type="button" onClick={() => void testConnection()}>
-            {testing ? <LoaderCircle className="spin" size={15} /> : <Zap size={15} />}
-            {testState === "ok" ? "连接正常" : testState === "error" ? "缺少 API Key" : "测试连接"}
+        <div className="model-picker">
+          <label className="field">
+            <span>模型</span>
+            <select
+              value={draft.model}
+              onChange={(event) =>
+                setDraft((current) => ({
+                  ...current,
+                  model: event.target.value,
+                  dimensions: "",
+                }))
+              }
+              disabled={!detectedModels.length}
+            >
+              {!detectedModels.length && <option value="">请先检测模型</option>}
+              {detectedModels.map((model) => (
+                <option value={model} key={model}>
+                  {model}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => void detectModels()}
+            disabled={detecting || !draft.baseUrl || (!draft.apiKey && !draft.configured)}
+          >
+            {detecting ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+            {detecting ? "检测中" : "检测模型"}
           </button>
+        </div>
+        {detectError && <div className="form-error">{detectError}</div>}
+        <div className="modal-actions">
           <button
             className="primary-button"
             type="button"
+            disabled={!draft.baseUrl || !draft.model}
             onClick={() =>
               void onSave({
                 baseUrl: draft.baseUrl,
                 model: draft.model,
-                dimensions: draft.dimensions,
+                dimensions: "",
                 configured: Boolean(draft.apiKey || draft.configured),
-                hybridEnabled: draft.hybridEnabled,
-                rerankEnabled: draft.rerankEnabled,
+                hybridEnabled: true,
+                rerankEnabled: false,
                 apiKey: draft.apiKey,
               })
             }

@@ -295,7 +295,8 @@ function applyCors(req, res) {
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
+  res.setHeader("Vary", "Origin, Access-Control-Request-Private-Network");
 }
 
 function sendJson(res, status, value, extraHeaders = {}) {
@@ -386,6 +387,36 @@ function chunksFromText(text, maxChars = 3000, overlap = 600) {
 
 function apiUrl(baseUrl, endpoint) {
   return `${String(baseUrl || "").replace(/\/+$/, "")}/${endpoint.replace(/^\/+/, "")}`;
+}
+
+async function listProviderModels(baseUrl, apiKey) {
+  const response = await fetch(apiUrl(baseUrl, "models"), {
+    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) {
+    const diagnostic = (await response.text()).slice(0, 300);
+    const error = new Error(
+      `模型列表接口返回 ${response.status}${diagnostic ? `：${diagnostic}` : ""}`,
+    );
+    error.statusCode = 502;
+    throw error;
+  }
+  const payload = await response.json();
+  const source = Array.isArray(payload?.data)
+    ? payload.data
+    : Array.isArray(payload?.models)
+      ? payload.models
+      : [];
+  return [
+    ...new Set(
+      source
+        .map((item) =>
+          typeof item === "string" ? item : String(item?.id || item?.name || ""),
+        )
+        .filter(Boolean),
+    ),
+  ].sort((left, right) => left.localeCompare(right));
 }
 
 async function callEmbedding(config, apiKey, inputs) {
@@ -691,47 +722,81 @@ function extractModelText(payload) {
     .join("\n");
 }
 
+function modelRequest(protocol, model, context, test = false) {
+  if (protocol === "chat-completions") {
+    return {
+      endpoint: "chat/completions",
+      body: {
+        model,
+        messages: test
+          ? [{ role: "user", content: "Reply with OK." }]
+          : [
+              { role: "system", content: "请严格遵守以下 EasyWork 上下文。" },
+              { role: "user", content: context },
+            ],
+        ...(test ? { max_tokens: 4 } : {}),
+      },
+    };
+  }
+  return {
+    endpoint: "responses",
+    body: {
+      model,
+      input: test
+        ? "Reply with OK."
+        : [
+            { role: "system", content: "请严格遵守以下 EasyWork 上下文。" },
+            { role: "user", content: context },
+          ],
+      ...(test ? { max_output_tokens: 4 } : {}),
+    },
+  };
+}
+
+async function callChatProvider(provider, apiKey, context, { test = false } = {}) {
+  const protocols =
+    provider.protocol === "responses" || provider.protocol === "chat-completions"
+      ? [provider.protocol]
+      : ["responses", "chat-completions"];
+  let lastError;
+  for (const protocol of protocols) {
+    const request = modelRequest(protocol, provider.model, context, test);
+    const response = await fetch(apiUrl(provider.baseUrl, request.endpoint), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(request.body),
+      signal: AbortSignal.timeout(test ? 30_000 : 120_000),
+    });
+    if (response.ok) {
+      return { payload: await response.json(), protocol };
+    }
+    const diagnostic = (await response.text()).slice(0, 400);
+    lastError = new Error(
+      `模型 API 返回 ${response.status}${diagnostic ? `：${diagnostic}` : ""}`,
+    );
+    lastError.statusCode = 502;
+    if ([401, 403, 429].includes(response.status)) break;
+  }
+  throw lastError || new Error("模型 API 请求失败");
+}
+
 async function runChatModel(actor, context, state) {
   const provider = state?.settings?.provider || {};
   const secrets = await getSecrets(actor);
   if (!provider.configured || !secrets.providerApiKey) {
     return {
-      content:
-        "当前还没有配置模型 API。我已完成界面、记忆边界、技能和文件检索链路的准备；请登录后在个人资料 → 模型 API 中保存兼容接口，即可切换为真实 LLM 回复。",
+      content: "尚未配置模型 API。请登录后在个人资料 → 模型 API 中完成设置。",
       demo: true,
     };
   }
-  const endpoint = provider.protocol === "chat-completions" ? "chat/completions" : "responses";
-  const body =
-    provider.protocol === "chat-completions"
-      ? {
-          model: provider.model,
-          messages: [
-            { role: "system", content: "请严格遵守以下 EasyWork 上下文。" },
-            { role: "user", content: context },
-          ],
-        }
-      : {
-          model: provider.model,
-          input: [
-            { role: "system", content: "请严格遵守以下 EasyWork 上下文。" },
-            { role: "user", content: context },
-          ],
-        };
-  const response = await fetch(apiUrl(provider.baseUrl, endpoint), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${secrets.providerApiKey}`,
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120_000),
-  });
-  if (!response.ok) {
-    const diagnostic = (await response.text()).slice(0, 400);
-    throw new Error(`模型 API 返回 ${response.status}：${diagnostic}`);
-  }
-  const payload = await response.json();
+  const { payload } = await callChatProvider(
+    provider,
+    secrets.providerApiKey,
+    context,
+  );
   return { content: extractModelText(payload) || "模型返回了空内容。", demo: false };
 }
 
@@ -927,6 +992,50 @@ async function handleHttp(req, res) {
       return;
     }
 
+    if (
+      req.method === "POST" &&
+      ["/api/settings/provider/models", "/api/settings/embedding/models"].includes(
+        url.pathname,
+      )
+    ) {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const secrets = await getSecrets(actor);
+      const embeddingRequest = url.pathname.includes("/embedding/");
+      const apiKey = String(
+        body.apiKey ||
+          (embeddingRequest ? secrets.embeddingApiKey : secrets.providerApiKey) ||
+          "",
+      );
+      if (!apiKey) {
+        sendJson(res, 400, { error: "请输入 API Key" });
+        return;
+      }
+      const models = await listProviderModels(body.baseUrl, apiKey);
+      const embeddingModels = models.filter((model) =>
+        /(embedding|embed|bge|e5|gte|nomic|jina|m3)/i.test(model),
+      );
+      const chatModels = models.filter(
+        (model) =>
+          !/(embedding|embed|moderation|whisper|tts|dall-e|image|audio|transcrib|realtime)/i.test(
+            model,
+          ),
+      );
+      const available = embeddingRequest
+        ? embeddingModels.length
+          ? embeddingModels
+          : models
+        : chatModels.length
+          ? chatModels
+          : models;
+      if (!available.length) {
+        sendJson(res, 404, { error: "接口没有返回可用模型" });
+        return;
+      }
+      sendJson(res, 200, { models: available });
+      return;
+    }
+
     if (req.method === "PUT" && url.pathname === "/api/settings/provider") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
@@ -937,7 +1046,10 @@ async function handleHttp(req, res) {
         name: String(body.name || "OpenAI Compatible"),
         baseUrl: String(body.baseUrl || "https://api.openai.com/v1"),
         model: String(body.model || ""),
-        protocol: body.protocol === "chat-completions" ? "chat-completions" : "responses",
+        protocol:
+          body.protocol === "chat-completions" || body.protocol === "responses"
+            ? body.protocol
+            : "auto",
         configured: Boolean(body.apiKey || (await getSecrets(actor)).providerApiKey),
       };
       await saveState(actor, state);
@@ -954,34 +1066,8 @@ async function handleHttp(req, res) {
         sendJson(res, 400, { error: "缺少模型 API Key" });
         return;
       }
-      const protocol =
-        body.protocol === "chat-completions" ? "chat-completions" : "responses";
-      const endpoint = protocol === "chat-completions" ? "chat/completions" : "responses";
-      const requestBody =
-        protocol === "chat-completions"
-          ? {
-              model: body.model,
-              messages: [{ role: "user", content: "Reply with OK." }],
-              max_tokens: 4,
-            }
-          : {
-              model: body.model,
-              input: "Reply with OK.",
-              max_output_tokens: 4,
-            };
-      const response = await fetch(apiUrl(body.baseUrl, endpoint), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!response.ok) {
-        throw new Error(`模型 API 返回 ${response.status}`);
-      }
-      sendJson(res, 200, { ok: true });
+      const result = await callChatProvider(body, apiKey, "", { test: true });
+      sendJson(res, 200, { ok: true, protocol: result.protocol });
       return;
     }
 
@@ -994,7 +1080,7 @@ async function handleHttp(req, res) {
       state.settings.embedding = {
         baseUrl: String(body.baseUrl || "https://api.openai.com/v1"),
         model: String(body.model || "text-embedding-3-small"),
-        dimensions: String(body.dimensions || "1536"),
+        dimensions: String(body.dimensions || ""),
         configured: Boolean(body.apiKey || (await getSecrets(actor)).embeddingApiKey),
         hybridEnabled: body.hybridEnabled !== false,
         rerankEnabled: Boolean(body.rerankEnabled),
