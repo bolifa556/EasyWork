@@ -344,12 +344,6 @@ const DEFAULT_STATE: EasyWorkState = {
 };
 
 const LEGACY_DEMO_PROJECT_IDS = new Set(["project_research", "project_course"]);
-const LEGACY_DEMO_CONVERSATION_IDS = new Set([
-  "chat_welcome",
-  "chat_cuda",
-  "chat_paper",
-  "chat_slurm",
-]);
 const LEGACY_DEMO_FILE_IDS = new Set(["file_ssh", "file_notes", "file_dataset"]);
 const LEGACY_DEMO_MEMORY_IDS = new Set(["memory_1", "memory_2", "memory_3"]);
 
@@ -359,9 +353,7 @@ function mergeStoredState(
 ): EasyWorkState {
   const conversations = Array.isArray(incoming.conversations)
     ? incoming.conversations.filter(
-        (conversation) =>
-          !LEGACY_DEMO_CONVERSATION_IDS.has(conversation.id) ||
-          conversation.messages.length > 0,
+        (conversation) => (conversation.messages?.length ?? 0) > 0,
       )
     : current.conversations;
   const referencedProjects = new Set(
@@ -452,6 +444,240 @@ const fileToBase64 = (file: globalThis.File) =>
     };
     reader.readAsDataURL(file);
   });
+
+function renderInlineMarkdown(value: string, keyPrefix: string) {
+  const nodes: React.ReactNode[] = [];
+  const pattern = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(value))) {
+    if (match.index > cursor) nodes.push(value.slice(cursor, match.index));
+    const token = match[0];
+    const key = `${keyPrefix}-${nodes.length}`;
+    if (token.startsWith("**")) {
+      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith("`")) {
+      nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
+    } else {
+      const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/);
+      nodes.push(
+        link ? (
+          <a key={key} href={link[2]} target="_blank" rel="noreferrer">
+            {link[1]}
+          </a>
+        ) : (
+          token
+        ),
+      );
+    }
+    cursor = match.index + token.length;
+  }
+  if (cursor < value.length) nodes.push(value.slice(cursor));
+  return nodes;
+}
+
+function tableCells(line: string) {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function isTableDivider(line: string) {
+  const cells = tableCells(line);
+  return (
+    cells.length > 0 &&
+    cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")))
+  );
+}
+
+function MarkdownContent({
+  content,
+  compact = false,
+}: {
+  content: string;
+  compact?: boolean;
+}) {
+  const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
+  const blocks: React.ReactNode[] = [];
+  let index = 0;
+  const beginsBlock = (line: string, next = "") =>
+    /^\s*```/.test(line) ||
+    /^#{1,3}\s+/.test(line) ||
+    /^\s*[-*+]\s+/.test(line) ||
+    /^\s*\d+\.\s+/.test(line) ||
+    /^\s*>\s?/.test(line) ||
+    /^\s*---+\s*$/.test(line) ||
+    (line.includes("|") && isTableDivider(next));
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = line.match(/^\s*```([\w-]+)?\s*$/);
+    if (fence) {
+      const code: string[] = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push(
+        <pre className="markdown-code-block" key={`code-${index}`}>
+          <code data-language={fence[1] || undefined}>{code.join("\n")}</code>
+        </pre>,
+      );
+      continue;
+    }
+
+    if (
+      line.includes("|") &&
+      index + 1 < lines.length &&
+      isTableDivider(lines[index + 1])
+    ) {
+      const header = tableCells(line);
+      const rows: string[][] = [];
+      index += 2;
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+        rows.push(tableCells(lines[index]));
+        index += 1;
+      }
+      blocks.push(
+        <div className="markdown-table-wrap" key={`table-${index}`}>
+          <table>
+            <thead>
+              <tr>
+                {header.map((cell, cellIndex) => (
+                  <th key={`head-${cellIndex}`}>
+                    {renderInlineMarkdown(cell, `head-${index}-${cellIndex}`)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={`row-${rowIndex}`}>
+                  {header.map((_, cellIndex) => (
+                    <td key={`cell-${cellIndex}`}>
+                      {renderInlineMarkdown(
+                        row[cellIndex] ?? "",
+                        `cell-${index}-${rowIndex}-${cellIndex}`,
+                      )}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      );
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      const children = renderInlineMarkdown(heading[2], `heading-${index}`);
+      blocks.push(
+        level === 1 ? (
+          <h2 key={`heading-${index}`}>{children}</h2>
+        ) : level === 2 ? (
+          <h3 key={`heading-${index}`}>{children}</h3>
+        ) : (
+          <h4 key={`heading-${index}`}>{children}</h4>
+        ),
+      );
+      index += 1;
+      continue;
+    }
+
+    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+    if (unordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = lines[index].match(/^\s*[-*+]\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1]);
+        index += 1;
+      }
+      blocks.push(
+        <ul key={`ul-${index}`}>
+          {items.map((item, itemIndex) => (
+            <li key={itemIndex}>{renderInlineMarkdown(item, `ul-${index}-${itemIndex}`)}</li>
+          ))}
+        </ul>,
+      );
+      continue;
+    }
+
+    const ordered = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (ordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = lines[index].match(/^\s*\d+\.\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1]);
+        index += 1;
+      }
+      blocks.push(
+        <ol key={`ol-${index}`}>
+          {items.map((item, itemIndex) => (
+            <li key={itemIndex}>{renderInlineMarkdown(item, `ol-${index}-${itemIndex}`)}</li>
+          ))}
+        </ol>,
+      );
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quote: string[] = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quote.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(
+        <blockquote key={`quote-${index}`}>
+          {renderInlineMarkdown(quote.join("\n"), `quote-${index}`)}
+        </blockquote>,
+      );
+      continue;
+    }
+
+    if (/^\s*---+\s*$/.test(line)) {
+      blocks.push(<hr key={`rule-${index}`} />);
+      index += 1;
+      continue;
+    }
+
+    const paragraph: string[] = [line];
+    index += 1;
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !beginsBlock(lines[index], lines[index + 1] ?? "")
+    ) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    blocks.push(
+      <p key={`paragraph-${index}`}>
+        {renderInlineMarkdown(paragraph.join("\n"), `paragraph-${index}`)}
+      </p>,
+    );
+  }
+
+  return (
+    <div className={`markdown-content${compact ? " compact" : ""}`}>
+      {blocks}
+    </div>
+  );
+}
 
 function Modal({
   title,
@@ -1037,16 +1263,22 @@ export default function EasyWorkApp() {
               : message.trace,
           }),
         );
-        if (failed) {
-          updateMessage(
-            conversationId,
-            (message) => message.runId === runId && message.role === "assistant",
-            (message) => ({
-              ...message,
-              content: result,
-            }),
-          );
-        }
+        updateMessage(
+          conversationId,
+          (message) => message.runId === runId && message.role === "assistant",
+          (message) => ({
+            ...message,
+            content: failed ? result : message.content,
+            events: (message.events ?? []).map((event) =>
+              event.status === "running"
+                ? {
+                    ...event,
+                    status: failed ? ("error" as const) : ("done" as const),
+                  }
+                : event,
+            ),
+          }),
+        );
         setSending(false);
       }
     },
@@ -1128,6 +1360,13 @@ export default function EasyWorkApp() {
     const socket = new WebSocket(url);
     let disposed = false;
     socketRef.current = socket;
+    socket.onopen = () => {
+      if (socketRef.current !== socket) return;
+      setConnection({
+        status: "disconnected",
+        label: "尚未连接算力平台",
+      });
+    };
     socket.onmessage = (event) => {
       try {
         handleSocketEvent(JSON.parse(String(event.data)) as Record<string, unknown>);
@@ -1136,7 +1375,9 @@ export default function EasyWorkApp() {
       }
     };
     socket.onclose = () => {
-      socketRef.current = null;
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+      }
       if (disposed) return;
       setConnection({
         status: "disconnected",
@@ -1147,7 +1388,9 @@ export default function EasyWorkApp() {
     return () => {
       disposed = true;
       socket.close();
-      socketRef.current = null;
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+      }
     };
   }, [deviceToken, gatewayStatus, handleSocketEvent]);
 
@@ -2149,7 +2392,13 @@ export default function EasyWorkApp() {
                       </div>
                       <div className="message-body">
                         {message.content ? (
-                          <div className="message-text">{message.content}</div>
+                          <div className="message-text">
+                            {message.role === "assistant" ? (
+                              <MarkdownContent content={message.content} />
+                            ) : (
+                              message.content
+                            )}
+                          </div>
                         ) : message.role === "assistant" ? (
                           <div className="typing-row">
                             <span />
@@ -2171,9 +2420,15 @@ export default function EasyWorkApp() {
                             })}
                           </div>
                         )}
-                        {!!message.events?.length && (
+                        {message.events?.some(
+                          (event) => !["result", "plan"].includes(event.kind),
+                        ) && (
                           <div className="work-event-stack">
-                            {message.events.map((event) => (
+                            {message.events
+                              .filter(
+                                (event) => !["result", "plan"].includes(event.kind),
+                              )
+                              .map((event) => (
                               <div
                                 className={`work-event ${event.kind} ${event.status}`}
                                 key={event.id}
@@ -2194,7 +2449,7 @@ export default function EasyWorkApp() {
                                 <div>
                                   <strong>{event.title}</strong>
                                   {event.detail && <small>{event.detail}</small>}
-                                  {event.output && (
+                                  {event.output && event.kind !== "result" && (
                                     <pre>
                                       <code>{event.output}</code>
                                     </pre>
@@ -3032,7 +3287,7 @@ export default function EasyWorkApp() {
                           {message.trace?.result && (
                             <div className="trace-result">
                               <span>结果</span>
-                              <p>{message.trace.result}</p>
+                              <MarkdownContent content={message.trace.result} compact />
                             </div>
                           )}
                         </div>

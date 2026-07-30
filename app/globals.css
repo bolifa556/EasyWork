@@ -3862,6 +3862,143 @@ textarea::placeholder {
   }
 }
 
+.markdown-content {
+  display: grid;
+  min-width: 0;
+  gap: 0.8em;
+  overflow-wrap: anywhere;
+}
+
+.markdown-content > * {
+  margin: 0;
+}
+
+.markdown-content p {
+  white-space: pre-wrap;
+}
+
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4 {
+  color: #171717;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.markdown-content h2 {
+  font-size: 1.2em;
+}
+
+.markdown-content h3 {
+  font-size: 1.1em;
+}
+
+.markdown-content h4 {
+  font-size: 1em;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+  display: grid;
+  gap: 0.35em;
+  margin: 0;
+  padding-left: 1.45em;
+}
+
+.markdown-content li {
+  padding-left: 0.15em;
+}
+
+.markdown-content a {
+  color: #245f43;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-content :not(pre) > code {
+  border-radius: 5px;
+  background: #f1f1f1;
+  padding: 0.12em 0.35em;
+  color: #252525;
+  font-size: 0.88em;
+}
+
+.markdown-code-block {
+  overflow-x: auto;
+  border-radius: 10px;
+  background: #202320;
+  padding: 13px 14px;
+  color: #f4f4f4;
+  font-size: 0.86em;
+  line-height: 1.6;
+  white-space: pre;
+}
+
+.markdown-content blockquote {
+  border-left: 3px solid #c8d7cc;
+  padding-left: 12px;
+  color: #5f6762;
+  white-space: pre-wrap;
+}
+
+.markdown-content hr {
+  width: 100%;
+  border: 0;
+  border-top: 1px solid #e5e5e5;
+}
+
+.markdown-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid #e4e4e4;
+  border-radius: 10px;
+}
+
+.markdown-content table {
+  width: 100%;
+  min-width: 360px;
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border-bottom: 1px solid #e8e8e8;
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-content th {
+  background: #f6f6f6;
+  color: #555;
+  font-weight: 600;
+}
+
+.markdown-content tr:last-child td {
+  border-bottom: 0;
+}
+
+.markdown-content.compact {
+  gap: 0.5em;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.markdown-content.compact table {
+  min-width: 0;
+  font-size: 11px;
+}
+
+.markdown-content.compact th,
+.markdown-content.compact td {
+  padding: 6px 7px;
+}
+
+.trace-result .markdown-content {
+  margin-top: 6px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

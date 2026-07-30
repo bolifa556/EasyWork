@@ -919,7 +919,21 @@ async function handleHttp(req, res) {
     if (req.method === "PUT" && url.pathname === "/api/state") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
-      await saveState(actor, body.state || {});
+      const nextState = body.state || {};
+      const storedState = await getState(actor);
+      const nextProvider = nextState?.settings?.provider;
+      const storedProvider = storedState?.settings?.provider;
+      if (
+        nextProvider &&
+        storedProvider &&
+        nextProvider.protocol === "auto" &&
+        ["chat-completions", "responses"].includes(storedProvider.protocol) &&
+        nextProvider.baseUrl === storedProvider.baseUrl &&
+        nextProvider.model === storedProvider.model
+      ) {
+        nextProvider.protocol = storedProvider.protocol;
+      }
+      await saveState(actor, nextState);
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -1348,6 +1362,34 @@ function remoteSftpWrite(client, remotePath, content, mode = 0o600) {
   });
 }
 
+async function readOpenCodeFailureLog(session, apiKey = "") {
+  const result = await remoteExec(
+    session.client,
+    [
+      "set +e",
+      'for root in "$HOME/.local/share/opencode/log" "$HOME/.local/share/opencode/logs"; do',
+      '  [ -d "$root" ] || continue',
+      '  latest="$(ls -1t "$root"/* 2>/dev/null | head -n 1)"',
+      '  [ -n "$latest" ] || continue',
+      '  tail -n 120 "$latest"',
+      "  break",
+      "done",
+    ].join("\n"),
+    { allowFailure: true },
+  );
+  const diagnosticText = `${result.stdout}\n${result.stderr}`;
+  const safelyRedacted = apiKey
+    ? diagnosticText.replaceAll(String(apiKey), "[redacted]")
+    : diagnosticText;
+  const redacted = safelyRedacted
+    .split(/\r?\n/)
+    .filter((line) => /error|fail|exception|provider|api[_ -]?call/i.test(line))
+    .slice(-10)
+    .join("\n")
+    .trim();
+  return redacted.slice(-4_000);
+}
+
 function workflowFor(prompt) {
   if (/内存|显存|资源|gpu|memory|磁盘|cpu/i.test(prompt)) {
     return ["查看服务器内存", "查看可用资源", "判断任务所需资源是否满足"];
@@ -1530,10 +1572,18 @@ function parseOpenCodeLine(line, state) {
     };
   }
   if (type === "error") {
+    const errorPayload = payload.error;
+    const errorMessage =
+      errorPayload?.data?.message ||
+      errorPayload?.message ||
+      (typeof errorPayload === "string" ? errorPayload : "") ||
+      payload.message ||
+      "未知错误";
+    state.lastError = String(errorMessage);
     return {
       kind: "tool",
       title: "Agent 执行错误",
-      output: String(payload.error?.message || payload.message || "未知错误"),
+      output: state.lastError,
       status: "error",
     };
   }
@@ -1625,6 +1675,7 @@ async function runRemoteWork(socket, session, actor, payload) {
   const parserState = {
     sessionId: boundSessionId,
     finalText: "",
+    lastError: "",
     eventIndex: 0,
     stepIndex: 0,
   };
@@ -1679,7 +1730,21 @@ async function runRemoteWork(socket, session, actor, payload) {
   }
   await remoteExec(session.client, `rm -f ${shellQuote(promptPath)}`, { allowFailure: true });
   if (result.code !== 0) {
-    throw new Error(stderrOutput.trim() || `OpenCode 退出码 ${result.code}`);
+    const primaryError =
+      parserState.lastError ||
+        stderrOutput.trim() ||
+        `OpenCode 退出码 ${result.code}`;
+    const needsLog =
+      !parserState.lastError ||
+      /unexpected server error|unknown error|未知错误/i.test(primaryError);
+    const logDiagnostic = needsLog
+      ? await readOpenCodeFailureLog(session, secrets.providerApiKey)
+      : "";
+    throw new Error(
+      logDiagnostic && !primaryError.includes(logDiagnostic)
+        ? `${primaryError}\n${logDiagnostic}`
+        : primaryError,
+    );
   }
   const finalText = parserState.finalText.trim() || "Agent 已完成任务，未返回额外文本。";
   wsSend(socket, {

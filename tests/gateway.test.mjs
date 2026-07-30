@@ -92,6 +92,23 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     });
     assert.equal(stateResponse.status, 200);
 
+    const staleState = structuredClone(state);
+    staleState.settings.provider.protocol = "auto";
+    const staleStateResponse = await fetch(`${base}/api/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({ state: staleState }),
+    });
+    assert.equal(staleStateResponse.status, 200);
+    const preservedStateResponse = await fetch(`${base}/api/bootstrap`, {
+      headers: { Cookie: cookies },
+    });
+    const preservedState = await preservedStateResponse.json();
+    assert.equal(
+      preservedState.state.settings.provider.protocol,
+      "responses",
+    );
+
     const fileResponse = await fetch(`${base}/api/files`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: cookies },

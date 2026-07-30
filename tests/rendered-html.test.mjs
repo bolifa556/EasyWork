@@ -53,6 +53,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /DEVICE_TOKEN_STORAGE_KEY/);
   assert.match(app, /beginConversation/);
   assert.match(app, /ConversationRow/);
+  assert.match(app, /function MarkdownContent/);
+  assert.match(app, /\(conversation\.messages\?\.length \?\? 0\) > 0/);
+  assert.match(app, /if \(socketRef\.current === socket\)/);
+  assert.match(app, /!\["result", "plan"\]\.includes\(event\.kind\)/);
   assert.match(app, /转换为\{mode === "chat" \? "工作" : "聊天"\}模式/);
   assert.doesNotMatch(app, /const EMPTY_CONVERSATION_ID/);
   assert.match(app, /Embedding API/);
@@ -69,6 +73,9 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /deviceToken/);
   assert.match(gateway, /--no-modify-path/);
   assert.match(gateway, /agentSessions:\s*new Map/);
+  assert.match(gateway, /errorPayload\?\.data\?\.message/);
+  assert.match(gateway, /readOpenCodeFailureLog/);
+  assert.match(gateway, /nextProvider\.protocol = storedProvider\.protocol/);
 
   await assert.rejects(access(new URL("../app/_sites-preview/", import.meta.url)));
   for (const starterAsset of ["file.svg", "globe.svg", "window.svg"]) {
