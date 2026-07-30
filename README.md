@@ -33,9 +33,11 @@ Syncthing 设置见 `sync\README.md`。
 - 访客临时目录；注册/登录后使用独立用户目录。
 - 技能上传与逐轮选择，所有技能位于 `skill/`。
 - 文件解析、切块、关键词检索，以及可选的 Embedding 混合检索。
-- SSH 私钥 + 短密码 + TOTP 登录，连接随浏览器 WebSocket 生命周期维持。
-- 自动扫描或安装 OpenCode 到远端 `~/.easywork`。
-- 一个 Work 对话对应一个 OpenCode session，过程事件实时映射到页面。
+- 同一账号可保存并同时连接多台 SSH 服务器；每个 Work 对话固定绑定首次选择的服务器。
+- 自动扫描 Agent，或将 OpenCode 安装到远端 `~/.easywork/agents/opencode`。
+- Agent 使用自己的配置和数据目录；EasyWork 只在 `~/.easywork/bindings` 保存对话与 Agent task 的绑定。
+- 通过当前 SSH 连接浏览、上传和下载远端文件。
+- 一个 Work 对话对应一个 Agent session，过程事件实时映射到页面。
 
 ## 目录
 
@@ -48,7 +50,7 @@ data/                 运行时账户与索引数据（Git 忽略）
 tests/                渲染与网关集成测试
 ```
 
-API Key 使用本机生成的 AES-256-GCM 密钥加密，SSH 私钥、私钥短密码和 TOTP 只保存在网关内存中。首次连接使用 TOFU 主机指纹确认。远端 API Key 写入会话专属的 `~/.easywork/runtime` 临时文件，并在断开时删除。
+网页聊天 API Key 和账号保存的 SSH 私钥使用本机生成的 AES-256-GCM 密钥加密。私钥短密码和 TOTP 只保存在网关内存中，首次连接使用 TOFU 主机指纹确认。Work 模式不再向 Agent 注入 EasyWork 模型配置；Agent 直接读取自己的原生配置。
 
 ## 验证
 

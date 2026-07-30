@@ -32,7 +32,9 @@ test("work planning is prepared before execution and OpenCode events stay struct
   );
   const {
     agentPromptWithWorkflow,
+    normalizeConversationTitle,
     parseOpenCodeLine,
+    parseWorkPlan,
     parseWorkflowPlan,
     workflowFor,
     workflowIndexForEvent,
@@ -48,6 +50,24 @@ test("work planning is prepared before execution and OpenCode events stay struct
     "核对 CPU 资源",
     "给出判断",
   ]);
+  assert.equal(
+    normalizeConversationTitle("“查看登录节点资源是否充足”", "查看资源"),
+    "查看登录节点资源是否充足",
+  );
+  assert.equal(
+    [...normalizeConversationTitle("", "请帮我查看服务器内存、GPU、磁盘与作业队列是否满足训练要求")].length,
+    14,
+  );
+  assert.deepEqual(
+    parseWorkPlan(
+      '{"title":"训练资源检查","steps":["查看内存","检查 GPU","给出判断"]}',
+      "检查训练资源",
+    ),
+    {
+      title: "训练资源检查",
+      steps: ["查看内存", "检查 GPU", "给出判断"],
+    },
+  );
   const prompt = agentPromptWithWorkflow("用户请求：检查资源", planned);
   assert.match(prompt, /EasyWork 网页端已编排的执行流程/);
   assert.match(prompt, /2\. 检查可用内存/);
@@ -237,7 +257,13 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
         reject(new Error("demo websocket timed out"));
       }, 4_000);
       socket.on("open", () => {
-        socket.send(JSON.stringify({ type: "ssh.connect", demo: true }));
+        socket.send(
+          JSON.stringify({
+            type: "ssh.connect",
+            serverId: "demo",
+            demo: true,
+          }),
+        );
       });
       socket.on("message", (raw) => {
         events.push(JSON.parse(String(raw)));
@@ -275,9 +301,13 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
         const event = JSON.parse(String(raw));
         resumedEvents.push(event);
         if (
-          event.type === "connection.status" &&
-          event.status === "connected" &&
-          event.resumed
+          event.type === "connections.snapshot" &&
+          event.connections?.some(
+            (connection) =>
+              connection.serverId === "demo" &&
+              connection.status === "connected" &&
+              connection.resumed,
+          )
         ) {
           clearTimeout(timer);
           socket.close();
@@ -286,7 +316,13 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       });
       socket.on("error", reject);
     });
-    assert.ok(resumedEvents.some((event) => event.resumed === true));
+    assert.ok(
+      resumedEvents.some(
+        (event) =>
+          event.type === "connections.snapshot" &&
+          event.connections?.some((connection) => connection.resumed === true),
+      ),
+    );
 
     const registration = await fetch(`${base}/api/auth/register`, {
       method: "POST",
@@ -391,7 +427,7 @@ test("an SSH failure is not overwritten by a later close event", async () => {
   }
 });
 
-test("an authenticated account can reuse its encrypted SSH key without sending it again", async () => {
+test("an authenticated account can reuse encrypted SSH keys and passwords", async () => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-ssh-profile-test-"));
   process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
   process.env.EASYWORK_SKILL_DIR = path.join(temporaryRoot, "skill");
@@ -412,12 +448,20 @@ test("an authenticated account can reuse its encrypted SSH key without sending i
   const sshServer = new SshServer({ hostKeys: [hostKeyPem] }, (client) => {
     client
       .on("authentication", (context) => {
-        if (context.method !== "publickey") {
-          context.reject();
+        if (context.method === "publickey") {
+          authenticationCount += 1;
+          context.accept();
           return;
         }
-        authenticationCount += 1;
-        context.accept();
+        if (
+          context.method === "password" &&
+          context.password === "secret-password"
+        ) {
+          authenticationCount += 1;
+          context.accept();
+          return;
+        }
+        context.reject();
       })
       .on("ready", () => {
         readyCount += 1;
@@ -469,7 +513,7 @@ test("an authenticated account can reuse its encrypted SSH key without sending i
       const onMessage = (raw) => {
         const event = JSON.parse(String(raw));
         events.push(event);
-        if (event.type === "ssh.profile") profileReceived = true;
+        if (event.type === "server.profile") profileReceived = true;
         if (event.type === "agent.list") agentsReceived = true;
         if (event.type === "connection.status" && event.status === "error") {
           clearTimeout(timer);
@@ -516,6 +560,7 @@ test("an authenticated account can reuse its encrypted SSH key without sending i
     const firstEvents = await waitForConnection(
       {
         type: "ssh.connect",
+        serverId: "cluster-a",
         host: "127.0.0.1",
         port: sshAddress.port,
         username: "cluster-user",
@@ -526,7 +571,23 @@ test("an authenticated account can reuse its encrypted SSH key without sending i
       },
       { expectProfile: true },
     );
-    assert.ok(firstEvents.some((event) => event.type === "ssh.profile"));
+    assert.ok(firstEvents.some((event) => event.type === "server.profile"));
+
+    await waitForConnection(
+      {
+        type: "ssh.connect",
+        serverId: "cluster-b",
+        name: "备用登录节点",
+        host: "127.0.0.1",
+        port: sshAddress.port,
+        username: "cluster-user",
+        privateKey: userKeyPem,
+        privateKeyName: "cluster_ed25519",
+        rememberKey: true,
+        trustHost: true,
+      },
+      { expectProfile: true },
+    );
 
     await new Promise((resolve) => {
       const onMessage = (raw) => {
@@ -536,10 +597,30 @@ test("an authenticated account can reuse its encrypted SSH key without sending i
         resolve();
       };
       socket.on("message", onMessage);
-      socket.send(JSON.stringify({ type: "ssh.disconnect" }));
+      socket.send(
+        JSON.stringify({ type: "ssh.disconnect", serverId: "cluster-a" }),
+      );
+    });
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("second SSH session was closed unexpectedly")),
+        3_000,
+      );
+      const onMessage = (raw) => {
+        const event = JSON.parse(String(raw));
+        if (event.type !== "agent.list" || event.serverId !== "cluster-b") return;
+        clearTimeout(timer);
+        socket.off("message", onMessage);
+        resolve();
+      };
+      socket.on("message", onMessage);
+      socket.send(
+        JSON.stringify({ type: "agent.scan", serverId: "cluster-b" }),
+      );
     });
     await waitForConnection({
       type: "ssh.connect",
+      serverId: "cluster-a",
       host: "127.0.0.1",
       port: sshAddress.port,
       username: "cluster-user",
@@ -547,23 +628,117 @@ test("an authenticated account can reuse its encrypted SSH key without sending i
       trustHost: true,
     });
     assert.ok(authenticationCount >= 2);
-    assert.equal(readyCount, 2);
+    assert.equal(readyCount, 3);
 
     const bootstrap = await fetch(`${base}/api/bootstrap`, {
       headers: { Authorization: `Bearer ${account.deviceToken}` },
     });
-    const profile = (await bootstrap.json()).state.settings.ssh;
+    const profiles = (await bootstrap.json()).state.settings.servers;
+    assert.ok(profiles.some((item) => item.id === "cluster-a"));
+    assert.ok(profiles.some((item) => item.id === "cluster-b"));
+    const profile = profiles.find((item) => item.id === "cluster-a");
     assert.deepEqual(profile, {
+      id: "cluster-a",
+      name: "127.0.0.1",
       host: "127.0.0.1",
       port: sshAddress.port,
       username: "cluster-user",
+      authMethod: "key",
       keyName: "cluster_ed25519",
       configured: true,
+      lastConnectedAt: profile.lastConnectedAt,
     });
     assert.equal(JSON.stringify(profile).includes("PRIVATE KEY"), false);
+
+    await waitForConnection(
+      {
+        type: "ssh.connect",
+        serverId: "cluster-c",
+        name: "密码登录节点",
+        host: "127.0.0.1",
+        port: sshAddress.port,
+        username: "password-user",
+        authMethod: "password",
+        password: "secret-password",
+        rememberCredential: true,
+        trustHost: true,
+      },
+      { expectProfile: true },
+    );
+    await new Promise((resolve) => {
+      const onMessage = (raw) => {
+        const event = JSON.parse(String(raw));
+        if (
+          event.type !== "connection.status" ||
+          event.serverId !== "cluster-c" ||
+          event.status !== "disconnected"
+        ) {
+          return;
+        }
+        socket.off("message", onMessage);
+        resolve();
+      };
+      socket.on("message", onMessage);
+      socket.send(
+        JSON.stringify({ type: "ssh.disconnect", serverId: "cluster-c" }),
+      );
+    });
+    await waitForConnection({
+      type: "ssh.connect",
+      serverId: "cluster-c",
+      host: "127.0.0.1",
+      port: sshAddress.port,
+      username: "password-user",
+      authMethod: "password",
+      useSavedCredential: true,
+      trustHost: true,
+    });
+    assert.equal(readyCount, 5);
+    const passwordBootstrap = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${account.deviceToken}` },
+    });
+    const passwordProfiles = (await passwordBootstrap.json()).state.settings
+      .servers;
+    const passwordProfile = passwordProfiles.find(
+      (item) => item.id === "cluster-c",
+    );
+    assert.deepEqual(passwordProfile, {
+      id: "cluster-c",
+      name: "密码登录节点",
+      host: "127.0.0.1",
+      port: sshAddress.port,
+      username: "password-user",
+      authMethod: "password",
+      keyName: "",
+      configured: true,
+      lastConnectedAt: passwordProfile.lastConnectedAt,
+    });
+    assert.equal(JSON.stringify(passwordProfile).includes("secret-password"), false);
+
+    await new Promise((resolve) => {
+      const onMessage = (raw) => {
+        const event = JSON.parse(String(raw));
+        if (
+          event.type !== "connection.status" ||
+          event.serverId !== "cluster-b" ||
+          event.status !== "disconnected"
+        ) {
+          return;
+        }
+        socket.off("message", onMessage);
+        resolve();
+      };
+      socket.on("message", onMessage);
+      socket.send(
+        JSON.stringify({ type: "ssh.disconnect", serverId: "cluster-b" }),
+      );
+    });
   } finally {
     if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "ssh.disconnect" }));
+      socket.send(JSON.stringify({ type: "ssh.disconnect", serverId: "cluster-a" }));
+      socket.send(JSON.stringify({ type: "ssh.disconnect", serverId: "cluster-b" }));
+      socket.send(JSON.stringify({ type: "ssh.disconnect", serverId: "cluster-c" }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
       socket.close();
     }
     await Promise.all([

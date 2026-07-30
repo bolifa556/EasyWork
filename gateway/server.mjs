@@ -26,7 +26,7 @@ const PROMPT_ROOT = path.join(ROOT, "prompts");
 const HOST = process.env.EASYWORK_GATEWAY_HOST || "127.0.0.1";
 const PORT = Number(process.env.EASYWORK_GATEWAY_PORT || 8789);
 const BODY_LIMIT = 36 * 1024 * 1024;
-const SESSION_MAX_AGE = 60 * 60 * 24 * 30;
+const SESSION_MAX_AGE = 60 * 60 * 24 * 180;
 const SSH_RECONNECT_GRACE_MS = 2 * 60 * 1000;
 const BUILTIN_SKILLS = {
   skill_cluster: path.join(SKILL_ROOT, "built-in", "cluster-ops"),
@@ -252,10 +252,18 @@ async function resolveActor(req, res, createGuest = true) {
 
 async function getSecrets(actor) {
   const stored = await readJson(path.join(actorDirectory(actor), "secrets.json"), {});
+  const sshCredentials = {};
+  for (const [serverId, credential] of Object.entries(stored.sshCredentials || {})) {
+    sshCredentials[serverId] = {
+      privateKey: decryptString(credential?.privateKey),
+      password: decryptString(credential?.password),
+    };
+  }
   return {
     providerApiKey: decryptString(stored.providerApiKey),
     embeddingApiKey: decryptString(stored.embeddingApiKey),
     sshPrivateKey: decryptString(stored.sshPrivateKey),
+    sshCredentials,
   };
 }
 
@@ -271,6 +279,21 @@ async function updateSecrets(actor, patch) {
   }
   if (typeof patch.sshPrivateKey === "string" && patch.sshPrivateKey) {
     next.sshPrivateKey = encryptString(patch.sshPrivateKey);
+  }
+  if (
+    patch.sshCredential?.serverId &&
+    (patch.sshCredential?.privateKey || patch.sshCredential?.password)
+  ) {
+    next.sshCredentials ||= {};
+    next.sshCredentials[safeSegment(patch.sshCredential.serverId)] = {
+      privateKey: patch.sshCredential.privateKey
+        ? encryptString(patch.sshCredential.privateKey)
+        : undefined,
+      password: patch.sshCredential.password
+        ? encryptString(patch.sshCredential.password)
+        : undefined,
+      updatedAt: isoNow(),
+    };
   }
   await writeJson(secretPath, next);
 }
@@ -296,10 +319,50 @@ async function stateForClient(actor) {
   if (state?.settings?.embedding) {
     state.settings.embedding.configured = Boolean(secrets.embeddingApiKey);
   }
-  if (secrets.sshPrivateKey || state?.settings?.ssh) {
+  if (secrets.sshPrivateKey || state?.settings?.ssh || state?.settings?.servers) {
     state.settings ||= {};
-    state.settings.ssh ||= {};
-    state.settings.ssh.configured = Boolean(secrets.sshPrivateKey);
+    const legacySsh = state.settings.ssh;
+    state.settings.servers = Array.isArray(state.settings.servers)
+      ? state.settings.servers
+      : [];
+    if (
+      legacySsh?.host &&
+      !state.settings.servers.some(
+        (profile) =>
+          profile.host === legacySsh.host &&
+          Number(profile.port || 22) === Number(legacySsh.port || 22) &&
+          profile.username === legacySsh.username,
+      )
+    ) {
+      const legacyId = `server-${crypto
+        .createHash("sha256")
+        .update(`${legacySsh.host}:${legacySsh.port || 22}:${legacySsh.username || ""}`)
+        .digest("hex")
+        .slice(0, 12)}`;
+      state.settings.servers.unshift({
+        id: legacyId,
+        name: legacySsh.name || legacySsh.host,
+        host: legacySsh.host,
+        port: Number(legacySsh.port || 22),
+        username: legacySsh.username || "",
+        keyName: legacySsh.keyName || "",
+        authMethod: "key",
+        configured: Boolean(secrets.sshPrivateKey),
+      });
+      state.settings.lastServerId ||= legacyId;
+    }
+    state.settings.servers = state.settings.servers.map((profile) => ({
+      ...profile,
+      configured: Boolean(
+        secrets.sshCredentials?.[safeSegment(profile.id)]?.privateKey ||
+          secrets.sshCredentials?.[safeSegment(profile.id)]?.password ||
+          (legacySsh &&
+            secrets.sshPrivateKey &&
+            profile.host === legacySsh.host &&
+            Number(profile.port || 22) === Number(legacySsh.port || 22) &&
+            profile.username === legacySsh.username),
+      ),
+    }));
   }
   return state;
 }
@@ -1287,13 +1350,20 @@ async function handleHttp(req, res) {
         conversationId: String(body.conversationId || ""),
       });
       const result = await runChatModel(actor, context.text, context.state);
+      const title = body.firstTurn
+        ? await generateConversationTitle(
+            actor,
+            String(body.prompt || ""),
+            result.content,
+          )
+        : undefined;
       await captureMemory(
         actor,
         String(body.prompt || ""),
         body.projectId ? String(body.projectId) : undefined,
         body.memoryMode === "project-only" ? "project-only" : "default",
       );
-      sendJson(res, 200, { ...result, sources: context.sources });
+      sendJson(res, 200, { ...result, title, sources: context.sources });
       return;
     }
 
@@ -1362,7 +1432,70 @@ function remoteSftpWrite(client, remotePath, content, mode = 0o600) {
   });
 }
 
-async function readOpenCodeFailureLog(session, apiKey = "") {
+function withRemoteSftp(client, operation) {
+  return new Promise((resolve, reject) => {
+    client.sftp((error, sftp) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      Promise.resolve()
+        .then(() => operation(sftp))
+        .then(resolve, reject)
+        .finally(() => sftp.end());
+    });
+  });
+}
+
+function remoteSftpRead(client, remotePath) {
+  return withRemoteSftp(
+    client,
+    (sftp) =>
+      new Promise((resolve, reject) => {
+        sftp.readFile(remotePath, (error, data) => {
+          if (error) reject(error);
+          else resolve(data);
+        });
+      }),
+  );
+}
+
+function remoteSftpList(client, remotePath) {
+  return withRemoteSftp(
+    client,
+    (sftp) =>
+      new Promise((resolve, reject) => {
+        sftp.readdir(remotePath, (error, list) => {
+          if (error) reject(error);
+          else resolve(list || []);
+        });
+      }),
+  );
+}
+
+function remoteSftpMkdir(client, remotePath) {
+  return withRemoteSftp(
+    client,
+    (sftp) =>
+      new Promise((resolve, reject) => {
+        sftp.mkdir(remotePath, (error) => {
+          if (error && error.code !== 4) reject(error);
+          else resolve();
+        });
+      }),
+  );
+}
+
+function remotePathForSession(session, value = "~") {
+  const input = String(value || "~").trim();
+  if (!session.home) throw new Error("尚未读取远端主目录");
+  if (input === "~") return session.home;
+  if (input.startsWith("~/")) return path.posix.join(session.home, input.slice(2));
+  if (input.startsWith("/")) return path.posix.normalize(input);
+  return path.posix.join(session.home, input);
+}
+
+async function readOpenCodeFailureLog(session) {
   const result = await remoteExec(
     session.client,
     [
@@ -1378,10 +1511,7 @@ async function readOpenCodeFailureLog(session, apiKey = "") {
     { allowFailure: true },
   );
   const diagnosticText = `${result.stdout}\n${result.stderr}`;
-  const safelyRedacted = apiKey
-    ? diagnosticText.replaceAll(String(apiKey), "[redacted]")
-    : diagnosticText;
-  const redacted = safelyRedacted
+  const redacted = diagnosticText
     .split(/\r?\n/)
     .filter((line) => /error|fail|exception|provider|api[_ -]?call/i.test(line))
     .slice(-10)
@@ -1443,6 +1573,47 @@ function parseWorkflowPlan(raw, fallback) {
   return fallback;
 }
 
+function fallbackConversationTitle(prompt) {
+  const compact = String(prompt || "")
+    .replace(/[`*_>#\[\]()]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/^(请|帮我|麻烦|我想|能否|可以|一下)+/g, "")
+    .trim();
+  return [...(compact || "新对话")].slice(0, 14).join("");
+}
+
+function normalizeConversationTitle(value, prompt) {
+  const normalized = String(value || "")
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/^[\s"'“”‘’《》【】]+|[\s"'“”‘’《》【】。！？!?：:]+$/g, "")
+    .replace(/^(标题|title)\s*[：:]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return fallbackConversationTitle(prompt);
+  return [...normalized].slice(0, 14).join("");
+}
+
+function parseWorkPlan(raw, prompt) {
+  const fallback = workflowFor(prompt);
+  const source = String(raw || "")
+    .replace(/```(?:json)?/gi, "")
+    .replace(/```/g, "")
+    .trim();
+  const objectMatch = source.match(/\{[\s\S]*\}/);
+  try {
+    const parsed = JSON.parse(objectMatch?.[0] || source);
+    return {
+      title: normalizeConversationTitle(parsed?.title, prompt),
+      steps: cleanWorkflowSteps(parsed?.steps, fallback),
+    };
+  } catch {
+    return {
+      title: fallbackConversationTitle(prompt),
+      steps: parseWorkflowPlan(source, fallback),
+    };
+  }
+}
+
 async function planWorkSteps(provider, apiKey, prompt) {
   const fallback = workflowFor(prompt);
   const planningPrompt = [
@@ -1456,6 +1627,44 @@ async function planWorkSteps(provider, apiKey, prompt) {
   return parseWorkflowPlan(extractModelText(payload), fallback);
 }
 
+async function planWorkRequest(provider, apiKey, prompt) {
+  const planningPrompt = [
+    "你是 EasyWork 网页端的任务编排器。",
+    "根据用户的第一条请求，生成一个简洁、具体的中文对话标题，最多 14 个汉字。",
+    "再把请求拆成 2 到 6 个按顺序执行、可以验证的简短步骤。",
+    "步骤必须是动作，不得假设尚未得到的结果；高风险操作前必须安排确认。",
+    '只返回严格 JSON：{"title":"短标题","steps":["步骤一","步骤二"]}，不要 Markdown 或解释。',
+    `用户请求：${String(prompt || "").slice(0, 4_000)}`,
+  ].join("\n");
+  const { payload } = await callChatProvider(provider, apiKey, planningPrompt);
+  return parseWorkPlan(extractModelText(payload), prompt);
+}
+
+async function generateConversationTitle(actor, prompt, response = "") {
+  const state = await getState(actor);
+  const provider = state?.settings?.provider || {};
+  const secrets = await getSecrets(actor);
+  if (!provider.configured || !provider.model || !secrets.providerApiKey) {
+    return fallbackConversationTitle(prompt);
+  }
+  const titlePrompt = [
+    "请根据下面第一轮用户请求和回答，为这段对话生成一个具体的中文标题。",
+    "要求：不超过 14 个汉字；不要引号、句号、前缀或解释；避免“关于”“问题讨论”等空泛表达。",
+    `用户：${String(prompt || "").slice(0, 1_500)}`,
+    `回答：${String(response || "").slice(0, 1_500)}`,
+  ].join("\n");
+  try {
+    const { payload } = await callChatProvider(
+      provider,
+      secrets.providerApiKey,
+      titlePrompt,
+    );
+    return normalizeConversationTitle(extractModelText(payload), prompt);
+  } catch {
+    return fallbackConversationTitle(prompt);
+  }
+}
+
 function agentPromptWithWorkflow(context, steps) {
   return [
     context,
@@ -1466,19 +1675,19 @@ function agentPromptWithWorkflow(context, steps) {
   ].join("\n");
 }
 
-function providerConfigForOpenCode(provider) {
+function providerConfigForOpenCode(provider, apiKey) {
   return {
     $schema: "https://opencode.ai/config.json",
     provider: {
-      easywork: {
+      custom: {
         npm:
           provider.protocol === "responses"
             ? "@ai-sdk/openai"
             : "@ai-sdk/openai-compatible",
-        name: "EasyWork API",
+        name: "Custom API",
         options: {
           baseURL: provider.baseUrl,
-          apiKey: "{env:EASYWORK_LLM_API_KEY}",
+          apiKey,
         },
         models: {
           [provider.model]: {
@@ -1490,66 +1699,225 @@ function providerConfigForOpenCode(provider) {
   };
 }
 
-async function scanRemoteAgents(session) {
+function agentConfigFor(adapter, home) {
+  if (adapter === "opencode") {
+    return {
+      configPath: `${home}/.config/opencode/opencode.json`,
+      alternateConfigPath: `${home}/.config/opencode/opencode.jsonc`,
+      dataPath: `${home}/.local/share/opencode`,
+    };
+  }
+  if (adapter === "claude") {
+    return {
+      configPath: `${home}/.claude/settings.json`,
+      dataPath: `${home}/.claude`,
+    };
+  }
+  if (adapter === "qwen") {
+    return {
+      configPath: `${home}/.qwen/settings.json`,
+      dataPath: `${home}/.qwen`,
+    };
+  }
+  return {};
+}
+
+function remoteAgentRegistryPath(actor) {
+  return path.join(actorDirectory(actor), "remote-agents.json");
+}
+
+function remoteServerKey(session) {
+  return safeSegment(
+    session.serverId ||
+      crypto
+        .createHash("sha256")
+        .update(`${session.host}:${session.port || 22}:${session.username}`)
+        .digest("hex")
+        .slice(0, 16),
+  );
+}
+
+async function storedRemoteAgents(actor, session) {
+  const registry = await readJson(remoteAgentRegistryPath(actor), {});
+  return Array.isArray(registry[remoteServerKey(session)])
+    ? registry[remoteServerKey(session)]
+    : [];
+}
+
+async function scanRemoteAgents(session, actor) {
   if (!session.client) throw new Error("SSH 尚未连接");
   const command = [
     "set +e",
-    'for spec in "opencode:$HOME/.easywork/bin/opencode" "opencode-global:$(command -v opencode 2>/dev/null)" "qwen:$(command -v qwen 2>/dev/null)" "claude:$(command -v claude 2>/dev/null)"; do',
-    '  id="${spec%%:*}"; bin="${spec#*:}";',
-    '  if [ -n "$bin" ] && [ -x "$bin" ]; then ver="$($bin --version 2>/dev/null | head -n 1)"; printf "%s\\t%s\\t%s\\n" "$id" "$bin" "$ver"; fi',
+    'managed_opencode="$HOME/.easywork/agents/opencode/bin/opencode"',
+    'user_opencode="$HOME/.opencode/bin/opencode"',
+    'system_opencode="$(command -v opencode 2>/dev/null)"',
+    'if [ -x "$managed_opencode" ]; then printf "opencode\\t%s\\t%s\\t%s\\topencode\\n" "$HOME/.easywork/agents/opencode" "$managed_opencode" "$("$managed_opencode" --version 2>/dev/null | head -n 1)";',
+    'elif [ -x "$user_opencode" ]; then printf "opencode\\t%s\\t%s\\t%s\\topencode\\n" "$HOME/.opencode" "$user_opencode" "$("$user_opencode" --version 2>/dev/null | head -n 1)";',
+    'elif [ -n "$system_opencode" ] && [ -x "$system_opencode" ]; then printf "opencode\\t%s\\t%s\\t%s\\topencode\\n" "$(dirname "$system_opencode")" "$system_opencode" "$("$system_opencode" --version 2>/dev/null | head -n 1)"; fi',
+    'for spec in "qwen:$HOME:$(command -v qwen 2>/dev/null):qwen" "claude:$HOME:$(command -v claude 2>/dev/null):claude"; do',
+    '  id="${spec%%:*}"; rest="${spec#*:}"; folder="${rest%%:*}"; rest="${rest#*:}"; bin="${rest%%:*}"; adapter="${rest##*:}";',
+    '  if [ -n "$bin" ] && [ -x "$bin" ]; then ver="$("$bin" --version 2>/dev/null | head -n 1)"; printf "%s\\t%s\\t%s\\t%s\\t%s\\n" "$id" "$folder" "$bin" "$ver" "$adapter"; fi',
     "done",
   ].join("\n");
   const result = await remoteExec(session.client, command, { allowFailure: true });
-  const agents = result.stdout
+  const discovered = result.stdout
     .split(/\r?\n/)
     .filter(Boolean)
     .map((line) => {
-      const [id, binaryPath, version] = line.split("\t");
-      const isOpenCode = id.startsWith("opencode");
+      const [id, folder, binaryPath, version, adapter = "plain"] = line.split("\t");
+      const isOpenCode = adapter === "opencode";
+      const config = agentConfigFor(adapter, session.home);
       return {
         id,
-        name: isOpenCode ? "OpenCode" : id === "qwen" ? "Qwen Code" : "Claude Code",
+        name: isOpenCode ? "OpenCode" : adapter === "qwen" ? "Qwen Code" : "Claude Code",
+        folder,
         path: binaryPath,
         version: version || undefined,
         status: isOpenCode ? "ready" : "needs-adapter",
-        adapter: isOpenCode ? "opencode" : "plain",
-        managed: id === "opencode",
+        adapter,
+        managed: folder.includes("/.easywork/agents/opencode"),
+        ...config,
       };
     });
-  if (!agents.some((agent) => agent.id === "opencode")) {
-    agents.unshift({
+
+  const custom = await storedRemoteAgents(actor, session);
+  for (const stored of custom) {
+    if (
+      discovered.some(
+        (agent) =>
+          agent.id === stored.id ||
+          (agent.adapter === "opencode" && stored.adapter === "opencode"),
+      )
+    ) {
+      continue;
+    }
+    const binaryResult = await remoteExec(
+      session.client,
+      `test -x ${shellQuote(stored.path)} && ${shellQuote(stored.path)} --version 2>/dev/null | head -n 1`,
+      { allowFailure: true },
+    );
+    if (binaryResult.code !== 0) continue;
+    discovered.push({
+      ...stored,
+      version: binaryResult.stdout.trim() || stored.version,
+      status: stored.adapter === "opencode" ? "ready" : "needs-adapter",
+    });
+  }
+
+  for (const agent of discovered) {
+    const configPaths = [agent.configPath, agent.alternateConfigPath].filter(Boolean);
+    const configCheck = configPaths.length
+      ? await remoteExec(
+          session.client,
+          [
+            "set +e",
+            ...configPaths.map(
+              (configPath) =>
+                agent.adapter === "opencode"
+                  ? `test -s ${shellQuote(configPath)} && grep -Eq '"(provider|model|apiKey|baseURL)"' ${shellQuote(configPath)} && exit 0`
+                  : `test -s ${shellQuote(configPath)} && exit 0`,
+            ),
+            agent.adapter === "opencode"
+              ? `test -s ${shellQuote(`${session.home}/.local/share/opencode/auth.json`)} && exit 0`
+              : "",
+            "exit 1",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          { allowFailure: true },
+        )
+      : { code: 1 };
+    agent.configured = configCheck.code === 0;
+    if (
+      agent.alternateConfigPath &&
+      (
+        await remoteExec(
+          session.client,
+          `test -s ${shellQuote(agent.alternateConfigPath)}`,
+          { allowFailure: true },
+        )
+      ).code === 0
+    ) {
+      agent.configPath = agent.alternateConfigPath;
+    }
+    delete agent.alternateConfigPath;
+  }
+
+  if (!discovered.some((agent) => agent.id === "opencode")) {
+    discovered.unshift({
       id: "opencode",
       name: "OpenCode",
-      path: "~/.easywork/bin/opencode",
+      folder: "~/.easywork/agents/opencode",
+      path: "~/.easywork/agents/opencode/bin/opencode",
       status: "missing",
       adapter: "opencode",
       managed: true,
+      configured: false,
+      ...agentConfigFor("opencode", session.home),
     });
   }
-  return agents;
+  return discovered;
 }
 
-async function installOpenCode(session, actor, onProgress = () => undefined) {
-  if (!session.client) throw new Error("SSH 尚未连接");
+async function ensureOpenCodeNativeConfig(
+  session,
+  actor,
+  onProgress = () => undefined,
+) {
   const state = await getState(actor);
   const provider = state?.settings?.provider || {};
   const secrets = await getSecrets(actor);
   if (!provider.baseUrl || !provider.model || !secrets.providerApiKey) {
-    throw new Error("请先在个人资料中配置模型 API，再安装远端 Agent");
+    return false;
   }
-  if (!["responses", "chat-completions"].includes(provider.protocol)) {
-    onProgress("detect", "检测模型接口");
-    const detected = await callChatProvider(provider, secrets.providerApiKey, "", {
-      test: true,
-    });
-    provider.protocol = detected.protocol;
-    state.settings.provider = provider;
-    await saveState(actor, state);
+  const nativeConfig = `${session.home}/.config/opencode/opencode.json`;
+  const alternateConfig = `${session.home}/.config/opencode/opencode.jsonc`;
+  const nativeAuth = `${session.home}/.local/share/opencode/auth.json`;
+  const existing = await remoteExec(
+    session.client,
+    [
+      "set +e",
+      `test -s ${shellQuote(nativeConfig)} && exit 0`,
+      `test -s ${shellQuote(alternateConfig)} && exit 0`,
+      `test -s ${shellQuote(nativeAuth)} && exit 0`,
+      "exit 1",
+    ].join("\n"),
+    { allowFailure: true },
+  );
+  if (existing.code === 0) return false;
+  onProgress("configure", "写入 OpenCode 原生模型配置");
+  await remoteExec(
+    session.client,
+    `mkdir -p ${shellQuote(path.posix.dirname(nativeConfig))}`,
+  );
+  await remoteSftpWrite(
+    session.client,
+    nativeConfig,
+    `${JSON.stringify(
+      providerConfigForOpenCode(provider, secrets.providerApiKey),
+      null,
+      2,
+    )}\n`,
+  );
+  return true;
+}
+
+async function installOpenCode(session, actor, onProgress = () => undefined) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const existingAgents = await scanRemoteAgents(session, actor);
+  const existingOpenCode = existingAgents.find(
+    (agent) => agent.adapter === "opencode" && agent.status === "ready",
+  );
+  if (existingOpenCode) {
+    if (existingOpenCode.managed) {
+      await ensureOpenCodeNativeConfig(session, actor, onProgress);
+    }
+    return scanRemoteAgents(session, actor);
   }
   onProgress("prepare", "准备安装目录");
   await remoteExec(
     session.client,
-    'mkdir -p "$HOME/.easywork/bin" "$HOME/.easywork/config" "$HOME/.easywork/tasks" "$HOME/.easywork/runtime"',
+    'mkdir -p "$HOME/.easywork/agents/opencode/bin" "$HOME/.easywork/bindings"',
   );
   onProgress("download", "下载 OpenCode");
   await remoteExec(
@@ -1557,25 +1925,29 @@ async function installOpenCode(session, actor, onProgress = () => undefined) {
     [
       "set -eu",
       'EW_INSTALLER="$HOME/.easywork/install-opencode.sh"',
-      'trap \'rm -f "$EW_INSTALLER"\' EXIT',
-      'if [ ! -x "$HOME/.opencode/bin/opencode" ]; then',
-      '  curl --connect-timeout 15 --max-time 90 --retry 2 -fsSL https://opencode.ai/install -o "$EW_INSTALLER"',
-      '  if command -v timeout >/dev/null 2>&1; then timeout 300 bash "$EW_INSTALLER" --no-modify-path; else bash "$EW_INSTALLER" --no-modify-path; fi',
+      'EW_AGENT_ROOT="$HOME/.easywork/agents/opencode"',
+      'EW_INSTALL_HOME="$EW_AGENT_ROOT/.installer-home"',
+      'trap \'rm -f "$EW_INSTALLER"; rm -rf "$EW_INSTALL_HOME"\' EXIT',
+      'if [ ! -x "$EW_AGENT_ROOT/bin/opencode" ]; then',
+      '  if [ -x "$HOME/.easywork/bin/opencode" ]; then',
+      '    cp "$HOME/.easywork/bin/opencode" "$EW_AGENT_ROOT/bin/opencode"',
+      '  elif [ -x "$HOME/.opencode/bin/opencode" ]; then',
+      '    cp "$HOME/.opencode/bin/opencode" "$EW_AGENT_ROOT/bin/opencode"',
+      '  else',
+      '    curl --connect-timeout 15 --max-time 90 --retry 2 -fsSL https://opencode.ai/install -o "$EW_INSTALLER"',
+      '    mkdir -p "$EW_INSTALL_HOME"',
+      '    if command -v timeout >/dev/null 2>&1; then HOME="$EW_INSTALL_HOME" timeout 300 bash "$EW_INSTALLER" --no-modify-path; else HOME="$EW_INSTALL_HOME" bash "$EW_INSTALLER" --no-modify-path; fi',
+      '    mv "$EW_INSTALL_HOME/.opencode/bin/opencode" "$EW_AGENT_ROOT/bin/opencode"',
+      '  fi',
       "fi",
-      'test -x "$HOME/.opencode/bin/opencode"',
-      'cp "$HOME/.opencode/bin/opencode" "$HOME/.easywork/bin/opencode"',
-      'chmod 755 "$HOME/.easywork/bin/opencode"',
-      '"$HOME/.easywork/bin/opencode" --version',
+      'test -x "$EW_AGENT_ROOT/bin/opencode"',
+      'chmod 755 "$EW_AGENT_ROOT/bin/opencode"',
+      '"$EW_AGENT_ROOT/bin/opencode" --version',
     ].join("\n"),
   );
-  onProgress("configure", "写入模型配置");
-  await remoteSftpWrite(
-    session.client,
-    `${session.home}/.easywork/config/opencode.json`,
-    `${JSON.stringify(providerConfigForOpenCode(provider), null, 2)}\n`,
-  );
+  await ensureOpenCodeNativeConfig(session, actor, onProgress);
   onProgress("verify", "验证 Agent");
-  return scanRemoteAgents(session);
+  return scanRemoteAgents(session, actor);
 }
 
 function parseOpenCodeLine(line, state) {
@@ -1745,16 +2117,23 @@ function workflowIndexForEvent(event, steps, currentIndex = 0) {
 
 async function runRemoteWork(socket, session, actor, payload) {
   if (!session.client) throw new Error("SSH 尚未连接");
-  if (session.activeStream) throw new Error("当前对话仍有任务在运行");
-  if (payload.agentId && !String(payload.agentId).startsWith("opencode")) {
-    throw new Error("当前版本已实现 OpenCode 适配；其他 Agent 需要先添加命令适配模板");
+  if (session.activeStream) throw new Error("该服务器上仍有任务在运行");
+  const availableAgents = await scanRemoteAgents(session, actor);
+  const selectedAgent = availableAgents.find(
+    (agent) => agent.id === String(payload.agentId || "opencode"),
+  );
+  if (!selectedAgent || selectedAgent.status !== "ready") {
+    throw new Error("所选 Agent 当前不可用，请重新扫描或安装");
+  }
+  if (selectedAgent.adapter !== "opencode") {
+    throw new Error("这个 Agent 尚未安装 EasyWork 运行适配器");
+  }
+  if (!selectedAgent.configured) {
+    throw new Error("请先打开 Agent 自带配置文件并完成模型配置");
   }
   const secrets = await getSecrets(actor);
   const state = await getState(actor);
   const provider = state?.settings?.provider || {};
-  if (!provider.configured || !secrets.providerApiKey) {
-    throw new Error("请先在个人资料 → 模型 API 中配置接口");
-  }
   const planningEventId = `${payload.runId}_planning`;
   wsSend(socket, {
     type: "agent.event",
@@ -1769,12 +2148,27 @@ async function runRemoteWork(socket, session, actor, payload) {
       timestamp: isoNow(),
     },
   });
-  let steps = workflowFor(String(payload.prompt || ""));
+  let plan = {
+    title: fallbackConversationTitle(payload.prompt),
+    steps: workflowFor(String(payload.prompt || "")),
+  };
   let usedFallbackPlan = false;
-  try {
-    steps = await planWorkSteps(provider, secrets.providerApiKey, payload.prompt);
-  } catch {
+  if (provider.configured && provider.model && secrets.providerApiKey) {
+    try {
+      plan = await planWorkRequest(provider, secrets.providerApiKey, payload.prompt);
+    } catch {
+      usedFallbackPlan = true;
+    }
+  } else {
     usedFallbackPlan = true;
+  }
+  const steps = plan.steps;
+  if (payload.firstTurn) {
+    wsSend(socket, {
+      type: "conversation.title",
+      conversationId: payload.conversationId,
+      title: plan.title,
+    });
   }
   wsSend(socket, {
     type: "workflow",
@@ -1809,37 +2203,16 @@ async function runRemoteWork(socket, session, actor, payload) {
     conversationId: String(payload.conversationId || ""),
   });
   const agentPrompt = agentPromptWithWorkflow(context.text, steps);
-  await remoteExec(
-    session.client,
-    'mkdir -p "$HOME/.easywork/config" "$HOME/.easywork/runtime"',
-  );
-  await remoteSftpWrite(
-    session.client,
-    `${session.home}/.easywork/config/opencode.json`,
-    `${JSON.stringify(providerConfigForOpenCode(provider), null, 2)}\n`,
-  );
-  const runtimeId = safeSegment(session.socketId);
-  const runId = safeSegment(payload.runId);
-  const remoteRuntime = `${session.home}/.easywork/runtime/${runtimeId}`;
-  await remoteExec(session.client, `mkdir -p ${shellQuote(remoteRuntime)}`);
-  const promptPath = `${remoteRuntime}/${runId}.prompt.md`;
-  const envPath = `${remoteRuntime}/provider.env`;
-  await remoteSftpWrite(session.client, promptPath, agentPrompt);
-  await remoteSftpWrite(
-    session.client,
-    envPath,
-    `EASYWORK_LLM_API_KEY=${shellQuote(secrets.providerApiKey)}\n`,
-  );
   const workspaceEncoded = Buffer.from(
-    String(payload.workspace || "~/.easywork/tasks"),
+    String(payload.workspace || "~"),
     "utf8",
   ).toString("base64");
+  const promptEncoded = Buffer.from(agentPrompt, "utf8").toString("base64");
   const sessionId = session.agentSessions.get(String(payload.conversationId || ""));
   const bindingsPath = path.join(actorDirectory(actor), "work-sessions.json");
   const bindings = await readJson(bindingsPath, {});
   const bindingKey = [
-    session.host || "unknown-host",
-    session.username || "unknown-user",
+    session.serverId || session.host || "unknown-host",
     String(payload.agentId || "opencode"),
     String(payload.conversationId || ""),
   ].join("::");
@@ -1847,21 +2220,18 @@ async function runRemoteWork(socket, session, actor, payload) {
   const command = [
     `EW_DIR="$(printf %s ${shellQuote(workspaceEncoded)} | base64 -d)"`,
     'case "$EW_DIR" in "~/"*) EW_DIR="$HOME/${EW_DIR#~/}" ;; esac',
-    'mkdir -p "$EW_DIR"',
-    `set -a; . ${shellQuote(envPath)}; set +a`,
+    '[ "$EW_DIR" = "~" ] && EW_DIR="$HOME" || true',
+    'test -d "$EW_DIR" || mkdir -p "$EW_DIR"',
     [
-      `OPENCODE_CONFIG=${shellQuote(`${session.home}/.easywork/config/opencode.json`)}`,
-      shellQuote(`${session.home}/.easywork/bin/opencode`),
+      `printf %s ${shellQuote(promptEncoded)} | base64 -d |`,
+      shellQuote(selectedAgent.path),
       "run --format json --auto",
       `--dir "$EW_DIR"`,
-      `--model ${shellQuote(`easywork/${provider.model}`)}`,
       boundSessionId ? `--session ${shellQuote(boundSessionId)}` : "",
     ]
       .filter(Boolean)
       .join(" "),
   ];
-  command[command.length - 1] =
-    `cat ${shellQuote(promptPath)} | ${command[command.length - 1]}`;
   const commandText = command.join(" && ");
 
   const parserState = {
@@ -1957,8 +2327,30 @@ async function runRemoteWork(socket, session, actor, payload) {
     session.agentSessions.set(String(payload.conversationId || ""), parserState.sessionId);
     bindings[bindingKey] = parserState.sessionId;
     await writeJson(bindingsPath, bindings);
+    const remoteBindingDirectory = `${session.home}/.easywork/bindings`;
+    await remoteExec(
+      session.client,
+      `mkdir -p ${shellQuote(remoteBindingDirectory)}`,
+      { allowFailure: true },
+    );
+    await remoteSftpWrite(
+      session.client,
+      `${remoteBindingDirectory}/${safeSegment(payload.conversationId)}.json`,
+      `${JSON.stringify(
+        {
+          conversationId: String(payload.conversationId || ""),
+          serverId: session.serverId,
+          agentId: selectedAgent.id,
+          agentSessionId: parserState.sessionId,
+          agentDataPath: selectedAgent.dataPath,
+          workspace: String(payload.workspace || "~"),
+          updatedAt: isoNow(),
+        },
+        null,
+        2,
+      )}\n`,
+    ).catch(() => undefined);
   }
-  await remoteExec(session.client, `rm -f ${shellQuote(promptPath)}`, { allowFailure: true });
   if (result.code !== 0) {
     const primaryError =
       parserState.lastError ||
@@ -1968,7 +2360,7 @@ async function runRemoteWork(socket, session, actor, payload) {
       !parserState.lastError ||
       /unexpected server error|unknown error|未知错误/i.test(primaryError);
     const logDiagnostic = needsLog
-      ? await readOpenCodeFailureLog(session, secrets.providerApiKey)
+      ? await readOpenCodeFailureLog(session)
       : "";
     throw new Error(
       logDiagnostic && !primaryError.includes(logDiagnostic)
@@ -2010,13 +2402,6 @@ async function closeSshSession(session) {
   if (session.activeStream) session.activeStream.close();
   if (session.client) {
     const client = session.client;
-    if (session.home) {
-      await remoteExec(
-        client,
-        `rm -rf ${shellQuote(`${session.home}/.easywork/runtime/${safeSegment(session.socketId)}`)}`,
-        { allowFailure: true },
-      ).catch(() => undefined);
-    }
     client.end();
   }
   session.client = null;
@@ -2028,6 +2413,7 @@ async function closeSshSession(session) {
 
 async function connectSsh(socket, session, actor, payload) {
   await closeSshSession(session);
+  session.serverId = safeSegment(payload.serverId || session.serverId || randomId("server-"));
   if (payload.demo) {
     session.demo = true;
     session.status = "connected";
@@ -2036,6 +2422,7 @@ async function connectSsh(socket, session, actor, payload) {
     session.latency = 18;
     wsSend(socket, {
       type: "connection.status",
+      serverId: session.serverId,
       status: "connected",
       label: "演示登录节点在线",
       host: "demo.easywork.local",
@@ -2049,23 +2436,47 @@ async function connectSsh(socket, session, actor, payload) {
         {
           id: "opencode",
           name: "OpenCode",
-          path: "~/.easywork/bin/opencode",
+          folder: "~/.easywork/agents/opencode",
+          path: "~/.easywork/agents/opencode/bin/opencode",
           version: "demo",
           status: "ready",
           adapter: "opencode",
           managed: true,
+          configured: true,
         },
       ],
+      serverId: session.serverId,
     });
     return;
   }
 
   const host = String(payload.host || "").trim();
   const username = String(payload.username || "").trim();
-  const storedSecrets = payload.useSavedKey ? await getSecrets(actor) : {};
-  const privateKey = String(payload.privateKey || storedSecrets.sshPrivateKey || "");
+  const authMethod =
+    payload.authMethod === "password" ? "password" : "key";
+  const useSavedCredential = Boolean(
+    payload.useSavedCredential || payload.useSavedKey,
+  );
+  const storedSecrets = useSavedCredential ? await getSecrets(actor) : {};
+  const savedCredential =
+    storedSecrets.sshCredentials?.[session.serverId] || {};
+  const privateKey = String(
+    authMethod === "key"
+      ? payload.privateKey ||
+          savedCredential.privateKey ||
+          storedSecrets.sshPrivateKey ||
+          ""
+      : "",
+  );
+  const password = String(
+    authMethod === "password"
+      ? payload.password || savedCredential.password || ""
+      : "",
+  );
   const port = Number(payload.port || 22);
-  if (!host || !username || !privateKey) throw new Error("主机、用户名和私钥不能为空");
+  if (!host || !username) throw new Error("主机和用户名不能为空");
+  if (authMethod === "key" && !privateKey) throw new Error("请选择或粘贴 SSH 私钥");
+  if (authMethod === "password" && !password) throw new Error("请输入 SSH 登录密码");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("SSH 端口无效");
 
   const knownHostsPath = path.join(actorDirectory(actor), "known-hosts.json");
@@ -2094,7 +2505,9 @@ async function connectSsh(socket, session, actor, payload) {
           const label = String(prompt.prompt || "");
           if (/verification|code|otp|token|验证码/i.test(label)) return String(payload.otp || "");
           if (/password|passphrase|口令|密码/i.test(label)) {
-            return String(payload.passphrase || "");
+            return authMethod === "password"
+              ? password
+              : String(payload.passphrase || "");
           }
           return String(payload.otp || "");
         });
@@ -2141,6 +2554,7 @@ async function connectSsh(socket, session, actor, payload) {
             session.status = "disconnected";
             sessionSend(session, {
               type: "connection.status",
+              serverId: session.serverId,
               status: "disconnected",
               label: "SSH 连接已关闭",
             });
@@ -2151,7 +2565,8 @@ async function connectSsh(socket, session, actor, payload) {
         host,
         port,
         username,
-        privateKey,
+        privateKey: authMethod === "key" ? privateKey : undefined,
+        password: authMethod === "password" ? password : undefined,
         passphrase: payload.passphrase ? String(payload.passphrase) : undefined,
         tryKeyboard: true,
         readyTimeout: 25_000,
@@ -2170,6 +2585,7 @@ async function connectSsh(socket, session, actor, payload) {
   }
   wsSend(socket, {
     type: "connection.status",
+    serverId: session.serverId,
     status: "connected",
     label: "算力平台登录节点在线",
     host,
@@ -2184,28 +2600,65 @@ async function connectSsh(socket, session, actor, payload) {
   session.fingerprint = observedFingerprint;
   if (
     actor.authenticated &&
-    (payload.useSavedKey || (payload.rememberKey && payload.privateKey))
+    (useSavedCredential ||
+      payload.rememberCredential ||
+      payload.rememberKey)
   ) {
     try {
-      if (payload.privateKey) {
-        await updateSecrets(actor, { sshPrivateKey: String(payload.privateKey) });
+      if (
+        payload.privateKey ||
+        payload.password
+      ) {
+        await updateSecrets(actor, {
+          sshCredential: {
+            serverId: session.serverId,
+            privateKey:
+              authMethod === "key" && payload.privateKey
+                ? String(payload.privateKey)
+                : undefined,
+            password:
+              authMethod === "password" && payload.password
+                ? String(payload.password)
+                : undefined,
+          },
+        });
       }
       const state = await getState(actor);
       state.settings ||= {};
-      const currentSsh = state.settings.ssh || {};
-      state.settings.ssh = {
+      const profiles = Array.isArray(state.settings.servers)
+        ? state.settings.servers
+        : [];
+      const currentProfile =
+        profiles.find((profile) => profile.id === session.serverId) || {};
+      const profile = {
+        id: session.serverId,
+        name: String(
+          payload.name || currentProfile.name || host,
+        )
+          .trim()
+          .slice(0, 80),
         host,
         port,
         username,
+        authMethod,
         keyName: String(
-          payload.privateKeyName || currentSsh.keyName || "SSH 私钥",
+          authMethod === "key"
+            ? payload.privateKeyName || currentProfile.keyName || "SSH 私钥"
+            : "",
         ).slice(0, 160),
         configured: true,
+        lastConnectedAt: isoNow(),
       };
+      state.settings.servers = [
+        profile,
+        ...profiles.filter((item) => item.id !== session.serverId),
+      ];
+      state.settings.lastServerId = session.serverId;
+      delete state.settings.ssh;
       await saveState(actor, state);
       wsSend(socket, {
-        type: "ssh.profile",
-        profile: state.settings.ssh,
+        type: "server.profile",
+        profile,
       });
     } catch {
       wsSend(socket, {
@@ -2214,7 +2667,188 @@ async function connectSsh(socket, session, actor, payload) {
       });
     }
   }
-  wsSend(socket, { type: "agent.list", agents: await scanRemoteAgents(session) });
+  wsSend(socket, {
+    type: "agent.list",
+    serverId: session.serverId,
+    agents: await scanRemoteAgents(session, actor),
+  });
+}
+
+async function addRemoteAgent(session, actor, payload) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const folder = remotePathForSession(session, payload.folder);
+  const candidateNames = ["opencode", "qwen", "qwen-code", "claude", "qoder"];
+  const checks = candidateNames.flatMap((name) => [
+    `${folder}/${name}`,
+    `${folder}/bin/${name}`,
+  ]);
+  const command = [
+    "set +e",
+    ...checks.map(
+      (candidate) =>
+        `if [ -x ${shellQuote(candidate)} ]; then printf "%s" ${shellQuote(candidate)}; exit 0; fi`,
+    ),
+    "exit 1",
+  ].join("\n");
+  const located = await remoteExec(session.client, command, { allowFailure: true });
+  if (located.code !== 0 || !located.stdout.trim()) {
+    throw new Error("该文件夹内没有找到受支持的 Agent 可执行文件");
+  }
+  const binaryPath = located.stdout.trim();
+  const binaryName = path.posix.basename(binaryPath).toLowerCase();
+  const adapter = binaryName.includes("opencode")
+    ? "opencode"
+    : binaryName.includes("qwen")
+      ? "qwen"
+      : binaryName.includes("claude")
+        ? "claude"
+        : "plain";
+  const id = `agent-${crypto
+    .createHash("sha256")
+    .update(`${session.serverId}:${binaryPath}`)
+    .digest("hex")
+    .slice(0, 14)}`;
+  const agent = {
+    id,
+    name: String(
+      payload.name ||
+        (adapter === "opencode"
+          ? "OpenCode"
+          : adapter === "qwen"
+            ? "Qwen Code"
+            : adapter === "claude"
+              ? "Claude Code"
+              : path.posix.basename(folder)),
+    )
+      .trim()
+      .slice(0, 80),
+    folder,
+    path: binaryPath,
+    adapter,
+    managed: false,
+    ...agentConfigFor(adapter, session.home),
+  };
+  const registryPath = remoteAgentRegistryPath(actor);
+  const registry = await readJson(registryPath, {});
+  const serverKey = remoteServerKey(session);
+  const current = Array.isArray(registry[serverKey]) ? registry[serverKey] : [];
+  registry[serverKey] = [agent, ...current.filter((item) => item.id !== id)];
+  await writeJson(registryPath, registry);
+  return scanRemoteAgents(session, actor);
+}
+
+async function agentForSession(session, actor, agentId) {
+  const agents = await scanRemoteAgents(session, actor);
+  const agent = agents.find((item) => item.id === String(agentId || ""));
+  if (!agent) throw new Error("没有找到这个 Agent");
+  return agent;
+}
+
+async function readAgentConfig(session, actor, agentId) {
+  const agent = await agentForSession(session, actor, agentId);
+  if (!agent.configPath) throw new Error("尚未识别该 Agent 的原生配置文件");
+  let content = "";
+  try {
+    content = (await remoteSftpRead(session.client, agent.configPath)).toString("utf8");
+  } catch (caught) {
+    if (caught?.code !== 2) throw caught;
+  }
+  if (!content && agent.adapter === "opencode") {
+    content = `${JSON.stringify(
+      {
+        $schema: "https://opencode.ai/config.json",
+      },
+      null,
+      2,
+    )}\n`;
+  }
+  return {
+    agent,
+    path: agent.configPath,
+    content,
+  };
+}
+
+async function writeAgentConfig(session, actor, payload) {
+  const agent = await agentForSession(session, actor, payload.agentId);
+  if (!agent.configPath) throw new Error("尚未识别该 Agent 的原生配置文件");
+  const content = String(payload.content || "");
+  if (!content.trim()) throw new Error("配置文件不能为空");
+  if (Buffer.byteLength(content) > 2 * 1024 * 1024) {
+    throw new Error("配置文件不能超过 2 MB");
+  }
+  if (agent.configPath.endsWith(".json")) {
+    try {
+      JSON.parse(content);
+    } catch {
+      throw new Error("配置文件不是有效 JSON；如需注释，请改用 Agent 的 JSONC 配置");
+    }
+  }
+  await remoteExec(
+    session.client,
+    `mkdir -p ${shellQuote(path.posix.dirname(agent.configPath))}`,
+  );
+  await remoteSftpWrite(session.client, agent.configPath, content);
+  return scanRemoteAgents(session, actor);
+}
+
+async function listRemoteFiles(session, requestedPath) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const target = remotePathForSession(session, requestedPath);
+  const list = await remoteSftpList(session.client, target);
+  return {
+    path: target,
+    home: session.home,
+    parent:
+      target === "/"
+        ? null
+        : path.posix.dirname(target) || "/",
+    entries: list
+      .filter((entry) => ![".", ".."].includes(entry.filename))
+      .map((entry) => ({
+        name: entry.filename,
+        path: path.posix.join(target, entry.filename),
+        type: entry.attrs?.isDirectory?.() ? "directory" : "file",
+        size: Number(entry.attrs?.size || 0),
+        modifiedAt: entry.attrs?.mtime
+          ? new Date(entry.attrs.mtime * 1000).toISOString()
+          : undefined,
+      }))
+      .sort(
+        (left, right) =>
+          Number(left.type !== "directory") - Number(right.type !== "directory") ||
+          left.name.localeCompare(right.name, "zh-CN"),
+      ),
+  };
+}
+
+async function readRemoteDownload(session, requestedPath) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const target = remotePathForSession(session, requestedPath);
+  const buffer = await remoteSftpRead(session.client, target);
+  if (buffer.length > 32 * 1024 * 1024) {
+    throw new Error("网页端单次下载暂时限制为 32 MB");
+  }
+  return {
+    path: target,
+    name: path.posix.basename(target),
+    size: buffer.length,
+    contentBase64: buffer.toString("base64"),
+  };
+}
+
+async function uploadRemoteFile(session, payload) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const directory = remotePathForSession(session, payload.path);
+  const name = String(payload.name || "").replaceAll("\\", "/").split("/").pop();
+  if (!name || [".", ".."].includes(name)) throw new Error("文件名无效");
+  const buffer = Buffer.from(String(payload.contentBase64 || ""), "base64");
+  if (buffer.length > 32 * 1024 * 1024) {
+    throw new Error("网页端单次上传暂时限制为 32 MB");
+  }
+  const target = path.posix.join(directory, name);
+  await remoteSftpWrite(session.client, target, buffer, 0o644);
+  return listRemoteFiles(session, directory);
 }
 
 function describeSshError(caught) {
@@ -2264,69 +2898,110 @@ function attachWebSocketServer(server) {
       setHeader() {},
     };
     const actor = await resolveActor(req, responseShim, false);
-    const sessionKey = `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
-    let session = sshSessionPool.get(sessionKey);
-    if (!session) {
-      session = {
-        socketId: crypto.randomUUID(),
-        client: null,
-        demo: false,
-        status: "disconnected",
-        home: "",
-        host: "",
-        port: 22,
-        username: "",
-        latency: undefined,
-        fingerprint: "",
-        activeStream: null,
-        activeRun: null,
-        agentSessions: new Map(),
-        sockets: new Set(),
-        disconnectTimer: null,
-      };
-      sshSessionPool.set(sessionKey, session);
-    }
-    if (session.disconnectTimer) {
-      clearTimeout(session.disconnectTimer);
-      session.disconnectTimer = null;
-    }
-    session.sockets.add(socket);
+    const actorKey = `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
+    const actorSessions = () =>
+      [...sshSessionPool.values()].filter((session) => session.actorKey === actorKey);
+    const attachSocket = (session) => {
+      if (session.disconnectTimer) {
+        clearTimeout(session.disconnectTimer);
+        session.disconnectTimer = null;
+      }
+      session.sockets.add(socket);
+      return session;
+    };
+    const getSession = (serverId, create = false) => {
+      const safeServerId = safeSegment(serverId || "default-server");
+      const poolKey = `${actorKey}:${safeServerId}`;
+      let session = sshSessionPool.get(poolKey);
+      if (!session && create) {
+        session = {
+          poolKey,
+          actorKey,
+          serverId: safeServerId,
+          socketId: crypto.randomUUID(),
+          client: null,
+          demo: false,
+          status: "disconnected",
+          home: "",
+          host: "",
+          port: 22,
+          username: "",
+          latency: undefined,
+          fingerprint: "",
+          activeStream: null,
+          activeRun: null,
+          agentSessions: new Map(),
+          sockets: new Set(),
+          disconnectTimer: null,
+        };
+        sshSessionPool.set(poolKey, session);
+      }
+      return session ? attachSocket(session) : null;
+    };
+    const connectionPayload = (session, resumed = false) => ({
+      serverId: session.serverId,
+      status: session.status,
+      label:
+        session.status === "connected"
+          ? session.demo
+            ? "演示登录节点在线"
+            : "算力平台登录节点在线"
+          : "远程连接未建立",
+      host: session.host,
+      port: session.port,
+      username: session.username,
+      latency: session.latency,
+      fingerprint: session.fingerprint || undefined,
+      demo: session.demo,
+      resumed,
+    });
+
     activeSockets.add(socket);
-    if (session.status === "connected") {
-      wsSend(socket, {
-        type: "connection.status",
-        status: "connected",
-        label: session.demo ? "演示登录节点在线" : "算力平台登录节点在线",
-        host: session.host,
-        username: session.username,
-        latency: session.latency,
-        fingerprint: session.fingerprint || undefined,
-        demo: session.demo,
-        resumed: true,
-      });
+    const resumedSessions = actorSessions();
+    for (const session of resumedSessions) attachSocket(session);
+    wsSend(socket, {
+      type: "connections.snapshot",
+      connections: resumedSessions
+        .filter((session) => session.status === "connected")
+        .map((session) => connectionPayload(session, true)),
+    });
+    for (const session of resumedSessions.filter(
+      (item) => item.status === "connected",
+    )) {
       if (session.demo) {
         wsSend(socket, {
           type: "agent.list",
+          serverId: session.serverId,
           agents: [
             {
               id: "opencode",
               name: "OpenCode",
-              path: "~/.easywork/bin/opencode",
+              folder: "~/.easywork/agents/opencode",
+              path: "~/.easywork/agents/opencode/bin/opencode",
               version: "demo",
               status: "ready",
               adapter: "opencode",
               managed: true,
+              configured: true,
             },
           ],
         });
       } else {
-        scanRemoteAgents(session)
-          .then((agents) => wsSend(socket, { type: "agent.list", agents }))
+        scanRemoteAgents(session, actor)
+          .then((agents) =>
+            wsSend(socket, {
+              type: "agent.list",
+              serverId: session.serverId,
+              agents,
+            }),
+          )
           .catch(() => undefined);
       }
     }
+
     socket.on("message", async (raw) => {
       let payload;
+      let targetSession = null;
       try {
         payload = JSON.parse(String(raw));
       } catch {
@@ -2334,63 +3009,213 @@ function attachWebSocketServer(server) {
         return;
       }
       try {
+        const requestedServerId = safeSegment(
+          payload.serverId || payload.profileId || "default-server",
+        );
         if (payload.type === "ssh.connect") {
+          targetSession = getSession(requestedServerId, true);
           wsSend(socket, {
             type: "connection.status",
+            serverId: targetSession.serverId,
             status: "connecting",
             label: payload.demo ? "正在创建演示会话…" : "正在进行 SSH 握手…",
           });
-          await connectSsh(socket, session, actor, payload);
+          await connectSsh(socket, targetSession, actor, {
+            ...payload,
+            serverId: targetSession.serverId,
+          });
           return;
         }
+
+        targetSession =
+          getSession(requestedServerId) ||
+          (payload.conversationId
+            ? actorSessions().find(
+                (session) =>
+                  session.activeRun?.conversationId === payload.conversationId,
+              )
+            : null);
+        if (!targetSession) throw new Error("没有找到对应的远程连接");
+
         if (payload.type === "ssh.disconnect") {
-          await closeSshSession(session);
-          sessionSend(session, {
+          await closeSshSession(targetSession);
+          sessionSend(targetSession, {
             type: "connection.status",
+            serverId: targetSession.serverId,
             status: "disconnected",
             label: "已主动断开",
           });
           return;
         }
         if (payload.type === "agent.scan") {
-          wsSend(socket, { type: "agent.list", agents: await scanRemoteAgents(session) });
+          const agents = targetSession.demo
+            ? [
+                {
+                  id: "opencode",
+                  name: "OpenCode",
+                  folder: "~/.easywork/agents/opencode",
+                  path: "~/.easywork/agents/opencode/bin/opencode",
+                  version: "demo",
+                  status: "ready",
+                  adapter: "opencode",
+                  managed: true,
+                  configured: true,
+                },
+              ]
+            : await scanRemoteAgents(targetSession, actor);
+          wsSend(socket, {
+            type: "agent.list",
+            serverId: targetSession.serverId,
+            agents,
+          });
+          return;
+        }
+        if (payload.type === "agent.add") {
+          const agents = await addRemoteAgent(targetSession, actor, payload);
+          wsSend(socket, {
+            type: "agent.list",
+            serverId: targetSession.serverId,
+            agents,
+          });
           return;
         }
         if (payload.type === "agent.install") {
-          sessionSend(session, {
+          const scannedAgents = targetSession.demo
+            ? []
+            : await scanRemoteAgents(targetSession, actor);
+          if (
+            scannedAgents.some(
+              (agent) =>
+                agent.adapter === "opencode" && agent.status === "ready",
+            )
+          ) {
+            const agents = await installOpenCode(targetSession, actor);
+            sessionSend(targetSession, {
+              type: "agent.list",
+              serverId: targetSession.serverId,
+              agents,
+            });
+            return;
+          }
+          sessionSend(targetSession, {
             type: "agent.list",
+            serverId: targetSession.serverId,
             agents: [
               {
                 id: "opencode",
                 name: "OpenCode",
-                path: "~/.easywork/bin/opencode",
+                folder: "~/.easywork/agents/opencode",
+                path: "~/.easywork/agents/opencode/bin/opencode",
                 status: "installing",
                 adapter: "opencode",
                 managed: true,
+                configured: false,
               },
             ],
           });
-          const agents = await installOpenCode(session, actor, (stage, label) => {
-            sessionSend(session, {
-              type: "agent.install.progress",
-              stage,
-              label,
-            });
+          const agents = await installOpenCode(
+            targetSession,
+            actor,
+            (stage, label) => {
+              sessionSend(targetSession, {
+                type: "agent.install.progress",
+                serverId: targetSession.serverId,
+                stage,
+                label,
+              });
+            },
+          );
+          sessionSend(targetSession, {
+            type: "agent.list",
+            serverId: targetSession.serverId,
+            agents,
           });
-          sessionSend(session, { type: "agent.list", agents });
+          return;
+        }
+        if (payload.type === "agent.config.read") {
+          const config = await readAgentConfig(
+            targetSession,
+            actor,
+            payload.agentId,
+          );
+          wsSend(socket, {
+            type: "agent.config",
+            serverId: targetSession.serverId,
+            requestId: payload.requestId,
+            ...config,
+          });
+          return;
+        }
+        if (payload.type === "agent.config.write") {
+          const agents = await writeAgentConfig(
+            targetSession,
+            actor,
+            payload,
+          );
+          wsSend(socket, {
+            type: "agent.config.saved",
+            serverId: targetSession.serverId,
+            requestId: payload.requestId,
+          });
+          sessionSend(targetSession, {
+            type: "agent.list",
+            serverId: targetSession.serverId,
+            agents,
+          });
+          return;
+        }
+        if (payload.type === "remote.fs.list") {
+          wsSend(socket, {
+            type: "remote.fs.list",
+            serverId: targetSession.serverId,
+            requestId: payload.requestId,
+            ...(await listRemoteFiles(targetSession, payload.path)),
+          });
+          return;
+        }
+        if (payload.type === "remote.fs.download") {
+          wsSend(socket, {
+            type: "remote.fs.download",
+            serverId: targetSession.serverId,
+            requestId: payload.requestId,
+            ...(await readRemoteDownload(targetSession, payload.path)),
+          });
+          return;
+        }
+        if (payload.type === "remote.fs.upload") {
+          wsSend(socket, {
+            type: "remote.fs.list",
+            serverId: targetSession.serverId,
+            requestId: payload.requestId,
+            ...(await uploadRemoteFile(targetSession, payload)),
+          });
+          return;
+        }
+        if (payload.type === "remote.fs.mkdir") {
+          const directory = remotePathForSession(targetSession, payload.path);
+          const name = safeSegment(payload.name, "");
+          if (!name) throw new Error("文件夹名称无效");
+          await remoteSftpMkdir(
+            targetSession.client,
+            path.posix.join(directory, name),
+          );
+          wsSend(socket, {
+            type: "remote.fs.list",
+            serverId: targetSession.serverId,
+            requestId: payload.requestId,
+            ...(await listRemoteFiles(targetSession, directory)),
+          });
           return;
         }
         if (payload.type === "work.run") {
-          await runRemoteWork(socket, session, actor, payload);
+          await runRemoteWork(socket, targetSession, actor, payload);
           return;
         }
         if (payload.type === "work.approval") {
-          // The current OpenCode adapter runs non-interactively. Keep the
-          // protocol endpoint so adapters that pause for approval can reuse it.
           return;
         }
         if (payload.type === "work.abort") {
-          if (session.activeStream) session.activeStream.close();
+          if (targetSession.activeStream) targetSession.activeStream.close();
           wsSend(socket, {
             type: "agent.event",
             conversationId: payload.conversationId,
@@ -2419,17 +3244,25 @@ function attachWebSocketServer(server) {
               ? caught.message
               : "远端操作失败";
         if (payload.type === "ssh.connect") {
-          const diagnostic = caught instanceof Error ? caught.message.replace(/\s+/g, " ").trim() : "unknown";
+          const diagnostic =
+            caught instanceof Error
+              ? caught.message.replace(/\s+/g, " ").trim()
+              : "unknown";
           console.warn(`[EasyWork SSH] connection failed: ${diagnostic}`);
           wsSend(socket, {
             type: "connection.status",
+            serverId:
+              targetSession?.serverId ||
+              safeSegment(payload.serverId || "default-server"),
             status: "error",
             label: message,
             fingerprint: caught?.fingerprint,
           });
         } else if (payload.type === "work.run") {
-          session.activeStream = null;
-          session.activeRun = null;
+          if (targetSession) {
+            targetSession.activeStream = null;
+            targetSession.activeRun = null;
+          }
           wsSend(socket, {
             type: "agent.event",
             conversationId: payload.conversationId,
@@ -2452,33 +3285,42 @@ function attachWebSocketServer(server) {
         } else if (payload.type === "agent.install") {
           wsSend(socket, {
             type: "agent.list",
+            serverId: targetSession?.serverId,
             agents: [
               {
                 id: "opencode",
                 name: "OpenCode",
-                path: "~/.easywork/bin/opencode",
+                folder: "~/.easywork/agents/opencode",
+                path: "~/.easywork/agents/opencode/bin/opencode",
                 status: "missing",
                 adapter: "opencode",
                 managed: true,
+                configured: false,
               },
             ],
           });
           wsSend(socket, { type: "error", error: message });
         } else {
-          wsSend(socket, { type: "error", error: message });
+          wsSend(socket, {
+            type: "error",
+            serverId: targetSession?.serverId,
+            requestId: payload.requestId,
+            error: message,
+          });
         }
       }
     });
     socket.on("close", () => {
       activeSockets.delete(socket);
-      session.sockets.delete(socket);
-      if (!session.sockets.size && !session.disconnectTimer) {
+      for (const session of actorSessions()) {
+        session.sockets.delete(socket);
+        if (session.sockets.size || session.disconnectTimer) continue;
         session.disconnectTimer = setTimeout(() => {
           session.disconnectTimer = null;
           if (session.sockets.size) return;
           void closeSshSession(session)
             .catch(() => undefined)
-            .finally(() => sshSessionPool.delete(sessionKey));
+            .finally(() => sshSessionPool.delete(session.poolKey));
         }, SSH_RECONNECT_GRACE_MS);
         session.disconnectTimer.unref?.();
       }
@@ -2501,7 +3343,10 @@ export async function createEasyWorkServer() {
 
 export const gatewayTestHelpers = {
   agentPromptWithWorkflow,
+  fallbackConversationTitle,
+  normalizeConversationTitle,
   parseOpenCodeLine,
+  parseWorkPlan,
   parseWorkflowPlan,
   planWorkSteps,
   workflowFor,
