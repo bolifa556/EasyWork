@@ -375,6 +375,8 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     assert.match(initial.actor.id, /^[a-f0-9-]{20,}$/i);
     assert.equal(typeof initial.deviceToken, "string");
     assert.ok(initial.deviceToken.length > 40);
+    assert.equal(initial.capabilities.chatStream, true);
+    assert.equal("gatewayEndpointConfig" in initial.capabilities, false);
 
     const tokenBootstrap = await fetch(`${base}/api/bootstrap`, {
       headers: { Authorization: `Bearer ${initial.deviceToken}` },

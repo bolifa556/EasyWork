@@ -6045,31 +6045,8 @@ body {
   font-weight: 600;
 }
 
-.gateway-unavailable-panel p {
-  max-width: 360px;
-  margin: 0;
-  color: #707070;
-}
-
-.gateway-unavailable-panel .modal-actions {
-  margin-top: 22px;
-}
-
-.gateway-online-line {
-  display: flex;
-  min-height: 36px;
-  align-items: center;
-  gap: 7px;
-  border-radius: 9px;
-  background: #edf7f0;
-  padding: 0 10px;
-  color: #166534;
-}
-
-.gateway-online-line span {
-  margin-left: auto;
-  color: #5b7563;
-  font-size: 12px !important;
+.gateway-retry-button {
+  margin-top: 16px;
 }
 
 .ssh-target-grid {
@@ -8470,10 +8447,6 @@ body {
   font-weight: 450;
 }
 
-.easywork-app.easywork-app .gateway-online-line {
-  border-radius: 10px;
-}
-
 @media (max-width: 980px) {
   .easywork-app.easywork-app,
   .easywork-app.easywork-app.with-task-rail {
@@ -8843,10 +8816,10 @@ body {
 .rail-edge-toggle:hover,
 .rail-edge-toggle:focus-visible,
 .rail-edge-toggle.open {
-  background: #e9e2d3;
-  color: #36432d;
+  background: #c9cbc8;
+  color: #4f5350;
   opacity: 1;
-  filter: drop-shadow(-2px 5px 6px rgb(55 46 30 / 10%));
+  filter: drop-shadow(-1px 3px 4px rgb(44 46 44 / 12%));
 }
 
 .remote-connection-panel {
@@ -9068,26 +9041,14 @@ body {
   line-height: 1.15;
 }
 
-.project-home-header p {
-  margin: 5px 0 0;
-  color: var(--ink-faint);
-  font-size: 12px;
-}
-
-.project-start-chat {
-  display: grid;
+.project-chat-launcher {
+  position: relative;
   width: 100%;
-  min-height: 72px;
-  grid-template-columns: 26px minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
+  min-height: 86px;
   margin-top: 32px;
   border: 1px solid var(--line);
   border-radius: 22px;
   background: rgb(255 253 247 / 68%);
-  padding: 0 24px;
-  color: var(--ink-faint);
-  text-align: left;
   box-shadow: var(--shadow-sm);
   transition:
     border-color 150ms ease,
@@ -9095,17 +9056,68 @@ body {
     box-shadow 150ms ease;
 }
 
-.project-start-chat:hover {
+.project-chat-launcher:focus-within {
   border-color: rgb(83 99 63 / 25%);
   background: rgb(255 253 247 / 92%);
   box-shadow: 0 10px 28px rgb(69 58 37 / 7%);
 }
 
-.project-start-chat span {
-  overflow: hidden;
+.project-launch-mode {
+  position: absolute;
+  top: 10px;
+  right: 13px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 9px;
+  background: rgb(83 99 63 / 7%);
+  padding: 2px;
+}
+
+.project-launch-mode button {
+  min-height: 26px;
+  border-radius: 7px;
+  background: transparent;
+  padding: 0 10px;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.project-launch-mode button.active {
+  background: var(--paper);
+  color: var(--green-deep);
+  box-shadow: 0 1px 3px rgb(69 58 37 / 9%);
+}
+
+.project-launch-field {
+  display: grid;
+  min-height: 86px;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: end;
+  gap: 10px;
+  padding: 37px 22px 13px;
+  color: var(--ink-faint);
+  cursor: text;
+}
+
+.project-launch-field > svg {
+  margin-bottom: 7px;
+}
+
+.project-launch-field input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
   font-size: 16px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  caret-color: var(--green);
+  cursor: text;
+}
+
+.project-launch-field input::placeholder {
+  color: var(--ink-faint);
 }
 
 .project-home-tabs {
@@ -9215,14 +9227,6 @@ body {
   font-size: 14px;
 }
 
-.project-home-empty button {
-  border-radius: 9px;
-  background: rgb(83 99 63 / 10%);
-  padding: 8px 12px;
-  color: var(--green-deep);
-  font-size: 13px;
-}
-
 .project-home-file-actions {
   display: flex;
   justify-content: flex-end;
@@ -9288,21 +9292,22 @@ body {
 
 /* Compact trapezoid attached to the activity rail edge. */
 .rail-edge-toggle {
-  top: calc(50% - 18px);
-  width: 18px;
-  height: 36px;
-  border: 1px solid rgb(79 73 59 / 16%);
+  top: calc(50% - 30px);
+  width: 13px;
+  height: 60px;
+  border: 1px solid #c2c5c1;
   border-right: 0;
-  border-radius: 5px 0 0 5px;
-  background: var(--canvas-soft);
-  box-shadow: -2px 4px 9px rgb(55 46 30 / 8%);
-  clip-path: polygon(34% 0, 100% 12%, 100% 88%, 34% 100%, 0 67%, 0 33%);
+  border-radius: 7px 0 0 7px;
+  background: #d7d9d6;
+  box-shadow: -1px 2px 5px rgb(44 46 44 / 11%);
+  clip-path: polygon(22% 0, 100% 5%, 100% 95%, 22% 100%, 0 76%, 0 24%);
+  color: #5f635f;
 }
 
 .rail-edge-toggle svg {
-  width: 11px;
-  height: 11px;
-  stroke-width: 2;
+  width: 10px;
+  height: 10px;
+  stroke-width: 2.1;
 }
 
 /* Collapsible reasoning and terminal activity. */
@@ -9428,15 +9433,18 @@ body {
   stroke: currentColor;
 }
 
-/* Rich assistant typography, Markdown markers, math, and stream cursor. */
-.easywork-app.easywork-app .message.user .message-text,
-.easywork-app.easywork-app .message.assistant .message-text,
-.easywork-app.easywork-app .message.work.assistant .message-text {
-  font-size: 16.5px !important;
+/* Message hierarchy: compact prompts, larger answers, clearer speaker labels. */
+.easywork-app.easywork-app .message-meta strong {
+  font-size: 13px !important;
+}
+
+.easywork-app.easywork-app .message.user .message-text {
+  font-size: 15.5px !important;
 }
 
 .easywork-app.easywork-app .message.assistant .message-text,
 .easywork-app.easywork-app .message.work.assistant .message-text {
+  font-size: 17.5px !important;
   line-height: 1.78;
 }
 
@@ -9495,35 +9503,23 @@ body {
   }
 }
 
-.gateway-endpoint-editor {
-  display: grid;
-  width: min(480px, 100%);
-  gap: 10px;
-  margin-top: 8px;
-  text-align: left;
-}
-
-.gateway-endpoint-editor > p {
-  margin: 0;
-  color: var(--ink-faint);
-  font-size: 11px;
-  line-height: 1.55;
-}
-
-.gateway-endpoint-editor .modal-actions {
-  margin-top: 0;
-}
-
 @media (max-width: 700px) {
   .project-page {
     padding-top: 28px;
   }
 
-  .project-start-chat {
-    min-height: 62px;
+  .project-chat-launcher,
+  .project-launch-field {
+    min-height: 78px;
+  }
+
+  .project-chat-launcher {
     margin-top: 24px;
     border-radius: 18px;
-    padding-inline: 18px;
+  }
+
+  .project-launch-field {
+    padding: 33px 16px 10px;
   }
 
   .project-home-conversation {
@@ -9536,7 +9532,8 @@ body {
   }
 
   .rail-edge-toggle {
-    width: 17px;
-    height: 34px;
+    top: calc(50% - 27px);
+    width: 12px;
+    height: 54px;
   }
 }

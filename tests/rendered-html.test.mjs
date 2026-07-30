@@ -52,6 +52,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /\/api\/bootstrap/);
   assert.match(app, /DEVICE_TOKEN_STORAGE_KEY/);
   assert.match(app, /beginConversation/);
+  assert.match(app, /project-chat-launcher/);
+  assert.match(app, /project-launch-mode/);
+  assert.match(app, /hydratedActorIdRef/);
+  assert.match(app, /queueStateSave/);
   assert.match(app, /ConversationRow/);
   assert.match(app, /function MarkdownContent/);
   assert.match(app, /\(conversation\.messages\?\.length \?\? 0\) > 0/);
@@ -87,6 +91,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /\.remote-connection-state/);
   assert.match(css, /\.rail-edge-toggle/);
   assert.match(css, /clip-path:\s*polygon/);
+  assert.match(css, /width:\s*13px/);
+  assert.match(css, /height:\s*60px/);
+  assert.match(css, /\.message\.user \.message-text\s*\{[\s\S]*font-size:\s*15\.5px !important/);
+  assert.match(css, /\.message\.assistant \.message-text,[\s\S]*font-size:\s*17\.5px !important/);
   assert.match(css, /\.project-sidebar-chats/);
   assert.match(css, /\.remote-file-manager/);
   assert.match(css, /@keyframes chat-title-scroll/);
@@ -137,7 +145,8 @@ test("keeps machine caches local while persistent EasyWork data remains shareabl
   assert.match(launcher, /Initialize-LocalFrpConfig/);
   assert.match(launcher, /\.cache\\devices\\/);
   assert.match(viteConfig, /proxy:/);
-  assert.match(viteConfig, /"\/ws"/);
+  assert.match(viteConfig, /"\/easywork-ws"/);
+  assert.match(viteConfig, /easywork-websocket-tunnel/);
   assert.match(gitignore, /\/frp\/frpc\.local\.toml/);
   assert.match(example, /REPLACE_WITH_FRP_TOKEN/);
   assert.doesNotMatch(example, /auth\.token\s*=\s*"[a-f0-9]{32,}"/i);

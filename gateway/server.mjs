@@ -1140,7 +1140,6 @@ async function handleHttp(req, res) {
         state: await stateForClient(actor),
         capabilities: {
           chatStream: true,
-          gatewayEndpointConfig: true,
         },
       });
       return;
@@ -3414,7 +3413,7 @@ function attachWebSocketServer(server) {
   const wss = new WebSocketServer({ noServer: true });
   server.on("upgrade", async (req, socket, head) => {
     const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
-    if (url.pathname !== "/ws") {
+    if (!["/ws", "/easywork-ws"].includes(url.pathname)) {
       socket.destroy();
       return;
     }

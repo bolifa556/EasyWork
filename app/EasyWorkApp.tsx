@@ -2,13 +2,11 @@
 
 import {
   Activity,
-  ArrowDown,
   ArrowUp,
   BookOpen,
   Bot,
   Brain,
   Check,
-  CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -284,12 +282,12 @@ type RemoteFileEntry = {
 };
 
 let GATEWAY_HTTP =
-  process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL ??
-  (typeof window !== "undefined" ? window.location.origin : "http://localhost:3000");
+  typeof window !== "undefined"
+    ? window.location.origin
+    : process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL ?? "http://localhost:3000";
 
 const DEVICE_TOKEN_STORAGE_KEY = "easywork.device-token.v1";
 const DEVICE_TOKEN_EVENT = "easywork:device-token";
-const GATEWAY_ENDPOINT_STORAGE_KEY = "easywork.gateway-endpoint.v1";
 
 function readDeviceToken() {
   if (typeof window === "undefined") return "";
@@ -306,37 +304,6 @@ function clearDeviceToken() {
   if (typeof window === "undefined") return;
   window.localStorage.removeItem(DEVICE_TOKEN_STORAGE_KEY);
   window.dispatchEvent(new Event(DEVICE_TOKEN_EVENT));
-}
-
-function normalizeGatewayEndpoint(value: string) {
-  const trimmed = value.trim().replace(/\/+$/, "");
-  if (!trimmed) return "";
-  try {
-    const endpoint = new URL(
-      /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`,
-    );
-    if (!["http:", "https:"].includes(endpoint.protocol)) return "";
-    return endpoint.toString().replace(/\/+$/, "");
-  } catch {
-    return "";
-  }
-}
-
-function readGatewayEndpoint() {
-  if (typeof window === "undefined") return "";
-  return normalizeGatewayEndpoint(
-    window.localStorage.getItem(GATEWAY_ENDPOINT_STORAGE_KEY) || "",
-  );
-}
-
-function storeGatewayEndpoint(value: string) {
-  if (typeof window === "undefined") return;
-  const normalized = normalizeGatewayEndpoint(value);
-  if (normalized) {
-    window.localStorage.setItem(GATEWAY_ENDPOINT_STORAGE_KEY, normalized);
-  } else {
-    window.localStorage.removeItem(GATEWAY_ENDPOINT_STORAGE_KEY);
-  }
 }
 
 function gatewayFetch(
@@ -356,27 +323,9 @@ function gatewayFetch(
 
 const gatewayCandidates = () => {
   const configured = process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL;
-  const stored = readGatewayEndpoint();
   const currentOrigin =
-    typeof window !== "undefined" ? window.location.origin : undefined;
-  const pageIsLocal =
-    typeof window !== "undefined" &&
-    ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
-  const candidates = [
-    stored,
-    configured,
-    currentOrigin,
-    ...(pageIsLocal
-      ? ["http://127.0.0.1:8789", "http://localhost:8789"]
-      : []),
-  ].filter((value): value is string => Boolean(value));
-  return [
-    ...new Set(
-      candidates
-        .map((value) => normalizeGatewayEndpoint(value))
-        .filter(Boolean),
-    ),
-  ];
+    typeof window !== "undefined" ? window.location.origin : "http://localhost:3000";
+  return [...new Set([currentOrigin, configured].filter(Boolean))] as string[];
 };
 
 const now = () => new Date().toISOString();
@@ -1156,7 +1105,6 @@ export default function EasyWorkApp() {
   const [gatewayStatus, setGatewayStatus] = useState<
     "checking" | "connected" | "unavailable"
   >("checking");
-  const [gatewayEndpoint, setGatewayEndpoint] = useState("");
   const [gatewayProbe, setGatewayProbe] = useState(0);
   const [deviceToken, setDeviceToken] = useState("");
   const [agentsByServer, setAgentsByServer] = useState<Record<string, AgentItem[]>>({});
@@ -1182,6 +1130,10 @@ export default function EasyWorkApp() {
 
   const socketRef = useRef<WebSocket | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
+  const latestStateRef = useRef(state);
+  const hydratedActorIdRef = useRef("");
+  const stateSaveTimerRef = useRef<number | null>(null);
+  const stateSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1269,22 +1221,6 @@ export default function EasyWorkApp() {
     setToast(message);
     window.setTimeout(() => setToast(""), 2600);
   }, []);
-
-  const configureGatewayEndpoint = useCallback(
-    (value: string) => {
-      const endpoint = normalizeGatewayEndpoint(value);
-      if (value.trim() && !endpoint) {
-        showToast("请输入有效的 EasyWork 服务地址");
-        return;
-      }
-      storeGatewayEndpoint(endpoint);
-      if (endpoint) GATEWAY_HTTP = endpoint;
-      setGatewayEndpoint("");
-      setGatewayProbe((current) => current + 1);
-      showToast(endpoint ? "正在连接 EasyWork 服务" : "已恢复自动检测");
-    },
-    [showToast],
-  );
 
   const updateConversation = useCallback(
     (conversationId: string, updater: (conversation: Conversation) => Conversation) => {
@@ -1942,11 +1878,13 @@ export default function EasyWorkApp() {
           if (!payload.actor) continue;
           if (disposed) return;
           GATEWAY_HTTP = candidate;
-          setGatewayEndpoint(candidate);
+          const shouldHydrate =
+            hydratedActorIdRef.current !== payload.actor.id;
+          hydratedActorIdRef.current = payload.actor.id;
           setGatewayStatus("connected");
           setActor(payload.actor);
           storeDeviceToken(payload.deviceToken);
-          if (payload.state) {
+          if (payload.state && shouldHydrate) {
             setState((current) => mergeStoredState(current, payload.state ?? {}));
           }
           return;
@@ -1955,7 +1893,6 @@ export default function EasyWorkApp() {
         }
       }
       if (!disposed) {
-        setGatewayEndpoint("");
         setGatewayStatus("unavailable");
       }
     };
@@ -1967,10 +1904,6 @@ export default function EasyWorkApp() {
 
   useEffect(() => {
     if (gatewayStatus !== "unavailable") return;
-    const localPage = ["localhost", "127.0.0.1", "::1"].includes(
-      window.location.hostname,
-    );
-    if (!localPage && !readGatewayEndpoint()) return;
     const timer = window.setTimeout(
       () => setGatewayProbe((current) => current + 1),
       4_000,
@@ -1982,7 +1915,7 @@ export default function EasyWorkApp() {
     if (gatewayStatus !== "connected") return;
     const url = new URL(GATEWAY_HTTP);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    url.pathname = "/ws";
+    url.pathname = "/easywork-ws";
     if (deviceToken) url.searchParams.set("deviceToken", deviceToken);
     const socket = new WebSocket(url);
     let disposed = false;
@@ -2023,17 +1956,38 @@ export default function EasyWorkApp() {
     };
   }, [deviceToken, gatewayStatus, handleSocketEvent]);
 
+  const queueStateSave = useCallback((snapshot: EasyWorkState) => {
+    stateSaveQueueRef.current = stateSaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const response = await gatewayFetch("/api/state", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ state: snapshot }),
+        });
+        if (!response.ok) throw new Error("state save failed");
+      });
+  }, []);
+
   useEffect(() => {
-    if (gatewayStatus !== "connected") return;
-    const timer = window.setTimeout(() => {
-      void gatewayFetch("/api/state", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ state }),
-      }).catch(() => undefined);
-    }, 800);
-    return () => window.clearTimeout(timer);
-  }, [gatewayStatus, state]);
+    latestStateRef.current = state;
+    if (gatewayStatus !== "connected" || stateSaveTimerRef.current !== null) {
+      return;
+    }
+    stateSaveTimerRef.current = window.setTimeout(() => {
+      stateSaveTimerRef.current = null;
+      queueStateSave(latestStateRef.current);
+    }, 320);
+  }, [gatewayStatus, queueStateSave, state]);
+
+  useEffect(
+    () => () => {
+      if (stateSaveTimerRef.current !== null) {
+        window.clearTimeout(stateSaveTimerRef.current);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({
@@ -2095,6 +2049,7 @@ export default function EasyWorkApp() {
     setActiveConversationId("");
     setDraftProjectId(undefined);
     setDraftServerId("");
+    setMode("chat");
     setView("project");
     setRightRailOpen(false);
     setConversationMenuId("");
@@ -4148,22 +4103,41 @@ export default function EasyWorkApp() {
               </span>
               <div>
                 <h1>{projectPage.name}</h1>
-                <p>
-                  {projectPage.memoryMode === "project-only"
-                    ? "仅限项目内记忆"
-                    : "使用默认记忆"}
-                </p>
               </div>
             </header>
 
-            <button
-              className="project-start-chat"
-              type="button"
-              onClick={() => beginConversation(projectPage.id)}
-            >
-              <Plus size={20} />
-              <span>在 {projectPage.name} 中新建聊天</span>
-            </button>
+            <div className="project-chat-launcher">
+              <div
+                className="project-launch-mode"
+                role="group"
+                aria-label="选择新对话类型"
+              >
+                <button
+                  className={mode === "chat" ? "active" : ""}
+                  type="button"
+                  onClick={() => setMode("chat")}
+                >
+                  聊天
+                </button>
+                <button
+                  className={mode === "work" ? "active" : ""}
+                  type="button"
+                  onClick={() => setMode("work")}
+                >
+                  工作
+                </button>
+              </div>
+              <label className="project-launch-field">
+                <Plus size={20} />
+                <input
+                  value=""
+                  readOnly
+                  aria-label={`在 ${projectPage.name} 中新建聊天`}
+                  placeholder={`在 ${projectPage.name} 中新建聊天`}
+                  onFocus={() => beginConversation(projectPage.id, mode)}
+                />
+              </label>
+            </div>
 
             <nav className="project-home-tabs" aria-label="项目内容">
               <button
@@ -4206,12 +4180,6 @@ export default function EasyWorkApp() {
                   {!projectConversations(projectPage.id).length && (
                     <div className="project-home-empty">
                       <p>还没有对话</p>
-                      <button
-                        type="button"
-                        onClick={() => beginConversation(projectPage.id)}
-                      >
-                        开始新聊天
-                      </button>
                     </div>
                   )}
                 </div>
@@ -5022,7 +4990,10 @@ export default function EasyWorkApp() {
           tab={accountTab}
           setTab={setAccountTab}
           onClose={() => setProfileModalOpen(false)}
-          onActor={setActor}
+          onActor={(nextActor) => {
+            hydratedActorIdRef.current = nextActor.id;
+            setActor(nextActor);
+          }}
           onState={setState}
           onToast={showToast}
           onDeleteGuest={deleteGuestData}
@@ -5050,7 +5021,6 @@ export default function EasyWorkApp() {
               activeConversation?.work?.serverId,
           )}
           gatewayStatus={gatewayStatus}
-          gatewayEndpoint={gatewayEndpoint}
           canRemember={actor.authenticated}
           onSelect={selectServerForModal}
           onClose={() => setSshModalOpen(false)}
@@ -5058,7 +5028,7 @@ export default function EasyWorkApp() {
           onSave={saveServerProfile}
           onConnect={connectSsh}
           onDisconnect={disconnectSsh}
-          onGatewayEndpoint={configureGatewayEndpoint}
+          onRetry={() => setGatewayProbe((current) => current + 1)}
         />
       )}
       {agentConfigOpen && (
@@ -5767,7 +5737,6 @@ function ServerManagerModal({
   selectedServerId,
   locked,
   gatewayStatus,
-  gatewayEndpoint,
   canRemember,
   onSelect,
   onClose,
@@ -5775,14 +5744,13 @@ function ServerManagerModal({
   onSave,
   onConnect,
   onDisconnect,
-  onGatewayEndpoint,
+  onRetry,
 }: {
   profiles: ServerProfile[];
   connections: Record<string, ConnectionState>;
   selectedServerId: string;
   locked: boolean;
   gatewayStatus: "checking" | "connected" | "unavailable";
-  gatewayEndpoint: string;
   canRemember: boolean;
   onSelect: (serverId: string) => void;
   onClose: () => void;
@@ -5805,7 +5773,7 @@ function ServerManagerModal({
     trustHost?: boolean;
   }) => void;
   onDisconnect: (serverId?: string) => void;
-  onGatewayEndpoint: (endpoint: string) => void;
+  onRetry: () => void;
 }) {
   const createId = () =>
     `server-${typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : Date.now()}`;
@@ -5833,9 +5801,6 @@ function ServerManagerModal({
   const [passphrase, setPassphrase] = useState("");
   const [otp, setOtp] = useState("");
   const [trustHost, setTrustHost] = useState(false);
-  const [serviceEndpoint, setServiceEndpoint] = useState(
-    readGatewayEndpoint() || gatewayEndpoint,
-  );
   const connection = connections[serverId] ?? {
     serverId,
     status: "disconnected",
@@ -5954,54 +5919,19 @@ function ServerManagerModal({
               </span>
               <h3>
                 {gatewayStatus === "checking"
-                  ? "正在连接 EasyWork 服务"
-                  : "EasyWork 服务不可达"}
+                  ? "正在连接"
+                  : "连接失败"}
               </h3>
-              <p>
-                {gatewayStatus === "checking"
-                  ? "请稍候。"
-                  : "当前浏览器需要先连接一个 EasyWork 服务，才能代你发起 SSH。"}
-              </p>
-              <div className="gateway-endpoint-editor">
-                <label className="field">
-                  <span>服务地址</span>
-                  <input
-                    value={serviceEndpoint}
-                    onChange={(event) =>
-                      setServiceEndpoint(event.target.value)
-                    }
-                    placeholder="https://easywork-gateway.example.com"
-                  />
-                </label>
-                <p>
-                  同一设备可使用本机服务；跨设备时填写可访问的服务地址。FRP
-                  只负责端口映射，不参与 SSH 登录。
-                </p>
-                <div className="modal-actions">
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    onClick={() => {
-                      setServiceEndpoint("");
-                      onGatewayEndpoint("");
-                    }}
-                  >
-                    自动检测
-                  </button>
-                  <button
-                    className="primary-button"
-                    type="button"
-                    onClick={() => onGatewayEndpoint(serviceEndpoint)}
-                    disabled={
-                      gatewayStatus === "checking" ||
-                      !serviceEndpoint.trim()
-                    }
-                  >
-                    <RefreshCw size={15} />
-                    连接服务
-                  </button>
-                </div>
-              </div>
+              {gatewayStatus === "unavailable" && (
+                <button
+                  className="secondary-button gateway-retry-button"
+                  type="button"
+                  onClick={onRetry}
+                >
+                  <RefreshCw size={15} />
+                  重试
+                </button>
+              )}
             </div>
           ) : connection.status === "connected" ? (
             <div className="connected-panel server-connected-panel">
@@ -6087,17 +6017,6 @@ function ServerManagerModal({
                 });
               }}
             >
-          <div className="gateway-online-line">
-            <CheckCircle2 size={15} />
-            EasyWork 服务已连接
-                {gatewayEndpoint && (
-                  <span>
-                    {gatewayEndpoint
-                      .replace(/^https?:\/\//, "")
-                      .replace(/\/+$/, "")}
-                  </span>
-                )}
-              </div>
               <label className="field">
                 <span>服务器名称</span>
                 <input
@@ -6331,11 +6250,6 @@ function ServerManagerModal({
                   </label>
                 </div>
               )}
-              <p className="security-line">
-                {canRemember
-                  ? "保存服务器信息；登录凭据会在连接成功后加密保存。"
-                  : "访客配置保存在临时数据中，登录后可跨设备使用。"}
-              </p>
               <div className="modal-actions">
                 <button
                   className="secondary-button"
@@ -6372,331 +6286,6 @@ function ServerManagerModal({
           )}
         </div>
       </div>
-    </Modal>
-  );
-}
-
-function SshModal({
-  connection,
-  gatewayStatus,
-  gatewayEndpoint,
-  profile,
-  canRemember,
-  onClose,
-  onDemo,
-  onConnect,
-  onDisconnect,
-  onRetry,
-}: {
-  connection: ConnectionState;
-  gatewayStatus: "checking" | "connected" | "unavailable";
-  gatewayEndpoint: string;
-  profile: NonNullable<AppSettings["ssh"]>;
-  canRemember: boolean;
-  onClose: () => void;
-  onDemo: () => void;
-  onConnect: (payload: {
-    host: string;
-    port: number;
-    username: string;
-    privateKey?: string;
-    privateKeyName?: string;
-    useSavedKey?: boolean;
-    rememberKey?: boolean;
-    passphrase?: string;
-    otp?: string;
-    trustHost?: boolean;
-  }) => void;
-  onDisconnect: () => void;
-  onRetry: () => void;
-}) {
-  const [host, setHost] = useState(profile.host || "107.ustc.edu.cn");
-  const [port, setPort] = useState(String(profile.port || 22));
-  const [username, setUsername] = useState(profile.username || "");
-  const [privateKey, setPrivateKey] = useState("");
-  const [privateKeyName, setPrivateKeyName] = useState("");
-  const [useSavedKey, setUseSavedKey] = useState(profile.configured);
-  const [pasteKeyOpen, setPasteKeyOpen] = useState(false);
-  const [passphrase, setPassphrase] = useState("");
-  const [otp, setOtp] = useState("");
-  const [trustHost, setTrustHost] = useState(false);
-
-  if (connection.status === "connected") {
-    return (
-      <Modal title="算力平台连接" onClose={onClose}>
-        <div className="connected-panel">
-          <span className="connected-hero">
-            <Wifi size={24} />
-          </span>
-          <h3>SSH 已连接</h3>
-          <p>
-            {connection.username}@{connection.host}
-          </p>
-          <div className="connection-facts">
-            <span>
-              <strong>{connection.latency ?? "—"} ms</strong>
-              <small>往返延迟</small>
-            </span>
-            <span>
-              <strong>15 s</strong>
-              <small>Keepalive</small>
-            </span>
-          </div>
-          {connection.fingerprint && (
-            <div className="fingerprint-card">
-              <ShieldCheck size={15} />
-              <span>
-                <strong>主机指纹</strong>
-                <code>{connection.fingerprint}</code>
-              </span>
-            </div>
-          )}
-          <div className="modal-actions">
-            <button className="text-danger-button" type="button" onClick={onDisconnect}>
-              <WifiOff size={15} />
-              断开连接
-            </button>
-            <button className="primary-button" type="button" onClick={onClose}>
-              继续工作
-            </button>
-          </div>
-        </div>
-      </Modal>
-    );
-  }
-
-  if (gatewayStatus !== "connected") {
-    return (
-      <Modal title="连接算力平台" onClose={onClose}>
-        <div className="gateway-unavailable-panel">
-          <span className="gateway-state-icon">
-            {gatewayStatus === "checking" ? (
-              <LoaderCircle className="spin" size={22} />
-            ) : (
-              <WifiOff size={22} />
-            )}
-          </span>
-          <h3>
-            {gatewayStatus === "checking"
-              ? "正在连接 EasyWork 服务"
-              : "EasyWork 服务不可达"}
-          </h3>
-          <p>
-            {gatewayStatus === "checking"
-              ? "请稍候。"
-              : "请先运行 EasyWork 服务；跨设备时可单独配置一个可访问的服务地址。FRP 不是 SSH 前置条件。"}
-          </p>
-          <div className="modal-actions">
-            <button className="secondary-button" type="button" onClick={onDemo}>
-              演示连接
-            </button>
-            <button
-              className="primary-button"
-              type="button"
-              onClick={onRetry}
-              disabled={gatewayStatus === "checking"}
-            >
-              <RefreshCw size={15} />
-              重新检测
-            </button>
-          </div>
-        </div>
-      </Modal>
-    );
-  }
-
-  return (
-    <Modal title="连接算力平台" onClose={onClose}>
-      <form
-        className="modal-form ssh-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onConnect({
-            host,
-            port: Number(port) || 22,
-            username,
-            privateKey: privateKey || undefined,
-            privateKeyName: privateKeyName || profile.keyName || undefined,
-            useSavedKey,
-            rememberKey: canRemember && Boolean(privateKey),
-            passphrase: passphrase || undefined,
-            otp: otp || undefined,
-            trustHost,
-          });
-        }}
-      >
-        <div className="gateway-online-line">
-          <CheckCircle2 size={15} />
-          EasyWork 服务已连接
-          {gatewayEndpoint && (
-            <span>{gatewayEndpoint.replace(/^https?:\/\//, "").replace(/\/+$/, "")}</span>
-          )}
-        </div>
-        <div className="ssh-target-grid">
-          <label className="field host-field">
-            <span>登录节点</span>
-            <input value={host} onChange={(event) => setHost(event.target.value)} />
-          </label>
-          <label className="field port-field">
-            <span>端口</span>
-            <input value={port} inputMode="numeric" onChange={(event) => setPort(event.target.value)} />
-          </label>
-        </div>
-        <label className="field">
-          <span>用户名</span>
-          <input
-            value={username}
-            onChange={(event) => setUsername(event.target.value)}
-            placeholder="小写学号"
-          />
-        </label>
-        <div className="field key-picker-field">
-          <span>SSH 私钥</span>
-          {profile.configured && (
-            <button
-              className={`saved-key-choice${useSavedKey ? " selected" : ""}`}
-              type="button"
-              onClick={() => {
-                setUseSavedKey(true);
-                setPrivateKey("");
-                setPrivateKeyName("");
-                setPasteKeyOpen(false);
-              }}
-            >
-              <ShieldCheck size={16} />
-              <span>
-                <strong>{profile.keyName || "已保存的私钥"}</strong>
-                <small>使用账号中保存的私钥</small>
-              </span>
-              {useSavedKey && <Check size={15} />}
-            </button>
-          )}
-          <div className="key-picker-actions">
-            <label className="secondary-button">
-              <Upload size={15} />
-              {profile.configured ? "更换文件" : "选择文件"}
-              <input
-                type="file"
-                hidden
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (!file) return;
-                  const reader = new FileReader();
-                  reader.onload = () => {
-                    setPrivateKey(String(reader.result ?? ""));
-                    setPrivateKeyName(file.name);
-                    setUseSavedKey(false);
-                    setPasteKeyOpen(false);
-                  };
-                  reader.readAsText(file);
-                }}
-              />
-            </label>
-            <button
-              className="text-button"
-              type="button"
-              onClick={() => {
-                setPasteKeyOpen((value) => !value);
-                setPrivateKeyName("");
-                if (!pasteKeyOpen) setUseSavedKey(false);
-              }}
-            >
-              {pasteKeyOpen ? "收起" : profile.configured ? "粘贴新私钥" : "粘贴私钥"}
-            </button>
-          </div>
-          {privateKeyName && (
-            <div className="selected-key-file">
-              <Check size={14} />
-              {privateKeyName}
-            </div>
-          )}
-          {pasteKeyOpen && (
-            <textarea
-              className="private-key-paste"
-              value={privateKey}
-              onChange={(event) => {
-                setPrivateKey(event.target.value);
-                setUseSavedKey(false);
-              }}
-              placeholder="粘贴 id_ed25519 私钥"
-              rows={4}
-              autoComplete="off"
-            />
-          )}
-        </div>
-        <div className="field-grid">
-          <label className="field">
-            <span>私钥密码</span>
-            <input
-              type="password"
-              value={passphrase}
-              onChange={(event) => setPassphrase(event.target.value)}
-              placeholder="可选"
-            />
-          </label>
-          <label className="field">
-            <span>动态验证码</span>
-            <input
-              value={otp}
-              inputMode="numeric"
-              maxLength={6}
-              onChange={(event) => setOtp(event.target.value.replace(/\D/g, ""))}
-              placeholder="6 位验证码"
-            />
-          </label>
-        </div>
-        {connection.status === "error" && !connection.fingerprint && (
-          <div className="form-error" role="alert" aria-live="polite">
-            <strong>连接失败</strong>
-            <span>{connection.label}</span>
-          </div>
-        )}
-        {connection.fingerprint && (
-          <div className="host-key-confirm">
-            <span>
-              <ShieldCheck size={16} />
-              <strong>确认主机指纹</strong>
-            </span>
-            <code>{connection.fingerprint}</code>
-            <label>
-              <input
-                type="checkbox"
-                checked={trustHost}
-                onChange={(event) => setTrustHost(event.target.checked)}
-              />
-              我已核对并信任此主机
-            </label>
-          </div>
-        )}
-        <p className="security-line">
-          {canRemember
-            ? "连接成功后，用户名和私钥会加密保存到账号；私钥密码和验证码不会保存。"
-            : "私钥、密码和验证码仅进入 EasyWork 服务内存。登录后可保存连接信息。"}
-        </p>
-        <div className="modal-actions spread">
-          <button className="secondary-button" type="button" onClick={onDemo}>
-            演示连接
-          </button>
-          <button
-            className="primary-button"
-            type="submit"
-            disabled={
-              connection.status === "connecting" ||
-              !host ||
-              !username ||
-              (!privateKey && !useSavedKey) ||
-              Boolean(connection.fingerprint && !trustHost)
-            }
-          >
-            {connection.status === "connecting" ? (
-              <LoaderCircle className="spin" size={16} />
-            ) : (
-              <KeyRound size={16} />
-            )}
-            {connection.status === "connecting" ? connection.label : "连接 SSH"}
-          </button>
-        </div>
-      </form>
     </Modal>
   );
 }
@@ -6884,132 +6473,6 @@ function RemoteFileManagerModal({
         </div>
       </div>
     </Modal>
-  );
-}
-
-function AgentModal({
-  agents,
-  activeAgentId,
-  connection,
-  onClose,
-  onSelect,
-  onScan,
-  onInstall,
-  onAdd,
-}: {
-  agents: AgentItem[];
-  activeAgentId: string;
-  connection: ConnectionState;
-  onClose: () => void;
-  onSelect: (id: string) => void;
-  onScan: () => void;
-  onInstall: () => void;
-  onAdd: (agent: AgentItem) => void;
-}) {
-  const [manualOpen, setManualOpen] = useState(false);
-  const [name, setName] = useState("");
-  const [path, setPath] = useState("");
-  return (
-    <Modal title="选择 Agent" onClose={onClose}>
-      <div className="agent-toolbar">
-        <button className="secondary-button" type="button" onClick={onScan}>
-          <RefreshCw size={15} />
-          自动扫描
-        </button>
-        <button
-          className="secondary-button"
-          type="button"
-          onClick={() => setManualOpen((value) => !value)}
-        >
-          <Plus size={15} />
-          手动添加
-        </button>
-      </div>
-      {manualOpen && (
-        <div className="manual-agent-form">
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Agent 名称" />
-          <input value={path} onChange={(event) => setPath(event.target.value)} placeholder="可执行文件路径" />
-          <button
-            type="button"
-            onClick={() => {
-              if (!name || !path) return;
-              onAdd({
-                id: uid("agent"),
-                name,
-                path,
-                status: "needs-adapter",
-                adapter: "plain",
-              });
-              setName("");
-              setPath("");
-              setManualOpen(false);
-            }}
-          >
-            添加
-          </button>
-        </div>
-      )}
-      <div className="agent-list">
-        {agents.map((agent) => (
-          <button
-            className={`agent-row${agent.id === activeAgentId ? " active" : ""}`}
-            type="button"
-            key={agent.id}
-            onClick={() => agent.status === "ready" && onSelect(agent.id)}
-          >
-            <span className="agent-logo">
-              {agent.id === "opencode" ? <Code2 size={19} /> : <Bot size={19} />}
-            </span>
-            <span>
-              <strong>
-                {agent.name}
-                {agent.managed && <b>EasyWork 管理</b>}
-              </strong>
-              <small>{agent.path}</small>
-            </span>
-            <span className={`agent-state ${agent.status}`}>
-              {agent.status === "ready"
-                ? agent.version ?? "可用"
-                   : agent.status === "missing"
-                   ? "未安装"
-                   : agent.status === "installing"
-                     ? agent.detail ?? "安装中…"
-                   : "需配置适配器"}
-            </span>
-            {agent.id === activeAgentId && agent.status === "ready" && (
-              <CheckCircle2 size={17} />
-            )}
-          </button>
-        ))}
-      </div>
-      {agents.some((agent) => agent.id === "opencode" && agent.status === "missing") && (
-        <div className="install-agent-card">
-          <span>
-            <DownloadGlyph />
-          </span>
-          <div>
-            <strong>安装 OpenCode</strong>
-            <p>安装位置：<code>~/.easywork/agents/opencode</code></p>
-          </div>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={onInstall}
-            disabled={connection.status !== "connected"}
-          >
-            安装
-          </button>
-        </div>
-      )}
-    </Modal>
-  );
-}
-
-function DownloadGlyph() {
-  return (
-    <span className="download-glyph">
-      <ArrowDown size={18} />
-    </span>
   );
 }
 
