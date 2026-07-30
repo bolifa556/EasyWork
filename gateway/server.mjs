@@ -16,6 +16,11 @@ import { fileURLToPath } from "node:url";
 import { Client as SshClient } from "ssh2";
 import { WebSocketServer } from "ws";
 import AdmZip from "adm-zip";
+import {
+  applyEdits as applyJsoncEdits,
+  modify as modifyJsonc,
+  parse as parseJsonc,
+} from "jsonc-parser";
 import mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
 
@@ -28,6 +33,7 @@ const PORT = Number(process.env.EASYWORK_GATEWAY_PORT || 8789);
 const BODY_LIMIT = 36 * 1024 * 1024;
 const SESSION_MAX_AGE = 60 * 60 * 24 * 180;
 const SSH_RECONNECT_GRACE_MS = 2 * 60 * 1000;
+const EASYWORK_OPENCODE_PROVIDER_ID = "easywork";
 const BUILTIN_SKILLS = {
   skill_cluster: path.join(SKILL_ROOT, "built-in", "cluster-ops"),
   skill_paper: path.join(SKILL_ROOT, "built-in", "paper-reading"),
@@ -1188,6 +1194,13 @@ async function handleHttp(req, res) {
         configured: Boolean(body.apiKey || (await getSecrets(actor)).providerApiKey),
       };
       await saveState(actor, state);
+      void syncManagedOpenCodeForActor(actor).catch((caught) => {
+        console.warn(
+          `[EasyWork Agent] provider sync skipped: ${
+            caught instanceof Error ? caught.message : "unknown error"
+          }`,
+        );
+      });
       sendJson(res, 200, { ok: true, provider: state.settings.provider });
       return;
     }
@@ -1430,6 +1443,40 @@ function remoteSftpWrite(client, remotePath, content, mode = 0o600) {
       });
     });
   });
+}
+
+async function remoteSftpReadOptional(client, remotePath) {
+  try {
+    return await remoteSftpRead(client, remotePath);
+  } catch (caught) {
+    if (
+      caught?.code === 2 ||
+      caught?.code === "ENOENT" ||
+      /no such file/i.test(String(caught?.message || ""))
+    ) {
+      return null;
+    }
+    throw caught;
+  }
+}
+
+async function remoteSftpWriteAtomic(client, remotePath, content, mode = 0o600) {
+  const tempPath = `${remotePath}.easywork-${crypto.randomBytes(6).toString("hex")}.tmp`;
+  try {
+    await remoteSftpWrite(client, tempPath, content, mode);
+    await remoteExec(
+      client,
+      [
+        `chmod ${Number(mode).toString(8)} ${shellQuote(tempPath)}`,
+        `mv -f ${shellQuote(tempPath)} ${shellQuote(remotePath)}`,
+      ].join(" && "),
+    );
+  } catch (caught) {
+    await remoteExec(client, `rm -f ${shellQuote(tempPath)}`, {
+      allowFailure: true,
+    }).catch(() => undefined);
+    throw caught;
+  }
 }
 
 function withRemoteSftp(client, operation) {
@@ -1675,19 +1722,18 @@ function agentPromptWithWorkflow(context, steps) {
   ].join("\n");
 }
 
-function providerConfigForOpenCode(provider, apiKey) {
+function providerConfigForOpenCode(provider) {
   return {
     $schema: "https://opencode.ai/config.json",
     provider: {
-      custom: {
+      [EASYWORK_OPENCODE_PROVIDER_ID]: {
         npm:
           provider.protocol === "responses"
             ? "@ai-sdk/openai"
             : "@ai-sdk/openai-compatible",
-        name: "Custom API",
+        name: "EasyWork",
         options: {
           baseURL: provider.baseUrl,
-          apiKey,
         },
         models: {
           [provider.model]: {
@@ -1696,6 +1742,152 @@ function providerConfigForOpenCode(provider, apiKey) {
         },
       },
     },
+  };
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseJsoncObject(content, label = "OpenCode 配置") {
+  const source = String(content || "").trim() ? String(content) : "{}";
+  const errors = [];
+  const value = parseJsonc(source, errors, {
+    allowTrailingComma: true,
+    disallowComments: false,
+  });
+  if (errors.length || !isPlainObject(value)) {
+    throw new Error(`${label}不是有效的 JSON/JSONC，已保留原文件`);
+  }
+  return value;
+}
+
+function setJsoncValue(content, propertyPath, value) {
+  const source = String(content || "").trim() ? String(content) : "{}\n";
+  return applyJsoncEdits(
+    source,
+    modifyJsonc(source, propertyPath, value, {
+      formattingOptions: {
+        insertSpaces: true,
+        tabSize: 2,
+        eol: "\n",
+      },
+    }),
+  );
+}
+
+function mergeOpenCodeConfigContent(content, provider) {
+  const current = parseJsoncObject(content);
+  let next = String(content || "").trim() ? String(content) : "{}\n";
+  if (!current.$schema) {
+    next = setJsoncValue(next, ["$schema"], "https://opencode.ai/config.json");
+  }
+  const managedProvider =
+    providerConfigForOpenCode(provider).provider[EASYWORK_OPENCODE_PROVIDER_ID];
+  next = setJsoncValue(
+    next,
+    ["provider", EASYWORK_OPENCODE_PROVIDER_ID],
+    managedProvider,
+  );
+
+  const legacyProvider = current.provider?.custom;
+  const legacyModels = Object.keys(legacyProvider?.models || {});
+  const legacyLooksManaged =
+    legacyProvider?.name === "Custom API" &&
+    legacyProvider?.options?.baseURL === provider.baseUrl &&
+    legacyModels.includes(provider.model);
+  if (legacyLooksManaged) {
+    next = setJsoncValue(next, ["provider", "custom"], undefined);
+  }
+  return `${next.trimEnd()}\n`;
+}
+
+function parseOpenCodeAuth(content) {
+  if (!String(content || "").trim()) return {};
+  try {
+    const value = JSON.parse(String(content));
+    if (isPlainObject(value)) return value;
+  } catch {
+    // Report one stable error below without leaking credential content.
+  }
+  throw new Error("OpenCode 原生认证文件不是有效 JSON，已保留原文件");
+}
+
+function mergeOpenCodeAuthContent(content, apiKey) {
+  const auth = parseOpenCodeAuth(content);
+  auth[EASYWORK_OPENCODE_PROVIDER_ID] = {
+    type: "api",
+    key: String(apiKey),
+  };
+  return `${JSON.stringify(auth, null, 2)}\n`;
+}
+
+function hasOpenCodeCredential(value) {
+  if (!isPlainObject(value)) return false;
+  if (value.type === "api") return Boolean(value.key);
+  if (value.type === "oauth") return Boolean(value.access || value.refresh);
+  return Object.values(value).some((item) => typeof item === "string" && item);
+}
+
+function openCodeConfigurationStatus(
+  configContent,
+  authContent,
+  { managed = false } = {},
+) {
+  let config;
+  let auth;
+  try {
+    config = parseJsoncObject(configContent);
+    auth = parseOpenCodeAuth(authContent);
+  } catch (caught) {
+    return {
+      configured: false,
+      error: caught instanceof Error ? caught.message : "OpenCode 配置无法解析",
+    };
+  }
+
+  const providers = isPlainObject(config.provider) ? config.provider : {};
+  const authenticatedProviderIds = Object.entries(auth)
+    .filter(([, credential]) => hasOpenCodeCredential(credential))
+    .map(([providerId]) => providerId);
+  const easyworkProvider = providers[EASYWORK_OPENCODE_PROVIDER_ID];
+  const easyworkModels = Object.keys(easyworkProvider?.models || {});
+  const easyworkConfigured = Boolean(
+    easyworkProvider?.options?.baseURL &&
+      easyworkModels.length &&
+      (hasOpenCodeCredential(auth[EASYWORK_OPENCODE_PROVIDER_ID]) ||
+        easyworkProvider?.options?.apiKey),
+  );
+  if (managed) {
+    return {
+      configured: easyworkConfigured,
+      providerId: EASYWORK_OPENCODE_PROVIDER_ID,
+      model: easyworkModels[0] || "",
+    };
+  }
+
+  const configuredProvider = Object.entries(providers).some(
+    ([providerId, providerValue]) => {
+      if (!isPlainObject(providerValue)) return false;
+      const modelCount = Object.keys(providerValue.models || {}).length;
+      const hasInlineCredential = Boolean(providerValue.options?.apiKey);
+      const hasNativeCredential = authenticatedProviderIds.includes(providerId);
+      const allowsKeylessEndpoint = Boolean(
+        providerValue.options?.baseURL && modelCount,
+      );
+      return Boolean(
+        modelCount &&
+          (hasInlineCredential || hasNativeCredential || allowsKeylessEndpoint),
+      );
+    },
+  );
+  return {
+    configured: Boolean(
+      easyworkConfigured ||
+        authenticatedProviderIds.length ||
+        String(config.model || "").trim() ||
+        configuredProvider,
+    ),
   };
 }
 
@@ -1742,6 +1934,33 @@ async function storedRemoteAgents(actor, session) {
   return Array.isArray(registry[remoteServerKey(session)])
     ? registry[remoteServerKey(session)]
     : [];
+}
+
+async function inspectOpenCodeNativeConfiguration(session, agent = {}) {
+  const defaults = agentConfigFor("opencode", session.home);
+  const jsonPath = agent.configPath || defaults.configPath;
+  const jsoncPath = agent.alternateConfigPath || defaults.alternateConfigPath;
+  const authPath = `${session.home}/.local/share/opencode/auth.json`;
+  const [jsonBuffer, jsoncBuffer, authBuffer] = await Promise.all([
+    remoteSftpReadOptional(session.client, jsonPath),
+    remoteSftpReadOptional(session.client, jsoncPath),
+    remoteSftpReadOptional(session.client, authPath),
+  ]);
+  const useJsonc = Boolean(jsoncBuffer?.length);
+  const configPath = useJsonc ? jsoncPath : jsonPath;
+  const configContent = String(
+    (useJsonc ? jsoncBuffer : jsonBuffer) || "",
+  );
+  const authContent = String(authBuffer || "");
+  return {
+    configPath,
+    authPath,
+    configContent,
+    authContent,
+    ...openCodeConfigurationStatus(configContent, authContent, {
+      managed: Boolean(agent.managed),
+    }),
+  };
 }
 
 async function scanRemoteAgents(session, actor) {
@@ -1805,40 +2024,23 @@ async function scanRemoteAgents(session, actor) {
   }
 
   for (const agent of discovered) {
-    const configPaths = [agent.configPath, agent.alternateConfigPath].filter(Boolean);
-    const configCheck = configPaths.length
-      ? await remoteExec(
-          session.client,
-          [
-            "set +e",
-            ...configPaths.map(
-              (configPath) =>
-                agent.adapter === "opencode"
-                  ? `test -s ${shellQuote(configPath)} && grep -Eq '"(provider|model|apiKey|baseURL)"' ${shellQuote(configPath)} && exit 0`
-                  : `test -s ${shellQuote(configPath)} && exit 0`,
-            ),
-            agent.adapter === "opencode"
-              ? `test -s ${shellQuote(`${session.home}/.local/share/opencode/auth.json`)} && exit 0`
-              : "",
-            "exit 1",
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          { allowFailure: true },
-        )
-      : { code: 1 };
-    agent.configured = configCheck.code === 0;
-    if (
-      agent.alternateConfigPath &&
-      (
-        await remoteExec(
-          session.client,
-          `test -s ${shellQuote(agent.alternateConfigPath)}`,
-          { allowFailure: true },
-        )
-      ).code === 0
-    ) {
-      agent.configPath = agent.alternateConfigPath;
+    if (agent.adapter === "opencode") {
+      const configuration = await inspectOpenCodeNativeConfiguration(
+        session,
+        agent,
+      );
+      agent.configured = configuration.configured;
+      agent.configPath = configuration.configPath;
+      if (configuration.error) agent.configurationError = configuration.error;
+    } else {
+      const configCheck = agent.configPath
+        ? await remoteExec(
+            session.client,
+            `test -s ${shellQuote(agent.configPath)}`,
+            { allowFailure: true },
+          )
+        : { code: 1 };
+      agent.configured = configCheck.code === 0;
     }
     delete agent.alternateConfigPath;
   }
@@ -1868,52 +2070,176 @@ async function ensureOpenCodeNativeConfig(
   const provider = state?.settings?.provider || {};
   const secrets = await getSecrets(actor);
   if (!provider.baseUrl || !provider.model || !secrets.providerApiKey) {
-    return false;
+    return {
+      configured: false,
+      changed: false,
+      reason: "missing-provider",
+    };
   }
-  const nativeConfig = `${session.home}/.config/opencode/opencode.json`;
-  const alternateConfig = `${session.home}/.config/opencode/opencode.jsonc`;
-  const nativeAuth = `${session.home}/.local/share/opencode/auth.json`;
-  const existing = await remoteExec(
-    session.client,
-    [
-      "set +e",
-      `test -s ${shellQuote(nativeConfig)} && exit 0`,
-      `test -s ${shellQuote(alternateConfig)} && exit 0`,
-      `test -s ${shellQuote(nativeAuth)} && exit 0`,
-      "exit 1",
-    ].join("\n"),
-    { allowFailure: true },
+  const configuration = await inspectOpenCodeNativeConfiguration(session, {
+    ...agentConfigFor("opencode", session.home),
+    managed: true,
+  });
+  const nextConfig = mergeOpenCodeConfigContent(
+    configuration.configContent,
+    provider,
   );
-  if (existing.code === 0) return false;
-  onProgress("configure", "写入 OpenCode 原生模型配置");
+  const nextAuth = mergeOpenCodeAuthContent(
+    configuration.authContent,
+    secrets.providerApiKey,
+  );
+  const configChanged = nextConfig !== configuration.configContent;
+  const authChanged = nextAuth !== configuration.authContent;
+  if (!configChanged && !authChanged) {
+    return {
+      configured: true,
+      changed: false,
+      configPath: configuration.configPath,
+      model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${provider.model}`,
+    };
+  }
+  onProgress("configure", "同步 OpenCode 原生模型配置");
   await remoteExec(
     session.client,
-    `mkdir -p ${shellQuote(path.posix.dirname(nativeConfig))}`,
+    [
+      `mkdir -p ${shellQuote(path.posix.dirname(configuration.configPath))}`,
+      `mkdir -p ${shellQuote(path.posix.dirname(configuration.authPath))}`,
+    ].join(" && "),
   );
-  await remoteSftpWrite(
+  if (configChanged) {
+    await remoteSftpWriteAtomic(
+      session.client,
+      configuration.configPath,
+      nextConfig,
+      0o600,
+    );
+  }
+  if (authChanged) {
+    await remoteSftpWriteAtomic(
+      session.client,
+      configuration.authPath,
+      nextAuth,
+      0o600,
+    );
+  }
+  return {
+    configured: true,
+    changed: true,
+    configPath: configuration.configPath,
+    model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${provider.model}`,
+  };
+}
+
+async function remoteExecutableExists(session, remotePath) {
+  return (
+    (
+      await remoteExec(
+        session.client,
+        `test -x ${shellQuote(remotePath)}`,
+        { allowFailure: true },
+      )
+    ).code === 0
+  );
+}
+
+async function migrateLegacyOpenCode(
+  session,
+  onProgress = () => undefined,
+) {
+  const legacyPath = `${session.home}/.easywork/bin/opencode`;
+  const managedRoot = `${session.home}/.easywork/agents/opencode`;
+  const managedPath = `${managedRoot}/bin/opencode`;
+  if (!(await remoteExecutableExists(session, legacyPath))) return false;
+  if (await remoteExecutableExists(session, managedPath)) return true;
+  onProgress("migrate", "迁移旧版 OpenCode");
+  await remoteExec(
     session.client,
-    nativeConfig,
-    `${JSON.stringify(
-      providerConfigForOpenCode(provider, secrets.providerApiKey),
-      null,
-      2,
-    )}\n`,
+    [
+      "set -eu",
+      `mkdir -p ${shellQuote(`${managedRoot}/bin`)}`,
+      `cp ${shellQuote(legacyPath)} ${shellQuote(managedPath)}`,
+      `chmod 755 ${shellQuote(managedPath)}`,
+      `${shellQuote(managedPath)} --version`,
+    ].join("\n"),
   );
   return true;
 }
 
+async function prepareRemoteAgents(
+  session,
+  actor,
+  onProgress = () => undefined,
+) {
+  let agents = await scanRemoteAgents(session, actor);
+  let managedOpenCode = agents.find(
+    (agent) =>
+      agent.adapter === "opencode" &&
+      agent.status === "ready" &&
+      agent.managed,
+  );
+  if (!managedOpenCode && (await migrateLegacyOpenCode(session, onProgress))) {
+    agents = await scanRemoteAgents(session, actor);
+    managedOpenCode = agents.find(
+      (agent) =>
+        agent.adapter === "opencode" &&
+        agent.status === "ready" &&
+        agent.managed,
+    );
+  }
+  if (managedOpenCode) {
+    await ensureOpenCodeNativeConfig(session, actor, onProgress);
+    agents = await scanRemoteAgents(session, actor);
+  }
+  return agents;
+}
+
+async function syncManagedOpenCodeForActor(actor) {
+  const actorKey = `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
+  const sessions = [...sshSessionPool.values()].filter(
+    (session) =>
+      session.actorKey === actorKey &&
+      session.status === "connected" &&
+      session.client &&
+      !session.demo &&
+      !session.activeStream,
+  );
+  const results = await Promise.allSettled(
+    sessions.map(async (session) => {
+      const agents = await prepareRemoteAgents(session, actor);
+      sessionSend(session, {
+        type: "agent.list",
+        serverId: session.serverId,
+        agents,
+      });
+      return agents;
+    }),
+  );
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+}
+
 async function installOpenCode(session, actor, onProgress = () => undefined) {
   if (!session.client) throw new Error("SSH 尚未连接");
-  const existingAgents = await scanRemoteAgents(session, actor);
-  const existingOpenCode = existingAgents.find(
-    (agent) => agent.adapter === "opencode" && agent.status === "ready",
+  let existingAgents = await scanRemoteAgents(session, actor);
+  let existingOpenCode = existingAgents.find(
+    (agent) =>
+      agent.adapter === "opencode" &&
+      agent.status === "ready" &&
+      agent.managed,
   );
   if (existingOpenCode) {
-    if (existingOpenCode.managed) {
-      await ensureOpenCodeNativeConfig(session, actor, onProgress);
-    }
+    await ensureOpenCodeNativeConfig(session, actor, onProgress);
     return scanRemoteAgents(session, actor);
   }
+  if (await migrateLegacyOpenCode(session, onProgress)) {
+    await ensureOpenCodeNativeConfig(session, actor, onProgress);
+    return scanRemoteAgents(session, actor);
+  }
+  existingOpenCode = existingAgents.find(
+    (agent) => agent.adapter === "opencode" && agent.status === "ready",
+  );
+  if (existingOpenCode) return existingAgents;
+
   onProgress("prepare", "准备安装目录");
   await remoteExec(
     session.client,
@@ -2118,7 +2444,7 @@ function workflowIndexForEvent(event, steps, currentIndex = 0) {
 async function runRemoteWork(socket, session, actor, payload) {
   if (!session.client) throw new Error("SSH 尚未连接");
   if (session.activeStream) throw new Error("该服务器上仍有任务在运行");
-  const availableAgents = await scanRemoteAgents(session, actor);
+  const availableAgents = await prepareRemoteAgents(session, actor);
   const selectedAgent = availableAgents.find(
     (agent) => agent.id === String(payload.agentId || "opencode"),
   );
@@ -2134,6 +2460,10 @@ async function runRemoteWork(socket, session, actor, payload) {
   const secrets = await getSecrets(actor);
   const state = await getState(actor);
   const provider = state?.settings?.provider || {};
+  const managedModel =
+    selectedAgent.managed && provider.model && secrets.providerApiKey
+      ? `${EASYWORK_OPENCODE_PROVIDER_ID}/${provider.model}`
+      : "";
   const planningEventId = `${payload.runId}_planning`;
   wsSend(socket, {
     type: "agent.event",
@@ -2227,6 +2557,7 @@ async function runRemoteWork(socket, session, actor, payload) {
       shellQuote(selectedAgent.path),
       "run --format json --auto",
       `--dir "$EW_DIR"`,
+      managedModel ? `--model ${shellQuote(managedModel)}` : "",
       boundSessionId ? `--session ${shellQuote(boundSessionId)}` : "",
     ]
       .filter(Boolean)
@@ -2670,7 +3001,7 @@ async function connectSsh(socket, session, actor, payload) {
   wsSend(socket, {
     type: "agent.list",
     serverId: session.serverId,
-    agents: await scanRemoteAgents(session, actor),
+    agents: await prepareRemoteAgents(session, actor),
   });
 }
 
@@ -2987,7 +3318,7 @@ function attachWebSocketServer(server) {
           ],
         });
       } else {
-        scanRemoteAgents(session, actor)
+        prepareRemoteAgents(session, actor)
           .then((agents) =>
             wsSend(socket, {
               type: "agent.list",
@@ -3062,7 +3393,7 @@ function attachWebSocketServer(server) {
                   configured: true,
                 },
               ]
-            : await scanRemoteAgents(targetSession, actor);
+            : await prepareRemoteAgents(targetSession, actor);
           wsSend(socket, {
             type: "agent.list",
             serverId: targetSession.serverId,
@@ -3344,11 +3675,16 @@ export async function createEasyWorkServer() {
 export const gatewayTestHelpers = {
   agentPromptWithWorkflow,
   fallbackConversationTitle,
+  mergeOpenCodeAuthContent,
+  mergeOpenCodeConfigContent,
   normalizeConversationTitle,
+  openCodeConfigurationStatus,
   parseOpenCodeLine,
   parseWorkPlan,
   parseWorkflowPlan,
   planWorkSteps,
+  prepareRemoteAgents,
+  providerConfigForOpenCode,
   workflowFor,
   workflowIndexForEvent,
 };

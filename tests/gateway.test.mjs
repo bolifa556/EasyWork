@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import ssh2 from "ssh2";
 import { WebSocket } from "ws";
@@ -32,10 +33,14 @@ test("work planning is prepared before execution and OpenCode events stay struct
   );
   const {
     agentPromptWithWorkflow,
+    mergeOpenCodeAuthContent,
+    mergeOpenCodeConfigContent,
     normalizeConversationTitle,
+    openCodeConfigurationStatus,
     parseOpenCodeLine,
     parseWorkPlan,
     parseWorkflowPlan,
+    providerConfigForOpenCode,
     workflowFor,
     workflowIndexForEvent,
   } = gatewayTestHelpers;
@@ -129,6 +134,220 @@ test("work planning is prepared before execution and OpenCode events stay struct
   );
   assert.equal(errorEvent.kind, "error");
   assert.equal(errorEvent.output, "remote command failed");
+
+  const provider = {
+    baseUrl: "https://api.example.com/v1",
+    model: "test-model",
+    protocol: "chat-completions",
+  };
+  const mergedConfig = mergeOpenCodeConfigContent(
+    `{
+  // Keep the user's own settings.
+  "theme": "system",
+  "provider": {
+    "other": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:11434/v1" },
+      "models": { "local-model": {} }
+    }
+  }
+}
+`,
+    provider,
+  );
+  assert.match(mergedConfig, /Keep the user's own settings/);
+  assert.match(mergedConfig, /"theme": "system"/);
+  assert.match(mergedConfig, /"easywork"/);
+  assert.match(mergedConfig, /"test-model"/);
+  assert.equal(mergedConfig.includes('"apiKey"'), false);
+  assert.deepEqual(
+    providerConfigForOpenCode(provider).provider.easywork.options,
+    { baseURL: "https://api.example.com/v1" },
+  );
+
+  const mergedAuth = mergeOpenCodeAuthContent(
+    '{"other":{"type":"api","key":"other-key"}}',
+    "easywork-key",
+  );
+  assert.deepEqual(JSON.parse(mergedAuth), {
+    other: { type: "api", key: "other-key" },
+    easywork: { type: "api", key: "easywork-key" },
+  });
+  assert.equal(
+    openCodeConfigurationStatus(mergedConfig, mergedAuth, {
+      managed: true,
+    }).configured,
+    true,
+  );
+  assert.equal(
+    openCodeConfigurationStatus(
+      '{"$schema":"https://opencode.ai/config.json"}',
+      "",
+      { managed: true },
+    ).configured,
+    false,
+  );
+});
+
+test("legacy EasyWork OpenCode is migrated and receives native configuration automatically", async () => {
+  const temporaryRoot = await mkdtemp(
+    path.join(os.tmpdir(), "easywork-agent-migration-test-"),
+  );
+  process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
+  process.env.EASYWORK_SKILL_DIR = path.join(temporaryRoot, "skill");
+  const { createEasyWorkServer, gatewayTestHelpers } = await import(
+    `../gateway/server.mjs?agent-migration=${Date.now()}`
+  );
+  const { server } = await createEasyWorkServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const base = `http://127.0.0.1:${address.port}`;
+  const home = "/home/easywork-test";
+  const legacyPath = `${home}/.easywork/bin/opencode`;
+  const userPath = `${home}/.opencode/bin/opencode`;
+  const managedPath = `${home}/.easywork/agents/opencode/bin/opencode`;
+  const configPath = `${home}/.config/opencode/opencode.json`;
+  const authPath = `${home}/.local/share/opencode/auth.json`;
+  const files = new Map([
+    [legacyPath, { content: Buffer.from("legacy-opencode"), mode: 0o755 }],
+    [userPath, { content: Buffer.from("user-opencode"), mode: 0o755 }],
+    [
+      configPath,
+      {
+        content: Buffer.from(
+          '{"$schema":"https://opencode.ai/config.json"}\n',
+        ),
+        mode: 0o600,
+      },
+    ],
+  ]);
+
+  const fakeClient = {
+    exec(command, _options, callback) {
+      const stream = new PassThrough();
+      stream.stderr = new PassThrough();
+      callback(null, stream);
+      setImmediate(() => {
+        let stdout = "";
+        let code = 0;
+        if (command.includes('managed_opencode="$HOME/.easywork/agents')) {
+          if (files.get(managedPath)?.mode & 0o111) {
+            stdout = `opencode\t${home}/.easywork/agents/opencode\t${managedPath}\t1.18.9\topencode\n`;
+          } else if (files.get(userPath)?.mode & 0o111) {
+            stdout = `opencode\t${home}/.opencode\t${userPath}\t1.18.9\topencode\n`;
+          }
+        } else if (/^test -x /.test(command)) {
+          const target = command.match(/^test -x '([^']+)'/)?.[1] || "";
+          code = files.get(target)?.mode & 0o111 ? 0 : 1;
+        } else if (command.includes(`cp '${legacyPath}' '${managedPath}'`)) {
+          files.set(managedPath, {
+            content: Buffer.from(files.get(legacyPath).content),
+            mode: 0o755,
+          });
+          stdout = "1.18.9\n";
+        } else if (command.includes("mv -f")) {
+          const match = command.match(/mv -f '([^']+)' '([^']+)'/);
+          if (match) {
+            const source = files.get(match[1]);
+            if (source) {
+              files.set(match[2], source);
+              files.delete(match[1]);
+            } else {
+              code = 1;
+            }
+          }
+        }
+        if (stdout) stream.write(stdout);
+        stream.emit("close", code);
+      });
+    },
+    sftp(callback) {
+      callback(null, {
+        readFile(remotePath, done) {
+          const file = files.get(remotePath);
+          if (file) {
+            done(null, Buffer.from(file.content));
+            return;
+          }
+          const error = new Error("No such file");
+          error.code = 2;
+          done(error);
+        },
+        writeFile(remotePath, content, options, done) {
+          files.set(remotePath, {
+            content: Buffer.from(content),
+            mode: options?.mode ?? 0o600,
+          });
+          done(null);
+        },
+        end() {},
+      });
+    },
+  };
+
+  try {
+    const registration = await fetch(`${base}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "agent-migration@example.com",
+        password: "correct-horse",
+        displayName: "Agent 迁移用户",
+      }),
+    });
+    assert.equal(registration.status, 200);
+    const account = await registration.json();
+    const providerResponse = await fetch(`${base}/api/settings/provider`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${account.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        baseUrl: "https://api.example.com/v1",
+        apiKey: "saved-provider-key",
+        model: "test-model",
+        protocol: "chat-completions",
+      }),
+    });
+    assert.equal(providerResponse.status, 200);
+
+    const agents = await gatewayTestHelpers.prepareRemoteAgents(
+      {
+        client: fakeClient,
+        home,
+        host: "cluster.example.com",
+        port: 22,
+        username: "cluster-user",
+        serverId: "cluster-agent-test",
+      },
+      account.actor,
+    );
+    const opencode = agents.find((agent) => agent.adapter === "opencode");
+    assert.equal(opencode.path, managedPath);
+    assert.equal(opencode.managed, true);
+    assert.equal(opencode.configured, true);
+    assert.equal(files.get(managedPath)?.mode, 0o755);
+    assert.equal(files.get(configPath)?.mode, 0o600);
+    assert.equal(files.get(authPath)?.mode, 0o600);
+    const nativeConfig = JSON.parse(files.get(configPath).content.toString());
+    const nativeAuth = JSON.parse(files.get(authPath).content.toString());
+    assert.equal(
+      nativeConfig.provider.easywork.options.baseURL,
+      "https://api.example.com/v1",
+    );
+    assert.ok(nativeConfig.provider.easywork.models["test-model"]);
+    assert.equal(nativeConfig.provider.easywork.options.apiKey, undefined);
+    assert.deepEqual(nativeAuth.easywork, {
+      type: "api",
+      key: "saved-provider-key",
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    const resolved = path.resolve(temporaryRoot);
+    assert.ok(resolved.startsWith(path.resolve(os.tmpdir()) + path.sep));
+    await rm(resolved, { recursive: true, force: true });
+  }
 });
 
 test("gateway persists identity, indexes files, and opens a demo work session", async () => {
