@@ -1,6 +1,6 @@
 # EasyWork
 
-EasyWork 是一个面向算力平台的对话工作台：普通聊天负责知识与创作，工作模式通过本机网关维持 SSH 连接，并把一个网页对话绑定到一个远端 CLI Agent session。
+EasyWork 是一个面向算力平台的对话工作台：普通聊天负责知识与创作，工作模式通过 EasyWork 服务维持 SSH 连接，并把一个网页对话绑定到一个远端 CLI Agent session。FRP 只是在跨设备访问时可选的端口映射方式，不参与 SSH 认证或会话本身。
 
 ## 本地启动
 

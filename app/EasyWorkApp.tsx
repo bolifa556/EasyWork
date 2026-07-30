@@ -35,6 +35,8 @@ import {
   MessageCircle,
   Network,
   Paperclip,
+  Pin,
+  PinOff,
   Pencil,
   Plus,
   RefreshCw,
@@ -54,6 +56,10 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import {
   KeyboardEvent,
   useCallback,
@@ -115,6 +121,7 @@ type Message = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  reasoning?: string;
   createdAt: string;
   mode: Mode;
   selectedSkills?: string[];
@@ -144,6 +151,7 @@ type Project = {
   icon: string;
   memoryMode: "default" | "project-only";
   fileIds?: string[];
+  pinned?: boolean;
   createdAt: string;
 };
 
@@ -281,6 +289,7 @@ let GATEWAY_HTTP =
 
 const DEVICE_TOKEN_STORAGE_KEY = "easywork.device-token.v1";
 const DEVICE_TOKEN_EVENT = "easywork:device-token";
+const GATEWAY_ENDPOINT_STORAGE_KEY = "easywork.gateway-endpoint.v1";
 
 function readDeviceToken() {
   if (typeof window === "undefined") return "";
@@ -297,6 +306,37 @@ function clearDeviceToken() {
   if (typeof window === "undefined") return;
   window.localStorage.removeItem(DEVICE_TOKEN_STORAGE_KEY);
   window.dispatchEvent(new Event(DEVICE_TOKEN_EVENT));
+}
+
+function normalizeGatewayEndpoint(value: string) {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) return "";
+  try {
+    const endpoint = new URL(
+      /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`,
+    );
+    if (!["http:", "https:"].includes(endpoint.protocol)) return "";
+    return endpoint.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function readGatewayEndpoint() {
+  if (typeof window === "undefined") return "";
+  return normalizeGatewayEndpoint(
+    window.localStorage.getItem(GATEWAY_ENDPOINT_STORAGE_KEY) || "",
+  );
+}
+
+function storeGatewayEndpoint(value: string) {
+  if (typeof window === "undefined") return;
+  const normalized = normalizeGatewayEndpoint(value);
+  if (normalized) {
+    window.localStorage.setItem(GATEWAY_ENDPOINT_STORAGE_KEY, normalized);
+  } else {
+    window.localStorage.removeItem(GATEWAY_ENDPOINT_STORAGE_KEY);
+  }
 }
 
 function gatewayFetch(
@@ -316,13 +356,27 @@ function gatewayFetch(
 
 const gatewayCandidates = () => {
   const configured = process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL;
+  const stored = readGatewayEndpoint();
+  const currentOrigin =
+    typeof window !== "undefined" ? window.location.origin : undefined;
+  const pageIsLocal =
+    typeof window !== "undefined" &&
+    ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
   const candidates = [
+    stored,
     configured,
-    "http://127.0.0.1:8789",
-    "http://localhost:8789",
-    typeof window !== "undefined" ? window.location.origin : undefined,
+    currentOrigin,
+    ...(pageIsLocal
+      ? ["http://127.0.0.1:8789", "http://localhost:8789"]
+      : []),
   ].filter((value): value is string => Boolean(value));
-  return [...new Set(candidates.map((value) => value.replace(/\/+$/, "")))];
+  return [
+    ...new Set(
+      candidates
+        .map((value) => normalizeGatewayEndpoint(value))
+        .filter(Boolean),
+    ),
+  ];
 };
 
 const now = () => new Date().toISOString();
@@ -538,6 +592,16 @@ const formatTime = (value: string) =>
     minute: "2-digit",
   }).format(new Date(value));
 
+const formatProjectDate = (value: string) =>
+  new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+  }).format(new Date(value));
+
+const conversationPreview = (conversation: Conversation) =>
+  conversation.messages.find((message) => message.role === "user")?.content ||
+  "还没有内容";
+
 const fileToBase64 = (file: globalThis.File) =>
   new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -549,54 +613,6 @@ const fileToBase64 = (file: globalThis.File) =>
     reader.readAsDataURL(file);
   });
 
-function renderInlineMarkdown(value: string, keyPrefix: string) {
-  const nodes: React.ReactNode[] = [];
-  const pattern = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(value))) {
-    if (match.index > cursor) nodes.push(value.slice(cursor, match.index));
-    const token = match[0];
-    const key = `${keyPrefix}-${nodes.length}`;
-    if (token.startsWith("**")) {
-      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
-    } else if (token.startsWith("`")) {
-      nodes.push(<code key={key}>{token.slice(1, -1)}</code>);
-    } else {
-      const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/);
-      nodes.push(
-        link ? (
-          <a key={key} href={link[2]} target="_blank" rel="noreferrer">
-            {link[1]}
-          </a>
-        ) : (
-          token
-        ),
-      );
-    }
-    cursor = match.index + token.length;
-  }
-  if (cursor < value.length) nodes.push(value.slice(cursor));
-  return nodes;
-}
-
-function tableCells(line: string) {
-  return line
-    .trim()
-    .replace(/^\|/, "")
-    .replace(/\|$/, "")
-    .split("|")
-    .map((cell) => cell.trim());
-}
-
-function isTableDivider(line: string) {
-  const cells = tableCells(line);
-  return (
-    cells.length > 0 &&
-    cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")))
-  );
-}
-
 function MarkdownContent({
   content,
   compact = false,
@@ -604,181 +620,29 @@ function MarkdownContent({
   content: string;
   compact?: boolean;
 }) {
-  const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
-  const blocks: React.ReactNode[] = [];
-  let index = 0;
-  const beginsBlock = (line: string, next = "") =>
-    /^\s*```/.test(line) ||
-    /^#{1,3}\s+/.test(line) ||
-    /^\s*[-*+]\s+/.test(line) ||
-    /^\s*\d+\.\s+/.test(line) ||
-    /^\s*>\s?/.test(line) ||
-    /^\s*---+\s*$/.test(line) ||
-    (line.includes("|") && isTableDivider(next));
-
-  while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    const fence = line.match(/^\s*```([\w-]+)?\s*$/);
-    if (fence) {
-      const code: string[] = [];
-      index += 1;
-      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
-        code.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length) index += 1;
-      blocks.push(
-        <pre className="markdown-code-block" key={`code-${index}`}>
-          <code data-language={fence[1] || undefined}>{code.join("\n")}</code>
-        </pre>,
-      );
-      continue;
-    }
-
-    if (
-      line.includes("|") &&
-      index + 1 < lines.length &&
-      isTableDivider(lines[index + 1])
-    ) {
-      const header = tableCells(line);
-      const rows: string[][] = [];
-      index += 2;
-      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
-        rows.push(tableCells(lines[index]));
-        index += 1;
-      }
-      blocks.push(
-        <div className="markdown-table-wrap" key={`table-${index}`}>
-          <table>
-            <thead>
-              <tr>
-                {header.map((cell, cellIndex) => (
-                  <th key={`head-${cellIndex}`}>
-                    {renderInlineMarkdown(cell, `head-${index}-${cellIndex}`)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, rowIndex) => (
-                <tr key={`row-${rowIndex}`}>
-                  {header.map((_, cellIndex) => (
-                    <td key={`cell-${cellIndex}`}>
-                      {renderInlineMarkdown(
-                        row[cellIndex] ?? "",
-                        `cell-${index}-${rowIndex}-${cellIndex}`,
-                      )}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>,
-      );
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,3})\s+(.+)$/);
-    if (heading) {
-      const level = heading[1].length;
-      const children = renderInlineMarkdown(heading[2], `heading-${index}`);
-      blocks.push(
-        level === 1 ? (
-          <h2 key={`heading-${index}`}>{children}</h2>
-        ) : level === 2 ? (
-          <h3 key={`heading-${index}`}>{children}</h3>
-        ) : (
-          <h4 key={`heading-${index}`}>{children}</h4>
-        ),
-      );
-      index += 1;
-      continue;
-    }
-
-    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
-    if (unordered) {
-      const items: string[] = [];
-      while (index < lines.length) {
-        const item = lines[index].match(/^\s*[-*+]\s+(.+)$/);
-        if (!item) break;
-        items.push(item[1]);
-        index += 1;
-      }
-      blocks.push(
-        <ul key={`ul-${index}`}>
-          {items.map((item, itemIndex) => (
-            <li key={itemIndex}>{renderInlineMarkdown(item, `ul-${index}-${itemIndex}`)}</li>
-          ))}
-        </ul>,
-      );
-      continue;
-    }
-
-    const ordered = line.match(/^\s*\d+\.\s+(.+)$/);
-    if (ordered) {
-      const items: string[] = [];
-      while (index < lines.length) {
-        const item = lines[index].match(/^\s*\d+\.\s+(.+)$/);
-        if (!item) break;
-        items.push(item[1]);
-        index += 1;
-      }
-      blocks.push(
-        <ol key={`ol-${index}`}>
-          {items.map((item, itemIndex) => (
-            <li key={itemIndex}>{renderInlineMarkdown(item, `ol-${index}-${itemIndex}`)}</li>
-          ))}
-        </ol>,
-      );
-      continue;
-    }
-
-    if (/^\s*>\s?/.test(line)) {
-      const quote: string[] = [];
-      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
-        quote.push(lines[index].replace(/^\s*>\s?/, ""));
-        index += 1;
-      }
-      blocks.push(
-        <blockquote key={`quote-${index}`}>
-          {renderInlineMarkdown(quote.join("\n"), `quote-${index}`)}
-        </blockquote>,
-      );
-      continue;
-    }
-
-    if (/^\s*---+\s*$/.test(line)) {
-      blocks.push(<hr key={`rule-${index}`} />);
-      index += 1;
-      continue;
-    }
-
-    const paragraph: string[] = [line];
-    index += 1;
-    while (
-      index < lines.length &&
-      lines[index].trim() &&
-      !beginsBlock(lines[index], lines[index + 1] ?? "")
-    ) {
-      paragraph.push(lines[index]);
-      index += 1;
-    }
-    blocks.push(
-      <p key={`paragraph-${index}`}>
-        {renderInlineMarkdown(paragraph.join("\n"), `paragraph-${index}`)}
-      </p>,
-    );
-  }
-
   return (
     <div className={`markdown-content${compact ? " compact" : ""}`}>
-      {blocks}
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
+        components={{
+          a: ({ children, ...props }) => (
+            <a {...props} target="_blank" rel="noreferrer">
+              {children}
+            </a>
+          ),
+          pre: ({ children }) => (
+            <pre className="markdown-code-block">{children}</pre>
+          ),
+          table: ({ children }) => (
+            <div className="markdown-table-wrap">
+              <table>{children}</table>
+            </div>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
     </div>
   );
 }
@@ -883,77 +747,138 @@ function EventGlyph({ event }: { event: WorkEvent }) {
   return <Check size={13} />;
 }
 
+function ReasoningDisclosure({
+  content,
+  running = false,
+}: {
+  content?: string;
+  running?: boolean;
+}) {
+  const [manuallyExpanded, setManuallyExpanded] = useState(false);
+  const expanded = running || manuallyExpanded;
+
+  if (!content && !running) return null;
+  return (
+    <section className={`reasoning-disclosure${expanded ? " expanded" : ""}`}>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => {
+          if (!running) setManuallyExpanded((current) => !current);
+        }}
+      >
+        <span className="reasoning-glyph">
+          {running ? <LoaderCircle size={14} /> : <Brain size={14} />}
+        </span>
+        <strong>{running ? "思考中" : "思考"}</strong>
+        <ChevronDown size={13} />
+      </button>
+      <div className="reasoning-motion">
+        <div>
+          <div className="reasoning-content">
+            {content ? (
+              <MarkdownContent content={content} compact />
+            ) : (
+              <span>正在整理思路…</span>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function CommandEventGroup({ events }: { events: WorkEvent[] }) {
   const [expandedCommands, setExpandedCommands] = useState<Set<string>>(new Set());
   const running = events.some((event) => event.status === "running");
   const failed = events.some((event) => event.status === "error");
+  const [manuallyExpanded, setManuallyExpanded] = useState(false);
+  const groupExpanded = running || manuallyExpanded;
   const groupLabel = running
     ? `正在运行 ${events.length} 个命令`
     : `运行了 ${events.length} 个命令`;
 
   return (
-    <section className={`command-group${running ? " running" : ""}${failed ? " error" : ""}`}>
-      <header className="command-group-heading">
+    <section
+      className={`command-group${running ? " running" : ""}${
+        failed ? " error" : ""
+      }${groupExpanded ? " expanded" : ""}`}
+    >
+      <button
+        className="command-group-heading"
+        type="button"
+        aria-expanded={groupExpanded}
+        onClick={() => {
+          if (!running) setManuallyExpanded((current) => !current);
+        }}
+      >
         <span className="command-group-glyph">
           {running ? <LoaderCircle size={14} /> : failed ? <X size={13} /> : <Terminal size={14} />}
         </span>
         <strong>{groupLabel}</strong>
         <span>{running ? "远程终端活动中" : failed ? "部分命令失败" : "远程终端"}</span>
-      </header>
-      <div className="command-list">
-        {events.map((event) => {
-          const expanded = event.status === "running" || expandedCommands.has(event.id);
-          const command = event.command || event.title;
-          const panelId = `command-output-${event.id}`;
-          return (
-            <article
-              className={`command-event ${event.status}${expanded ? " expanded" : ""}`}
-              key={event.id}
-            >
-              <button
-                className="command-summary"
-                type="button"
-                aria-expanded={expanded}
-                aria-controls={panelId}
-                onClick={() =>
-                  setExpandedCommands((current) => {
-                    const next = new Set(current);
-                    if (next.has(event.id)) next.delete(event.id);
-                    else next.add(event.id);
-                    return next;
-                  })
-                }
+        <ChevronDown className="command-group-chevron" size={13} />
+      </button>
+      <div className="command-list-motion">
+        <div className="command-list">
+          {events.map((event) => {
+            const expanded = event.status === "running" || expandedCommands.has(event.id);
+            const command = event.command || event.title;
+            const panelId = `command-output-${event.id}`;
+            return (
+              <article
+                className={`command-event ${event.status}${expanded ? " expanded" : ""}`}
+                key={event.id}
               >
-                <span className="command-status">
-                  {event.status === "running" ? (
-                    <LoaderCircle size={13} />
-                  ) : event.status === "error" ? (
-                    <X size={12} />
-                  ) : (
-                    <Terminal size={12} />
-                  )}
-                </span>
-                <code title={command}>{command}</code>
-                <small>{eventStatusLabel(event.status)}</small>
-                <ChevronDown size={13} />
-              </button>
-              <div className="command-output-motion" id={panelId}>
-                <div>
-                  <pre className="remote-terminal">
-                    <span className="terminal-caption">
-                      <i />
-                      {event.detail || "登录节点"}
-                    </span>
-                    <code>
-                      <b>$</b> {command}
-                      {event.output ? `\n${event.output}` : event.status === "running" ? "\n等待远端输出…" : ""}
-                    </code>
-                  </pre>
+                <button
+                  className="command-summary"
+                  type="button"
+                  aria-expanded={expanded}
+                  aria-controls={panelId}
+                  onClick={() =>
+                    setExpandedCommands((current) => {
+                      const next = new Set(current);
+                      if (next.has(event.id)) next.delete(event.id);
+                      else next.add(event.id);
+                      return next;
+                    })
+                  }
+                >
+                  <span className="command-status">
+                    {event.status === "running" ? (
+                      <LoaderCircle size={13} />
+                    ) : event.status === "error" ? (
+                      <X size={12} />
+                    ) : (
+                      <Terminal size={12} />
+                    )}
+                  </span>
+                  <code title={command}>{command}</code>
+                  <small>{eventStatusLabel(event.status)}</small>
+                  <ChevronDown size={13} />
+                </button>
+                <div className="command-output-motion" id={panelId}>
+                  <div>
+                    <pre className="remote-terminal">
+                      <span className="terminal-caption">
+                        <i />
+                        {event.detail || "登录节点"}
+                      </span>
+                      <code>
+                        <b>$</b> {command}
+                        {event.output
+                          ? `\n${event.output}`
+                          : event.status === "running"
+                            ? "\n等待远端输出…"
+                            : ""}
+                      </code>
+                    </pre>
+                  </div>
                 </div>
-              </div>
-            </article>
-          );
-        })}
+              </article>
+            );
+          })}
+        </div>
       </div>
     </section>
   );
@@ -1007,7 +932,10 @@ function WorkEventFeed({
   runStatus?: RunTrace["status"];
 }) {
   const visibleEvents = events
-    .filter((event) => normalizedEventKind(event.kind) !== "message")
+    .filter(
+      (event) =>
+        !["message", "reasoning"].includes(normalizedEventKind(event.kind)),
+    )
     .filter(
       (event) =>
         !(
@@ -1184,7 +1112,19 @@ export default function EasyWorkApp() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightRailOpen, setRightRailOpen] = useState(false);
   const [expandedTraces, setExpandedTraces] = useState<Set<string>>(new Set());
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [projectPageTab, setProjectPageTab] = useState<"chats" | "files">(
+    "chats",
+  );
   const [projectModalOpen, setProjectModalOpen] = useState(false);
+  const [projectEditor, setProjectEditor] = useState<{
+    project: Project;
+    mode: "rename" | "settings";
+  } | null>(null);
+  const [projectPendingDelete, setProjectPendingDelete] =
+    useState<Project | null>(null);
   const [projectLibraryModalOpen, setProjectLibraryModalOpen] = useState(false);
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [sshModalOpen, setSshModalOpen] = useState(false);
@@ -1241,6 +1181,7 @@ export default function EasyWorkApp() {
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
 
   const socketRef = useRef<WebSocket | null>(null);
+  const chatAbortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1271,6 +1212,13 @@ export default function EasyWorkApp() {
     () => state.projects.find((item) => item.id === activeProjectId),
     [activeProjectId, state.projects],
   );
+  const activeLastMessage = activeConversation?.messages.at(-1);
+  const activeMessageCount = activeConversation?.messages.length ?? 0;
+  const activeStreamProgress = [
+    activeLastMessage?.content.length ?? 0,
+    activeLastMessage?.reasoning?.length ?? 0,
+    activeLastMessage?.events?.length ?? 0,
+  ].join(":");
 
   const globalServerId =
     selectedServerId ||
@@ -1321,6 +1269,22 @@ export default function EasyWorkApp() {
     setToast(message);
     window.setTimeout(() => setToast(""), 2600);
   }, []);
+
+  const configureGatewayEndpoint = useCallback(
+    (value: string) => {
+      const endpoint = normalizeGatewayEndpoint(value);
+      if (value.trim() && !endpoint) {
+        showToast("请输入有效的 EasyWork 服务地址");
+        return;
+      }
+      storeGatewayEndpoint(endpoint);
+      if (endpoint) GATEWAY_HTTP = endpoint;
+      setGatewayEndpoint("");
+      setGatewayProbe((current) => current + 1);
+      showToast(endpoint ? "正在连接 EasyWork 服务" : "已恢复自动检测");
+    },
+    [showToast],
+  );
 
   const updateConversation = useCallback(
     (conversationId: string, updater: (conversation: Conversation) => Conversation) => {
@@ -1824,15 +1788,27 @@ export default function EasyWorkApp() {
           (message) => {
             const previous = message.events ?? [];
             const exists = previous.some((item) => item.id === eventId);
+            const eventKind = normalizedEventKind(workEvent.kind);
+            const isMessage = eventKind === "message";
+            const isReasoning = eventKind === "reasoning";
             return {
               ...message,
               content:
-                normalizedEventKind(workEvent.kind) === "message" && workEvent.output
+                isMessage && workEvent.output
                   ? workEvent.output
                   : message.content,
-              events: exists
-                ? previous.map((item) => (item.id === eventId ? workEvent : item))
-                : [...previous, workEvent],
+              reasoning:
+                isReasoning && (workEvent.output || workEvent.detail)
+                  ? workEvent.output || workEvent.detail
+                  : message.reasoning,
+              events:
+                isMessage || isReasoning
+                  ? previous.filter((item) => item.id !== eventId)
+                  : exists
+                    ? previous.map((item) =>
+                        item.id === eventId ? workEvent : item,
+                      )
+                    : [...previous, workEvent],
             };
           },
         );
@@ -1935,10 +1911,11 @@ export default function EasyWorkApp() {
       if (!(target instanceof Element)) return;
       if (
         !target.closest(
-          ".chat-row, .conversation-mode-menu, .agent-selector",
+          ".chat-row, .project-list-item, .conversation-mode-menu, .agent-selector",
         )
       ) {
         setConversationMenuId("");
+        setProjectMenuId("");
         setModeMenuOpen(false);
         setAgentMenuOpen(false);
       }
@@ -1974,7 +1951,7 @@ export default function EasyWorkApp() {
           }
           return;
         } catch {
-          // Try the same-origin gateway first, then the two loopback addresses.
+          // Continue with the next reachable EasyWork service candidate.
         }
       }
       if (!disposed) {
@@ -1987,6 +1964,19 @@ export default function EasyWorkApp() {
       disposed = true;
     };
   }, [gatewayProbe]);
+
+  useEffect(() => {
+    if (gatewayStatus !== "unavailable") return;
+    const localPage = ["localhost", "127.0.0.1", "::1"].includes(
+      window.location.hostname,
+    );
+    if (!localPage && !readGatewayEndpoint()) return;
+    const timer = window.setTimeout(
+      () => setGatewayProbe((current) => current + 1),
+      4_000,
+    );
+    return () => window.clearTimeout(timer);
+  }, [gatewayProbe, gatewayStatus]);
 
   useEffect(() => {
     if (gatewayStatus !== "connected") return;
@@ -2017,7 +2007,7 @@ export default function EasyWorkApp() {
             {
               ...item,
               status: "disconnected",
-              label: "本机网关已断开",
+              label: "EasyWork 服务连接已断开",
             },
           ]),
         ),
@@ -2046,8 +2036,15 @@ export default function EasyWorkApp() {
   }, [gatewayStatus, state]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [activeConversation?.messages.length]);
+    messagesEndRef.current?.scrollIntoView({
+      behavior: sending ? "auto" : "smooth",
+      block: "end",
+    });
+  }, [
+    activeMessageCount,
+    activeStreamProgress,
+    sending,
+  ]);
 
   const selectConversation = (conversation: Conversation) => {
     setActiveConversationId(conversation.id);
@@ -2061,6 +2058,13 @@ export default function EasyWorkApp() {
     setProjectMenuId("");
     setModeMenuOpen(false);
     setSidebarOpen(false);
+    if (conversation.projectId) {
+      setExpandedProjectIds((current) => {
+        const next = new Set(current);
+        next.add(conversation.projectId!);
+        return next;
+      });
+    }
     window.setTimeout(() => textareaRef.current?.focus(), 0);
   };
 
@@ -2076,6 +2080,13 @@ export default function EasyWorkApp() {
     setProjectMenuId("");
     setModeMenuOpen(false);
     setSidebarOpen(false);
+    if (projectId) {
+      setExpandedProjectIds((current) => {
+        const next = new Set(current);
+        next.add(projectId);
+        return next;
+      });
+    }
     window.setTimeout(() => textareaRef.current?.focus(), 0);
   };
 
@@ -2089,6 +2100,22 @@ export default function EasyWorkApp() {
     setConversationMenuId("");
     setProjectMenuId("");
     setSidebarOpen(false);
+    setProjectPageTab("chats");
+    setExpandedProjectIds((current) => {
+      const next = new Set(current);
+      next.add(projectId);
+      return next;
+    });
+  };
+
+  const toggleProjectExpansion = (projectId: string) => {
+    setExpandedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+    setProjectMenuId("");
   };
 
   const createProject = (name: string, memoryMode: Project["memoryMode"]) => {
@@ -2106,6 +2133,62 @@ export default function EasyWorkApp() {
     }));
     setProjectModalOpen(false);
     openProject(project.id);
+  };
+
+  const updateProject = (
+    projectId: string,
+    updates: Pick<Project, "name" | "memoryMode">,
+  ) => {
+    setState((current) => ({
+      ...current,
+      projects: current.projects.map((project) =>
+        project.id === projectId
+          ? {
+              ...project,
+              name: updates.name.trim() || project.name,
+              icon: (updates.name.trim()[0] || project.icon).toUpperCase(),
+              memoryMode: updates.memoryMode,
+            }
+          : project,
+      ),
+    }));
+    setProjectEditor(null);
+    showToast("项目已更新");
+  };
+
+  const toggleProjectPin = (projectId: string) => {
+    setState((current) => ({
+      ...current,
+      projects: current.projects.map((project) =>
+        project.id === projectId
+          ? { ...project, pinned: !project.pinned }
+          : project,
+      ),
+    }));
+    setProjectMenuId("");
+  };
+
+  const deleteProject = (projectId: string) => {
+    setState((current) => ({
+      ...current,
+      projects: current.projects.filter((project) => project.id !== projectId),
+      conversations: current.conversations.filter(
+        (conversation) => conversation.projectId !== projectId,
+      ),
+    }));
+    setExpandedProjectIds((current) => {
+      const next = new Set(current);
+      next.delete(projectId);
+      return next;
+    });
+    const activeBelongsToProject =
+      activeConversation?.projectId === projectId ||
+      draftProjectId === projectId ||
+      (view === "project" && activeProjectId === projectId);
+    if (activeBelongsToProject) beginConversation();
+    setProjectPendingDelete(null);
+    setProjectMenuId("");
+    showToast("项目已删除");
   };
 
   const changeMode = (nextMode: Mode) => {
@@ -2333,52 +2416,127 @@ export default function EasyWorkApp() {
       return;
     }
 
+    const requestBody = JSON.stringify({
+      conversationId,
+      prompt: content,
+      firstTurn,
+      skillIds: selectedSkills,
+      projectId,
+      memoryMode: conversationProject?.memoryMode ?? "default",
+    });
+    const abortController = new AbortController();
+    chatAbortRef.current = abortController;
     try {
-      const response = await gatewayFetch("/api/chat", {
+      const response = await gatewayFetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          conversationId,
-          prompt: content,
-          firstTurn,
-          skillIds: selectedSkills,
-          projectId,
-          memoryMode: conversationProject?.memoryMode ?? "default",
-        }),
+        body: requestBody,
+        signal: abortController.signal,
       });
-      if (!response.ok) throw new Error("LLM request failed");
-      const payload = (await response.json()) as { content?: string; title?: string };
+
+      if (!response.ok || !response.body) {
+        throw new Error("LLM stream unavailable");
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      let streamError = "";
+      const consumeEvent = (line: string) => {
+          if (!line.trim()) return;
+          let event: {
+            type?: string;
+            delta?: string;
+            title?: string;
+            content?: string;
+            reasoning?: string;
+            error?: string;
+          };
+          try {
+            event = JSON.parse(line);
+          } catch {
+            return;
+          }
+          if (event.type === "content_delta" && event.delta) {
+            updateMessage(
+              conversationId,
+              (message) => message.id === assistantMessage.id,
+              (message) => ({
+                ...message,
+                content: `${message.content}${event.delta}`,
+              }),
+            );
+          } else if (event.type === "reasoning_delta" && event.delta) {
+            updateMessage(
+              conversationId,
+              (message) => message.id === assistantMessage.id,
+              (message) => ({
+                ...message,
+                reasoning: `${message.reasoning || ""}${event.delta}`,
+              }),
+            );
+          } else if (event.type === "title" && event.title) {
+            updateConversation(conversationId, (item) => ({
+              ...item,
+              title: event.title!,
+            }));
+          } else if (event.type === "done") {
+            updateMessage(
+              conversationId,
+              (message) => message.id === assistantMessage.id,
+              (message) => ({
+                ...message,
+                content:
+                  event.content ||
+                  message.content ||
+                  "请求已完成，但模型没有返回可显示的文本。",
+                reasoning: event.reasoning || message.reasoning,
+              }),
+            );
+          } else if (event.type === "error") {
+            streamError = event.error || "模型流式请求失败";
+          }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() || "";
+        for (const line of lines) consumeEvent(line);
+      }
+      pending += decoder.decode();
+      if (pending.trim()) consumeEvent(pending);
+      if (streamError) throw new Error(streamError);
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === "AbortError") {
+        showToast("已停止生成");
+        return;
+      }
       updateMessage(
         conversationId,
         (message) => message.id === assistantMessage.id,
         (message) => ({
           ...message,
           content:
-            payload.content ??
-            "请求已完成，但模型没有返回可显示的文本。",
-        }),
-      );
-      if (firstTurn && payload.title) {
-        updateConversation(conversationId, (item) => ({
-          ...item,
-          title: payload.title!,
-        }));
-      }
-    } catch {
-      updateMessage(
-        conversationId,
-        (message) => message.id === assistantMessage.id,
-        (message) => ({
-          ...message,
-          content: "暂时无法连接模型服务，请检查本机网关与模型 API 设置。",
+            message.content ||
+            "暂时无法连接模型服务，请检查 EasyWork 服务与模型 API 设置。",
         }),
       );
     } finally {
+      if (chatAbortRef.current === abortController) {
+        chatAbortRef.current = null;
+      }
       setSending(false);
     }
   };
 
   const stopCurrentRun = () => {
+    if (mode === "chat" && chatAbortRef.current) {
+      chatAbortRef.current.abort();
+      setSending(false);
+      return;
+    }
     if (!activeConversation) return;
     const running = [...activeConversation.messages]
       .reverse()
@@ -2553,7 +2711,7 @@ export default function EasyWorkApp() {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       setGatewayProbe((current) => current + 1);
-      showToast("正在重新检测本机网关");
+      showToast("正在重新连接 EasyWork 服务");
       return;
     }
     setSelectedServerId(payload.serverId);
@@ -2938,6 +3096,12 @@ export default function EasyWorkApp() {
         conversation.projectId === projectId && conversation.messages.length > 0,
     );
 
+  const orderedProjects = [...state.projects].sort(
+    (left, right) =>
+      Number(Boolean(right.pinned)) - Number(Boolean(left.pinned)) ||
+      new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
+  );
+
   const generalConversations = visibleConversations.filter(
     (conversation) => !conversation.projectId && conversation.messages.length > 0,
   );
@@ -3063,7 +3227,12 @@ export default function EasyWorkApp() {
 
       <aside className={`left-sidebar${sidebarOpen ? " mobile-open" : ""}`}>
         <div className="brand-row">
-          <button className="brand-button" type="button" onClick={() => setView("chat")}>
+          <button
+            className="brand-button"
+            type="button"
+            onClick={() => beginConversation()}
+            aria-label="返回新聊天"
+          >
             <span className="brand-mark">E</span>
             <span className="brand-copy">
               <strong>EasyWork</strong>
@@ -3170,42 +3339,52 @@ export default function EasyWorkApp() {
             </button>
           </div>
           <div className="project-list">
-            {state.projects.map((project) => {
-              const selected =
-                project.id === activeProjectId &&
-                (view === "project" ||
-                  activeConversation?.projectId === project.id ||
-                  (!activeConversation && draftProjectId === project.id));
+            {orderedProjects.map((project) => {
+              const expanded = expandedProjectIds.has(project.id);
+              const projectHomeActive =
+                view === "project" && project.id === activeProjectId;
               const conversations = projectConversations(project.id);
               return (
                 <div
-                  className={`project-nav-group${selected ? " selected" : ""}`}
+                  className={`project-nav-group${expanded ? " expanded" : ""}`}
                   key={project.id}
                 >
                   <div
-                    className={`project-list-item${selected ? " active" : ""}`}
+                    className={`project-list-item${
+                      projectHomeActive ? " active" : ""
+                    }`}
                   >
                     <button
                       className="project-row"
                       type="button"
-                      onClick={() => openProject(project.id)}
+                      aria-expanded={expanded}
+                      onClick={() => toggleProjectExpansion(project.id)}
                     >
-                      <Folder size={17} />
+                      <span className="project-folder-icon">
+                        {expanded ? (
+                          <FolderOpen size={18} />
+                        ) : (
+                          <Folder size={18} />
+                        )}
+                      </span>
                       <span className="project-title" title={project.name}>
                         {project.name}
                       </span>
+                      {project.pinned && (
+                        <Pin className="project-pin-indicator" size={11} />
+                      )}
                     </button>
                     <div className="project-row-actions">
                       <button
-                        className="project-new-chat"
+                        className="project-home-button"
                         type="button"
-                        aria-label={`在“${project.name}”中新建聊天`}
+                        aria-label={`打开“${project.name}”项目主页`}
                         onClick={(event) => {
                           event.stopPropagation();
-                          beginConversation(project.id);
+                          openProject(project.id);
                         }}
                       >
-                        <Pencil size={14} />
+                        <Home size={14} />
                       </button>
                       <button
                         className="project-more-button"
@@ -3228,28 +3407,63 @@ export default function EasyWorkApp() {
                           type="button"
                           role="menuitem"
                           onClick={() => {
-                            openProject(project.id);
+                            setProjectEditor({ project, mode: "rename" });
                             setProjectMenuId("");
                           }}
                         >
-                          <FolderOpen size={15} />
-                          打开项目
+                          <Pencil size={15} />
+                          重命名项目
                         </button>
                         <button
                           type="button"
                           role="menuitem"
                           onClick={() => {
-                            beginConversation(project.id);
+                            setProjectEditor({ project, mode: "settings" });
                             setProjectMenuId("");
                           }}
                         >
-                          <Pencil size={15} />
-                          新聊天
+                          <Settings2 size={15} />
+                          项目设置
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            openProject(project.id);
+                            setProjectMenuId("");
+                          }}
+                        >
+                          <Home size={15} />
+                          项目主页
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => toggleProjectPin(project.id)}
+                        >
+                          {project.pinned ? (
+                            <PinOff size={15} />
+                          ) : (
+                            <Pin size={15} />
+                          )}
+                          {project.pinned ? "取消置顶" : "置顶项目"}
+                        </button>
+                        <button
+                          className="danger"
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            setProjectPendingDelete(project);
+                            setProjectMenuId("");
+                          }}
+                        >
+                          <Trash2 size={15} />
+                          删除项目
                         </button>
                       </div>
                     )}
                   </div>
-                  {selected && conversations.length > 0 && (
+                  {expanded && conversations.length > 0 && (
                     <div className="project-sidebar-chats">
                       {conversations.map((conversation) => (
                         <ConversationRow
@@ -3725,6 +3939,17 @@ export default function EasyWorkApp() {
                         </div>
                       </div>
                       <div className="message-body">
+                        {message.role === "assistant" && (
+                          <ReasoningDisclosure
+                            content={message.reasoning}
+                            running={
+                              sending &&
+                              message.id ===
+                                activeConversation.messages.at(-1)?.id &&
+                              !message.content
+                            }
+                          />
+                        )}
                         {message.role === "assistant" &&
                           message.mode === "work" &&
                           !!message.events?.length && (
@@ -3754,17 +3979,20 @@ export default function EasyWorkApp() {
                         {message.content ? (
                           <div className="message-text">
                             {message.role === "assistant" ? (
-                              <MarkdownContent content={message.content} />
+                              <>
+                                <MarkdownContent content={message.content} />
+                                {sending &&
+                                  message.id ===
+                                    activeConversation.messages.at(-1)?.id && (
+                                    <span
+                                      className="streaming-caret"
+                                      aria-hidden="true"
+                                    />
+                                  )}
+                              </>
                             ) : (
                               message.content
                             )}
-                          </div>
-                        ) : message.role === "assistant" && !message.events?.length ? (
-                          <div className="typing-row">
-                            <span />
-                            <span />
-                            <span />
-                            {message.mode === "work" ? "Agent 正在工作" : "正在生成回复"}
                           </div>
                         ) : null}
                         {!!message.selectedSkills?.length && (
@@ -3914,88 +4142,94 @@ export default function EasyWorkApp() {
 
         {view === "project" && projectPage && (
           <section className="workspace-page project-page">
-            <div className="page-intro project-page-intro">
-              <div className="project-page-title">
-                <span className="project-page-avatar">{projectPage.icon}</span>
-                <div>
-                  <h1>{projectPage.name}</h1>
-                  <p>
-                    {projectPage.memoryMode === "project-only"
-                      ? "仅使用本项目的聊天、文件和记忆"
-                      : "使用默认记忆范围"}
-                  </p>
-                </div>
+            <header className="project-home-header">
+              <span className="project-home-folder">
+                <FolderOpen size={34} />
+              </span>
+              <div>
+                <h1>{projectPage.name}</h1>
+                <p>
+                  {projectPage.memoryMode === "project-only"
+                    ? "仅限项目内记忆"
+                    : "使用默认记忆"}
+                </p>
               </div>
+            </header>
+
+            <button
+              className="project-start-chat"
+              type="button"
+              onClick={() => beginConversation(projectPage.id)}
+            >
+              <Plus size={20} />
+              <span>在 {projectPage.name} 中新建聊天</span>
+            </button>
+
+            <nav className="project-home-tabs" aria-label="项目内容">
               <button
-                className="primary-button"
+                className={projectPageTab === "chats" ? "active" : ""}
                 type="button"
-                onClick={() => beginConversation(projectPage.id)}
+                onClick={() => setProjectPageTab("chats")}
               >
-                <Plus size={16} />
-                新聊天
+                对话
+                <span>{projectConversations(projectPage.id).length}</span>
               </button>
-            </div>
-            <div className="project-content-grid">
-              <div className="content-card project-conversations-card">
-                <div className="card-toolbar">
-                  <div className="project-section-heading">
-                    <h2>对话</h2>
-                    <span className="project-count">
-                      {projectConversations(projectPage.id).length}
-                    </span>
-                  </div>
-                </div>
-                <div className="project-conversation-list">
+              <button
+                className={projectPageTab === "files" ? "active" : ""}
+                type="button"
+                onClick={() => setProjectPageTab("files")}
+              >
+                文件
+                <span>{projectFiles.length}</span>
+              </button>
+            </nav>
+
+            <div className="project-home-content">
+              {projectPageTab === "chats" ? (
+                <div className="project-home-conversations">
                   {projectConversations(projectPage.id).map((conversation) => (
-                    <ConversationRow
+                    <button
+                      className="project-home-conversation"
+                      type="button"
                       key={conversation.id}
-                      conversation={conversation}
-                      active={false}
-                      projects={state.projects}
-                      menuOpen={conversationMenuId === conversation.id}
-                      onSelect={() => selectConversation(conversation)}
-                      onToggleMenu={() =>
-                        setConversationMenuId((current) =>
-                          current === conversation.id ? "" : conversation.id,
-                        )
-                      }
-                      onMove={(projectId) => moveConversation(conversation.id, projectId)}
-                      onDelete={() => {
-                        setConversationPendingDelete(conversation);
-                        setConversationMenuId("");
-                      }}
-                    />
+                      onClick={() => selectConversation(conversation)}
+                    >
+                      <span>
+                        <strong>{conversation.title}</strong>
+                        <small>{conversationPreview(conversation)}</small>
+                      </span>
+                      <time dateTime={conversation.updatedAt}>
+                        {formatProjectDate(conversation.updatedAt)}
+                      </time>
+                    </button>
                   ))}
                   {!projectConversations(projectPage.id).length && (
-                    <div className="project-empty-state">
+                    <div className="project-home-empty">
                       <p>还没有对话</p>
-                      <button type="button" onClick={() => beginConversation(projectPage.id)}>
+                      <button
+                        type="button"
+                        onClick={() => beginConversation(projectPage.id)}
+                      >
                         开始新聊天
                       </button>
                     </div>
                   )}
                 </div>
-              </div>
-
-              <div className="content-card project-files-card">
-                <div className="card-toolbar project-files-toolbar">
-                  <div className="project-section-heading">
-                    <h2>文件</h2>
-                    <span className="project-count">{projectFiles.length}</span>
-                  </div>
-                  <div className="project-file-actions">
+              ) : (
+                <div className="project-home-files">
+                  <div className="project-home-file-actions">
                     <button
                       type="button"
                       onClick={() => setProjectLibraryModalOpen(true)}
                     >
-                      <Library size={14} />
-                      关联
+                      <Library size={15} />
+                      关联文件库
                     </button>
                     <button
                       type="button"
                       onClick={() => projectFileInputRef.current?.click()}
                     >
-                      <Upload size={14} />
+                      <Upload size={15} />
                       上传
                     </button>
                     <input
@@ -4004,52 +4238,52 @@ export default function EasyWorkApp() {
                       multiple
                       type="file"
                       onChange={(event) =>
-                        void handleLibraryUpload(event.target.files, projectPage.id)
+                        void handleLibraryUpload(
+                          event.target.files,
+                          projectPage.id,
+                        )
                       }
                     />
                   </div>
+                  <div className="project-home-file-list">
+                    {projectFiles.map((file) => (
+                      <div className="project-home-file" key={file.id}>
+                        <FileText size={17} />
+                        <span>
+                          <strong>{file.name}</strong>
+                          <small>{formatBytes(file.size)}</small>
+                        </span>
+                        <button
+                          type="button"
+                          aria-label={`从项目移除 ${file.name}`}
+                          onClick={() =>
+                            setState((current) => ({
+                              ...current,
+                              projects: current.projects.map((project) =>
+                                project.id === projectPage.id
+                                  ? {
+                                      ...project,
+                                      fileIds: (project.fileIds ?? []).filter(
+                                        (fileId) => fileId !== file.id,
+                                      ),
+                                    }
+                                  : project,
+                              ),
+                            }))
+                          }
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    ))}
+                    {!projectFiles.length && (
+                      <div className="project-home-empty">
+                        <p>还没有项目文件</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <div className="project-file-list">
-                  {projectFiles.map((file) => (
-                    <div className="project-file-row" key={file.id}>
-                      <span className="project-file-icon">
-                        <FileText size={16} />
-                      </span>
-                      <span>
-                        <strong>{file.name}</strong>
-                        <small>{formatBytes(file.size)}</small>
-                      </span>
-                      <button
-                        type="button"
-                        aria-label={`从项目移除 ${file.name}`}
-                        onClick={() =>
-                          setState((current) => ({
-                            ...current,
-                            projects: current.projects.map((project) =>
-                              project.id === projectPage.id
-                                ? {
-                                    ...project,
-                                    fileIds: (project.fileIds ?? []).filter(
-                                      (fileId) => fileId !== file.id,
-                                    ),
-                                  }
-                                : project,
-                            ),
-                          }))
-                        }
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
-                  ))}
-                  {!projectFiles.length && (
-                    <div className="project-files-empty">
-                      <FolderOpen size={20} />
-                      <p>还没有项目文件</p>
-                    </div>
-                  )}
-                </div>
-              </div>
+              )}
             </div>
           </section>
         )}
@@ -4722,10 +4956,45 @@ export default function EasyWorkApp() {
           </div>
         </Modal>
       )}
+      {projectPendingDelete && (
+        <Modal title="删除项目？" onClose={() => setProjectPendingDelete(null)}>
+          <div className="delete-conversation-dialog">
+            <p>
+              “{projectPendingDelete.name}”及其中的对话将被删除。文件库中的原文件会保留。
+            </p>
+            <div className="modal-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setProjectPendingDelete(null)}
+              >
+                取消
+              </button>
+              <button
+                className="danger-button"
+                type="button"
+                onClick={() => deleteProject(projectPendingDelete.id)}
+              >
+                删除项目
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
       {projectModalOpen && (
         <ProjectModal
           onClose={() => setProjectModalOpen(false)}
           onCreate={createProject}
+        />
+      )}
+      {projectEditor && (
+        <ProjectEditModal
+          project={projectEditor.project}
+          mode={projectEditor.mode}
+          onClose={() => setProjectEditor(null)}
+          onSave={(updates) =>
+            updateProject(projectEditor.project.id, updates)
+          }
         />
       )}
       {projectLibraryModalOpen && projectPage && (
@@ -4789,7 +5058,7 @@ export default function EasyWorkApp() {
           onSave={saveServerProfile}
           onConnect={connectSsh}
           onDisconnect={disconnectSsh}
-          onRetry={() => setGatewayProbe((current) => current + 1)}
+          onGatewayEndpoint={configureGatewayEndpoint}
         />
       )}
       {agentConfigOpen && (
@@ -4926,6 +5195,93 @@ function ProjectModal({
           </button>
           <button className="primary-button" type="submit" disabled={!name.trim()}>
             创建项目
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function ProjectEditModal({
+  project,
+  mode,
+  onClose,
+  onSave,
+}: {
+  project: Project;
+  mode: "rename" | "settings";
+  onClose: () => void;
+  onSave: (updates: Pick<Project, "name" | "memoryMode">) => void;
+}) {
+  const [name, setName] = useState(project.name);
+  const [memoryMode, setMemoryMode] = useState<Project["memoryMode"]>(
+    project.memoryMode,
+  );
+  return (
+    <Modal
+      title={mode === "rename" ? "重命名项目" : "项目设置"}
+      onClose={onClose}
+    >
+      <form
+        className="modal-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave({ name, memoryMode });
+        }}
+      >
+        <label className="field">
+          <span>项目名称</span>
+          <input
+            autoFocus
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </label>
+        {mode === "settings" && (
+          <fieldset className="memory-mode-choice">
+            <legend>记忆范围</legend>
+            <label className={memoryMode === "default" ? "selected" : ""}>
+              <input
+                type="radio"
+                name="edit-memory-mode"
+                checked={memoryMode === "default"}
+                onChange={() => setMemoryMode("default")}
+              />
+              <span className="choice-icon">
+                <Network size={18} />
+              </span>
+              <span>
+                <strong>默认记忆</strong>
+                <small>使用全局记忆和本项目内容。</small>
+              </span>
+              <span className="radio-dot" />
+            </label>
+            <label
+              className={memoryMode === "project-only" ? "selected" : ""}
+            >
+              <input
+                type="radio"
+                name="edit-memory-mode"
+                checked={memoryMode === "project-only"}
+                onChange={() => setMemoryMode("project-only")}
+              />
+              <span className="choice-icon">
+                <FolderLock size={18} />
+              </span>
+              <span>
+                <strong>仅限项目内记忆</strong>
+                <small>只使用本项目的对话、文件和记忆。</small>
+              </span>
+              <span className="radio-dot" />
+            </label>
+          </fieldset>
+        )}
+        <div className="modal-actions">
+          <button className="secondary-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button" type="submit" disabled={!name.trim()}>
+            保存
           </button>
         </div>
       </form>
@@ -5419,7 +5775,7 @@ function ServerManagerModal({
   onSave,
   onConnect,
   onDisconnect,
-  onRetry,
+  onGatewayEndpoint,
 }: {
   profiles: ServerProfile[];
   connections: Record<string, ConnectionState>;
@@ -5449,7 +5805,7 @@ function ServerManagerModal({
     trustHost?: boolean;
   }) => void;
   onDisconnect: (serverId?: string) => void;
-  onRetry: () => void;
+  onGatewayEndpoint: (endpoint: string) => void;
 }) {
   const createId = () =>
     `server-${typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : Date.now()}`;
@@ -5477,6 +5833,9 @@ function ServerManagerModal({
   const [passphrase, setPassphrase] = useState("");
   const [otp, setOtp] = useState("");
   const [trustHost, setTrustHost] = useState(false);
+  const [serviceEndpoint, setServiceEndpoint] = useState(
+    readGatewayEndpoint() || gatewayEndpoint,
+  );
   const connection = connections[serverId] ?? {
     serverId,
     status: "disconnected",
@@ -5595,23 +5954,54 @@ function ServerManagerModal({
               </span>
               <h3>
                 {gatewayStatus === "checking"
-                  ? "正在检测本机网关"
-                  : "本机网关未连接"}
+                  ? "正在连接 EasyWork 服务"
+                  : "EasyWork 服务不可达"}
               </h3>
               <p>
                 {gatewayStatus === "checking"
                   ? "请稍候。"
-                  : "启动 frp 后重新检测。"}
+                  : "当前浏览器需要先连接一个 EasyWork 服务，才能代你发起 SSH。"}
               </p>
-              <button
-                className="primary-button"
-                type="button"
-                onClick={onRetry}
-                disabled={gatewayStatus === "checking"}
-              >
-                <RefreshCw size={15} />
-                重新检测
-              </button>
+              <div className="gateway-endpoint-editor">
+                <label className="field">
+                  <span>服务地址</span>
+                  <input
+                    value={serviceEndpoint}
+                    onChange={(event) =>
+                      setServiceEndpoint(event.target.value)
+                    }
+                    placeholder="https://easywork-gateway.example.com"
+                  />
+                </label>
+                <p>
+                  同一设备可使用本机服务；跨设备时填写可访问的服务地址。FRP
+                  只负责端口映射，不参与 SSH 登录。
+                </p>
+                <div className="modal-actions">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => {
+                      setServiceEndpoint("");
+                      onGatewayEndpoint("");
+                    }}
+                  >
+                    自动检测
+                  </button>
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={() => onGatewayEndpoint(serviceEndpoint)}
+                    disabled={
+                      gatewayStatus === "checking" ||
+                      !serviceEndpoint.trim()
+                    }
+                  >
+                    <RefreshCw size={15} />
+                    连接服务
+                  </button>
+                </div>
+              </div>
             </div>
           ) : connection.status === "connected" ? (
             <div className="connected-panel server-connected-panel">
@@ -5697,9 +6087,9 @@ function ServerManagerModal({
                 });
               }}
             >
-              <div className="gateway-online-line">
-                <CheckCircle2 size={15} />
-                本机网关已连接
+          <div className="gateway-online-line">
+            <CheckCircle2 size={15} />
+            EasyWork 服务已连接
                 {gatewayEndpoint && (
                   <span>
                     {gatewayEndpoint
@@ -6086,11 +6476,15 @@ function SshModal({
               <WifiOff size={22} />
             )}
           </span>
-          <h3>{gatewayStatus === "checking" ? "正在检测本机网关" : "本机网关未连接"}</h3>
+          <h3>
+            {gatewayStatus === "checking"
+              ? "正在连接 EasyWork 服务"
+              : "EasyWork 服务不可达"}
+          </h3>
           <p>
             {gatewayStatus === "checking"
               ? "请稍候。"
-              : "请在项目目录运行 frp/start.ps1，启动后重新检测。"}
+              : "请先运行 EasyWork 服务；跨设备时可单独配置一个可访问的服务地址。FRP 不是 SSH 前置条件。"}
           </p>
           <div className="modal-actions">
             <button className="secondary-button" type="button" onClick={onDemo}>
@@ -6133,7 +6527,7 @@ function SshModal({
       >
         <div className="gateway-online-line">
           <CheckCircle2 size={15} />
-          本机网关已连接
+          EasyWork 服务已连接
           {gatewayEndpoint && (
             <span>{gatewayEndpoint.replace(/^https?:\/\//, "").replace(/\/+$/, "")}</span>
           )}
@@ -6277,7 +6671,7 @@ function SshModal({
         <p className="security-line">
           {canRemember
             ? "连接成功后，用户名和私钥会加密保存到账号；私钥密码和验证码不会保存。"
-            : "私钥、密码和验证码仅进入本机网关内存。登录后可保存连接信息。"}
+            : "私钥、密码和验证码仅进入 EasyWork 服务内存。登录后可保存连接信息。"}
         </p>
         <div className="modal-actions spread">
           <button className="secondary-button" type="button" onClick={onDemo}>

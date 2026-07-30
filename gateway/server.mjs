@@ -893,21 +893,178 @@ async function callChatProvider(provider, apiKey, context, { test = false } = {}
   throw lastError || new Error("模型 API 请求失败");
 }
 
-async function runChatModel(actor, context, state) {
+function textFromContentPart(value) {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((item) =>
+      typeof item === "string"
+        ? item
+        : String(item?.text || item?.content || item?.output_text || ""),
+    )
+    .join("");
+}
+
+function extractModelReasoning(payload) {
+  const message = payload?.choices?.[0]?.message;
+  const chatReasoning =
+    message?.reasoning_content || message?.reasoning || message?.thinking;
+  if (typeof chatReasoning === "string") return chatReasoning;
+  const output = Array.isArray(payload?.output) ? payload.output : [];
+  return output
+    .filter((item) => /reasoning|thinking/i.test(String(item?.type || "")))
+    .flatMap((item) => item?.summary || item?.content || [])
+    .map((item) =>
+      typeof item === "string"
+        ? item
+        : String(item?.text || item?.content || ""),
+    )
+    .filter(Boolean)
+    .join("\n");
+}
+
+function providerStreamDelta(payload, protocol) {
+  let content = "";
+  let reasoning = "";
+  if (protocol === "chat-completions") {
+    const delta = payload?.choices?.[0]?.delta || {};
+    content = textFromContentPart(delta.content);
+    reasoning = textFromContentPart(
+      delta.reasoning_content || delta.reasoning || delta.thinking,
+    );
+    return { content, reasoning };
+  }
+
+  const type = String(payload?.type || "");
+  if (
+    type === "response.output_text.delta" ||
+    type === "response.content_part.delta"
+  ) {
+    content = textFromContentPart(payload.delta || payload.text);
+  } else if (
+    /reasoning.*delta|thinking.*delta/i.test(type) ||
+    type === "response.reasoning_summary_text.delta"
+  ) {
+    reasoning = textFromContentPart(payload.delta || payload.text);
+  }
+  return { content, reasoning };
+}
+
+async function callChatProviderStream(provider, apiKey, context, onDelta) {
+  assertApiKeyShape(apiKey);
+  const protocols =
+    provider.protocol === "responses" || provider.protocol === "chat-completions"
+      ? [provider.protocol]
+      : ["responses", "chat-completions"];
+  let lastError;
+
+  for (const protocol of protocols) {
+    const request = modelRequest(protocol, provider.model, context, false);
+    const response = await fetch(apiUrl(provider.baseUrl, request.endpoint), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ ...request.body, stream: true }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!response.ok) {
+      const diagnostic = (await response.text()).slice(0, 400);
+      lastError = new Error(
+        `模型 API 返回 ${response.status}${diagnostic ? `：${diagnostic}` : ""}`,
+      );
+      lastError.statusCode = 502;
+      if ([401, 403, 429].includes(response.status)) break;
+      continue;
+    }
+
+    const contentType = String(response.headers.get("content-type") || "");
+    if (!response.body || /application\/json/i.test(contentType)) {
+      const payload = await response.json();
+      const content = extractModelText(payload);
+      const reasoning = extractModelReasoning(payload);
+      if (reasoning) onDelta("reasoning", reasoning);
+      if (content) onDelta("content", content);
+      return { content, reasoning, protocol };
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    let content = "";
+    let reasoning = "";
+    let completedPayload;
+
+    const consumeLine = (rawLine) => {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("event:") || line.startsWith(":")) return;
+      const data = line.startsWith("data:") ? line.slice(5).trim() : line;
+      if (!data || data === "[DONE]") return;
+      let payload;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (payload?.type === "response.completed") {
+        completedPayload = payload.response;
+      }
+      const delta = providerStreamDelta(payload, protocol);
+      if (delta.reasoning) {
+        reasoning += delta.reasoning;
+        onDelta("reasoning", delta.reasoning);
+      }
+      if (delta.content) {
+        content += delta.content;
+        onDelta("content", delta.content);
+      }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() || "";
+      for (const line of lines) consumeLine(line);
+    }
+    pending += decoder.decode();
+    if (pending.trim()) consumeLine(pending);
+
+    if (!content && completedPayload) {
+      content = extractModelText(completedPayload);
+      if (content) onDelta("content", content);
+    }
+    if (!reasoning && completedPayload) {
+      reasoning = extractModelReasoning(completedPayload);
+      if (reasoning) onDelta("reasoning", reasoning);
+    }
+    return { content, reasoning, protocol };
+  }
+  throw lastError || new Error("模型 API 请求失败");
+}
+
+async function runChatModelStream(actor, context, state, onDelta) {
   const provider = state?.settings?.provider || {};
   const secrets = await getSecrets(actor);
   if (!provider.configured || !secrets.providerApiKey) {
-    return {
-      content: "尚未配置模型 API。请登录后在个人资料 → 模型 API 中完成设置。",
-      demo: true,
-    };
+    const content =
+      "尚未配置模型 API。请登录后在个人资料 → 模型 API 中完成设置。";
+    onDelta("content", content);
+    return { content, reasoning: "", demo: true };
   }
-  const { payload } = await callChatProvider(
+  const result = await callChatProviderStream(
     provider,
     secrets.providerApiKey,
     context,
+    onDelta,
   );
-  return { content: extractModelText(payload) || "模型返回了空内容。", demo: false };
+  if (!result.content) {
+    result.content = "模型返回了空内容。";
+    onDelta("content", result.content);
+  }
+  return { ...result, demo: false };
 }
 
 async function captureMemory(actor, prompt, projectId, memoryMode) {
@@ -981,6 +1138,10 @@ async function handleHttp(req, res) {
         actor,
         deviceToken: issueDeviceToken(actor),
         state: await stateForClient(actor),
+        capabilities: {
+          chatStream: true,
+          gatewayEndpointConfig: true,
+        },
       });
       return;
     }
@@ -1350,7 +1511,7 @@ async function handleHttp(req, res) {
       return;
     }
 
-    if (req.method === "POST" && url.pathname === "/api/chat") {
+    if (req.method === "POST" && url.pathname === "/api/chat/stream") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
       const context = await buildContext({
@@ -1359,24 +1520,58 @@ async function handleHttp(req, res) {
         prompt: String(body.prompt || ""),
         skillIds: Array.isArray(body.skillIds) ? body.skillIds : [],
         projectId: body.projectId ? String(body.projectId) : undefined,
-        memoryMode: body.memoryMode === "project-only" ? "project-only" : "default",
+        memoryMode:
+          body.memoryMode === "project-only" ? "project-only" : "default",
         conversationId: String(body.conversationId || ""),
       });
-      const result = await runChatModel(actor, context.text, context.state);
-      const title = body.firstTurn
-        ? await generateConversationTitle(
-            actor,
-            String(body.prompt || ""),
-            result.content,
-          )
-        : undefined;
-      await captureMemory(
-        actor,
-        String(body.prompt || ""),
-        body.projectId ? String(body.projectId) : undefined,
-        body.memoryMode === "project-only" ? "project-only" : "default",
-      );
-      sendJson(res, 200, { ...result, title, sources: context.sources });
+      res.writeHead(200, {
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-cache, no-store",
+        "X-Accel-Buffering": "no",
+        Connection: "keep-alive",
+      });
+      res.flushHeaders?.();
+      const sendEvent = (event) => {
+        if (!res.destroyed && !res.writableEnded) {
+          res.write(`${JSON.stringify(event)}\n`);
+        }
+      };
+      sendEvent({ type: "meta", sources: context.sources });
+      try {
+        const result = await runChatModelStream(
+          actor,
+          context.text,
+          context.state,
+          (kind, delta) => sendEvent({ type: `${kind}_delta`, delta }),
+        );
+        const title = body.firstTurn
+          ? await generateConversationTitle(
+              actor,
+              String(body.prompt || ""),
+              result.content,
+            )
+          : undefined;
+        await captureMemory(
+          actor,
+          String(body.prompt || ""),
+          body.projectId ? String(body.projectId) : undefined,
+          body.memoryMode === "project-only" ? "project-only" : "default",
+        );
+        if (title) sendEvent({ type: "title", title });
+        sendEvent({
+          type: "done",
+          content: result.content,
+          reasoning: result.reasoning,
+          demo: result.demo,
+        });
+      } catch (caught) {
+        sendEvent({
+          type: "error",
+          error:
+            caught instanceof Error ? caught.message : "模型流式请求失败",
+        });
+      }
+      if (!res.writableEnded) res.end();
       return;
     }
 
@@ -2350,11 +2545,18 @@ function parseOpenCodeLine(line, state) {
     };
   }
   if (type === "reasoning") {
+    if (!(state.reasoningParts instanceof Map)) {
+      state.reasoningParts = new Map();
+    }
+    const reasoningText = String(part.text || payload.text || "");
+    const reasoningKey = sourceId || `reasoning-${state.reasoningParts.size}`;
+    if (reasoningText) state.reasoningParts.set(reasoningKey, reasoningText);
+    state.reasoningText = [...state.reasoningParts.values()].join("\n\n");
     return {
       sourceId,
       kind: "reasoning",
-      title: "正在分析下一步",
-      detail: String(part.text || "").slice(0, 500),
+      title: "思考",
+      output: state.reasoningText.slice(-16_000),
       status: "running",
     };
   }
@@ -2568,6 +2770,8 @@ async function runRemoteWork(socket, session, actor, payload) {
   const parserState = {
     sessionId: boundSessionId,
     finalText: "",
+    reasoningText: "",
+    reasoningParts: new Map(),
     lastError: "",
     eventIndex: 0,
     stepIndex: 0,

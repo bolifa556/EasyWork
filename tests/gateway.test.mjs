@@ -451,7 +451,7 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     assert.equal(indexed.status, "keyword-only");
     assert.ok(indexed.chunks >= 1);
 
-    const chatResponse = await fetch(`${base}/api/chat`, {
+    const chatResponse = await fetch(`${base}/api/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: cookies },
       body: JSON.stringify({
@@ -462,9 +462,17 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       }),
     });
     assert.equal(chatResponse.status, 200);
-    const chat = await chatResponse.json();
-    assert.equal(chat.demo, true);
-    assert.ok(chat.sources.includes("cluster-notes.txt"));
+    const chatEvents = (await chatResponse.text())
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    const chatDone = chatEvents.find((event) => event.type === "done");
+    assert.equal(chatDone.demo, true);
+    assert.ok(
+      chatEvents
+        .find((event) => event.type === "meta")
+        .sources.includes("cluster-notes.txt"),
+    );
 
     const events = [];
     await new Promise((resolve, reject) => {
@@ -997,6 +1005,30 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
       return;
     }
     if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      const parsedBody = JSON.parse(requestBody || "{}");
+      if (parsedBody.stream) {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+        });
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [{ delta: { reasoning_content: "先检查上下文。" } }],
+          })}\n\n`,
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [{ delta: { content: "流式" } }],
+          })}\n\n`,
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [{ delta: { content: "回答" } }],
+          })}\n\n`,
+        );
+        res.end("data: [DONE]\n\n");
+        return;
+      }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -1083,6 +1115,61 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
     });
     assert.equal(testResponse.status, 200);
     assert.equal((await testResponse.json()).protocol, "chat-completions");
+
+    const bootstrapResponse = await fetch(`${base}/api/bootstrap`);
+    assert.equal(bootstrapResponse.status, 200);
+    const bootstrapPayload = await bootstrapResponse.json();
+    assert.equal(bootstrapPayload.capabilities.chatStream, true);
+    const authorization = `Bearer ${bootstrapPayload.deviceToken}`;
+    const saveProviderResponse = await fetch(`${base}/api/settings/provider`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authorization,
+      },
+      body: JSON.stringify({
+        baseUrl: providerBase,
+        apiKey: "test-key",
+        model: "chat-model",
+        protocol: "chat-completions",
+      }),
+    });
+    assert.equal(saveProviderResponse.status, 200);
+    const streamResponse = await fetch(`${base}/api/chat/stream`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authorization,
+      },
+      body: JSON.stringify({
+        conversationId: "stream-test",
+        prompt: "测试流式输出",
+        firstTurn: false,
+      }),
+    });
+    assert.equal(streamResponse.status, 200);
+    assert.match(
+      streamResponse.headers.get("content-type"),
+      /application\/x-ndjson/,
+    );
+    const streamEvents = (await streamResponse.text())
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      streamEvents
+        .filter((event) => event.type === "content_delta")
+        .map((event) => event.delta),
+      ["流式", "回答"],
+    );
+    assert.equal(
+      streamEvents.find((event) => event.type === "reasoning_delta")?.delta,
+      "先检查上下文。",
+    );
+    assert.equal(
+      streamEvents.find((event) => event.type === "done")?.content,
+      "流式回答",
+    );
 
     const plannedSteps = await gatewayTestHelpers.planWorkSteps(
       {
