@@ -1093,6 +1093,7 @@ function ScrollingTitle({ title }: { title: string }) {
 function ConversationRow({
   conversation,
   active,
+  nested = false,
   projects,
   menuOpen,
   onSelect,
@@ -1102,6 +1103,7 @@ function ConversationRow({
 }: {
   conversation: Conversation;
   active: boolean;
+  nested?: boolean;
   projects: Project[];
   menuOpen: boolean;
   onSelect: () => void;
@@ -1111,9 +1113,12 @@ function ConversationRow({
 }) {
   const destinations = projects.filter((project) => project.id !== conversation.projectId);
   return (
-    <div className={`chat-row${active ? " active" : ""}`}>
+    <div
+      className={`chat-row${nested ? " project-chat-row" : ""}${
+        active ? " active" : ""
+      }`}
+    >
       <button className="chat-row-main" type="button" onClick={onSelect}>
-        <span className={`mode-dot ${conversation.mode}`} />
         <ScrollingTitle title={conversation.title} />
       </button>
       <button
@@ -1221,6 +1226,7 @@ export default function EasyWorkApp() {
   const [sending, setSending] = useState(false);
   const [toast, setToast] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+  const [sidebarSearchOpen, setSidebarSearchOpen] = useState(false);
   const [fileSearch, setFileSearch] = useState("");
   const [memoryFilter, setMemoryFilter] = useState<"all" | "global" | "project">(
     "all",
@@ -1229,6 +1235,7 @@ export default function EasyWorkApp() {
   const [editingMemoryId, setEditingMemoryId] = useState("");
   const [editingMemoryText, setEditingMemoryText] = useState("");
   const [conversationMenuId, setConversationMenuId] = useState("");
+  const [projectMenuId, setProjectMenuId] = useState("");
   const [conversationPendingDelete, setConversationPendingDelete] =
     useState<Conversation | null>(null);
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
@@ -2051,6 +2058,7 @@ export default function EasyWorkApp() {
     setView("chat");
     setRightRailOpen(false);
     setConversationMenuId("");
+    setProjectMenuId("");
     setModeMenuOpen(false);
     setSidebarOpen(false);
     window.setTimeout(() => textareaRef.current?.focus(), 0);
@@ -2065,6 +2073,7 @@ export default function EasyWorkApp() {
     setView("chat");
     setRightRailOpen(false);
     setConversationMenuId("");
+    setProjectMenuId("");
     setModeMenuOpen(false);
     setSidebarOpen(false);
     window.setTimeout(() => textareaRef.current?.focus(), 0);
@@ -2078,6 +2087,7 @@ export default function EasyWorkApp() {
     setView("project");
     setRightRailOpen(false);
     setConversationMenuId("");
+    setProjectMenuId("");
     setSidebarOpen(false);
   };
 
@@ -2147,6 +2157,28 @@ export default function EasyWorkApp() {
       return;
     }
     setDraftServerId(serverId);
+  };
+
+  const saveServerProfile = (profile: ServerProfile) => {
+    setState((current) => ({
+      ...current,
+      settings: {
+        ...current.settings,
+        servers: [
+          profile,
+          ...current.settings.servers.filter((item) => item.id !== profile.id),
+        ],
+        lastServerId: profile.id,
+      },
+    }));
+    setSelectedServerId(profile.id);
+    if (
+      sshModalContext === "conversation" &&
+      !activeConversation?.work?.serverId
+    ) {
+      setDraftServerId(profile.id);
+    }
+    showToast("服务器配置已保存");
   };
 
   const moveConversation = (conversationId: string, projectId?: string) => {
@@ -3037,14 +3069,27 @@ export default function EasyWorkApp() {
               <strong>EasyWork</strong>
             </span>
           </button>
-          <button
-            className="icon-button sidebar-close"
-            type="button"
-            onClick={() => setSidebarOpen(false)}
-            aria-label="关闭菜单"
-          >
-            <X size={17} />
-          </button>
+          <div className="brand-row-actions">
+            <button
+              className={`icon-button sidebar-search-toggle${
+                sidebarSearchOpen ? " active" : ""
+              }`}
+              type="button"
+              onClick={() => setSidebarSearchOpen((current) => !current)}
+              aria-label={sidebarSearchOpen ? "关闭搜索" : "搜索聊天"}
+              aria-expanded={sidebarSearchOpen}
+            >
+              <Search size={17} />
+            </button>
+            <button
+              className="icon-button sidebar-close"
+              type="button"
+              onClick={() => setSidebarOpen(false)}
+              aria-label="关闭菜单"
+            >
+              <X size={17} />
+            </button>
+          </div>
         </div>
 
         <div className="sidebar-primary">
@@ -3095,20 +3140,23 @@ export default function EasyWorkApp() {
           </button>
         </div>
 
-        <div className="sidebar-search">
-          <Search size={15} />
-          <input
-            value={searchQuery}
-            onChange={(event) => setSearchQuery(event.target.value)}
-            placeholder="搜索聊天"
-            aria-label="搜索聊天"
-          />
-          {searchQuery && (
-            <button type="button" onClick={() => setSearchQuery("")} aria-label="清空搜索">
-              <X size={13} />
-            </button>
-          )}
-        </div>
+        {(sidebarSearchOpen || searchQuery) && (
+          <div className="sidebar-search">
+            <Search size={15} />
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="搜索聊天"
+              aria-label="搜索聊天"
+              autoFocus={sidebarSearchOpen}
+            />
+            {searchQuery && (
+              <button type="button" onClick={() => setSearchQuery("")} aria-label="清空搜索">
+                <X size={13} />
+              </button>
+            )}
+          </div>
+        )}
 
         <div className="sidebar-scroll">
           <div className="section-label">
@@ -3122,38 +3170,122 @@ export default function EasyWorkApp() {
             </button>
           </div>
           <div className="project-list">
-            {state.projects.map((project) => (
-              <div
-                className={`project-list-item${
-                  view === "project" && project.id === activeProjectId ? " active" : ""
-                }`}
-                key={project.id}
-              >
-                <button
-                  className="project-row"
-                  type="button"
-                  onClick={() => openProject(project.id)}
+            {state.projects.map((project) => {
+              const selected =
+                project.id === activeProjectId &&
+                (view === "project" ||
+                  activeConversation?.projectId === project.id ||
+                  (!activeConversation && draftProjectId === project.id));
+              const conversations = projectConversations(project.id);
+              return (
+                <div
+                  className={`project-nav-group${selected ? " selected" : ""}`}
+                  key={project.id}
                 >
-                  <span className="project-avatar">{project.icon}</span>
-                  <strong>{project.name}</strong>
-                </button>
-                <button
-                  className="project-new-chat"
-                  type="button"
-                  aria-label={`在“${project.name}”中新建聊天`}
-                  onClick={() => beginConversation(project.id)}
-                >
-                  <Plus size={15} />
-                </button>
-              </div>
-            ))}
+                  <div
+                    className={`project-list-item${selected ? " active" : ""}`}
+                  >
+                    <button
+                      className="project-row"
+                      type="button"
+                      onClick={() => openProject(project.id)}
+                    >
+                      <Folder size={17} />
+                      <span className="project-title" title={project.name}>
+                        {project.name}
+                      </span>
+                    </button>
+                    <div className="project-row-actions">
+                      <button
+                        className="project-new-chat"
+                        type="button"
+                        aria-label={`在“${project.name}”中新建聊天`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          beginConversation(project.id);
+                        }}
+                      >
+                        <Pencil size={14} />
+                      </button>
+                      <button
+                        className="project-more-button"
+                        type="button"
+                        aria-label={`打开“${project.name}”的项目选项`}
+                        aria-expanded={projectMenuId === project.id}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setProjectMenuId((current) =>
+                            current === project.id ? "" : project.id,
+                          );
+                        }}
+                      >
+                        <Ellipsis size={16} />
+                      </button>
+                    </div>
+                    {projectMenuId === project.id && (
+                      <div className="conversation-menu project-menu" role="menu">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            openProject(project.id);
+                            setProjectMenuId("");
+                          }}
+                        >
+                          <FolderOpen size={15} />
+                          打开项目
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            beginConversation(project.id);
+                            setProjectMenuId("");
+                          }}
+                        >
+                          <Pencil size={15} />
+                          新聊天
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  {selected && conversations.length > 0 && (
+                    <div className="project-sidebar-chats">
+                      {conversations.map((conversation) => (
+                        <ConversationRow
+                          key={conversation.id}
+                          conversation={conversation}
+                          active={
+                            conversation.id === activeConversationId &&
+                            view === "chat"
+                          }
+                          nested
+                          projects={state.projects}
+                          menuOpen={conversationMenuId === conversation.id}
+                          onSelect={() => selectConversation(conversation)}
+                          onToggleMenu={() =>
+                            setConversationMenuId((current) =>
+                              current === conversation.id ? "" : conversation.id,
+                            )
+                          }
+                          onMove={(projectId) =>
+                            moveConversation(conversation.id, projectId)
+                          }
+                          onDelete={() => {
+                            setConversationPendingDelete(conversation);
+                            setConversationMenuId("");
+                          }}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
 
           <div className="section-label chat-section-label">
             <span>聊天</span>
-            <button type="button" onClick={() => beginConversation()} aria-label="新建聊天">
-              <Plus size={15} />
-            </button>
           </div>
           <div className="general-chats">
             {generalConversations.map((conversation) => (
@@ -3325,22 +3457,6 @@ export default function EasyWorkApp() {
                   </button>
                 )}
               </>
-            )}
-            {view === "chat" && activeConversation && (
-              <button
-                className={`icon-button rail-toggle-button${
-                  rightRailOpen ? " open" : ""
-                }`}
-                type="button"
-                onClick={() => setRightRailOpen((current) => !current)}
-                aria-label={rightRailOpen ? "收起对话记录" : "打开对话记录"}
-              >
-                {rightRailOpen ? (
-                  <ChevronRight size={17} />
-                ) : (
-                  <ChevronLeft size={17} />
-                )}
-              </button>
             )}
           </div>
         </header>
@@ -3542,22 +3658,6 @@ export default function EasyWorkApp() {
                       </div>
                     )}
                   </div>
-                )}
-                {activeConversation && (
-                  <button
-                    className={`icon-button rail-toggle-button${
-                      rightRailOpen ? " open" : ""
-                    }`}
-                    type="button"
-                    onClick={() => setRightRailOpen((current) => !current)}
-                    aria-label={rightRailOpen ? "收起对话记录" : "打开对话记录"}
-                  >
-                    {rightRailOpen ? (
-                      <ChevronRight size={17} />
-                    ) : (
-                      <ChevronLeft size={17} />
-                    )}
-                  </button>
                 )}
               </div>
             </div>
@@ -4451,16 +4551,39 @@ export default function EasyWorkApp() {
       </main>
 
       {view === "chat" && activeConversation && (
-        <aside
-          className={`right-rail${mode === "chat" ? " chat-rail" : ""}${
-            rightRailOpen ? " mobile-open" : ""
-          }`}
-        >
+        <>
+          <button
+            className={`rail-edge-toggle${rightRailOpen ? " open" : ""}`}
+            type="button"
+            onClick={() => setRightRailOpen((current) => !current)}
+            aria-label={rightRailOpen ? "收起对话记录" : "展开对话记录"}
+            aria-expanded={rightRailOpen}
+          >
+            {rightRailOpen ? (
+              <ChevronRight size={16} />
+            ) : (
+              <ChevronLeft size={16} />
+            )}
+          </button>
+          <aside
+            className={`right-rail${mode === "chat" ? " chat-rail" : ""}${
+              rightRailOpen ? " mobile-open" : ""
+            }`}
+          >
           {mode === "work" && (
             <section className={`remote-connection-panel ${connection.status}`}>
             <div className="remote-connection-heading">
               <span>远程连接</span>
-              <i />
+              <span className="remote-connection-state">
+                <i />
+                {connection.status === "connected"
+                  ? "已连接"
+                  : connection.status === "connecting"
+                    ? "连接中"
+                    : connection.status === "error"
+                      ? "连接失败"
+                      : "未连接"}
+              </span>
             </div>
             <strong>
               {activeServerProfile?.name ||
@@ -4497,14 +4620,6 @@ export default function EasyWorkApp() {
 
           <header className="right-rail-header">
             <h2>对话记录</h2>
-            <button
-              className="icon-button right-rail-close"
-              type="button"
-              onClick={() => setRightRailOpen(false)}
-              aria-label="关闭对话记录"
-            >
-              <ChevronRight size={17} />
-            </button>
           </header>
 
           <div className="trace-list">
@@ -4580,7 +4695,8 @@ export default function EasyWorkApp() {
                 );
               })}
           </div>
-        </aside>
+          </aside>
+        </>
       )}
 
       {conversationPendingDelete && (
@@ -4670,6 +4786,7 @@ export default function EasyWorkApp() {
           onSelect={selectServerForModal}
           onClose={() => setSshModalOpen(false)}
           onDemo={connectDemo}
+          onSave={saveServerProfile}
           onConnect={connectSsh}
           onDisconnect={disconnectSsh}
           onRetry={() => setGatewayProbe((current) => current + 1)}
@@ -5299,6 +5416,7 @@ function ServerManagerModal({
   onSelect,
   onClose,
   onDemo,
+  onSave,
   onConnect,
   onDisconnect,
   onRetry,
@@ -5313,6 +5431,7 @@ function ServerManagerModal({
   onSelect: (serverId: string) => void;
   onClose: () => void;
   onDemo: () => void;
+  onSave: (profile: ServerProfile) => void;
   onConnect: (payload: {
     serverId: string;
     name?: string;
@@ -5364,6 +5483,29 @@ function ServerManagerModal({
     label: "尚未连接",
   };
   const selectedProfile = profiles.find((profile) => profile.id === serverId);
+  const normalizedPort = Number(port) || 22;
+  const keepsSavedCredential = Boolean(
+    selectedProfile?.configured &&
+      useSavedCredential &&
+      selectedProfile.host === host.trim() &&
+      selectedProfile.port === normalizedPort &&
+      selectedProfile.username === username.trim() &&
+      (selectedProfile.authMethod || "key") === authMethod,
+  );
+  const profileDraft = (): ServerProfile => ({
+    id: serverId,
+    name: name.trim() || host.trim(),
+    host: host.trim(),
+    port: normalizedPort,
+    username: username.trim(),
+    keyName:
+      authMethod === "key"
+        ? privateKeyName || selectedProfile?.keyName || ""
+        : "",
+    authMethod,
+    configured: keepsSavedCredential,
+    lastConnectedAt: selectedProfile?.lastConnectedAt,
+  });
 
   const chooseProfile = (profile: ServerProfile) => {
     setServerId(profile.id);
@@ -5498,6 +5640,32 @@ function ServerManagerModal({
                 >
                   <WifiOff size={15} />
                   断开
+                </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() =>
+                    onSave({
+                      id: serverId,
+                      name:
+                        selectedProfile?.name ||
+                        connection.host ||
+                        "远程服务器",
+                      host: connection.host || selectedProfile?.host || "",
+                      port:
+                        connection.port || selectedProfile?.port || 22,
+                      username:
+                        connection.username || selectedProfile?.username || "",
+                      keyName: selectedProfile?.keyName || "",
+                      authMethod: selectedProfile?.authMethod || "key",
+                      configured: Boolean(selectedProfile?.configured),
+                      lastConnectedAt:
+                        selectedProfile?.lastConnectedAt || now(),
+                    })
+                  }
+                >
+                  <Save size={15} />
+                  保存
                 </button>
                 <button className="primary-button" type="button" onClick={onClose}>
                   完成
@@ -5775,10 +5943,19 @@ function ServerManagerModal({
               )}
               <p className="security-line">
                 {canRemember
-                  ? "连接成功后，服务器信息和登录凭据会加密保存到账号。"
-                  : "登录账号后可跨设备保存服务器配置。"}
+                  ? "保存服务器信息；登录凭据会在连接成功后加密保存。"
+                  : "访客配置保存在临时数据中，登录后可跨设备使用。"}
               </p>
               <div className="modal-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => onSave(profileDraft())}
+                  disabled={!host.trim() || !port || !username.trim()}
+                >
+                  <Save size={15} />
+                  保存
+                </button>
                 <button
                   className="primary-button"
                   type="submit"

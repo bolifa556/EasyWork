@@ -8550,3 +8550,438 @@ body {
     padding: 18px 16px 24px;
   }
 }
+
+/* ChatGPT-style navigation and an edge-mounted activity rail control. */
+.easywork-app.easywork-app .left-sidebar {
+  border-right-color: #e6e6e6;
+  background: #f8f8f8;
+}
+
+.easywork-app.easywork-app .brand-row {
+  min-height: 58px;
+  padding: 8px 10px 7px 12px;
+}
+
+.brand-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.easywork-app.easywork-app .sidebar-search-toggle {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 9px;
+  color: #6d6d6d;
+}
+
+.easywork-app.easywork-app .sidebar-search-toggle:hover,
+.easywork-app.easywork-app .sidebar-search-toggle.active {
+  border: 0;
+  background: #e9e9e9;
+  color: #202020;
+}
+
+.easywork-app.easywork-app .sidebar-primary {
+  gap: 1px;
+  padding: 3px 10px 8px;
+}
+
+.easywork-app.easywork-app .new-chat-button,
+.easywork-app.easywork-app .sidebar-nav-item {
+  min-height: 38px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  box-shadow: none;
+  padding: 0 9px;
+  color: #262626;
+  font-size: 13.5px !important;
+  font-weight: 430;
+  transform: none;
+}
+
+.easywork-app.easywork-app .new-chat-button {
+  margin-bottom: 2px;
+}
+
+.easywork-app.easywork-app .new-chat-button:hover,
+.easywork-app.easywork-app .sidebar-nav-item:hover,
+.easywork-app.easywork-app .sidebar-nav-item.active {
+  border: 0;
+  background: #eaeaea;
+  box-shadow: none;
+  color: #171717;
+  font-weight: 430;
+  transform: none;
+}
+
+.easywork-app.easywork-app .sidebar-search {
+  min-height: 38px;
+  margin: 2px 10px 6px;
+  border: 1px solid #dedede;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 3%);
+  color: #737373;
+  animation: sidebar-search-reveal 160ms ease-out both;
+}
+
+.easywork-app.easywork-app .sidebar-search:focus-within {
+  border-color: #bcbcbc;
+  background: #fff;
+  box-shadow: 0 0 0 3px rgb(0 0 0 / 5%);
+}
+
+.easywork-app.easywork-app .sidebar-search input {
+  color: #242424;
+  font-size: 13px !important;
+}
+
+@keyframes sidebar-search-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.easywork-app.easywork-app .sidebar-scroll {
+  padding: 5px 8px 18px;
+}
+
+.easywork-app.easywork-app .section-label {
+  min-height: 36px;
+  padding: 10px 7px 5px;
+  color: #171717;
+  font-size: 12.5px !important;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.easywork-app.easywork-app .chat-section-label {
+  margin-top: 16px;
+}
+
+.project-nav-group {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.easywork-app.easywork-app .project-list-item {
+  position: relative;
+  display: grid;
+  min-height: 36px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-radius: 9px;
+  background: transparent;
+  padding: 0 3px;
+  transition: background 120ms ease;
+}
+
+.easywork-app.easywork-app .project-list-item:hover,
+.easywork-app.easywork-app .project-list-item.active {
+  background: #e9e9e9;
+}
+
+.easywork-app.easywork-app .project-list-item .project-row {
+  display: grid;
+  min-width: 0;
+  min-height: 36px;
+  grid-template-columns: 19px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  border-radius: 8px;
+  background: transparent;
+  padding: 0 5px;
+  color: #252525;
+}
+
+.easywork-app.easywork-app .project-list-item .project-row:hover {
+  background: transparent;
+}
+
+.project-title {
+  overflow: hidden;
+  color: #252525;
+  font-size: 13.5px !important;
+  font-weight: 430;
+  line-height: 1.25;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.easywork-app.easywork-app .project-list-item.active .project-title {
+  color: #252525;
+  font-weight: 430;
+}
+
+.project-row-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0;
+  opacity: 0;
+  transition: opacity 110ms ease;
+}
+
+.project-list-item:hover .project-row-actions,
+.project-list-item.active .project-row-actions,
+.project-row-actions:focus-within {
+  opacity: 1;
+}
+
+.project-new-chat,
+.project-more-button {
+  display: grid;
+  width: 26px;
+  height: 28px;
+  place-items: center;
+  border-radius: 7px;
+  background: transparent;
+  color: #6a6a6a;
+}
+
+.project-new-chat {
+  opacity: 1;
+}
+
+.project-new-chat:hover,
+.project-more-button:hover,
+.project-more-button[aria-expanded="true"] {
+  background: #dadada;
+  color: #171717;
+}
+
+.project-menu {
+  top: calc(100% + 3px);
+  right: 2px;
+  width: 190px;
+}
+
+.project-sidebar-chats {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+  padding-left: 27px;
+}
+
+.easywork-app.easywork-app .chat-row {
+  min-height: 36px;
+  grid-template-columns: minmax(0, 1fr) 29px;
+  border-radius: 9px;
+  background: transparent;
+  padding: 0 3px;
+  transition: background 120ms ease;
+}
+
+.easywork-app.easywork-app .chat-row:hover,
+.easywork-app.easywork-app .chat-row.active {
+  background: #e9e9e9;
+}
+
+.easywork-app.easywork-app .chat-row-main {
+  display: grid;
+  min-width: 0;
+  height: 36px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 0;
+  border-radius: 8px;
+  padding: 0 6px;
+}
+
+.easywork-app.easywork-app .project-chat-row .chat-row-main {
+  padding-left: 6px;
+}
+
+.easywork-app.easywork-app .chat-title-viewport {
+  mask-image: linear-gradient(to right, #000 91%, transparent);
+}
+
+.easywork-app.easywork-app .chat-title-viewport > span,
+.easywork-app.easywork-app .chat-row.active .chat-title-viewport > span {
+  color: #2b2b2b;
+  font-family:
+    Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 13.5px !important;
+  font-weight: 430;
+  letter-spacing: 0;
+}
+
+.easywork-app.easywork-app .chat-row-menu-button {
+  width: 27px;
+  height: 28px;
+  border-radius: 7px;
+  color: #686868;
+}
+
+.easywork-app.easywork-app .chat-row-menu-button:hover,
+.easywork-app.easywork-app .chat-row-menu-button[aria-expanded="true"] {
+  background: #dadada;
+  color: #171717;
+}
+
+.easywork-app.easywork-app .profile-wrap {
+  border-top-color: #e4e4e4;
+  background: #f8f8f8;
+}
+
+.rail-edge-toggle {
+  position: fixed;
+  z-index: 64;
+  top: 50%;
+  right: 0;
+  display: grid;
+  width: 27px;
+  height: 66px;
+  place-items: center;
+  border: 1px solid rgb(79 73 59 / 15%);
+  border-right: 0;
+  border-radius: 11px 0 0 11px;
+  background: #f3eee2;
+  box-shadow:
+    -4px 8px 18px rgb(55 46 30 / 8%),
+    inset 0 1px rgb(255 255 255 / 55%);
+  clip-path: polygon(24% 0, 100% 9%, 100% 91%, 24% 100%, 0 70%, 0 30%);
+  color: #6b665b;
+  opacity: 0.92;
+  transition:
+    right 320ms cubic-bezier(0.22, 1, 0.36, 1),
+    background 150ms ease,
+    color 150ms ease,
+    opacity 150ms ease,
+    filter 150ms ease;
+}
+
+.easywork-app.with-task-rail .rail-edge-toggle {
+  right: var(--right-width);
+}
+
+.rail-edge-toggle:hover,
+.rail-edge-toggle:focus-visible,
+.rail-edge-toggle.open {
+  background: #e9e2d3;
+  color: #36432d;
+  opacity: 1;
+  filter: drop-shadow(-2px 5px 6px rgb(55 46 30 / 10%));
+}
+
+.remote-connection-panel {
+  position: relative;
+  gap: 8px;
+  border-bottom-color: rgb(79 73 59 / 10%);
+  padding: 14px 14px 13px 16px;
+  transition: background 180ms ease;
+}
+
+.remote-connection-panel.connected {
+  background: linear-gradient(90deg, rgb(65 128 76 / 8%), transparent 72%);
+  box-shadow: inset 3px 0 #4f8b5a;
+}
+
+.remote-connection-panel.disconnected,
+.remote-connection-panel.error {
+  background: linear-gradient(90deg, rgb(172 66 54 / 7%), transparent 72%);
+  box-shadow: inset 3px 0 #b8574e;
+}
+
+.remote-connection-panel.connecting {
+  background: linear-gradient(90deg, rgb(171 119 47 / 8%), transparent 72%);
+  box-shadow: inset 3px 0 #b78645;
+}
+
+.remote-connection-heading {
+  color: #625e54;
+  font-size: 12px !important;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.remote-connection-state {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgb(172 66 54 / 18%);
+  border-radius: 999px;
+  background: #faece9;
+  padding: 0 8px;
+  color: #98453d;
+  font-size: 11px !important;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.remote-connection-heading .remote-connection-state i {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  background: #b8574e;
+  box-shadow: 0 0 0 3px rgb(184 87 78 / 11%);
+}
+
+.remote-connection-panel.connected .remote-connection-state {
+  border-color: rgb(65 128 76 / 20%);
+  background: #e8f4e9;
+  color: #347043;
+}
+
+.remote-connection-panel.connected
+  .remote-connection-heading
+  .remote-connection-state
+  i {
+  background: #4f8b5a;
+  box-shadow: 0 0 0 3px rgb(79 139 90 / 12%);
+}
+
+.remote-connection-panel.connecting .remote-connection-state {
+  border-color: rgb(171 119 47 / 20%);
+  background: #f7efdf;
+  color: #8a642e;
+}
+
+.remote-connection-panel.connecting
+  .remote-connection-heading
+  .remote-connection-state
+  i {
+  background: #b78645;
+  box-shadow: 0 0 0 3px rgb(183 134 69 / 12%);
+  animation: pulse 1.15s ease-in-out infinite;
+}
+
+.easywork-app.easywork-app .right-rail-header {
+  min-height: 45px;
+  padding: 12px 14px 5px;
+}
+
+.easywork-app.easywork-app .server-form .modal-actions {
+  gap: 8px;
+}
+
+@media (max-width: 980px) {
+  .rail-edge-toggle {
+    z-index: 62;
+  }
+
+  .easywork-app.with-task-rail .rail-edge-toggle {
+    right: min(350px, 92vw);
+  }
+}
+
+@media (max-width: 700px) {
+  .project-row-actions,
+  .easywork-app.easywork-app .chat-row-menu-button {
+    opacity: 1;
+  }
+}

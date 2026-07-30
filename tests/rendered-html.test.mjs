@@ -62,6 +62,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /\| "job_status"/);
   assert.match(app, /function fallbackConversationTitle/);
   assert.match(app, /function ScrollingTitle/);
+  assert.match(app, /project-sidebar-chats/);
+  assert.match(app, /rail-edge-toggle/);
+  assert.match(app, /remote-connection-state/);
+  assert.match(app, /onSave=\{saveServerProfile\}/);
   assert.match(app, /servers: ServerProfile\[\]/);
   assert.match(app, /type: "remote\.fs\.list"/);
   assert.match(app, /type: "agent\.config\.read"/);
@@ -80,6 +84,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /\.trace-detail-motion/);
   assert.match(css, /\.remote-terminal/);
   assert.match(css, /\.remote-connection-panel/);
+  assert.match(css, /\.remote-connection-state/);
+  assert.match(css, /\.rail-edge-toggle/);
+  assert.match(css, /clip-path:\s*polygon/);
+  assert.match(css, /\.project-sidebar-chats/);
   assert.match(css, /\.remote-file-manager/);
   assert.match(css, /@keyframes chat-title-scroll/);
   assert.match(css, /LLMGame-inspired conversation/);
