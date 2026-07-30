@@ -56,7 +56,14 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /function MarkdownContent/);
   assert.match(app, /\(conversation\.messages\?\.length \?\? 0\) > 0/);
   assert.match(app, /if \(socketRef\.current === socket\)/);
-  assert.match(app, /!\["result", "plan"\]\.includes\(event\.kind\)/);
+  assert.match(app, /type WorkEventKind/);
+  assert.match(app, /\| "approval_request"/);
+  assert.match(app, /\| "file_change"/);
+  assert.match(app, /\| "job_status"/);
+  assert.match(app, /function WorkEventFeed/);
+  assert.match(app, /className="trace-jump"/);
+  assert.match(app, /className="trace-toggle"/);
+  assert.match(app, /event\.status === "running" \|\| expandedCommands\.has/);
   assert.match(app, /转换为\{mode === "chat" \? "工作" : "聊天"\}模式/);
   assert.doesNotMatch(app, /const EMPTY_CONVERSATION_ID/);
   assert.match(app, /Embedding API/);
@@ -64,6 +71,9 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /grid-template-columns:\s*var\(--left-width\).*var\(--right-width\)/);
   assert.match(css, /@media \(max-width: 720px\)/);
   assert.match(css, /prefers-reduced-motion/);
+  assert.match(css, /\.trace-detail-motion/);
+  assert.match(css, /\.remote-terminal/);
+  assert.match(css, /LLMGame-inspired conversation/);
   assert.match(gateway, /keepaliveInterval:\s*15_000/);
   assert.match(gateway, /hostVerifier/);
   assert.match(gateway, /Access-Control-Allow-Private-Network/);
@@ -76,6 +86,9 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /errorPayload\?\.data\?\.message/);
   assert.match(gateway, /readOpenCodeFailureLog/);
   assert.match(gateway, /nextProvider\.protocol = storedProvider\.protocol/);
+  assert.match(gateway, /planWorkSteps/);
+  assert.match(gateway, /agentPromptWithWorkflow\(context\.text, steps\)/);
+  assert.match(gateway, /type: "workflow\.step"/);
 
   await assert.rejects(access(new URL("../app/_sites-preview/", import.meta.url)));
   for (const starterAsset of ["file.svg", "globe.svg", "window.svg"]) {

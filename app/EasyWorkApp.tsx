@@ -3,7 +3,6 @@
 import {
   Activity,
   ArrowDown,
-  ArrowRight,
   ArrowUp,
   BookOpen,
   Bot,
@@ -64,6 +63,20 @@ type Mode = "chat" | "work";
 type ViewName = "chat" | "project" | "library" | "skills" | "memory";
 type StepStatus = "pending" | "running" | "done" | "error";
 type EventStatus = "pending" | "running" | "done" | "error";
+type WorkEventKind =
+  | "message"
+  | "plan"
+  | "tool_call"
+  | "approval_request"
+  | "file_change"
+  | "job_status"
+  | "artifact"
+  | "error"
+  | "reasoning"
+  | "connection"
+  | "tool"
+  | "terminal"
+  | "result";
 
 type WorkflowStep = {
   id: string;
@@ -74,10 +87,13 @@ type WorkflowStep = {
 
 type WorkEvent = {
   id: string;
-  kind: "plan" | "tool" | "terminal" | "reasoning" | "result";
+  kind: WorkEventKind;
   title: string;
   detail?: string;
   output?: string;
+  command?: string;
+  path?: string;
+  language?: string;
   status: EventStatus;
   timestamp: string;
 };
@@ -751,6 +767,206 @@ function StatusGlyph({ status }: { status: StepStatus }) {
   );
 }
 
+function normalizedEventKind(kind: WorkEventKind): WorkEventKind {
+  if (kind === "tool" || kind === "terminal") return "tool_call";
+  if (kind === "result") return "message";
+  return kind;
+}
+
+function eventStatusLabel(status: EventStatus) {
+  if (status === "running") return "正在进行";
+  if (status === "done") return "已完成";
+  if (status === "error") return "失败";
+  return "等待";
+}
+
+function EventGlyph({ event }: { event: WorkEvent }) {
+  const kind = normalizedEventKind(event.kind);
+  if (event.status === "running") return <LoaderCircle size={14} />;
+  if (event.status === "error" || kind === "error") return <X size={13} />;
+  if (kind === "plan") return <Activity size={14} />;
+  if (kind === "approval_request") return <ShieldCheck size={14} />;
+  if (kind === "file_change") return <FileText size={14} />;
+  if (kind === "job_status") return <Gauge size={14} />;
+  if (kind === "artifact") return <FileArchive size={14} />;
+  if (kind === "reasoning") return <Brain size={14} />;
+  if (kind === "connection") return <Network size={14} />;
+  if (kind === "message") return <MessageCircle size={14} />;
+  return <Check size={13} />;
+}
+
+function CommandEventGroup({ events }: { events: WorkEvent[] }) {
+  const [expandedCommands, setExpandedCommands] = useState<Set<string>>(new Set());
+  const running = events.some((event) => event.status === "running");
+  const failed = events.some((event) => event.status === "error");
+  const groupLabel = running
+    ? `正在运行 ${events.length} 个命令`
+    : `运行了 ${events.length} 个命令`;
+
+  return (
+    <section className={`command-group${running ? " running" : ""}${failed ? " error" : ""}`}>
+      <header className="command-group-heading">
+        <span className="command-group-glyph">
+          {running ? <LoaderCircle size={14} /> : failed ? <X size={13} /> : <Terminal size={14} />}
+        </span>
+        <strong>{groupLabel}</strong>
+        <span>{running ? "远程终端活动中" : failed ? "部分命令失败" : "远程终端"}</span>
+      </header>
+      <div className="command-list">
+        {events.map((event) => {
+          const expanded = event.status === "running" || expandedCommands.has(event.id);
+          const command = event.command || event.title;
+          const panelId = `command-output-${event.id}`;
+          return (
+            <article
+              className={`command-event ${event.status}${expanded ? " expanded" : ""}`}
+              key={event.id}
+            >
+              <button
+                className="command-summary"
+                type="button"
+                aria-expanded={expanded}
+                aria-controls={panelId}
+                onClick={() =>
+                  setExpandedCommands((current) => {
+                    const next = new Set(current);
+                    if (next.has(event.id)) next.delete(event.id);
+                    else next.add(event.id);
+                    return next;
+                  })
+                }
+              >
+                <span className="command-status">
+                  {event.status === "running" ? (
+                    <LoaderCircle size={13} />
+                  ) : event.status === "error" ? (
+                    <X size={12} />
+                  ) : (
+                    <Terminal size={12} />
+                  )}
+                </span>
+                <code title={command}>{command}</code>
+                <small>{eventStatusLabel(event.status)}</small>
+                <ChevronDown size={13} />
+              </button>
+              <div className="command-output-motion" id={panelId}>
+                <div>
+                  <pre className="remote-terminal">
+                    <span className="terminal-caption">
+                      <i />
+                      {event.detail || "登录节点"}
+                    </span>
+                    <code>
+                      <b>$</b> {command}
+                      {event.output ? `\n${event.output}` : event.status === "running" ? "\n等待远端输出…" : ""}
+                    </code>
+                  </pre>
+                </div>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function AgentEventRow({
+  event,
+  onApproval,
+}: {
+  event: WorkEvent;
+  onApproval?: (event: WorkEvent, approved: boolean) => void;
+}) {
+  const kind = normalizedEventKind(event.kind);
+  return (
+    <article className={`agent-event ${kind} ${event.status}`}>
+      <span className="agent-event-glyph">
+        <EventGlyph event={event} />
+      </span>
+      <div className="agent-event-copy">
+        <strong>{event.title}</strong>
+        {event.detail && <small>{event.detail}</small>}
+        {event.path && <code className="agent-event-path">{event.path}</code>}
+        {event.output && kind !== "plan" && (
+          <div className="agent-event-output">
+            <MarkdownContent content={event.output} compact />
+          </div>
+        )}
+        {kind === "approval_request" && event.status === "pending" && onApproval && (
+          <div className="approval-actions">
+            <button type="button" onClick={() => onApproval(event, false)}>
+              拒绝
+            </button>
+            <button type="button" onClick={() => onApproval(event, true)}>
+              允许
+            </button>
+          </div>
+        )}
+      </div>
+      <span className="agent-event-status">{eventStatusLabel(event.status)}</span>
+    </article>
+  );
+}
+
+function WorkEventFeed({
+  events,
+  onApproval,
+  runStatus,
+}: {
+  events: WorkEvent[];
+  onApproval?: (event: WorkEvent, approved: boolean) => void;
+  runStatus?: RunTrace["status"];
+}) {
+  const visibleEvents = events
+    .filter((event) => normalizedEventKind(event.kind) !== "message")
+    .filter(
+      (event) =>
+        !(
+          normalizedEventKind(event.kind) === "plan" &&
+          /开始新步骤|开始推进下一步/.test(event.title)
+        ),
+    )
+    .map((event) =>
+      event.status === "running" && (runStatus === "done" || runStatus === "error")
+        ? {
+            ...event,
+            status: runStatus === "done" ? ("done" as const) : ("error" as const),
+          }
+        : event,
+    );
+  const segments: Array<
+    | { type: "commands"; id: string; events: WorkEvent[] }
+    | { type: "event"; id: string; event: WorkEvent }
+  > = [];
+
+  for (const event of visibleEvents) {
+    if (normalizedEventKind(event.kind) === "tool_call") {
+      const previous = segments.at(-1);
+      if (previous?.type === "commands") {
+        previous.events.push(event);
+      } else {
+        segments.push({ type: "commands", id: event.id, events: [event] });
+      }
+    } else {
+      segments.push({ type: "event", id: event.id, event });
+    }
+  }
+
+  if (!segments.length) return null;
+  return (
+    <div className="agent-activity" aria-label="Agent 调用过程">
+      {segments.map((segment) =>
+        segment.type === "commands" ? (
+          <CommandEventGroup events={segment.events} key={segment.id} />
+        ) : (
+          <AgentEventRow event={segment.event} key={segment.id} onApproval={onApproval} />
+        ),
+      )}
+    </div>
+  );
+}
+
 function ConversationRow({
   conversation,
   active,
@@ -940,9 +1156,12 @@ export default function EasyWorkApp() {
   const simulateWorkRun = useCallback(
     (conversationId: string, runId: string, prompt: string) => {
       const isMemoryQuestion = /内存|显存|资源|memory|gpu/i.test(prompt);
+      const isFileTask = /文件|代码|修改|编辑|脚本|报告/i.test(prompt);
       const steps = isMemoryQuestion
         ? ["查看服务器内存", "查看可用资源", "判断任务所需资源是否满足"]
-        : ["理解请求并确认工作目录", "执行任务", "检查结果并整理回复"];
+        : isFileTask
+          ? ["确认工作目录与约束", "检查相关文件", "执行修改", "验证并整理结果"]
+          : ["理解请求并确认工作目录", "执行任务", "检查结果并整理回复"];
       updateMessage(
         conversationId,
         (message) => message.runId === runId && message.role === "user",
@@ -977,15 +1196,27 @@ export default function EasyWorkApp() {
 
       const outputs = isMemoryQuestion
         ? [
-            "free -h\nMem: 251Gi total · 164Gi available",
-            "nvidia-smi\n4 × NVIDIA A100 80GB · 2 cards idle",
+            "Mem: 251Gi total · 164Gi available",
+            "4 × NVIDIA A100 80GB · 2 cards idle",
             "当前资源满足一次单卡推理或小规模微调任务。",
           ]
+        : isFileTask
+          ? [
+              "~/.easywork/tasks/current",
+              "train.py\nconfig.yaml\nREADME.md",
+              "已更新参数检查与错误提示。",
+              "验证通过，结果文件已生成。",
+            ]
         : [
-            "工作目录：~/.easywork/tasks/current",
+            "~/.easywork/tasks/current",
             "OpenCode 已完成本轮工具调用。",
             "验证通过，未发现阻塞问题。",
           ];
+      const commands = isMemoryQuestion
+        ? ["free -h", "nvidia-smi", "评估任务资源条件"]
+        : isFileTask
+          ? ["pwd", "rg --files", "apply_patch train.py", "python -m pytest"]
+        : ["pwd", "opencode run", "检查执行结果"];
 
       steps.forEach((title, index) => {
         window.setTimeout(
@@ -1022,10 +1253,31 @@ export default function EasyWorkApp() {
                   ),
                   {
                     id: `${runId}_tool_${index}`,
-                    kind: index === 0 ? "terminal" : "tool",
+                    kind:
+                      isFileTask && index === 2
+                        ? "file_change"
+                        : isFileTask &&
+                            index === steps.length - 1 &&
+                            /报告|结果文件|导出/i.test(prompt)
+                          ? "artifact"
+                          : index === steps.length - 1
+                            ? "job_status"
+                            : "tool_call",
                     title,
                     detail: index === 0 ? "bash · 登录节点" : "OpenCode · 算力平台",
                     output: outputs[index],
+                    command:
+                      index === steps.length - 1 || (isFileTask && index === 2)
+                        ? undefined
+                        : commands[index],
+                    path:
+                      isFileTask && index === 2
+                        ? "~/.easywork/tasks/current/train.py"
+                        : isFileTask &&
+                            index === steps.length - 1 &&
+                            /报告|结果文件|导出/i.test(prompt)
+                          ? "~/.easywork/tasks/current/report.md"
+                          : undefined,
                     status: "running",
                     timestamp: now(),
                   },
@@ -1075,7 +1327,7 @@ export default function EasyWorkApp() {
                   index === steps.length - 1
                     ? isMemoryQuestion
                       ? "检查完成。登录节点共有 251 GiB 内存，目前约 164 GiB 可用；GPU 队列中有 2 张 A100 处于空闲状态。按当前资源，轻量推理可以直接进行；如果是训练任务，我建议先提交一个小规模试跑并限制峰值内存。"
-                      : "任务已经完成，执行过程与验证结果都记录在下方。你可以展开右侧任务轨迹查看每一步，也可以继续在同一个 agent task 中追加要求。"
+                      : "任务已经完成。你可以在右侧展开执行流程，也可以继续在同一个 Agent 任务中追加要求。"
                     : message.content,
                 events: (message.events ?? []).map((event) =>
                   event.id === `${runId}_tool_${index}`
@@ -1151,11 +1403,20 @@ export default function EasyWorkApp() {
 
       if (type === "workflow") {
         const steps = Array.isArray(payload.steps)
-          ? payload.steps.map((step, index) => ({
-              id: `${runId}_step_${index}`,
-              title: String(step),
-              status: index === 0 ? ("running" as const) : ("pending" as const),
-            }))
+          ? payload.steps.map((step, index) => {
+              const incomingStep =
+                typeof step === "object" && step
+                  ? (step as Record<string, unknown>)
+                  : undefined;
+              return {
+                id: String(incomingStep?.id ?? `${runId}_step_${index}`),
+                title: String(incomingStep?.title ?? step),
+                status: String(
+                  incomingStep?.status ?? (index === 0 ? "running" : "pending"),
+                ) as StepStatus,
+                detail: incomingStep?.detail ? String(incomingStep.detail) : undefined,
+              };
+            })
           : [];
         updateMessage(
           conversationId,
@@ -1170,18 +1431,60 @@ export default function EasyWorkApp() {
             },
           }),
         );
+        setExpandedTraces((current) => {
+          const next = new Set(current);
+          next.add(runId);
+          return next;
+        });
+        return;
+      }
+
+      if (type === "workflow.step") {
+        const stepIndex = Number(payload.stepIndex);
+        const status = String(payload.status ?? "running") as StepStatus;
+        if (!Number.isInteger(stepIndex) || stepIndex < 0) return;
+        updateMessage(
+          conversationId,
+          (message) => message.runId === runId && message.role === "user",
+          (message) => ({
+            ...message,
+            trace: message.trace
+              ? {
+                  ...message.trace,
+                  status: status === "error" ? "error" : "running",
+                  steps: message.trace.steps.map((step, index) => ({
+                    ...step,
+                    status:
+                      index < stepIndex
+                        ? "done"
+                        : index === stepIndex
+                          ? status
+                          : step.status,
+                    detail:
+                      index === stepIndex && payload.detail
+                        ? String(payload.detail)
+                        : step.detail,
+                  })),
+                }
+              : message.trace,
+          }),
+        );
         return;
       }
 
       if (type === "agent.event") {
         const event = payload.event as Record<string, unknown>;
         const eventId = String(event.id ?? uid("event"));
+        const rawKind = String(event.kind ?? "tool_call") as WorkEventKind;
         const workEvent: WorkEvent = {
           id: eventId,
-          kind: String(event.kind ?? "tool") as WorkEvent["kind"],
+          kind: normalizedEventKind(rawKind),
           title: String(event.title ?? "Agent 事件"),
           detail: event.detail ? String(event.detail) : undefined,
           output: event.output ? String(event.output) : undefined,
+          command: event.command ? String(event.command) : undefined,
+          path: event.path ? String(event.path) : undefined,
+          language: event.language ? String(event.language) : undefined,
           status: String(event.status ?? "done") as EventStatus,
           timestamp: String(event.timestamp ?? now()),
         };
@@ -1194,7 +1497,7 @@ export default function EasyWorkApp() {
             return {
               ...message,
               content:
-                workEvent.kind === "result" && workEvent.output
+                normalizedEventKind(workEvent.kind) === "message" && workEvent.output
                   ? workEvent.output
                   : message.content,
               events: exists
@@ -1252,12 +1555,11 @@ export default function EasyWorkApp() {
                   result,
                   steps: message.trace.steps.map((step) => ({
                     ...step,
-                    status:
-                      step.status === "running"
-                        ? failed
-                          ? "error"
-                          : "done"
-                        : step.status,
+                    status: failed
+                      ? step.status === "running"
+                        ? "error"
+                        : step.status
+                      : "done",
                   })),
                 }
               : message.trace,
@@ -1664,6 +1966,44 @@ export default function EasyWorkApp() {
     setSending(false);
     showToast("已请求停止当前任务");
   };
+
+  const respondToApproval = useCallback(
+    (
+      conversationId: string,
+      runId: string,
+      event: WorkEvent,
+      approved: boolean,
+    ) => {
+      if (socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send(
+          JSON.stringify({
+            type: "work.approval",
+            conversationId,
+            runId,
+            eventId: event.id,
+            approved,
+          }),
+        );
+      }
+      updateMessage(
+        conversationId,
+        (message) => message.runId === runId && message.role === "assistant",
+        (message) => ({
+          ...message,
+          events: (message.events ?? []).map((item) =>
+            item.id === event.id
+              ? {
+                  ...item,
+                  detail: approved ? "用户已允许继续" : "用户已拒绝本次操作",
+                  status: approved ? "done" : "error",
+                }
+              : item,
+          ),
+        }),
+      );
+    },
+    [updateMessage],
+  );
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -2336,7 +2676,7 @@ export default function EasyWorkApp() {
                 className="icon-button mobile-activity-button"
                 type="button"
                 onClick={() => setRightRailOpen(true)}
-                aria-label="打开任务轨迹"
+                aria-label="打开对话记录"
               >
                 <Activity size={17} />
               </button>
@@ -2383,7 +2723,7 @@ export default function EasyWorkApp() {
                           )}
                         </span>
                         <div>
-                          <strong>{message.role === "user" ? actor.displayName : "EasyWork"}</strong>
+                          <strong>{message.role === "user" ? "你" : "EasyWork"}</strong>
                           <small>
                             {formatTime(message.createdAt)}
                             {message.mode === "work" && " · Work"}
@@ -2391,6 +2731,32 @@ export default function EasyWorkApp() {
                         </div>
                       </div>
                       <div className="message-body">
+                        {message.role === "assistant" &&
+                          message.mode === "work" &&
+                          !!message.events?.length && (
+                            <WorkEventFeed
+                              events={message.events}
+                              runStatus={
+                                activeConversation.messages.find(
+                                  (item) =>
+                                    item.role === "user" &&
+                                    item.runId &&
+                                    item.runId === message.runId,
+                                )?.trace?.status
+                              }
+                              onApproval={
+                                message.runId
+                                  ? (event, approved) =>
+                                      respondToApproval(
+                                        activeConversation.id,
+                                        message.runId!,
+                                        event,
+                                        approved,
+                                      )
+                                  : undefined
+                              }
+                            />
+                          )}
                         {message.content ? (
                           <div className="message-text">
                             {message.role === "assistant" ? (
@@ -2399,7 +2765,7 @@ export default function EasyWorkApp() {
                               message.content
                             )}
                           </div>
-                        ) : message.role === "assistant" ? (
+                        ) : message.role === "assistant" && !message.events?.length ? (
                           <div className="typing-row">
                             <span />
                             <span />
@@ -2418,54 +2784,6 @@ export default function EasyWorkApp() {
                                 </span>
                               ) : null;
                             })}
-                          </div>
-                        )}
-                        {message.events?.some(
-                          (event) => !["result", "plan"].includes(event.kind),
-                        ) && (
-                          <div className="work-event-stack">
-                            {message.events
-                              .filter(
-                                (event) => !["result", "plan"].includes(event.kind),
-                              )
-                              .map((event) => (
-                              <div
-                                className={`work-event ${event.kind} ${event.status}`}
-                                key={event.id}
-                              >
-                                <div className="work-event-icon">
-                                  {event.status === "running" ? (
-                                    <LoaderCircle size={15} />
-                                  ) : event.kind === "terminal" ? (
-                                    <Terminal size={15} />
-                                  ) : event.kind === "plan" ? (
-                                    <Activity size={15} />
-                                  ) : event.kind === "reasoning" ? (
-                                    <Brain size={15} />
-                                  ) : (
-                                    <Check size={15} />
-                                  )}
-                                </div>
-                                <div>
-                                  <strong>{event.title}</strong>
-                                  {event.detail && <small>{event.detail}</small>}
-                                  {event.output && event.kind !== "result" && (
-                                    <pre>
-                                      <code>{event.output}</code>
-                                    </pre>
-                                  )}
-                                </div>
-                                <span className="event-status">
-                                  {event.status === "running"
-                                    ? "运行中"
-                                    : event.status === "done"
-                                      ? "完成"
-                                      : event.status === "error"
-                                        ? "失败"
-                                        : "等待"}
-                                </span>
-                              </div>
-                            ))}
                           </div>
                         )}
                       </div>
@@ -3174,141 +3492,108 @@ export default function EasyWorkApp() {
 
       {view === "chat" && mode === "work" && (
         <aside className={`right-rail${rightRailOpen ? " mobile-open" : ""}`}>
-            <header className="right-rail-header">
-              <div>
-                <h2>任务轨迹</h2>
-              </div>
-              <div>
-                {activeConversation?.messages.filter((message) => message.role === "user").length ?? 0}
-              </div>
-              <button
-                className="icon-button right-rail-close"
-                type="button"
-                onClick={() => setRightRailOpen(false)}
-                aria-label="关闭任务轨迹"
-              >
-                <X size={17} />
-              </button>
-            </header>
-
-            <div className={`remote-status-card ${connection.status}`}>
-                <div className="remote-status-top">
-                  <span>
-                    <i />
-                    {connection.status === "connected" ? "SSH 会话在线" : "SSH 未连接"}
-                  </span>
-                  <small>{connection.latency ? `${connection.latency} ms` : "—"}</small>
-                </div>
-                <strong>
-                  {connection.status === "connected"
-                    ? `${connection.username ?? "demo"}@${connection.host ?? "login-node"}`
-                    : "尚未连接"}
-                </strong>
-                <div className="remote-meta">
-                  <span>
-                    <Bot size={12} />
-                    {activeAgent?.name ?? "无 Agent"}
-                  </span>
-                  <span>
-                    <Folder size={12} />
-                    {activeConversation?.work?.workspace ?? "~/.easywork/tasks"}
-                  </span>
-                </div>
+          <header className="right-rail-header">
+            <div>
+              <h2>对话记录</h2>
             </div>
+            <div>
+              {activeConversation?.messages.filter((message) => message.role === "user").length ?? 0}
+            </div>
+            <button
+              className="icon-button right-rail-close"
+              type="button"
+              onClick={() => setRightRailOpen(false)}
+              aria-label="关闭对话记录"
+            >
+              <X size={17} />
+            </button>
+          </header>
 
-            <div className="trace-list">
-              {activeConversation?.messages
-                .filter((message) => message.role === "user")
-                .map((message, index) => {
-                  const expanded = expandedTraces.has(message.id);
-                  return (
-                    <article
-                      className={`trace-item${expanded ? " expanded" : ""}`}
-                      key={message.id}
+          <div
+            className={`remote-status-strip ${connection.status}`}
+            title={activeConversation?.work?.workspace ?? "~/.easywork/tasks"}
+          >
+            <span>
+              <i />
+              {connection.status === "connected" ? "远程会话在线" : "远程会话未连接"}
+            </span>
+            <span>{activeAgent?.name ?? "无 Agent"}</span>
+            {connection.latency ? <small>{connection.latency} ms</small> : null}
+          </div>
+
+          <div className="trace-list">
+            {activeConversation?.messages
+              .filter((message) => message.role === "user")
+              .map((message) => {
+                const traceKey = message.runId ?? message.id;
+                const expanded = expandedTraces.has(traceKey);
+                const hasSteps = Boolean(message.trace?.steps?.length);
+                return (
+                  <article
+                    className={`trace-item${expanded ? " expanded" : ""}`}
+                    key={message.id}
+                  >
+                    <button
+                      className="trace-jump"
+                      type="button"
+                      onClick={() =>
+                        document
+                          .getElementById(`message-${message.id}`)
+                          ?.scrollIntoView({ behavior: "smooth", block: "center" })
+                      }
+                      title="跳转到这条提问"
                     >
+                      <span className="trace-question">
+                        <strong>{message.content}</strong>
+                        {message.trace?.status === "running" && <small>正在执行</small>}
+                        {message.trace?.status === "error" && <small>执行失败</small>}
+                      </span>
+                    </button>
+                    {hasSteps && (
                       <button
-                        className="trace-main"
+                        className="trace-toggle"
                         type="button"
+                        aria-label={expanded ? "收起任务流程" : "展开任务流程"}
+                        aria-expanded={expanded}
                         onClick={() =>
                           setExpandedTraces((current) => {
                             const next = new Set(current);
-                            if (next.has(message.id)) next.delete(message.id);
-                            else next.add(message.id);
+                            if (next.has(traceKey)) next.delete(traceKey);
+                            else next.add(traceKey);
                             return next;
                           })
                         }
                       >
-                        <span className="trace-index">{String(index + 1).padStart(2, "0")}</span>
-                        <span className="trace-question">
-                          <strong>{message.content}</strong>
-                          <small>
-                            {message.trace
-                              ? message.trace.status === "running"
-                                ? "正在执行"
-                                : message.trace.status === "done"
-                                  ? "已完成"
-                                  : message.trace.status === "error"
-                                    ? "执行失败"
-                                    : "等待执行"
-                              : formatTime(message.createdAt)}
-                          </small>
-                        </span>
                         <ChevronDown size={15} />
                       </button>
-                      <button
-                        className="jump-button"
-                        type="button"
-                        onClick={() =>
-                          document
-                            .getElementById(`message-${message.id}`)
-                            ?.scrollIntoView({ behavior: "smooth", block: "center" })
-                        }
-                        aria-label="跳转到该提问"
-                      >
-                        <ArrowRight size={14} />
-                      </button>
-                      {expanded && (
+                    )}
+                    <div className="trace-detail-motion" aria-hidden={!expanded}>
+                      <div>
                         <div className="trace-detail">
-                          {message.trace?.steps?.length ? (
+                          {hasSteps && (
                             <div className="trace-steps">
-                              {message.trace.steps.map((step) => (
-                                <div className={`trace-step ${step.status}`} key={step.id}>
+                              {message.trace!.steps.map((step) => (
+                                <div
+                                  className={`trace-step ${step.status}`}
+                                  key={step.id}
+                                  aria-label={`${step.title}，${eventStatusLabel(step.status)}`}
+                                >
                                   <StatusGlyph status={step.status} />
-                                  <span>{step.title}</span>
-                                  {step.status === "running" && <small>正在运行</small>}
+                                  <span className="trace-step-copy">
+                                    <strong>{step.title}</strong>
+                                    {step.detail && <small>{step.detail}</small>}
+                                  </span>
                                 </div>
                               ))}
                             </div>
-                          ) : (
-                            <p className="trace-no-plan">
-                              任务开始后，步骤会显示在这里。
-                            </p>
-                          )}
-                          {message.trace?.result && (
-                            <div className="trace-result">
-                              <span>结果</span>
-                              <MarkdownContent content={message.trace.result} compact />
-                            </div>
                           )}
                         </div>
-                      )}
-                    </article>
-                  );
-                })}
-              {!activeConversation?.messages.some((message) => message.role === "user") && (
-                <div className="right-empty">
-                  <p>任务开始后，这里会显示执行进度。</p>
-                </div>
-              )}
-            </div>
-            <footer className="right-rail-footer">
-              <span>
-                <ShieldCheck size={13} />
-                {activeProject?.memoryMode === "project-only"
-                  ? "仅使用项目内记忆"
-                  : "使用默认记忆范围"}
-              </span>
-            </footer>
+                      </div>
+                    </div>
+                  </article>
+                );
+              })}
+          </div>
         </aside>
       )}
 

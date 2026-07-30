@@ -1400,6 +1400,72 @@ function workflowFor(prompt) {
   return ["理解请求并确认环境", "执行任务", "检查结果并整理回复"];
 }
 
+function cleanWorkflowSteps(steps, fallback) {
+  const normalized = Array.isArray(steps)
+    ? steps
+        .map((step) =>
+          String(
+            typeof step === "object" && step
+              ? step.title || step.name || step.step || ""
+              : step,
+          )
+            .replace(/^[\s\d.)、\-*]+/, "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 42),
+        )
+        .filter(Boolean)
+    : [];
+  const unique = [...new Set(normalized)].slice(0, 6);
+  return unique.length >= 2 ? unique : fallback;
+}
+
+function parseWorkflowPlan(raw, fallback) {
+  const source = String(raw || "")
+    .replace(/```(?:json)?/gi, "")
+    .replace(/```/g, "")
+    .trim();
+  const candidates = [source];
+  const objectMatch = source.match(/\{[\s\S]*\}/);
+  const arrayMatch = source.match(/\[[\s\S]*\]/);
+  if (objectMatch?.[0] && objectMatch[0] !== source) candidates.push(objectMatch[0]);
+  if (arrayMatch?.[0] && arrayMatch[0] !== source) candidates.push(arrayMatch[0]);
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      const steps = Array.isArray(parsed) ? parsed : parsed?.steps;
+      const cleaned = cleanWorkflowSteps(steps, fallback);
+      if (cleaned !== fallback) return cleaned;
+    } catch {
+      // Try the next JSON-shaped fragment.
+    }
+  }
+  return fallback;
+}
+
+async function planWorkSteps(provider, apiKey, prompt) {
+  const fallback = workflowFor(prompt);
+  const planningPrompt = [
+    "你是 EasyWork 网页端的任务编排器。",
+    "把用户请求拆成 2 到 6 个按顺序执行、可以验证的简短步骤。",
+    "步骤必须是动作，不得假设尚未得到的结果；高风险操作前必须安排确认。",
+    '只返回严格 JSON：{"steps":["步骤一","步骤二"]}，不要 Markdown 或解释。',
+    `用户请求：${String(prompt || "").slice(0, 4_000)}`,
+  ].join("\n");
+  const { payload } = await callChatProvider(provider, apiKey, planningPrompt);
+  return parseWorkflowPlan(extractModelText(payload), fallback);
+}
+
+function agentPromptWithWorkflow(context, steps) {
+  return [
+    context,
+    "## EasyWork 网页端已编排的执行流程",
+    ...steps.map((step, index) => `${index + 1}. ${step}`),
+    "",
+    "严格按以上顺序执行并验证。不要重新生成另一套计划；工具调用和最终回复应与这些步骤对应。",
+  ].join("\n");
+}
+
 function providerConfigForOpenCode(provider) {
   return {
     $schema: "https://opencode.ai/config.json",
@@ -1522,26 +1588,55 @@ function parseOpenCodeLine(line, state) {
   if (payload.sessionID) state.sessionId = payload.sessionID;
   const type = String(payload.type || payload.part?.type || "");
   const part = payload.part || payload;
+  const sourceId = String(part.id || payload.id || "");
   if (type === "tool_use" || type === "tool") {
     const tool = String(part.tool || part.name || "tool");
-    const command = part.state?.input?.command || part.input?.command || "";
+    const input = part.state?.input || part.input || {};
+    const command = String(input.command || "");
+    const filePath = String(
+      input.filePath || input.file_path || input.path || input.filename || "",
+    );
     const output =
       part.state?.output ||
       part.output ||
       part.state?.error ||
-      (command ? `$ ${command}` : "");
+      "";
     const statusValue = part.state?.status || part.status;
+    const normalizedTool = `${tool} ${command}`.toLowerCase();
+    const status =
+      statusValue === "error"
+        ? "error"
+        : ["completed", "done", "success"].includes(statusValue)
+          ? "done"
+          : "running";
+    const kind = /write|edit|patch|apply|replace|create_file/.test(normalizedTool)
+      ? "file_change"
+      : /\b(?:sbatch|srun|salloc|squeue|sacct|scancel|qsub|qstat|qdel)\b/.test(
+            normalizedTool,
+          )
+        ? "job_status"
+        : /artifact|export|download|archive/.test(normalizedTool)
+          ? "artifact"
+          : "tool_call";
+    const title =
+      kind === "file_change"
+        ? `${status === "done" ? "已修改" : "正在修改"} ${path.basename(filePath || tool)}`
+        : kind === "job_status"
+          ? command
+            ? command.slice(0, 120)
+            : `更新作业状态 · ${tool}`
+          : command
+            ? command.slice(0, 120)
+            : `调用 ${tool}`;
     return {
-      kind: tool.includes("bash") ? "terminal" : "tool",
-      title: command ? String(command).slice(0, 120) : `调用 ${tool}`,
+      sourceId,
+      kind,
+      title,
       detail: `OpenCode · ${tool}`,
       output: String(output || "").slice(0, 12_000),
-      status:
-        statusValue === "error"
-          ? "error"
-          : ["completed", "done", "success"].includes(statusValue)
-            ? "done"
-            : "running",
+      command: command || undefined,
+      path: filePath || undefined,
+      status,
     };
   }
   if (type === "text") {
@@ -1549,7 +1644,8 @@ function parseOpenCodeLine(line, state) {
     if (!text) return null;
     state.finalText += text;
     return {
-      kind: "result",
+      sourceId: sourceId || "message",
+      kind: "message",
       title: "Agent 回复",
       output: state.finalText.slice(-16_000),
       status: "running",
@@ -1557,6 +1653,7 @@ function parseOpenCodeLine(line, state) {
   }
   if (type === "reasoning") {
     return {
+      sourceId,
       kind: "reasoning",
       title: "正在分析下一步",
       detail: String(part.text || "").slice(0, 500),
@@ -1565,10 +1662,41 @@ function parseOpenCodeLine(line, state) {
   }
   if (type === "step_start") {
     return {
+      sourceId,
       kind: "plan",
-      title: "开始新步骤",
-      detail: part.title || "OpenCode 正在编排工具调用",
+      title: "Agent 开始推进下一步",
+      detail: part.title || "正在按网页端流程继续执行",
       status: "running",
+    };
+  }
+  if (/permission|approval|question/.test(type)) {
+    return {
+      sourceId,
+      kind: "approval_request",
+      title: String(part.title || part.question || "需要用户确认"),
+      detail: String(part.description || part.message || "").slice(0, 800),
+      status: "pending",
+    };
+  }
+  if (/file_change|file_update/.test(type)) {
+    const filePath = String(part.path || part.filePath || "");
+    return {
+      sourceId,
+      kind: "file_change",
+      title: `${part.status === "completed" ? "已修改" : "正在修改"} ${path.basename(filePath || "文件")}`,
+      detail: String(part.summary || "").slice(0, 500),
+      path: filePath || undefined,
+      status: part.status === "completed" ? "done" : "running",
+    };
+  }
+  if (/artifact/.test(type)) {
+    return {
+      sourceId,
+      kind: "artifact",
+      title: String(part.title || part.name || "生成结果文件"),
+      detail: String(part.description || "").slice(0, 500),
+      path: String(part.path || part.url || "") || undefined,
+      status: part.status === "error" ? "error" : "done",
     };
   }
   if (type === "error") {
@@ -1581,13 +1709,38 @@ function parseOpenCodeLine(line, state) {
       "未知错误";
     state.lastError = String(errorMessage);
     return {
-      kind: "tool",
+      sourceId,
+      kind: "error",
       title: "Agent 执行错误",
       output: state.lastError,
       status: "error",
     };
   }
   return null;
+}
+
+function workflowIndexForEvent(event, steps, currentIndex = 0) {
+  if (!steps.length) return 0;
+  const kind = String(event.kind || "");
+  if (kind === "message" || kind === "artifact") return steps.length - 1;
+  const text = [event.title, event.command, event.path, event.output]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  const find = (pattern) => steps.findIndex((step) => pattern.test(step));
+  const candidates = [
+    [/\bfree\b|meminfo|vmstat|内存|显存/, /内存|显存/],
+    [/\bnvidia-smi\b|\bsinfo\b|\bnproc\b|\blscpu\b|\bdf\b|gpu|cpu|资源/, /资源|GPU|CPU|磁盘/],
+    [/apply_patch|\bwrite\b|\bedit\b|\bsed\b|\btee\b|修改|编辑/, /修改|编辑|执行/],
+    [/\btest\b|\blint\b|pytest|验证|检查结果/, /验证|检查结果|整理回复|判断/],
+    [/\bls\b|\bfind\b|\brg\b|\bgrep\b|\bcat\b|\bread\b|检查相关|工作目录/, /检查|确认|目录/],
+  ];
+  for (const [eventPattern, stepPattern] of candidates) {
+    if (!eventPattern.test(text)) continue;
+    const index = find(stepPattern);
+    if (index >= 0) return Math.max(currentIndex, index);
+  }
+  return Math.min(currentIndex, steps.length - 1);
 }
 
 async function runRemoteWork(socket, session, actor, payload) {
@@ -1597,6 +1750,55 @@ async function runRemoteWork(socket, session, actor, payload) {
     throw new Error("当前版本已实现 OpenCode 适配；其他 Agent 需要先添加命令适配模板");
   }
   const secrets = await getSecrets(actor);
+  const state = await getState(actor);
+  const provider = state?.settings?.provider || {};
+  if (!provider.configured || !secrets.providerApiKey) {
+    throw new Error("请先在个人资料 → 模型 API 中配置接口");
+  }
+  const planningEventId = `${payload.runId}_planning`;
+  wsSend(socket, {
+    type: "agent.event",
+    conversationId: payload.conversationId,
+    runId: payload.runId,
+    event: {
+      id: planningEventId,
+      kind: "job_status",
+      title: "正在编排执行流程",
+      detail: "EasyWork 网页端",
+      status: "running",
+      timestamp: isoNow(),
+    },
+  });
+  let steps = workflowFor(String(payload.prompt || ""));
+  let usedFallbackPlan = false;
+  try {
+    steps = await planWorkSteps(provider, secrets.providerApiKey, payload.prompt);
+  } catch {
+    usedFallbackPlan = true;
+  }
+  wsSend(socket, {
+    type: "workflow",
+    conversationId: payload.conversationId,
+    runId: payload.runId,
+    steps: steps.map((title, index) => ({
+      id: `${payload.runId}_step_${index}`,
+      title,
+      status: index === 0 ? "running" : "pending",
+    })),
+  });
+  wsSend(socket, {
+    type: "agent.event",
+    conversationId: payload.conversationId,
+    runId: payload.runId,
+    event: {
+      id: planningEventId,
+      kind: "plan",
+      title: `已编排 ${steps.length} 个步骤`,
+      detail: usedFallbackPlan ? "已使用本地流程模板并发送给 Agent" : "流程已发送给 Agent",
+      status: "done",
+      timestamp: isoNow(),
+    },
+  });
   const context = await buildContext({
     actor,
     mode: "work",
@@ -1606,10 +1808,7 @@ async function runRemoteWork(socket, session, actor, payload) {
     memoryMode: payload.memoryMode === "project-only" ? "project-only" : "default",
     conversationId: String(payload.conversationId || ""),
   });
-  const provider = context.state?.settings?.provider || {};
-  if (!provider.configured || !secrets.providerApiKey) {
-    throw new Error("请先在个人资料 → 模型 API 中配置接口");
-  }
+  const agentPrompt = agentPromptWithWorkflow(context.text, steps);
   await remoteExec(
     session.client,
     'mkdir -p "$HOME/.easywork/config" "$HOME/.easywork/runtime"',
@@ -1619,20 +1818,13 @@ async function runRemoteWork(socket, session, actor, payload) {
     `${session.home}/.easywork/config/opencode.json`,
     `${JSON.stringify(providerConfigForOpenCode(provider), null, 2)}\n`,
   );
-  const steps = workflowFor(String(payload.prompt || ""));
-  wsSend(socket, {
-    type: "workflow",
-    conversationId: payload.conversationId,
-    runId: payload.runId,
-    steps,
-  });
   const runtimeId = safeSegment(session.socketId);
   const runId = safeSegment(payload.runId);
   const remoteRuntime = `${session.home}/.easywork/runtime/${runtimeId}`;
   await remoteExec(session.client, `mkdir -p ${shellQuote(remoteRuntime)}`);
   const promptPath = `${remoteRuntime}/${runId}.prompt.md`;
   const envPath = `${remoteRuntime}/provider.env`;
-  await remoteSftpWrite(session.client, promptPath, context.text);
+  await remoteSftpWrite(session.client, promptPath, agentPrompt);
   await remoteSftpWrite(
     session.client,
     envPath,
@@ -1697,21 +1889,59 @@ async function runRemoteWork(socket, session, actor, payload) {
       for (const line of lines) {
         const event = parseOpenCodeLine(line, parserState);
         if (!event) continue;
+        const { sourceId, ...eventPayload } = event;
         const eventId =
-          event.kind === "result"
-            ? `${payload.runId}_result`
-            : `${payload.runId}_event_${parserState.eventIndex++}`;
-        if (event.kind === "tool" || event.kind === "terminal") {
-          parserState.stepIndex = Math.min(parserState.stepIndex + 1, steps.length - 1);
+          event.kind === "message"
+            ? `${payload.runId}_message`
+            : sourceId
+              ? `${payload.runId}_${safeSegment(sourceId)}`
+              : `${payload.runId}_event_${parserState.eventIndex++}`;
+        const stepIndex = workflowIndexForEvent(
+          event,
+          steps,
+          parserState.stepIndex,
+        );
+        parserState.stepIndex = Math.max(parserState.stepIndex, stepIndex);
+        if (!["plan", "reasoning"].includes(event.kind)) {
+          wsSend(socket, {
+            type: "workflow.step",
+            conversationId: payload.conversationId,
+            runId: payload.runId,
+            stepIndex,
+            status:
+              event.status === "error"
+                ? "error"
+                : event.kind === "message"
+                  ? "running"
+                  : event.status,
+            detail:
+              event.kind === "tool_call" && event.command
+                ? event.command.slice(0, 90)
+                : undefined,
+          });
+          if (
+            event.status === "done" &&
+            ["tool_call", "file_change", "job_status"].includes(event.kind) &&
+            stepIndex < steps.length - 1
+          ) {
+            parserState.stepIndex = stepIndex + 1;
+            wsSend(socket, {
+              type: "workflow.step",
+              conversationId: payload.conversationId,
+              runId: payload.runId,
+              stepIndex: parserState.stepIndex,
+              status: "running",
+            });
+          }
         }
         wsSend(socket, {
           type: "agent.event",
           conversationId: payload.conversationId,
           runId: payload.runId,
-          stepIndex: Math.min(parserState.stepIndex, steps.length - 1),
+          stepIndex,
           event: {
             id: eventId,
-            ...event,
+            ...eventPayload,
             timestamp: isoNow(),
           },
         });
@@ -1748,14 +1978,21 @@ async function runRemoteWork(socket, session, actor, payload) {
   }
   const finalText = parserState.finalText.trim() || "Agent 已完成任务，未返回额外文本。";
   wsSend(socket, {
+    type: "workflow.step",
+    conversationId: payload.conversationId,
+    runId: payload.runId,
+    stepIndex: steps.length - 1,
+    status: "done",
+  });
+  wsSend(socket, {
     type: "agent.event",
     conversationId: payload.conversationId,
     runId: payload.runId,
     stepIndex: steps.length - 1,
     event: {
-      id: `${payload.runId}_result`,
-      kind: "result",
-      title: "任务结果",
+      id: `${payload.runId}_message`,
+      kind: "message",
+      title: "Agent 回复",
       output: finalText,
       status: "done",
       timestamp: isoNow(),
@@ -2147,8 +2384,26 @@ function attachWebSocketServer(server) {
           await runRemoteWork(socket, session, actor, payload);
           return;
         }
+        if (payload.type === "work.approval") {
+          // The current OpenCode adapter runs non-interactively. Keep the
+          // protocol endpoint so adapters that pause for approval can reuse it.
+          return;
+        }
         if (payload.type === "work.abort") {
           if (session.activeStream) session.activeStream.close();
+          wsSend(socket, {
+            type: "agent.event",
+            conversationId: payload.conversationId,
+            runId: payload.runId,
+            event: {
+              id: `${payload.runId}_aborted`,
+              kind: "job_status",
+              title: "任务已停止",
+              detail: "用户主动停止了远程执行",
+              status: "error",
+              timestamp: isoNow(),
+            },
+          });
           wsSend(socket, {
             type: "task.error",
             conversationId: payload.conversationId,
@@ -2175,6 +2430,19 @@ function attachWebSocketServer(server) {
         } else if (payload.type === "work.run") {
           session.activeStream = null;
           session.activeRun = null;
+          wsSend(socket, {
+            type: "agent.event",
+            conversationId: payload.conversationId,
+            runId: payload.runId,
+            event: {
+              id: `${payload.runId}_error`,
+              kind: "error",
+              title: "远程任务执行失败",
+              detail: message,
+              status: "error",
+              timestamp: isoNow(),
+            },
+          });
           wsSend(socket, {
             type: "task.error",
             conversationId: payload.conversationId,
@@ -2230,6 +2498,15 @@ export async function createEasyWorkServer() {
   const wss = attachWebSocketServer(server);
   return { server, wss };
 }
+
+export const gatewayTestHelpers = {
+  agentPromptWithWorkflow,
+  parseOpenCodeLine,
+  parseWorkflowPlan,
+  planWorkSteps,
+  workflowFor,
+  workflowIndexForEvent,
+};
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {

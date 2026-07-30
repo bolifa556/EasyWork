@@ -26,6 +26,91 @@ function mergeCookies(current, response) {
   return [...next.values()].join("; ");
 }
 
+test("work planning is prepared before execution and OpenCode events stay structured", async () => {
+  const { gatewayTestHelpers } = await import(
+    `../gateway/server.mjs?work-events=${Date.now()}`
+  );
+  const {
+    agentPromptWithWorkflow,
+    parseOpenCodeLine,
+    parseWorkflowPlan,
+    workflowFor,
+    workflowIndexForEvent,
+  } = gatewayTestHelpers;
+  const fallback = workflowFor("查看内存和 CPU");
+  const planned = parseWorkflowPlan(
+    '```json\n{"steps":["确认登录节点","检查可用内存","核对 CPU 资源","给出判断"]}\n```',
+    fallback,
+  );
+  assert.deepEqual(planned, [
+    "确认登录节点",
+    "检查可用内存",
+    "核对 CPU 资源",
+    "给出判断",
+  ]);
+  const prompt = agentPromptWithWorkflow("用户请求：检查资源", planned);
+  assert.match(prompt, /EasyWork 网页端已编排的执行流程/);
+  assert.match(prompt, /2\. 检查可用内存/);
+  assert.match(prompt, /不要重新生成另一套计划/);
+
+  const parserState = {
+    sessionId: "",
+    finalText: "",
+    lastError: "",
+  };
+  const commandEvent = parseOpenCodeLine(
+    JSON.stringify({
+      type: "tool_use",
+      part: {
+        id: "tool_1",
+        tool: "bash",
+        state: {
+          status: "running",
+          input: { command: "free -h" },
+          output: "Mem: 125Gi",
+        },
+      },
+    }),
+    parserState,
+  );
+  assert.equal(commandEvent.kind, "tool_call");
+  assert.equal(commandEvent.command, "free -h");
+  assert.equal(commandEvent.sourceId, "tool_1");
+  assert.equal(
+    workflowIndexForEvent(commandEvent, ["查看服务器内存", "查看可用资源", "判断结果"], 0),
+    0,
+  );
+
+  const fileEvent = parseOpenCodeLine(
+    JSON.stringify({
+      type: "tool_use",
+      part: {
+        id: "tool_2",
+        tool: "edit",
+        state: {
+          status: "completed",
+          input: { filePath: "/work/train.py" },
+          output: "updated",
+        },
+      },
+    }),
+    parserState,
+  );
+  assert.equal(fileEvent.kind, "file_change");
+  assert.equal(fileEvent.path, "/work/train.py");
+  assert.equal(fileEvent.status, "done");
+
+  const errorEvent = parseOpenCodeLine(
+    JSON.stringify({
+      type: "error",
+      error: { data: { message: "remote command failed" } },
+    }),
+    parserState,
+  );
+  assert.equal(errorEvent.kind, "error");
+  assert.equal(errorEvent.output, "remote command failed");
+});
+
 test("gateway persists identity, indexes files, and opens a demo work session", async () => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-test-"));
   process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
@@ -499,6 +584,7 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
   const providerServer = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
+    const requestBody = Buffer.concat(chunks).toString("utf8");
     if (req.method === "GET" && req.url === "/v1/models") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
@@ -520,7 +606,15 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          choices: [{ message: { content: "OK" } }],
+          choices: [
+            {
+              message: {
+                content: requestBody.includes("任务编排器")
+                  ? '{"steps":["确认目标","检查文件","执行修改","验证结果"]}'
+                  : "OK",
+              },
+            },
+          ],
         }),
       );
       return;
@@ -532,7 +626,7 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
   const providerAddress = providerServer.address();
   const providerBase = `http://127.0.0.1:${providerAddress.port}/v1`;
 
-  const { createEasyWorkServer } = await import(
+  const { createEasyWorkServer, gatewayTestHelpers } = await import(
     `../gateway/server.mjs?models=${Date.now()}`
   );
   const { server } = await createEasyWorkServer();
@@ -595,6 +689,22 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
     });
     assert.equal(testResponse.status, 200);
     assert.equal((await testResponse.json()).protocol, "chat-completions");
+
+    const plannedSteps = await gatewayTestHelpers.planWorkSteps(
+      {
+        baseUrl: providerBase,
+        model: "chat-model",
+        protocol: "chat-completions",
+      },
+      "test-key",
+      "修改训练脚本并验证",
+    );
+    assert.deepEqual(plannedSteps, [
+      "确认目标",
+      "检查文件",
+      "执行修改",
+      "验证结果",
+    ]);
   } finally {
     await Promise.all([
       new Promise((resolve) => server.close(resolve)),
