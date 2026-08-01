@@ -20,6 +20,7 @@ import {
   Ellipsis,
   Folder,
   FolderOpen,
+  FolderPlus,
   FolderLock,
   Gauge,
   HardDrive,
@@ -55,6 +56,7 @@ import {
   X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import { createPortal } from "react-dom";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -132,6 +134,7 @@ type Conversation = {
   title: string;
   mode: Mode;
   projectId?: string;
+  pinned?: boolean;
   messages: Message[];
   updatedAt: string;
   work?: {
@@ -194,6 +197,11 @@ type ServerProfile = {
   authMethod?: "key" | "password";
   configured: boolean;
   lastConnectedAt?: string;
+};
+
+type ServerProfileDraft = ServerProfile & {
+  privateKey?: string;
+  password?: string;
 };
 
 type AppSettings = {
@@ -269,7 +277,32 @@ type AgentItem = {
   configured?: boolean;
   configPath?: string;
   dataPath?: string;
+  model?: string;
   detail?: string;
+};
+
+type AgentModelConfigState = {
+  status: "idle" | "configuring" | "done" | "error";
+  model?: string;
+  label?: string;
+  error?: string;
+};
+
+type AgentUpdateState = {
+  status:
+    | "idle"
+    | "checking"
+    | "downloading"
+    | "current"
+    | "available"
+    | "updating"
+    | "configuring"
+    | "done"
+    | "error";
+  currentVersion?: string;
+  latestVersion?: string;
+  label?: string;
+  error?: string;
 };
 
 type RemoteFileEntry = {
@@ -312,7 +345,9 @@ function gatewayFetch(
 ) {
   const headers = new Headers(init.headers);
   const token = readDeviceToken();
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
   return fetch(`${baseUrl}${path}`, {
     ...init,
     credentials: "include",
@@ -568,6 +603,13 @@ function MarkdownContent({
   content: string;
   compact?: boolean;
 }) {
+  const inlineTone = (value: string) => {
+    let hash = 0;
+    for (const character of value) {
+      hash = (hash * 31 + character.codePointAt(0)!) >>> 0;
+    }
+    return hash % 5;
+  };
   return (
     <div className={`markdown-content${compact ? " compact" : ""}`}>
       <ReactMarkdown
@@ -582,6 +624,21 @@ function MarkdownContent({
           pre: ({ children }) => (
             <pre className="markdown-code-block">{children}</pre>
           ),
+          code: ({ children, className }) => {
+            const value = String(children).replace(/\n$/, "");
+            const block = Boolean(className) || value.includes("\n");
+            return (
+              <code
+                className={
+                  block || compact
+                    ? className
+                    : `inline-function-field tone-${inlineTone(value)}`
+                }
+              >
+                {children}
+              </code>
+            );
+          },
           table: ({ children }) => (
             <div className="markdown-table-wrap">
               <table>{children}</table>
@@ -702,8 +759,13 @@ function ReasoningDisclosure({
   content?: string;
   running?: boolean;
 }) {
-  const [manuallyExpanded, setManuallyExpanded] = useState(false);
-  const expanded = running || manuallyExpanded;
+  const [expanded, setExpanded] = useState(false);
+  const previousRunning = useRef(running);
+
+  useEffect(() => {
+    if (previousRunning.current && !running) setExpanded(false);
+    previousRunning.current = running;
+  }, [running]);
 
   if (!content && !running) return null;
   return (
@@ -711,14 +773,12 @@ function ReasoningDisclosure({
       <button
         type="button"
         aria-expanded={expanded}
-        onClick={() => {
-          if (!running) setManuallyExpanded((current) => !current);
-        }}
+        onClick={() => setExpanded((current) => !current)}
       >
         <span className="reasoning-glyph">
           {running ? <LoaderCircle size={14} /> : <Brain size={14} />}
         </span>
-        <strong>{running ? "思考中" : "思考"}</strong>
+        <strong>{running ? "思考中" : "思考完成"}</strong>
         <ChevronDown size={13} />
       </button>
       <div className="reasoning-motion">
@@ -727,7 +787,7 @@ function ReasoningDisclosure({
             {content ? (
               <MarkdownContent content={content} compact />
             ) : (
-              <span>正在整理思路…</span>
+              <span>正在生成思考内容…</span>
             )}
           </div>
         </div>
@@ -736,12 +796,71 @@ function ReasoningDisclosure({
   );
 }
 
+function useAutoDisclosure(autoOpen: boolean) {
+  const [expanded, setExpanded] = useState(autoOpen);
+  const previousAutoOpen = useRef(autoOpen);
+  useEffect(() => {
+    if (previousAutoOpen.current === autoOpen) return;
+    previousAutoOpen.current = autoOpen;
+    setExpanded(autoOpen);
+  }, [autoOpen]);
+  return [expanded, setExpanded] as const;
+}
+
+function CommandEventItem({ event }: { event: WorkEvent }) {
+  const [expanded, setExpanded] = useAutoDisclosure(event.status === "running");
+  const command = event.command || event.title;
+  const panelId = `command-output-${event.id}`;
+  return (
+    <article
+      className={`command-event ${event.status}${expanded ? " expanded" : ""}`}
+    >
+      <button
+        className="command-summary"
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={panelId}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="command-status">
+          {event.status === "running" ? (
+            <LoaderCircle size={13} />
+          ) : event.status === "error" ? (
+            <X size={12} />
+          ) : (
+            <Terminal size={12} />
+          )}
+        </span>
+        <code title={command}>{command}</code>
+        <small>{eventStatusLabel(event.status)}</small>
+        <ChevronRight className="command-event-chevron" size={13} />
+      </button>
+      <div className="command-output-motion" id={panelId}>
+        <div>
+          <pre className="remote-terminal">
+            <span className="terminal-caption">
+              <i />
+              {event.detail || "登录节点"}
+            </span>
+            <code>
+              <b>$</b> {command}
+              {event.output
+                ? `\n${event.output}`
+                : event.status === "running"
+                  ? "\n等待远端输出…"
+                  : ""}
+            </code>
+          </pre>
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function CommandEventGroup({ events }: { events: WorkEvent[] }) {
-  const [expandedCommands, setExpandedCommands] = useState<Set<string>>(new Set());
   const running = events.some((event) => event.status === "running");
   const failed = events.some((event) => event.status === "error");
-  const [manuallyExpanded, setManuallyExpanded] = useState(false);
-  const groupExpanded = running || manuallyExpanded;
+  const [groupExpanded, setGroupExpanded] = useAutoDisclosure(running);
   const groupLabel = running
     ? `正在运行 ${events.length} 个命令`
     : `运行了 ${events.length} 个命令`;
@@ -756,9 +875,7 @@ function CommandEventGroup({ events }: { events: WorkEvent[] }) {
         className="command-group-heading"
         type="button"
         aria-expanded={groupExpanded}
-        onClick={() => {
-          if (!running) setManuallyExpanded((current) => !current);
-        }}
+        onClick={() => setGroupExpanded((current) => !current)}
       >
         <span className="command-group-glyph">
           {running ? <LoaderCircle size={14} /> : failed ? <X size={13} /> : <Terminal size={14} />}
@@ -769,63 +886,9 @@ function CommandEventGroup({ events }: { events: WorkEvent[] }) {
       </button>
       <div className="command-list-motion">
         <div className="command-list">
-          {events.map((event) => {
-            const expanded = event.status === "running" || expandedCommands.has(event.id);
-            const command = event.command || event.title;
-            const panelId = `command-output-${event.id}`;
-            return (
-              <article
-                className={`command-event ${event.status}${expanded ? " expanded" : ""}`}
-                key={event.id}
-              >
-                <button
-                  className="command-summary"
-                  type="button"
-                  aria-expanded={expanded}
-                  aria-controls={panelId}
-                  onClick={() =>
-                    setExpandedCommands((current) => {
-                      const next = new Set(current);
-                      if (next.has(event.id)) next.delete(event.id);
-                      else next.add(event.id);
-                      return next;
-                    })
-                  }
-                >
-                  <span className="command-status">
-                    {event.status === "running" ? (
-                      <LoaderCircle size={13} />
-                    ) : event.status === "error" ? (
-                      <X size={12} />
-                    ) : (
-                      <Terminal size={12} />
-                    )}
-                  </span>
-                  <code title={command}>{command}</code>
-                  <small>{eventStatusLabel(event.status)}</small>
-                  <ChevronRight className="command-event-chevron" size={13} />
-                </button>
-                <div className="command-output-motion" id={panelId}>
-                  <div>
-                    <pre className="remote-terminal">
-                      <span className="terminal-caption">
-                        <i />
-                        {event.detail || "登录节点"}
-                      </span>
-                      <code>
-                        <b>$</b> {command}
-                        {event.output
-                          ? `\n${event.output}`
-                          : event.status === "running"
-                            ? "\n等待远端输出…"
-                            : ""}
-                      </code>
-                    </pre>
-                  </div>
-                </div>
-              </article>
-            );
-          })}
+          {events.map((event) => (
+            <CommandEventItem event={event} key={event.id} />
+          ))}
         </div>
       </div>
     </section>
@@ -835,37 +898,88 @@ function CommandEventGroup({ events }: { events: WorkEvent[] }) {
 function AgentEventRow({
   event,
   onApproval,
+  runStatus,
+  workflowSteps,
 }: {
   event: WorkEvent;
   onApproval?: (event: WorkEvent, approved: boolean) => void;
+  runStatus?: RunTrace["status"];
+  workflowSteps?: WorkflowStep[];
 }) {
   const kind = normalizedEventKind(event.kind);
+  const autoOpen =
+    event.status === "running" ||
+    (kind === "plan" && runStatus === "running");
+  const [expanded, setExpanded] = useAutoDisclosure(autoOpen);
+  const disclosable = Boolean(
+    event.detail ||
+      event.path ||
+      event.output ||
+      (kind === "plan" && workflowSteps?.length) ||
+      (kind === "approval_request" && event.status === "pending"),
+  );
   return (
-    <article className={`agent-event ${kind} ${event.status}`}>
-      <span className="agent-event-glyph">
-        <EventGlyph event={event} />
-      </span>
-      <div className="agent-event-copy">
-        <strong>{event.title}</strong>
-        {event.detail && <small>{event.detail}</small>}
-        {event.path && <code className="agent-event-path">{event.path}</code>}
-        {event.output && kind !== "plan" && (
-          <div className="agent-event-output">
-            <MarkdownContent content={event.output} compact />
+    <article
+      className={`agent-event ${kind} ${event.status}${expanded ? " expanded" : ""}`}
+    >
+      <button
+        className="agent-event-summary"
+        type="button"
+        aria-expanded={disclosable ? expanded : undefined}
+        onClick={() => disclosable && setExpanded((current) => !current)}
+      >
+        <span className="agent-event-glyph">
+          <EventGlyph event={event} />
+        </span>
+        <span className="agent-event-copy">
+          <strong>{event.title}</strong>
+          {event.detail && <small>{event.detail}</small>}
+        </span>
+        <span className="agent-event-status">{eventStatusLabel(event.status)}</span>
+        {disclosable && <ChevronRight className="agent-event-chevron" size={13} />}
+      </button>
+      {disclosable && (
+        <div className="agent-event-detail-motion">
+          <div>
+            <div className="agent-event-detail">
+              {event.path && <code className="agent-event-path">{event.path}</code>}
+              {kind === "plan" && workflowSteps?.length ? (
+                <div className="trace-steps plan-event-steps">
+                  {workflowSteps.map((step) => (
+                    <div
+                      className={`trace-step ${step.status}`}
+                      key={step.id}
+                      aria-label={`${step.title}，${eventStatusLabel(step.status)}`}
+                    >
+                      <StatusGlyph status={step.status} />
+                      <span className="trace-step-copy">
+                        <strong>{step.title}</strong>
+                        {step.detail && <small>{step.detail}</small>}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : event.output ? (
+                <div className="agent-event-output">
+                  <MarkdownContent content={event.output} compact />
+                </div>
+              ) : null}
+              {kind === "approval_request" &&
+                event.status === "pending" &&
+                onApproval && (
+                  <div className="approval-actions">
+                    <button type="button" onClick={() => onApproval(event, false)}>
+                      拒绝
+                    </button>
+                    <button type="button" onClick={() => onApproval(event, true)}>
+                      允许
+                    </button>
+                  </div>
+                )}
+            </div>
           </div>
-        )}
-        {kind === "approval_request" && event.status === "pending" && onApproval && (
-          <div className="approval-actions">
-            <button type="button" onClick={() => onApproval(event, false)}>
-              拒绝
-            </button>
-            <button type="button" onClick={() => onApproval(event, true)}>
-              允许
-            </button>
-          </div>
-        )}
-      </div>
-      <span className="agent-event-status">{eventStatusLabel(event.status)}</span>
+        </div>
+      )}
     </article>
   );
 }
@@ -874,10 +988,12 @@ function WorkEventFeed({
   events,
   onApproval,
   runStatus,
+  workflowSteps,
 }: {
   events: WorkEvent[];
   onApproval?: (event: WorkEvent, approved: boolean) => void;
   runStatus?: RunTrace["status"];
+  workflowSteps?: WorkflowStep[];
 }) {
   const visibleEvents = events
     .filter(
@@ -905,7 +1021,7 @@ function WorkEventFeed({
   > = [];
 
   for (const event of visibleEvents) {
-    if (normalizedEventKind(event.kind) === "tool_call") {
+    if (normalizedEventKind(event.kind) === "tool_call" || event.command) {
       const previous = segments.at(-1);
       if (previous?.type === "commands") {
         previous.events.push(event);
@@ -924,7 +1040,13 @@ function WorkEventFeed({
         segment.type === "commands" ? (
           <CommandEventGroup events={segment.events} key={segment.id} />
         ) : (
-          <AgentEventRow event={segment.event} key={segment.id} onApproval={onApproval} />
+          <AgentEventRow
+            event={segment.event}
+            key={segment.id}
+            onApproval={onApproval}
+            runStatus={runStatus}
+            workflowSteps={workflowSteps}
+          />
         ),
       )}
     </div>
@@ -978,6 +1100,9 @@ function ConversationRow({
   onSelect,
   onToggleMenu,
   onMove,
+  onMoveToNewProject,
+  onRename,
+  onTogglePin,
   onDelete,
 }: {
   conversation: Conversation;
@@ -988,9 +1113,63 @@ function ConversationRow({
   onSelect: () => void;
   onToggleMenu: () => void;
   onMove: (projectId?: string) => void;
+  onMoveToNewProject: () => void;
+  onRename: () => void;
+  onTogglePin: () => void;
   onDelete: () => void;
 }) {
   const destinations = projects.filter((project) => project.id !== conversation.projectId);
+  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [menuPosition, setMenuPosition] = useState({
+    left: 0,
+    top: 0,
+    ready: false,
+  });
+
+  useEffect(() => {
+    if (!menuOpen) return;
+
+    const updatePosition = () => {
+      const anchor = menuButtonRef.current;
+      if (!anchor) return;
+      const rect = anchor.getBoundingClientRect();
+      const menuWidth = menuRef.current?.offsetWidth || 214;
+      const menuHeight = menuRef.current?.offsetHeight || 220;
+      const below = rect.bottom + 4;
+      const top =
+        below + menuHeight <= window.innerHeight - 8
+          ? below
+          : Math.max(8, rect.top - menuHeight - 4);
+      const left = Math.max(
+        8,
+        Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 8),
+      );
+      setMenuPosition({ left, top, ready: true });
+    };
+    const frame = window.requestAnimationFrame(updatePosition);
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (
+        menuRef.current?.contains(target) ||
+        menuButtonRef.current?.contains(target)
+      ) {
+        return;
+      }
+      onToggleMenu();
+    };
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+    };
+  }, [menuOpen, onToggleMenu]);
+
   return (
     <div
       className={`chat-row${nested ? " project-chat-row" : ""}${
@@ -1006,6 +1185,7 @@ function ConversationRow({
         <span className="conversation-work-mark">工作</span>
       )}
       <button
+        ref={menuButtonRef}
         className="chat-row-menu-button"
         type="button"
         aria-label={`打开“${conversation.title}”的对话选项`}
@@ -1017,11 +1197,41 @@ function ConversationRow({
       >
         <Ellipsis size={16} />
       </button>
-      {menuOpen && (
-        <div className="conversation-menu" role="menu">
-          {!!destinations.length && (
-            <>
-              <span className="conversation-menu-label">移动到项目</span>
+      {menuOpen &&
+        typeof document !== "undefined" &&
+        createPortal(
+        <div
+          className="conversation-menu conversation-menu-portal"
+          role="menu"
+          ref={menuRef}
+          style={{
+            left: menuPosition.left,
+            top: menuPosition.top,
+            visibility: menuPosition.ready ? "visible" : "hidden",
+          }}
+        >
+          <button type="button" role="menuitem" onClick={onRename}>
+            <Pencil size={15} />
+            重命名
+          </button>
+          <div className="conversation-menu-submenu">
+            <button
+              className="conversation-menu-submenu-trigger"
+              type="button"
+              role="menuitem"
+              aria-haspopup="menu"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <FolderPlus size={15} />
+              <span>移至项目</span>
+              <ChevronRight className="conversation-menu-submenu-chevron" size={15} />
+            </button>
+            <div className="conversation-move-submenu" role="menu">
+              <button type="button" role="menuitem" onClick={onMoveToNewProject}>
+                <FolderPlus size={15} />
+                新项目
+              </button>
+              {!!destinations.length && <span className="conversation-menu-separator" />}
               {destinations.map((project) => (
                 <button
                   type="button"
@@ -1029,26 +1239,29 @@ function ConversationRow({
                   key={project.id}
                   onClick={() => onMove(project.id)}
                 >
-                  <span className="menu-project-avatar">{project.icon}</span>
+                  <Folder size={15} />
                   {project.name}
                 </button>
               ))}
-            </>
-          )}
+            </div>
+          </div>
           {conversation.projectId && (
             <button type="button" role="menuitem" onClick={() => onMove(undefined)}>
               <Folder size={15} />
-              移出项目
+              从项目中移出
             </button>
           )}
-          {(destinations.length > 0 || conversation.projectId) && (
-            <span className="conversation-menu-separator" />
-          )}
+          <button type="button" role="menuitem" onClick={onTogglePin}>
+            {conversation.pinned ? <PinOff size={15} /> : <Pin size={15} />}
+            {conversation.pinned ? "取消置顶" : "置顶聊天"}
+          </button>
+          <span className="conversation-menu-separator" />
           <button className="danger" type="button" role="menuitem" onClick={onDelete}>
             <Trash2 size={15} />
-            删除
+            删除聊天
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
@@ -1061,6 +1274,10 @@ function UnifiedComposer({
   sending = false,
   skills,
   selectedSkills,
+  model,
+  models,
+  modelsLoading = false,
+  modelError = "",
   textareaRef,
   menuDirection = "up",
   onChange,
@@ -1068,6 +1285,8 @@ function UnifiedComposer({
   onStop,
   onUpload,
   onToggleSkill,
+  onDetectModels,
+  onSelectModel,
 }: {
   value: string;
   placeholder: string;
@@ -1075,6 +1294,10 @@ function UnifiedComposer({
   sending?: boolean;
   skills: SkillItem[];
   selectedSkills: string[];
+  model: string;
+  models: string[];
+  modelsLoading?: boolean;
+  modelError?: string;
   textareaRef?: React.RefObject<HTMLTextAreaElement | null>;
   menuDirection?: "up" | "down";
   onChange: (value: string) => void;
@@ -1082,10 +1305,14 @@ function UnifiedComposer({
   onStop: () => void;
   onUpload: (files: FileList | null) => void;
   onToggleSkill: (skillId: string) => void;
+  onDetectModels: () => void;
+  onSelectModel: (model: string) => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPage, setMenuPage] = useState<"root" | "skills">("root");
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const menuWrapRef = useRef<HTMLDivElement | null>(null);
+  const modelWrapRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const enabledSkills = skills.filter((skill) => skill.enabled);
   const skillMenuHeight = Math.min(54 + Math.max(enabledSkills.length, 1) * 52, 314);
@@ -1101,6 +1328,17 @@ function UnifiedComposer({
     document.addEventListener("pointerdown", closeOnOutsidePress);
     return () => document.removeEventListener("pointerdown", closeOnOutsidePress);
   }, [menuOpen]);
+
+  useEffect(() => {
+    if (!modelMenuOpen) return;
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      if (!modelWrapRef.current?.contains(event.target as Node)) {
+        setModelMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePress);
+  }, [modelMenuOpen]);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -1221,6 +1459,73 @@ function UnifiedComposer({
           }
         }}
       />
+      <div className="composer-model-wrap" ref={modelWrapRef}>
+        <button
+          className={`composer-model-button${modelMenuOpen ? " active" : ""}`}
+          type="button"
+          aria-label="选择模型"
+          aria-expanded={modelMenuOpen}
+          disabled={sending}
+          title={model || "选择模型"}
+          onClick={() => {
+            setModelMenuOpen((current) => {
+              const next = !current;
+              if (next) onDetectModels();
+              return next;
+            });
+          }}
+        >
+          <span>{model || "选择模型"}</span>
+          {modelsLoading ? (
+            <LoaderCircle className="spin" size={13} />
+          ) : (
+            <ChevronDown size={13} />
+          )}
+        </button>
+        {modelMenuOpen && (
+          <div className={`composer-model-popover ${menuDirection}`}>
+            <div className="composer-model-heading">
+              <strong>选择模型</strong>
+              <button
+                type="button"
+                onClick={onDetectModels}
+                disabled={modelsLoading}
+                aria-label="重新检测模型"
+              >
+                <RefreshCw className={modelsLoading ? "spin" : undefined} size={14} />
+              </button>
+            </div>
+            <div className="composer-model-list">
+              {models.map((item) => (
+                <button
+                  className={item === model ? "selected" : ""}
+                  type="button"
+                  key={item}
+                  onClick={() => {
+                    onSelectModel(item);
+                    setModelMenuOpen(false);
+                  }}
+                >
+                  <span title={item}>{item}</span>
+                  {item === model && <Check size={14} />}
+                </button>
+              ))}
+              {modelsLoading && !models.length && (
+                <span className="composer-model-state">
+                  <LoaderCircle className="spin" size={15} />
+                  正在检测模型
+                </span>
+              )}
+              {!modelsLoading && modelError && (
+                <span className="composer-model-state error">{modelError}</span>
+              )}
+              {!modelsLoading && !modelError && !models.length && (
+                <span className="composer-model-state">暂无可用模型</span>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
       {sending ? (
         <button
           className="unified-send-button stop"
@@ -1261,10 +1566,16 @@ export default function EasyWorkApp() {
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
     new Set(),
   );
+  const [projectSectionOpen, setProjectSectionOpen] = useState(true);
+  const [chatSectionOpen, setChatSectionOpen] = useState(true);
+  const [expandedProjectConversationIds, setExpandedProjectConversationIds] =
+    useState<Set<string>>(new Set());
   const [projectPageTab, setProjectPageTab] = useState<"chats" | "files">(
     "chats",
   );
   const [projectModalOpen, setProjectModalOpen] = useState(false);
+  const [projectModalConversationId, setProjectModalConversationId] =
+    useState("");
   const [projectEditor, setProjectEditor] = useState<{
     project: Project;
     mode: "rename" | "settings";
@@ -1275,9 +1586,12 @@ export default function EasyWorkApp() {
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [sshModalOpen, setSshModalOpen] = useState(false);
   const [sshModalContext, setSshModalContext] = useState<
-    "conversation" | "manage"
-  >("conversation");
+    "bound" | "new-work" | "manage"
+  >("new-work");
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
+  const [agentMenuPage, setAgentMenuPage] = useState<
+    "root" | "config" | "models"
+  >("root");
   const [manualAgentOpen, setManualAgentOpen] = useState(false);
   const [manualAgentName, setManualAgentName] = useState("");
   const [manualAgentFolder, setManualAgentFolder] = useState("");
@@ -1286,6 +1600,13 @@ export default function EasyWorkApp() {
   const [agentConfigPath, setAgentConfigPath] = useState("");
   const [agentConfigContent, setAgentConfigContent] = useState("");
   const [agentConfigLoading, setAgentConfigLoading] = useState(false);
+  const [agentUpdatesByServer, setAgentUpdatesByServer] = useState<
+    Record<string, AgentUpdateState>
+  >({});
+  const [agentModelsByServer, setAgentModelsByServer] = useState<
+    Record<string, AgentModelConfigState>
+  >({});
+  const [agentUpdateModalOpen, setAgentUpdateModalOpen] = useState(false);
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
   const [remoteFilePath, setRemoteFilePath] = useState("~");
   const [remoteFileHome, setRemoteFileHome] = useState("");
@@ -1323,14 +1644,22 @@ export default function EasyWorkApp() {
   const [projectMenuId, setProjectMenuId] = useState("");
   const [conversationPendingDelete, setConversationPendingDelete] =
     useState<Conversation | null>(null);
+  const [conversationEditor, setConversationEditor] =
+    useState<Conversation | null>(null);
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
+  const [providerModels, setProviderModels] = useState<string[]>([]);
+  const [providerModelsLoading, setProviderModelsLoading] = useState(false);
+  const [providerModelsError, setProviderModelsError] = useState("");
 
   const socketRef = useRef<WebSocket | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
-  const latestStateRef = useRef(state);
   const hydratedActorIdRef = useRef("");
   const stateSaveTimerRef = useRef<number | null>(null);
   const stateSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingStateSaveRef = useRef<{
+    snapshot: EasyWorkState;
+    deviceToken: string;
+  } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1402,6 +1731,12 @@ export default function EasyWorkApp() {
     agents.find((item) => item.id === activeAgentId) ??
     agents.find((item) => item.status === "ready") ??
     agents[0];
+  const activeAgentUpdate = agentUpdatesByServer[effectiveServerId] ?? {
+    status: "idle",
+  };
+  const activeAgentModelConfig = agentModelsByServer[effectiveServerId] ?? {
+    status: "idle",
+  };
   const configAgent =
     agents.find((item) => item.id === agentConfigAgentId) || activeAgent;
   const activeServerProfile = state.settings.servers.find(
@@ -1417,6 +1752,85 @@ export default function EasyWorkApp() {
     setToast(message);
     window.setTimeout(() => setToast(""), 2600);
   }, []);
+
+  const detectProviderModels = useCallback(async () => {
+    const provider = state.settings.provider;
+    if (!provider.baseUrl || !provider.configured) {
+      setProviderModels([]);
+      setProviderModelsError("请先在个人资料中配置模型 API");
+      return;
+    }
+    setProviderModelsLoading(true);
+    setProviderModels([]);
+    setProviderModelsError("");
+    try {
+      const response = await gatewayFetch("/api/settings/provider/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ baseUrl: provider.baseUrl }),
+      });
+      const payload = (await response.json()) as {
+        models?: string[];
+        error?: string;
+      };
+      if (!response.ok || !payload.models?.length) {
+        throw new Error(payload.error || "没有检测到可用模型");
+      }
+      setProviderModels(payload.models);
+    } catch (caught) {
+      setProviderModels([]);
+      setProviderModelsError(
+        caught instanceof Error ? caught.message : "模型检测失败",
+      );
+    } finally {
+      setProviderModelsLoading(false);
+    }
+  }, [state.settings.provider]);
+
+  const selectProviderModel = useCallback(
+    async (modelId: string) => {
+      const previousModel = state.settings.provider.model;
+      setState((current) => ({
+        ...current,
+        settings: {
+          ...current.settings,
+          provider: { ...current.settings.provider, model: modelId },
+        },
+      }));
+      try {
+        const response = await gatewayFetch("/api/settings/provider", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            baseUrl: state.settings.provider.baseUrl,
+            model: modelId,
+          }),
+        });
+        const payload = (await response.json().catch(() => ({}))) as {
+          provider?: AppSettings["provider"];
+          error?: string;
+        };
+        if (!response.ok) throw new Error(payload.error || "模型保存失败");
+        if (payload.provider) {
+          setState((current) => ({
+            ...current,
+            settings: { ...current.settings, provider: payload.provider! },
+          }));
+        }
+        showToast(`已选择 ${modelId}`);
+      } catch (caught) {
+        setState((current) => ({
+          ...current,
+          settings: {
+            ...current.settings,
+            provider: { ...current.settings.provider, model: previousModel },
+          },
+        }));
+        showToast(caught instanceof Error ? caught.message : "模型保存失败");
+      }
+    },
+    [showToast, state.settings.provider],
+  );
 
   const updateConversation = useCallback(
     (conversationId: string, updater: (conversation: Conversation) => Conversation) => {
@@ -1484,8 +1898,9 @@ export default function EasyWorkApp() {
       const eventPlan: WorkEvent = {
         id: `${runId}_plan`,
         kind: "plan",
-        title: "任务已编排",
-        detail: `${steps.length} 个步骤`,
+        title: `已编排 ${steps.length} 个步骤`,
+        detail: "流程已发送给 Agent",
+        output: steps.map((step, index) => `${index + 1}. ${step}`).join("\n"),
         status: "done",
         timestamp: now(),
       };
@@ -1637,7 +2052,14 @@ export default function EasyWorkApp() {
                 ),
               }),
             );
-            if (index === steps.length - 1) setSending(false);
+            if (index === steps.length - 1) {
+              setExpandedTraces((current) => {
+                const next = new Set(current);
+                next.delete(runId);
+                return next;
+              });
+              setSending(false);
+            }
           },
           1150 + index * 850,
         );
@@ -1668,9 +2090,11 @@ export default function EasyWorkApp() {
                   port: typeof item.port === "number" ? item.port : undefined,
                   latency:
                     typeof item.latency === "number" ? item.latency : undefined,
-                  fingerprint: item.fingerprint
-                    ? String(item.fingerprint)
-                    : undefined,
+                  fingerprint:
+                    String(item.status || "connected") === "error" &&
+                    item.fingerprint
+                      ? String(item.fingerprint)
+                      : undefined,
                   demo: Boolean(item.demo),
                 } satisfies ConnectionState,
               ];
@@ -1703,6 +2127,7 @@ export default function EasyWorkApp() {
         }));
         if (status === "connected") {
           setSelectedServerId(serverId);
+          setSshModalOpen(false);
           const pendingBinding = pendingServerBindingRef.current;
           if (pendingBinding?.serverId === serverId) {
             updateConversation(pendingBinding.conversationId, (conversation) => ({
@@ -1715,7 +2140,6 @@ export default function EasyWorkApp() {
             pendingServerBindingRef.current = null;
             setDraftServerId("");
           }
-          setSshModalOpen(false);
         }
         return;
       }
@@ -1765,6 +2189,57 @@ export default function EasyWorkApp() {
               : agent,
           ),
         }));
+        return;
+      }
+      if (type === "agent.update.status") {
+        const serverId = String(payload.serverId || "");
+        if (!serverId) return;
+        const nextUpdate: AgentUpdateState = {
+          status: String(payload.status || "idle") as AgentUpdateState["status"],
+          currentVersion: payload.currentVersion
+            ? String(payload.currentVersion)
+            : undefined,
+          latestVersion: payload.latestVersion
+            ? String(payload.latestVersion)
+            : undefined,
+          label: payload.label ? String(payload.label) : undefined,
+          error: payload.error ? String(payload.error) : undefined,
+        };
+        setAgentUpdatesByServer((current) => ({
+          ...current,
+          [serverId]: {
+            ...(current[serverId] ?? { status: "idle" }),
+            ...nextUpdate,
+          },
+        }));
+        if (nextUpdate.status === "current") {
+          setAgentUpdateModalOpen(false);
+          showToast(nextUpdate.label || "OpenCode 已是最新版");
+        } else if (
+          ["available", "updating", "configuring", "done", "error"].includes(
+            nextUpdate.status,
+          )
+        ) {
+          setAgentUpdateModalOpen(true);
+        }
+        return;
+      }
+      if (type === "agent.model.status") {
+        const serverId = String(payload.serverId || "");
+        if (!serverId) return;
+        const nextModelState: AgentModelConfigState = {
+          status: String(payload.status || "idle") as AgentModelConfigState["status"],
+          model: payload.model ? String(payload.model) : undefined,
+          label: payload.label ? String(payload.label) : undefined,
+          error: payload.error ? String(payload.error) : undefined,
+        };
+        setAgentModelsByServer((current) => ({
+          ...current,
+          [serverId]: nextModelState,
+        }));
+        if (nextModelState.status === "done") {
+          showToast(nextModelState.label || "OpenCode 模型配置完成");
+        }
         return;
       }
       if (type === "conversation.title") {
@@ -1862,6 +2337,7 @@ export default function EasyWorkApp() {
             },
           }),
         );
+        setExpandedTraces(new Set([runId]));
         return;
       }
 
@@ -2019,6 +2495,12 @@ export default function EasyWorkApp() {
             ),
           }),
         );
+        setExpandedTraces((current) => {
+          if (!current.has(runId)) return current;
+          const next = new Set(current);
+          next.delete(runId);
+          return next;
+        });
         setSending(false);
       }
     },
@@ -2043,13 +2525,14 @@ export default function EasyWorkApp() {
       if (!(target instanceof Element)) return;
       if (
         !target.closest(
-          ".chat-row, .project-list-item, .conversation-mode-menu, .agent-selector",
+          ".chat-row, .project-list-item, .conversation-menu, .conversation-mode-menu, .agent-selector",
         )
       ) {
         setConversationMenuId("");
         setProjectMenuId("");
         setModeMenuOpen(false);
         setAgentMenuOpen(false);
+        setAgentMenuPage("root");
       }
     };
     document.addEventListener("pointerdown", closeFloatingMenus);
@@ -2081,7 +2564,7 @@ export default function EasyWorkApp() {
           setActor(payload.actor);
           storeDeviceToken(payload.deviceToken);
           if (payload.state && shouldHydrate) {
-            setState((current) => mergeStoredState(current, payload.state ?? {}));
+            setState(mergeStoredState(DEFAULT_STATE, payload.state ?? {}));
           }
           return;
         } catch {
@@ -2152,13 +2635,17 @@ export default function EasyWorkApp() {
     };
   }, [deviceToken, gatewayStatus, handleSocketEvent]);
 
-  const queueStateSave = useCallback((snapshot: EasyWorkState) => {
+  const queueStateSave = useCallback((snapshot: EasyWorkState, ownerToken: string) => {
     stateSaveQueueRef.current = stateSaveQueueRef.current
       .catch(() => undefined)
       .then(async () => {
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+        };
+        if (ownerToken) headers.Authorization = `Bearer ${ownerToken}`;
         const response = await gatewayFetch("/api/state", {
           method: "PUT",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify({ state: snapshot }),
         });
         if (!response.ok) throw new Error("state save failed");
@@ -2166,13 +2653,17 @@ export default function EasyWorkApp() {
   }, []);
 
   useEffect(() => {
-    latestStateRef.current = state;
+    pendingStateSaveRef.current = {
+      snapshot: state,
+      deviceToken: readDeviceToken(),
+    };
     if (gatewayStatus !== "connected" || stateSaveTimerRef.current !== null) {
       return;
     }
     stateSaveTimerRef.current = window.setTimeout(() => {
       stateSaveTimerRef.current = null;
-      queueStateSave(latestStateRef.current);
+      const pending = pendingStateSaveRef.current;
+      if (pending) queueStateSave(pending.snapshot, pending.deviceToken);
     }, 320);
   }, [gatewayStatus, queueStateSave, state]);
 
@@ -2274,6 +2765,7 @@ export default function EasyWorkApp() {
   };
 
   const createProject = (name: string, memoryMode: Project["memoryMode"]) => {
+    const conversationId = projectModalConversationId;
     const project: Project = {
       id: uid("project"),
       name: name.trim() || "未命名项目",
@@ -2285,9 +2777,28 @@ export default function EasyWorkApp() {
     setState((current) => ({
       ...current,
       projects: [...current.projects, project],
+      conversations: conversationId
+        ? current.conversations.map((conversation) =>
+            conversation.id === conversationId
+              ? {
+                  ...conversation,
+                  projectId: project.id,
+                  updatedAt: now(),
+                }
+              : conversation,
+          )
+        : current.conversations,
     }));
     setProjectModalOpen(false);
-    openProject(project.id);
+    setProjectModalConversationId("");
+    setExpandedProjectIds((current) => new Set(current).add(project.id));
+    setProjectSectionOpen(true);
+    if (conversationId) {
+      setConversationMenuId("");
+      showToast("项目已创建，对话已移入项目");
+    } else {
+      openProject(project.id);
+    }
   };
 
   const updateProject = (
@@ -2369,7 +2880,9 @@ export default function EasyWorkApp() {
   };
 
   const openConversationServerManager = () => {
-    setSshModalContext("conversation");
+    setSshModalContext(
+      activeConversation?.work?.serverId ? "bound" : "new-work",
+    );
     setSshModalOpen(true);
   };
 
@@ -2381,7 +2894,7 @@ export default function EasyWorkApp() {
 
   const selectServerForModal = (serverId: string) => {
     setSelectedServerId(serverId);
-    if (sshModalContext !== "conversation") return;
+    if (sshModalContext === "manage") return;
     if (activeConversation?.work?.serverId) return;
     if (activeConversation && connections[serverId]?.status === "connected") {
       updateConversation(activeConversation.id, (conversation) => ({
@@ -2397,26 +2910,50 @@ export default function EasyWorkApp() {
     setDraftServerId(serverId);
   };
 
-  const saveServerProfile = (profile: ServerProfile) => {
-    setState((current) => ({
-      ...current,
-      settings: {
-        ...current.settings,
-        servers: [
-          profile,
-          ...current.settings.servers.filter((item) => item.id !== profile.id),
-        ],
-        lastServerId: profile.id,
-      },
-    }));
-    setSelectedServerId(profile.id);
-    if (
-      sshModalContext === "conversation" &&
-      !activeConversation?.work?.serverId
-    ) {
-      setDraftServerId(profile.id);
+  const saveServerProfile = async (profile: ServerProfileDraft) => {
+    try {
+      const response = await gatewayFetch(
+        `/api/settings/servers/${encodeURIComponent(profile.id)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(profile),
+        },
+      );
+      const payload = (await response.json().catch(() => ({}))) as {
+        profile?: ServerProfile;
+        error?: string;
+      };
+      if (!response.ok || !payload.profile) {
+        throw new Error(payload.error || "服务器配置保存失败");
+      }
+      const savedProfile = payload.profile;
+      setState((current) => ({
+        ...current,
+        settings: {
+          ...current.settings,
+          servers: [
+            savedProfile,
+            ...current.settings.servers.filter(
+              (item) => item.id !== savedProfile.id,
+            ),
+          ],
+          lastServerId: savedProfile.id,
+        },
+      }));
+      setSelectedServerId(savedProfile.id);
+      if (
+        sshModalContext !== "manage" &&
+        !activeConversation?.work?.serverId
+      ) {
+        setDraftServerId(savedProfile.id);
+      }
+      showToast("服务器配置已保存");
+    } catch (caught) {
+      showToast(
+        caught instanceof Error ? caught.message : "服务器配置保存失败",
+      );
     }
-    showToast("服务器配置已保存");
   };
 
   const moveConversation = (conversationId: string, projectId?: string) => {
@@ -2425,8 +2962,40 @@ export default function EasyWorkApp() {
       projectId,
       updatedAt: now(),
     }));
+    if (projectId) {
+      setProjectSectionOpen(true);
+      setExpandedProjectIds((current) => new Set(current).add(projectId));
+    } else {
+      setChatSectionOpen(true);
+    }
     setConversationMenuId("");
     showToast(projectId ? "对话已移动到项目" : "对话已移出项目");
+  };
+
+  const renameConversation = (conversationId: string, title: string) => {
+    const nextTitle = title.trim();
+    if (!nextTitle) return;
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      title: nextTitle,
+      updatedAt: now(),
+    }));
+    setConversationEditor(null);
+    setConversationMenuId("");
+    showToast("对话已重命名");
+  };
+
+  const toggleConversationPin = (conversationId: string) => {
+    const conversation = state.conversations.find(
+      (item) => item.id === conversationId,
+    );
+    updateConversation(conversationId, (item) => ({
+      ...item,
+      pinned: !item.pinned,
+      updatedAt: now(),
+    }));
+    setConversationMenuId("");
+    showToast(conversation?.pinned ? "已取消置顶" : "聊天已置顶");
   };
 
   const deleteConversation = (conversationId: string) => {
@@ -2467,6 +3036,12 @@ export default function EasyWorkApp() {
       submissionMode === "work" &&
       (activeAgent?.status !== "ready" || !activeAgent.configured)
     ) {
+      if (activeAgent?.status === "ready") {
+        setAgentConfigAgentId(activeAgent.id);
+        setAgentMenuPage("config");
+      } else {
+        setAgentMenuPage("root");
+      }
       setAgentMenuOpen(true);
       showToast(
         activeAgent?.status === "missing"
@@ -2557,6 +3132,10 @@ export default function EasyWorkApp() {
       setView("chat");
       setRightRailOpen(false);
       setSidebarOpen(false);
+    }
+    if (submissionMode === "work") {
+      setExpandedTraces(new Set([runId]));
+      if (firstTurn) setRightRailOpen(true);
     }
     setDraft("");
     setSending(true);
@@ -2766,7 +3345,7 @@ export default function EasyWorkApp() {
   const connectDemo = () => {
     const serverId = "demo";
     setSelectedServerId(serverId);
-    if (sshModalContext === "conversation") {
+    if (sshModalContext !== "manage") {
       setDraftServerId(serverId);
       if (activeConversation && !activeConversation.work?.serverId) {
         pendingServerBindingRef.current = {
@@ -2849,7 +3428,6 @@ export default function EasyWorkApp() {
           pendingServerBindingRef.current = null;
           setDraftServerId("");
         }
-        setSshModalOpen(false);
       }, 650);
     }
   };
@@ -2877,7 +3455,7 @@ export default function EasyWorkApp() {
       return;
     }
     setSelectedServerId(payload.serverId);
-    if (sshModalContext === "conversation") {
+    if (sshModalContext !== "manage") {
       setDraftServerId(payload.serverId);
       if (activeConversation && !activeConversation.work?.serverId) {
         pendingServerBindingRef.current = {
@@ -2900,22 +3478,47 @@ export default function EasyWorkApp() {
         port: payload.port,
       },
     }));
+    setState((current) => {
+      const existing = current.settings.servers.find(
+        (profile) => profile.id === payload.serverId,
+      );
+      const profile: ServerProfile = {
+        id: payload.serverId,
+        name: payload.name?.trim() || payload.host,
+        host: payload.host,
+        port: payload.port,
+        username: payload.username,
+        authMethod: payload.authMethod,
+        keyName: payload.privateKeyName || existing?.keyName || "",
+        configured: Boolean(
+          payload.useSavedCredential || payload.rememberCredential,
+        ),
+        lastConnectedAt: existing?.lastConnectedAt,
+      };
+      return {
+        ...current,
+        settings: {
+          ...current.settings,
+          servers: [
+            profile,
+            ...current.settings.servers.filter(
+              (item) => item.id !== payload.serverId,
+            ),
+          ],
+          lastServerId: payload.serverId,
+        },
+      };
+    });
     socket.send(JSON.stringify({ type: "ssh.connect", ...payload }));
   };
 
-  const disconnectSsh = (serverId = effectiveServerId) => {
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: "ssh.disconnect", serverId }));
+  const disconnectSsh = (serverId: string) => {
+    const socket = socketRef.current;
+    if (!serverId || !socket || socket.readyState !== WebSocket.OPEN) {
+      showToast("EasyWork 服务未连接");
+      return;
     }
-    setConnections((current) => ({
-      ...current,
-      [serverId]: {
-        ...(current[serverId] ?? { serverId }),
-        serverId,
-        status: "disconnected",
-        label: "已主动断开",
-      },
-    }));
+    socket.send(JSON.stringify({ type: "ssh.disconnect", serverId }));
   };
 
   const scanAgents = () => {
@@ -2972,6 +3575,67 @@ export default function EasyWorkApp() {
     }
   };
 
+  const checkAgentUpdate = (agent = activeAgent) => {
+    if (
+      !effectiveServerId ||
+      connection.status !== "connected" ||
+      agent?.adapter !== "opencode" ||
+      !agent.managed
+    ) {
+      return;
+    }
+    if (activeAgentUpdate.status === "available") {
+      setAgentUpdateModalOpen(true);
+      return;
+    }
+    if (socketRef.current?.readyState !== WebSocket.OPEN) {
+      showToast("EasyWork 服务未连接");
+      return;
+    }
+    setAgentUpdatesByServer((current) => ({
+      ...current,
+      [effectiveServerId]: {
+        status: "checking",
+        currentVersion: agent.version,
+        label: "正在检测 OpenCode 更新",
+      },
+    }));
+    setAgentMenuOpen(false);
+    setAgentMenuPage("root");
+    setAgentUpdateModalOpen(true);
+    socketRef.current.send(
+      JSON.stringify({
+        type: "agent.update.check",
+        serverId: effectiveServerId,
+        agentId: agent.id,
+      }),
+    );
+  };
+
+  const applyAgentUpdate = () => {
+    if (
+      !effectiveServerId ||
+      socketRef.current?.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    setAgentUpdatesByServer((current) => ({
+      ...current,
+      [effectiveServerId]: {
+        ...(current[effectiveServerId] ?? { status: "idle" }),
+        status: "updating",
+        label: "正在更新 OpenCode",
+      },
+    }));
+    socketRef.current.send(
+      JSON.stringify({
+        type: "agent.update.apply",
+        serverId: effectiveServerId,
+        agentId: "opencode",
+      }),
+    );
+  };
+
   const selectAgent = (agentId: string) => {
     if (!effectiveServerId) return;
     setActiveAgentByServer((current) => ({
@@ -2989,6 +3653,7 @@ export default function EasyWorkApp() {
       }));
     }
     setAgentMenuOpen(false);
+    setAgentMenuPage("root");
   };
 
   const addManualAgent = () => {
@@ -3018,12 +3683,82 @@ export default function EasyWorkApp() {
     setAgentConfigAgentId(agent.id);
     setAgentConfigOpen(true);
     setAgentMenuOpen(false);
+    setAgentMenuPage("root");
     socketRef.current.send(
       JSON.stringify({
         type: "agent.config.read",
         serverId: effectiveServerId,
         agentId: agent.id,
         requestId: uid("config"),
+      }),
+    );
+  };
+
+  const openAgentSettings = (agent: AgentItem) => {
+    setAgentConfigAgentId(agent.id);
+    setAgentMenuPage("config");
+  };
+
+  const openAgentModelPicker = () => {
+    setAgentModelsByServer((current) => ({
+      ...current,
+      [effectiveServerId]:
+        current[effectiveServerId]?.status === "configuring"
+          ? current[effectiveServerId]
+          : { status: "idle" },
+    }));
+    setAgentMenuPage("models");
+    void detectProviderModels();
+  };
+
+  const configureAgentModel = (modelId: string) => {
+    if (!configAgent || !effectiveServerId) return;
+    setAgentModelsByServer((current) => ({
+      ...current,
+      [effectiveServerId]: {
+        status: "configuring",
+        model: modelId,
+        label: "正在准备 OpenCode 配置",
+      },
+    }));
+    if (connection.demo) {
+      window.setTimeout(() => {
+        setAgentModelsByServer((current) => ({
+          ...current,
+          [effectiveServerId]: {
+            status: "done",
+            model: modelId,
+            label: `OpenCode 已切换到 ${modelId}`,
+          },
+        }));
+        setAgentsByServer((current) => ({
+          ...current,
+          [effectiveServerId]: (current[effectiveServerId] ?? []).map((agent) =>
+            agent.id === configAgent.id
+              ? { ...agent, configured: true, model: modelId }
+              : agent,
+          ),
+        }));
+      }, 650);
+      return;
+    }
+    if (socketRef.current?.readyState !== WebSocket.OPEN) {
+      setAgentModelsByServer((current) => ({
+        ...current,
+        [effectiveServerId]: {
+          status: "error",
+          model: modelId,
+          error: "EasyWork 服务未连接",
+        },
+      }));
+      return;
+    }
+    socketRef.current.send(
+      JSON.stringify({
+        type: "agent.model.configure",
+        serverId: effectiveServerId,
+        agentId: configAgent.id,
+        model: modelId,
       }),
     );
   };
@@ -3251,10 +3986,19 @@ export default function EasyWorkApp() {
     return conversation.title.toLowerCase().includes(searchQuery.trim().toLowerCase());
   });
 
+  const orderConversations = (conversations: Conversation[]) =>
+    [...conversations].sort(
+      (left, right) =>
+        Number(Boolean(right.pinned)) - Number(Boolean(left.pinned)) ||
+        new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+    );
+
   const projectConversations = (projectId: string) =>
-    visibleConversations.filter(
-      (conversation) =>
-        conversation.projectId === projectId && conversation.messages.length > 0,
+    orderConversations(
+      visibleConversations.filter(
+        (conversation) =>
+          conversation.projectId === projectId && conversation.messages.length > 0,
+      ),
     );
 
   const orderedProjects = [...state.projects].sort(
@@ -3263,8 +4007,10 @@ export default function EasyWorkApp() {
       new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
   );
 
-  const generalConversations = visibleConversations.filter(
-    (conversation) => !conversation.projectId && conversation.messages.length > 0,
+  const generalConversations = orderConversations(
+    visibleConversations.filter(
+      (conversation) => !conversation.projectId && conversation.messages.length > 0,
+    ),
   );
 
   const visibleLibraryFiles = state.files.filter((file) =>
@@ -3497,217 +4243,307 @@ export default function EasyWorkApp() {
         )}
 
         <div className="sidebar-scroll">
-          <div className="section-label">
-            <span>项目</span>
-            <button
-              type="button"
-              onClick={() => setProjectModalOpen(true)}
-              aria-label="新建项目"
-            >
-              <Plus size={15} />
-            </button>
-          </div>
-          <div className="project-list">
-            {orderedProjects.map((project) => {
-              const expanded = expandedProjectIds.has(project.id);
-              const projectHomeActive =
-                view === "project" && project.id === activeProjectId;
-              const conversations = projectConversations(project.id);
-              return (
-                <div
-                  className={`project-nav-group${expanded ? " expanded" : ""}`}
-                  key={project.id}
-                >
-                  <div
-                    className={`project-list-item${
-                      projectHomeActive ? " active" : ""
-                    }`}
-                  >
-                    <button
-                      className="project-row"
-                      type="button"
-                      aria-expanded={expanded}
-                      onClick={() => toggleProjectExpansion(project.id)}
-                    >
-                      <span className="project-folder-icon">
-                        {expanded ? (
-                          <FolderOpen size={18} />
-                        ) : (
-                          <Folder size={18} />
-                        )}
-                      </span>
-                      <span className="project-title" title={project.name}>
-                        {project.name}
-                      </span>
-                      {project.pinned && (
-                        <Pin className="project-pin-indicator" size={11} />
-                      )}
-                    </button>
-                    <div className="project-row-actions">
-                      <button
-                        className="project-home-button"
-                        type="button"
-                        aria-label={`打开“${project.name}”项目主页`}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          openProject(project.id);
-                        }}
-                      >
-                        <Home size={14} />
-                      </button>
-                      <button
-                        className="project-more-button"
-                        type="button"
-                        aria-label={`打开“${project.name}”的项目选项`}
-                        aria-expanded={projectMenuId === project.id}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setProjectMenuId((current) =>
-                            current === project.id ? "" : project.id,
-                          );
-                        }}
-                      >
-                        <Ellipsis size={16} />
-                      </button>
-                    </div>
-                    {projectMenuId === project.id && (
-                      <div className="conversation-menu project-menu" role="menu">
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            setProjectEditor({ project, mode: "rename" });
-                            setProjectMenuId("");
-                          }}
-                        >
-                          <Pencil size={15} />
-                          重命名项目
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            setProjectEditor({ project, mode: "settings" });
-                            setProjectMenuId("");
-                          }}
-                        >
-                          <Settings2 size={15} />
-                          项目设置
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            openProject(project.id);
-                            setProjectMenuId("");
-                          }}
-                        >
-                          <Home size={15} />
-                          项目主页
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => toggleProjectPin(project.id)}
-                        >
-                          {project.pinned ? (
-                            <PinOff size={15} />
-                          ) : (
-                            <Pin size={15} />
-                          )}
-                          {project.pinned ? "取消置顶" : "置顶项目"}
-                        </button>
-                        <button
-                          className="danger"
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            setProjectPendingDelete(project);
-                            setProjectMenuId("");
-                          }}
-                        >
-                          <Trash2 size={15} />
-                          删除项目
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                  {conversations.length > 0 && (
-                    <div
-                      className={`project-sidebar-chats-motion${
-                        expanded ? " expanded" : ""
-                      }`}
-                      aria-hidden={!expanded}
-                    >
-                      <div>
-                        <div className="project-sidebar-chats">
-                          {conversations.map((conversation) => (
-                            <ConversationRow
-                              key={conversation.id}
-                              conversation={conversation}
-                              active={
-                                conversation.id === activeConversationId &&
-                                view === "chat"
-                              }
-                              nested
-                              projects={state.projects}
-                              menuOpen={conversationMenuId === conversation.id}
-                              onSelect={() => selectConversation(conversation)}
-                              onToggleMenu={() =>
-                                setConversationMenuId((current) =>
-                                  current === conversation.id ? "" : conversation.id,
-                                )
-                              }
-                              onMove={(projectId) =>
-                                moveConversation(conversation.id, projectId)
-                              }
-                              onDelete={() => {
-                                setConversationPendingDelete(conversation);
-                                setConversationMenuId("");
-                              }}
-                            />
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="section-label chat-section-label">
-            <span>聊天</span>
-            <button
-              type="button"
-              onClick={() => beginConversation()}
-              aria-label="新建聊天"
-            >
-              <Plus size={15} />
-            </button>
-          </div>
-          <div className="general-chats">
-            {generalConversations.map((conversation) => (
-              <ConversationRow
-                key={conversation.id}
-                conversation={conversation}
-                active={conversation.id === activeConversationId && view === "chat"}
-                projects={state.projects}
-                menuOpen={conversationMenuId === conversation.id}
-                onSelect={() => selectConversation(conversation)}
-                onToggleMenu={() =>
-                  setConversationMenuId((current) =>
-                    current === conversation.id ? "" : conversation.id,
-                  )
-                }
-                onMove={(projectId) => moveConversation(conversation.id, projectId)}
-                onDelete={() => {
-                  setConversationPendingDelete(conversation);
-                  setConversationMenuId("");
+          <section
+            className={`sidebar-content-section project-sidebar-section${
+              projectSectionOpen ? " expanded" : ""
+            }`}
+          >
+            <div className="section-label sidebar-section-heading">
+              <button
+                className="sidebar-section-toggle"
+                type="button"
+                aria-expanded={projectSectionOpen}
+                onClick={() => setProjectSectionOpen((current) => !current)}
+              >
+                <span>项目</span>
+                <ChevronRight className="sidebar-section-chevron" size={14} />
+              </button>
+              <button
+                className="sidebar-section-add"
+                type="button"
+                onClick={() => {
+                  setProjectModalConversationId("");
+                  setProjectModalOpen(true);
                 }}
-              />
-            ))}
-          </div>
+                aria-label="新建项目"
+              >
+                <Plus size={15} />
+              </button>
+            </div>
+            <div className="sidebar-section-motion" aria-hidden={!projectSectionOpen}>
+              <div>
+                <div className="project-list">
+                  {orderedProjects.map((project) => {
+                    const expanded = expandedProjectIds.has(project.id);
+                    const projectHomeActive =
+                      view === "project" && project.id === activeProjectId;
+                    const conversations = projectConversations(project.id);
+                    const showingAllConversations =
+                      expandedProjectConversationIds.has(project.id);
+                    const displayedConversations = showingAllConversations
+                      ? conversations
+                      : conversations.slice(0, 4);
+                    return (
+                      <div
+                        className={`project-nav-group${expanded ? " expanded" : ""}`}
+                        key={project.id}
+                      >
+                        <div
+                          className={`project-list-item${
+                            projectHomeActive ? " active" : ""
+                          }`}
+                        >
+                          <button
+                            className="project-row"
+                            type="button"
+                            aria-expanded={expanded}
+                            onClick={() => toggleProjectExpansion(project.id)}
+                          >
+                            <span className="project-folder-icon">
+                              {expanded ? (
+                                <FolderOpen size={18} />
+                              ) : (
+                                <Folder size={18} />
+                              )}
+                            </span>
+                            <span className="project-title" title={project.name}>
+                              {project.name}
+                            </span>
+                            {project.pinned && (
+                              <Pin className="project-pin-indicator" size={11} />
+                            )}
+                          </button>
+                          <div className="project-row-actions">
+                            <button
+                              className="project-home-button"
+                              type="button"
+                              aria-label={`打开“${project.name}”项目主页`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openProject(project.id);
+                              }}
+                            >
+                              <Home size={14} />
+                            </button>
+                            <button
+                              className="project-more-button"
+                              type="button"
+                              aria-label={`打开“${project.name}”的项目选项`}
+                              aria-expanded={projectMenuId === project.id}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setProjectMenuId((current) =>
+                                  current === project.id ? "" : project.id,
+                                );
+                              }}
+                            >
+                              <Ellipsis size={16} />
+                            </button>
+                          </div>
+                          {projectMenuId === project.id && (
+                            <div className="conversation-menu project-menu" role="menu">
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setProjectEditor({ project, mode: "rename" });
+                                  setProjectMenuId("");
+                                }}
+                              >
+                                <Pencil size={15} />
+                                重命名项目
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setProjectEditor({ project, mode: "settings" });
+                                  setProjectMenuId("");
+                                }}
+                              >
+                                <Settings2 size={15} />
+                                项目设置
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  openProject(project.id);
+                                  setProjectMenuId("");
+                                }}
+                              >
+                                <Home size={15} />
+                                项目主页
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => toggleProjectPin(project.id)}
+                              >
+                                {project.pinned ? (
+                                  <PinOff size={15} />
+                                ) : (
+                                  <Pin size={15} />
+                                )}
+                                {project.pinned ? "取消置顶" : "置顶项目"}
+                              </button>
+                              <button
+                                className="danger"
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setProjectPendingDelete(project);
+                                  setProjectMenuId("");
+                                }}
+                              >
+                                <Trash2 size={15} />
+                                删除项目
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        {conversations.length > 0 && (
+                          <div
+                            className={`project-sidebar-chats-motion${
+                              expanded ? " expanded" : ""
+                            }`}
+                            aria-hidden={!expanded}
+                          >
+                            <div>
+                              <div className="project-sidebar-chats">
+                                {displayedConversations.map((conversation) => (
+                                  <ConversationRow
+                                    key={conversation.id}
+                                    conversation={conversation}
+                                    active={
+                                      conversation.id === activeConversationId &&
+                                      view === "chat"
+                                    }
+                                    nested
+                                    projects={state.projects}
+                                    menuOpen={conversationMenuId === conversation.id}
+                                    onSelect={() => selectConversation(conversation)}
+                                    onToggleMenu={() =>
+                                      setConversationMenuId((current) =>
+                                        current === conversation.id
+                                          ? ""
+                                          : conversation.id,
+                                      )
+                                    }
+                                    onMove={(projectId) =>
+                                      moveConversation(conversation.id, projectId)
+                                    }
+                                    onMoveToNewProject={() => {
+                                      setProjectModalConversationId(conversation.id);
+                                      setProjectModalOpen(true);
+                                      setConversationMenuId("");
+                                    }}
+                                    onRename={() => {
+                                      setConversationEditor(conversation);
+                                      setConversationMenuId("");
+                                    }}
+                                    onTogglePin={() =>
+                                      toggleConversationPin(conversation.id)
+                                    }
+                                    onDelete={() => {
+                                      setConversationPendingDelete(conversation);
+                                      setConversationMenuId("");
+                                    }}
+                                  />
+                                ))}
+                                {conversations.length > 4 && (
+                                  <button
+                                    className="project-conversations-more"
+                                    type="button"
+                                    onClick={() =>
+                                      setExpandedProjectConversationIds((current) => {
+                                        const next = new Set(current);
+                                        if (next.has(project.id)) next.delete(project.id);
+                                        else next.add(project.id);
+                                        return next;
+                                      })
+                                    }
+                                  >
+                                    {showingAllConversations ? "收起" : "显示更多"}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            className={`sidebar-content-section chat-sidebar-section${
+              chatSectionOpen ? " expanded" : ""
+            }`}
+          >
+            <div className="section-label chat-section-label sidebar-section-heading">
+              <button
+                className="sidebar-section-toggle"
+                type="button"
+                aria-expanded={chatSectionOpen}
+                onClick={() => setChatSectionOpen((current) => !current)}
+              >
+                <span>聊天</span>
+                <ChevronRight className="sidebar-section-chevron" size={14} />
+              </button>
+              <button
+                className="sidebar-section-add"
+                type="button"
+                onClick={() => beginConversation()}
+                aria-label="新建聊天"
+              >
+                <Plus size={15} />
+              </button>
+            </div>
+            <div className="sidebar-section-motion" aria-hidden={!chatSectionOpen}>
+              <div>
+                <div className="general-chats">
+                  {generalConversations.map((conversation) => (
+                    <ConversationRow
+                      key={conversation.id}
+                      conversation={conversation}
+                      active={
+                        conversation.id === activeConversationId && view === "chat"
+                      }
+                      projects={state.projects}
+                      menuOpen={conversationMenuId === conversation.id}
+                      onSelect={() => selectConversation(conversation)}
+                      onToggleMenu={() =>
+                        setConversationMenuId((current) =>
+                          current === conversation.id ? "" : conversation.id,
+                        )
+                      }
+                      onMove={(projectId) =>
+                        moveConversation(conversation.id, projectId)
+                      }
+                      onMoveToNewProject={() => {
+                        setProjectModalConversationId(conversation.id);
+                        setProjectModalOpen(true);
+                        setConversationMenuId("");
+                      }}
+                      onRename={() => {
+                        setConversationEditor(conversation);
+                        setConversationMenuId("");
+                      }}
+                      onTogglePin={() => toggleConversationPin(conversation.id)}
+                      onDelete={() => {
+                        setConversationPendingDelete(conversation);
+                        setConversationMenuId("");
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+          </section>
         </div>
 
         <div className="profile-wrap">
@@ -3835,20 +4671,27 @@ export default function EasyWorkApp() {
           <div className="topbar-actions">
             {view === "chat" && mode === "work" && (
               <>
-                <button
-                  className={`connection-pill ${connection.status}`}
-                  type="button"
-                  onClick={openConversationServerManager}
-                >
-                  {connection.status === "connected" ? <Wifi size={14} /> : <WifiOff size={14} />}
-                  <span>{connection.status === "connected" ? "登录节点在线" : "连接平台"}</span>
-                  {connection.latency && <small>{connection.latency}ms</small>}
-                </button>
-                {connection.status === "connected" && (
+                {!rightRailOpen && (
                   <button
-                    className="agent-picker"
+                    className={`connection-pill ${connection.status}`}
                     type="button"
-                    onClick={() => setAgentMenuOpen((current) => !current)}
+                    onClick={openConversationServerManager}
+                  >
+                    {connection.status === "connected" ? <Wifi size={14} /> : <WifiOff size={14} />}
+                    <span>{connection.status === "connected" ? "登录节点在线" : "连接平台"}</span>
+                    {connection.latency && <small>{connection.latency}ms</small>}
+                  </button>
+                )}
+                {connection.status === "connected" && (
+                    <button
+                      className="agent-picker"
+                      type="button"
+                      onClick={() =>
+                        setAgentMenuOpen((current) => {
+                          if (!current) setAgentMenuPage("root");
+                          return !current;
+                        })
+                      }
                   >
                     <Bot size={15} />
                     <span>{activeAgent?.name ?? "选择 Agent"}</span>
@@ -3933,13 +4776,41 @@ export default function EasyWorkApp() {
               </div>
 
               <div className="conversation-toolbar-right">
+                {mode === "work" && !rightRailOpen && (
+                  <button
+                    className={`work-connection-button ${connection.status}`}
+                    type="button"
+                    onClick={openConversationServerManager}
+                    aria-label={
+                      connection.status === "connected"
+                        ? "远程服务器已连接，打开连接详情"
+                        : "远程服务器未连接，打开连接窗口"
+                    }
+                  >
+                    {connection.status === "connecting" ? (
+                      <LoaderCircle className="spin" size={14} />
+                    ) : connection.status === "connected" ? (
+                      <Wifi size={14} />
+                    ) : (
+                      <WifiOff size={14} />
+                    )}
+                    <span>
+                      {connection.status === "connected" ? "已连接" : "未连接"}
+                    </span>
+                  </button>
+                )}
                 {mode === "work" && connection.status === "connected" && (
                   <div className="agent-selector">
                     <button
                       className="agent-picker"
                       type="button"
                       aria-expanded={agentMenuOpen}
-                      onClick={() => setAgentMenuOpen((current) => !current)}
+                      onClick={() =>
+                        setAgentMenuOpen((current) => {
+                          if (!current) setAgentMenuPage("root");
+                          return !current;
+                        })
+                      }
                     >
                       <Bot size={15} />
                       <span>
@@ -3950,109 +4821,274 @@ export default function EasyWorkApp() {
                       <ChevronDown size={13} />
                     </button>
                     {agentMenuOpen && (
-                      <div className="agent-dropdown">
-                        <div className="agent-dropdown-list">
-                          {agents.map((agent) => (
-                            <div
-                              className={`agent-dropdown-row${
-                                agent.id === activeAgentId &&
-                                agent.status === "ready"
-                                  ? " active"
-                                  : ""
-                              }`}
-                              key={agent.id}
-                            >
+                      <div
+                        className={`agent-dropdown show-${agentMenuPage}`}
+                        style={
+                          {
+                            "--agent-menu-height":
+                              agentMenuPage === "config"
+                                ? "145px"
+                                : agentMenuPage === "models"
+                                  ? `${Math.min(
+                                      350,
+                                      112 + Math.max(providerModels.length, 1) * 40,
+                                    )}px`
+                                  : `${Math.min(
+                                      390,
+                                      66 +
+                                        Math.max(agents.length, 1) * 58 +
+                                        (agents.some(
+                                          (agent) =>
+                                            agent.id === "opencode" &&
+                                            agent.status === "missing",
+                                        )
+                                          ? 45
+                                          : 0) +
+                                        (manualAgentOpen ? 112 : 0),
+                                    )}px`,
+                          } as React.CSSProperties
+                        }
+                      >
+                        <div className="agent-menu-track">
+                          <div className="agent-menu-panel agent-root-panel">
+                            <div className="agent-dropdown-list">
+                              {agents.map((agent) => (
+                                <div
+                                  className={`agent-dropdown-row${
+                                    agent.id === activeAgentId &&
+                                    agent.status === "ready"
+                                      ? " active"
+                                      : ""
+                                  }`}
+                                  key={agent.id}
+                                >
+                                  <button
+                                    type="button"
+                                    disabled={agent.status !== "ready"}
+                                    onClick={() => selectAgent(agent.id)}
+                                  >
+                                    <span>
+                                      {agent.id === "opencode" ? (
+                                        <Code2 size={16} />
+                                      ) : (
+                                        <Bot size={16} />
+                                      )}
+                                    </span>
+                                    <span>
+                                      <strong>{agent.name}</strong>
+                                      <small>
+                                        {agent.status === "missing"
+                                          ? "未安装"
+                                          : agent.status === "installing"
+                                            ? agent.detail || "安装中"
+                                            : agent.configured
+                                              ? agent.version || "可用"
+                                              : "需要配置"}
+                                      </small>
+                                    </span>
+                                    {agent.id === activeAgentId &&
+                                      agent.status === "ready" && (
+                                        <Check size={14} />
+                                      )}
+                                  </button>
+                                  {agent.status === "ready" &&
+                                    (agent.configPath ||
+                                      agent.adapter === "opencode") && (
+                                    <span className="agent-row-actions">
+                                      {agent.adapter === "opencode" &&
+                                        agent.managed && (
+                                          <button
+                                            className={`agent-update-shortcut ${activeAgentUpdate.status}`}
+                                            type="button"
+                                            onClick={() => checkAgentUpdate(agent)}
+                                            disabled={[
+                                              "checking",
+                                              "downloading",
+                                              "updating",
+                                              "configuring",
+                                            ].includes(activeAgentUpdate.status)}
+                                            aria-label="检测 OpenCode 更新"
+                                            title="检测更新"
+                                          >
+                                            <RefreshCw
+                                              className={
+                                                [
+                                                  "checking",
+                                                  "downloading",
+                                                  "updating",
+                                                  "configuring",
+                                                ].includes(activeAgentUpdate.status)
+                                                  ? "spin"
+                                                  : undefined
+                                              }
+                                              size={14}
+                                            />
+                                          </button>
+                                        )}
+                                      <button
+                                        className="agent-config-shortcut"
+                                        type="button"
+                                        onClick={() => openAgentSettings(agent)}
+                                        aria-label={`配置 ${agent.name}`}
+                                      >
+                                        <ChevronRight size={15} />
+                                      </button>
+                                    </span>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                            {agents.some(
+                              (agent) =>
+                                agent.id === "opencode" && agent.status === "missing",
+                            ) && (
+                              <button
+                                className="agent-install-action"
+                                type="button"
+                                onClick={installManagedAgent}
+                                disabled={connection.status !== "connected"}
+                              >
+                                <Download size={15} />
+                                安装 OpenCode
+                              </button>
+                            )}
+                            {manualAgentOpen && (
+                              <div className="manual-agent-inline">
+                                <input
+                                  value={manualAgentName}
+                                  onChange={(event) =>
+                                    setManualAgentName(event.target.value)
+                                  }
+                                  placeholder="名称（可选）"
+                                />
+                                <input
+                                  value={manualAgentFolder}
+                                  onChange={(event) =>
+                                    setManualAgentFolder(event.target.value)
+                                  }
+                                  placeholder="Agent 文件夹，如 ~/.local/opencode"
+                                />
+                                <button type="button" onClick={addManualAgent}>
+                                  添加
+                                </button>
+                              </div>
+                            )}
+                            <div className="agent-dropdown-actions">
+                              <button type="button" onClick={scanAgents}>
+                                <RefreshCw size={14} />
+                                自动扫描
+                              </button>
                               <button
                                 type="button"
-                                disabled={agent.status !== "ready"}
-                                onClick={() => selectAgent(agent.id)}
+                                onClick={() =>
+                                  setManualAgentOpen((current) => !current)
+                                }
                               >
-                                <span>
-                                  {agent.id === "opencode" ? (
-                                    <Code2 size={16} />
-                                  ) : (
-                                    <Bot size={16} />
-                                  )}
-                                </span>
-                                <span>
-                                  <strong>{agent.name}</strong>
-                                  <small>
-                                    {agent.status === "missing"
-                                      ? "未安装"
-                                      : agent.status === "installing"
-                                        ? agent.detail || "安装中"
-                                        : agent.configured
-                                          ? agent.version || "可用"
-                                          : "需要配置"}
-                                  </small>
-                                </span>
-                                {agent.id === activeAgentId &&
-                                  agent.status === "ready" && (
-                                  <Check size={14} />
-                                )}
+                                <Plus size={14} />
+                                手动添加
                               </button>
-                              {agent.status === "ready" && agent.configPath && (
-                                <button
-                                  className="agent-config-shortcut"
-                                  type="button"
-                                  onClick={() => openAgentConfig(agent)}
-                                  aria-label={`打开 ${agent.name} 配置`}
-                                >
-                                  <Settings2 size={14} />
-                                </button>
+                            </div>
+                          </div>
+
+                          <div className="agent-menu-panel agent-config-panel">
+                            <button
+                              className="agent-menu-back"
+                              type="button"
+                              onClick={() => setAgentMenuPage("root")}
+                            >
+                              <ChevronLeft size={15} />
+                              返回
+                            </button>
+                            <button
+                              className="agent-menu-option"
+                              type="button"
+                              onClick={() => openAgentConfig(configAgent)}
+                            >
+                              <FileText size={16} />
+                              <span>打开配置</span>
+                            </button>
+                            {configAgent?.adapter === "opencode" && (
+                              <button
+                                className="agent-menu-option"
+                                type="button"
+                                onClick={openAgentModelPicker}
+                              >
+                                <Bot size={16} />
+                                <span>选择模型</span>
+                                <ChevronRight size={15} />
+                              </button>
+                            )}
+                          </div>
+
+                          <div className="agent-menu-panel agent-model-panel">
+                            <button
+                              className="agent-menu-back"
+                              type="button"
+                              onClick={() => setAgentMenuPage("config")}
+                            >
+                              <ChevronLeft size={15} />
+                              返回
+                            </button>
+                            <p>基于用户 API 进行配置</p>
+                            {activeAgentModelConfig.status === "configuring" && (
+                              <div className="agent-model-progress" role="status">
+                                <LoaderCircle className="spin" size={15} />
+                                <span>
+                                  {activeAgentModelConfig.label || "正在配置"}
+                                </span>
+                              </div>
+                            )}
+                            {activeAgentModelConfig.status === "error" && (
+                              <div className="agent-model-progress error" role="alert">
+                                <X size={14} />
+                                <span>
+                                  {activeAgentModelConfig.error ||
+                                    activeAgentModelConfig.label ||
+                                    "配置失败"}
+                                </span>
+                              </div>
+                            )}
+                            <div className="agent-model-list">
+                              {providerModels.map((modelId) => {
+                                const selectedModel =
+                                  activeAgentModelConfig.status === "done"
+                                    ? activeAgentModelConfig.model
+                                    : configAgent?.model;
+                                return (
+                                  <button
+                                    className={
+                                      selectedModel === modelId ? "selected" : ""
+                                    }
+                                    type="button"
+                                    key={modelId}
+                                    disabled={
+                                      activeAgentModelConfig.status === "configuring"
+                                    }
+                                    onClick={() => configureAgentModel(modelId)}
+                                  >
+                                    <span title={modelId}>{modelId}</span>
+                                    {activeAgentModelConfig.status === "configuring" &&
+                                    activeAgentModelConfig.model === modelId ? (
+                                      <LoaderCircle className="spin" size={14} />
+                                    ) : selectedModel === modelId ? (
+                                      <Check size={14} />
+                                    ) : null}
+                                  </button>
+                                );
+                              })}
+                              {providerModelsLoading && !providerModels.length && (
+                                <span className="agent-model-empty">
+                                  <LoaderCircle className="spin" size={15} />
+                                  正在检测模型
+                                </span>
+                              )}
+                              {!providerModelsLoading && providerModelsError && (
+                                <span className="agent-model-empty error">
+                                  {providerModelsError}
+                                </span>
                               )}
                             </div>
-                          ))}
-                        </div>
-                        {agents.some(
-                          (agent) =>
-                            agent.id === "opencode" && agent.status === "missing",
-                        ) && (
-                          <button
-                            className="agent-install-action"
-                            type="button"
-                            onClick={installManagedAgent}
-                            disabled={connection.status !== "connected"}
-                          >
-                            <Download size={15} />
-                            安装 OpenCode
-                          </button>
-                        )}
-                        {manualAgentOpen && (
-                          <div className="manual-agent-inline">
-                            <input
-                              value={manualAgentName}
-                              onChange={(event) =>
-                                setManualAgentName(event.target.value)
-                              }
-                              placeholder="名称（可选）"
-                            />
-                            <input
-                              value={manualAgentFolder}
-                              onChange={(event) =>
-                                setManualAgentFolder(event.target.value)
-                              }
-                              placeholder="Agent 文件夹，如 ~/.local/opencode"
-                            />
-                            <button type="button" onClick={addManualAgent}>
-                              添加
-                            </button>
                           </div>
-                        )}
-                        <div className="agent-dropdown-actions">
-                          <button type="button" onClick={scanAgents}>
-                            <RefreshCw size={14} />
-                            自动扫描
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setManualAgentOpen((current) => !current)
-                            }
-                          >
-                            <Plus size={14} />
-                            手动添加
-                          </button>
                         </div>
                       </div>
                     )}
@@ -4084,8 +5120,17 @@ export default function EasyWorkApp() {
                         type="button"
                         onClick={() =>
                           activeAgent?.status === "missing"
-                            ? setAgentMenuOpen(true)
-                            : openAgentConfig()
+                            ? (() => {
+                                setAgentMenuPage("root");
+                                setAgentMenuOpen(true);
+                              })()
+                            : (() => {
+                                if (activeAgent) {
+                                  setAgentConfigAgentId(activeAgent.id);
+                                }
+                                setAgentMenuPage("config");
+                                setAgentMenuOpen(true);
+                              })()
                         }
                       >
                         <Settings2 size={16} />
@@ -4146,7 +5191,15 @@ export default function EasyWorkApp() {
                                     item.role === "user" &&
                                     item.runId &&
                                     item.runId === message.runId,
-                                )?.trace?.status
+                                  )?.trace?.status
+                              }
+                              workflowSteps={
+                                activeConversation.messages.find(
+                                  (item) =>
+                                    item.role === "user" &&
+                                    item.runId &&
+                                    item.runId === message.runId,
+                                )?.trace?.steps
                               }
                               onApproval={
                                 message.runId
@@ -4209,6 +5262,10 @@ export default function EasyWorkApp() {
                 sending={sending}
                 skills={state.skills}
                 selectedSkills={selectedSkills}
+                model={state.settings.provider.model}
+                models={providerModels}
+                modelsLoading={providerModelsLoading}
+                modelError={providerModelsError}
                 menuDirection="up"
                 onChange={setDraft}
                 onSubmit={() => void submitMessage()}
@@ -4217,6 +5274,8 @@ export default function EasyWorkApp() {
                   void handleLibraryUpload(files, activeProject?.id)
                 }
                 onToggleSkill={toggleSelectedSkill}
+                onDetectModels={() => void detectProviderModels()}
+                onSelectModel={(modelId) => void selectProviderModel(modelId)}
                 placeholder={
                   mode === "chat"
                     ? "给 EasyWork 发消息"
@@ -4276,6 +5335,10 @@ export default function EasyWorkApp() {
                 sending={sending}
                 skills={state.skills}
                 selectedSkills={selectedSkills}
+                model={state.settings.provider.model}
+                models={providerModels}
+                modelsLoading={providerModelsLoading}
+                modelError={providerModelsError}
                 menuDirection="down"
                 onChange={setDraft}
                 onSubmit={() =>
@@ -4290,6 +5353,8 @@ export default function EasyWorkApp() {
                   void handleLibraryUpload(files, projectPage.id)
                 }
                 onToggleSkill={toggleSelectedSkill}
+                onDetectModels={() => void detectProviderModels()}
+                onSelectModel={(modelId) => void selectProviderModel(modelId)}
                 placeholder={`在 ${projectPage.name} 中发起${
                   mode === "work" ? "工作" : "聊天"
                 }`}
@@ -5086,6 +6151,13 @@ export default function EasyWorkApp() {
           </div>
         </Modal>
       )}
+      {conversationEditor && (
+        <ConversationRenameModal
+          conversation={conversationEditor}
+          onClose={() => setConversationEditor(null)}
+          onSave={(title) => renameConversation(conversationEditor.id, title)}
+        />
+      )}
       {projectPendingDelete && (
         <Modal title="删除项目？" onClose={() => setProjectPendingDelete(null)}>
           <div className="delete-conversation-dialog">
@@ -5113,7 +6185,10 @@ export default function EasyWorkApp() {
       )}
       {projectModalOpen && (
         <ProjectModal
-          onClose={() => setProjectModalOpen(false)}
+          onClose={() => {
+            setProjectModalOpen(false);
+            setProjectModalConversationId("");
+          }}
           onCreate={createProject}
         />
       )}
@@ -5164,7 +6239,7 @@ export default function EasyWorkApp() {
       {sshModalOpen && (
         <ServerManagerModal
           profiles={
-            sshModalContext === "conversation" &&
+            sshModalContext === "bound" &&
             activeConversation?.work?.serverId
               ? state.settings.servers.filter(
                   (profile) =>
@@ -5174,12 +6249,17 @@ export default function EasyWorkApp() {
           }
           connections={connections}
           selectedServerId={
-            sshModalContext === "conversation"
+            sshModalContext === "bound"
               ? effectiveServerId
-              : globalServerId
+              : sshModalContext === "new-work"
+                ? draftServerId || globalServerId
+                : globalServerId
           }
+          conversationScoped={sshModalContext === "bound"}
+          showFormConnect={sshModalContext === "new-work"}
+          showDemo={sshModalContext === "new-work"}
           locked={Boolean(
-            sshModalContext === "conversation" &&
+            sshModalContext === "bound" &&
               activeConversation?.work?.serverId,
           )}
           gatewayStatus={gatewayStatus}
@@ -5205,6 +6285,14 @@ export default function EasyWorkApp() {
             setAgentConfigOpen(false);
             setAgentConfigLoading(false);
           }}
+        />
+      )}
+      {agentUpdateModalOpen && (
+        <AgentUpdateModal
+          state={activeAgentUpdate}
+          onUpdate={applyAgentUpdate}
+          onRetry={checkAgentUpdate}
+          onClose={() => setAgentUpdateModalOpen(false)}
         />
       )}
       {fileManagerOpen && (
@@ -5259,6 +6347,47 @@ export default function EasyWorkApp() {
   );
 }
 
+function ConversationRenameModal({
+  conversation,
+  onClose,
+  onSave,
+}: {
+  conversation: Conversation;
+  onClose: () => void;
+  onSave: (title: string) => void;
+}) {
+  const [title, setTitle] = useState(conversation.title);
+  return (
+    <Modal title="重命名对话" onClose={onClose}>
+      <form
+        className="modal-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave(title);
+        }}
+      >
+        <label className="field">
+          <span>对话名称</span>
+          <input
+            autoFocus
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            maxLength={120}
+          />
+        </label>
+        <div className="modal-actions">
+          <button className="secondary-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button" type="submit" disabled={!title.trim()}>
+            保存
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 function ProjectModal({
   onClose,
   onCreate,
@@ -5267,7 +6396,8 @@ function ProjectModal({
   onCreate: (name: string, mode: Project["memoryMode"]) => void;
 }) {
   const [name, setName] = useState("");
-  const [memoryMode, setMemoryMode] = useState<Project["memoryMode"]>("default");
+  const [memoryMode, setMemoryMode] =
+    useState<Project["memoryMode"]>("project-only");
   return (
     <Modal title="新建项目" eyebrow="PROJECT" onClose={onClose}>
       <form
@@ -5288,22 +6418,6 @@ function ProjectModal({
         </label>
         <fieldset className="memory-mode-choice">
           <legend>记忆范围</legend>
-          <label className={memoryMode === "default" ? "selected" : ""}>
-            <input
-              type="radio"
-              name="memory-mode"
-              checked={memoryMode === "default"}
-              onChange={() => setMemoryMode("default")}
-            />
-            <span className="choice-icon">
-              <Network size={18} />
-            </span>
-            <span>
-              <strong>默认记忆</strong>
-              <small>使用全局记忆和本项目内容。</small>
-            </span>
-            <span className="radio-dot" />
-          </label>
           <label className={memoryMode === "project-only" ? "selected" : ""}>
             <input
               type="radio"
@@ -5317,6 +6431,22 @@ function ProjectModal({
             <span>
               <strong>仅限项目内记忆</strong>
               <small>只使用本项目的聊天、文件和记忆。</small>
+            </span>
+            <span className="radio-dot" />
+          </label>
+          <label className={memoryMode === "default" ? "selected" : ""}>
+            <input
+              type="radio"
+              name="memory-mode"
+              checked={memoryMode === "default"}
+              onChange={() => setMemoryMode("default")}
+            />
+            <span className="choice-icon">
+              <Network size={18} />
+            </span>
+            <span>
+              <strong>全局记忆</strong>
+              <small>同时使用全局记忆和本项目内容。</small>
             </span>
             <span className="radio-dot" />
           </label>
@@ -5372,22 +6502,6 @@ function ProjectEditModal({
         {mode === "settings" && (
           <fieldset className="memory-mode-choice">
             <legend>记忆范围</legend>
-            <label className={memoryMode === "default" ? "selected" : ""}>
-              <input
-                type="radio"
-                name="edit-memory-mode"
-                checked={memoryMode === "default"}
-                onChange={() => setMemoryMode("default")}
-              />
-              <span className="choice-icon">
-                <Network size={18} />
-              </span>
-              <span>
-                <strong>默认记忆</strong>
-                <small>使用全局记忆和本项目内容。</small>
-              </span>
-              <span className="radio-dot" />
-            </label>
             <label
               className={memoryMode === "project-only" ? "selected" : ""}
             >
@@ -5403,6 +6517,22 @@ function ProjectEditModal({
               <span>
                 <strong>仅限项目内记忆</strong>
                 <small>只使用本项目的对话、文件和记忆。</small>
+              </span>
+              <span className="radio-dot" />
+            </label>
+            <label className={memoryMode === "default" ? "selected" : ""}>
+              <input
+                type="radio"
+                name="edit-memory-mode"
+                checked={memoryMode === "default"}
+                onChange={() => setMemoryMode("default")}
+              />
+              <span className="choice-icon">
+                <Network size={18} />
+              </span>
+              <span>
+                <strong>全局记忆</strong>
+                <small>同时使用全局记忆和本项目内容。</small>
               </span>
               <span className="radio-dot" />
             </label>
@@ -5533,16 +6663,59 @@ function ProfileModal({
     ...state.settings.provider,
     apiKey: "",
   });
-  const [detectedModels, setDetectedModels] = useState<string[]>(
-    state.settings.provider.model ? [state.settings.provider.model] : [],
+  const [apiKeyVisible, setApiKeyVisible] = useState(false);
+  const [apiKeyLoading, setApiKeyLoading] = useState(
+    tab === "api" && state.settings.provider.configured,
   );
-  const [modelDetecting, setModelDetecting] = useState(false);
   const [modelError, setModelError] = useState("");
+
+  useEffect(() => {
+    if (tab !== "api" || !provider.configured) return;
+    let cancelled = false;
+    void gatewayFetch("/api/settings/provider/key")
+      .then(async (response) => {
+        const payload = (await response.json()) as {
+          apiKey?: string;
+          error?: string;
+        };
+        if (!response.ok) throw new Error(payload.error || "API Key 读取失败");
+        if (!cancelled) {
+          setProvider((current) => ({
+            ...current,
+            apiKey: String(payload.apiKey || ""),
+          }));
+        }
+      })
+      .catch((caught) => {
+        if (!cancelled) {
+          setModelError(
+            caught instanceof Error ? caught.message : "API Key 读取失败",
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setApiKeyLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [provider.configured, tab]);
 
   const authenticate = async (kind: "login" | "register") => {
     setBusy(true);
     setError("");
     try {
+      const currentToken = readDeviceToken();
+      await gatewayFetch("/api/state", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          ...(currentToken
+            ? { Authorization: `Bearer ${currentToken}` }
+            : {}),
+        },
+        body: JSON.stringify({ state }),
+      }).catch(() => undefined);
       const response = await gatewayFetch(`/api/auth/${kind}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -5564,7 +6737,7 @@ function ProfileModal({
         };
         storeDeviceToken(bootstrap.deviceToken);
         if (bootstrap.state) {
-          onState((current) => mergeStoredState(current, bootstrap.state ?? {}));
+          onState(mergeStoredState(DEFAULT_STATE, bootstrap.state ?? {}));
         }
       }
       setTab("profile");
@@ -5596,61 +6769,33 @@ function ProfileModal({
       setModelError("API Key 不能填写 API URL");
       return;
     }
-    const nextProvider = {
-      name: "OpenAI Compatible",
-      baseUrl: provider.baseUrl,
-      model: provider.model,
-      protocol: "auto" as const,
-      configured: Boolean(provider.apiKey || provider.configured),
-    };
     setModelError("");
     try {
       const response = await gatewayFetch("/api/settings/provider", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(provider),
+        body: JSON.stringify({
+          name: "OpenAI Compatible",
+          baseUrl: provider.baseUrl,
+          ...(provider.apiKey ? { apiKey: provider.apiKey } : {}),
+        }),
       });
-      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: string;
+        provider?: AppSettings["provider"];
+      };
       if (!response.ok) throw new Error(payload.error || "模型 API 保存失败");
       onState((current) => ({
         ...current,
-        settings: { ...current.settings, provider: nextProvider },
+        settings: {
+          ...current.settings,
+          provider: payload.provider ?? current.settings.provider,
+        },
       }));
       onToast("模型 API 已保存");
       onClose();
     } catch (caught) {
       setModelError(caught instanceof Error ? caught.message : "模型 API 保存失败");
-    }
-  };
-
-  const detectProviderModels = async () => {
-    if (/^https?:\/\//i.test(provider.apiKey.trim())) {
-      setModelError("API Key 不能填写 API URL");
-      return;
-    }
-    setModelDetecting(true);
-    setModelError("");
-    try {
-      const response = await gatewayFetch("/api/settings/provider/models", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(provider),
-      });
-      const payload = (await response.json()) as { models?: string[]; error?: string };
-      if (!response.ok || !payload.models?.length) {
-        throw new Error(payload.error || "没有检测到可用模型");
-      }
-      setDetectedModels(payload.models);
-      setProvider((current) => ({
-        ...current,
-        model: payload.models?.includes(current.model)
-          ? current.model
-          : payload.models?.[0] ?? "",
-      }));
-    } catch (caught) {
-      setModelError(caught instanceof Error ? caught.message : "模型检测失败");
-    } finally {
-      setModelDetecting(false);
     }
   };
 
@@ -5835,53 +6980,45 @@ function ProfileModal({
           </label>
           <label className="field">
             <span>API Key</span>
+            <span className="api-key-control">
               <input
-                type="password"
+                type={apiKeyVisible ? "text" : "password"}
                 autoComplete="new-password"
                 spellCheck={false}
-              value={provider.apiKey}
-              onChange={(event) => setProvider((current) => ({ ...current, apiKey: event.target.value }))}
-              placeholder={provider.configured ? "已保存；留空表示不修改" : "sk-…"}
-            />
-          </label>
-          <div className="model-picker">
-            <label className="field">
-              <span>模型</span>
-              <select
-                value={provider.model}
+                value={provider.apiKey}
                 onChange={(event) =>
-                  setProvider((current) => ({ ...current, model: event.target.value }))
+                  setProvider((current) => ({
+                    ...current,
+                    apiKey: event.target.value,
+                  }))
                 }
-                disabled={!detectedModels.length}
+                placeholder={
+                  apiKeyLoading
+                    ? "正在读取…"
+                    : provider.configured
+                      ? "••••••••••••••••"
+                      : "sk-…"
+                }
+              />
+              <button
+                type="button"
+                onClick={() => setApiKeyVisible((current) => !current)}
+                disabled={apiKeyLoading || !provider.apiKey}
               >
-                {!detectedModels.length && <option value="">请先检测模型</option>}
-                {detectedModels.map((model) => (
-                  <option value={model} key={model}>
-                    {model}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              className="secondary-button"
-              type="button"
-              onClick={() => void detectProviderModels()}
-              disabled={modelDetecting || !provider.baseUrl || (!provider.apiKey && !provider.configured)}
-            >
-              {modelDetecting ? (
-                <LoaderCircle className="spin" size={15} />
-              ) : (
-                <RefreshCw size={15} />
-              )}
-              {modelDetecting ? "检测中" : "检测模型"}
-            </button>
-          </div>
+                {apiKeyVisible ? "隐藏" : "显示"}
+              </button>
+            </span>
+          </label>
           {modelError && <div className="form-error">{modelError}</div>}
           <div className="modal-actions">
             <button
               className="primary-button"
               type="button"
-              disabled={!provider.baseUrl || !provider.model}
+              disabled={
+                !provider.baseUrl ||
+                (!provider.apiKey && !provider.configured) ||
+                apiKeyLoading
+              }
               onClick={() => void saveProvider()}
             >
               保存 API
@@ -5897,6 +7034,9 @@ function ServerManagerModal({
   profiles,
   connections,
   selectedServerId,
+  conversationScoped,
+  showFormConnect,
+  showDemo,
   locked,
   gatewayStatus,
   canRemember,
@@ -5911,13 +7051,16 @@ function ServerManagerModal({
   profiles: ServerProfile[];
   connections: Record<string, ConnectionState>;
   selectedServerId: string;
+  conversationScoped: boolean;
+  showFormConnect: boolean;
+  showDemo: boolean;
   locked: boolean;
   gatewayStatus: "checking" | "connected" | "unavailable";
   canRemember: boolean;
   onSelect: (serverId: string) => void;
   onClose: () => void;
   onDemo: () => void;
-  onSave: (profile: ServerProfile) => void;
+  onSave: (profile: ServerProfileDraft) => void;
   onConnect: (payload: {
     serverId: string;
     name?: string;
@@ -5934,7 +7077,7 @@ function ServerManagerModal({
     otp?: string;
     trustHost?: boolean;
   }) => void;
-  onDisconnect: (serverId?: string) => void;
+  onDisconnect: (serverId: string) => void;
   onRetry: () => void;
 }) {
   const createId = () =>
@@ -5963,6 +7106,7 @@ function ServerManagerModal({
   const [passphrase, setPassphrase] = useState("");
   const [otp, setOtp] = useState("");
   const [trustHost, setTrustHost] = useState(false);
+  const [configurationOpen, setConfigurationOpen] = useState(false);
   const connection = connections[serverId] ?? {
     serverId,
     status: "disconnected",
@@ -5978,7 +7122,7 @@ function ServerManagerModal({
       selectedProfile.username === username.trim() &&
       (selectedProfile.authMethod || "key") === authMethod,
   );
-  const profileDraft = (): ServerProfile => ({
+  const profileDraft = (): ServerProfileDraft => ({
     id: serverId,
     name: name.trim() || host.trim(),
     host: host.trim(),
@@ -5990,6 +7134,14 @@ function ServerManagerModal({
         : "",
     authMethod,
     configured: keepsSavedCredential,
+    privateKey:
+      authMethod === "key" && !useSavedCredential && privateKey
+        ? privateKey
+        : undefined,
+    password:
+      authMethod === "password" && !useSavedCredential && password
+        ? password
+        : undefined,
     lastConnectedAt: selectedProfile?.lastConnectedAt,
   });
 
@@ -6007,6 +7159,7 @@ function ServerManagerModal({
     setPasteKeyOpen(false);
     setPassphrase("");
     setOtp("");
+    setConfigurationOpen(false);
     setTrustHost(false);
     onSelect(profile.id);
   };
@@ -6026,14 +7179,33 @@ function ServerManagerModal({
     setPasteKeyOpen(false);
     setPassphrase("");
     setOtp("");
+    setConfigurationOpen(true);
     setTrustHost(false);
     onSelect(nextId);
   };
 
+  const connectSavedProfile = () => {
+    if (!selectedProfile?.configured) {
+      setConfigurationOpen(true);
+      return;
+    }
+    onConnect({
+      serverId: selectedProfile.id,
+      name: selectedProfile.name,
+      host: selectedProfile.host,
+      port: selectedProfile.port || 22,
+      username: selectedProfile.username,
+      authMethod: selectedProfile.authMethod || "key",
+      useSavedCredential: true,
+      otp: otp.trim() || undefined,
+    });
+  };
+
   return (
     <Modal title="远程连接" onClose={onClose} wide>
-      <div className="server-manager">
-        <aside className="server-profile-list">
+      <div className={`server-manager${conversationScoped ? " compact" : ""}`}>
+        {!conversationScoped && (
+          <aside className="server-profile-list">
           <div className="server-profile-list-heading">
             <span>{locked ? "当前服务器" : "服务器"}</span>
             {!locked && (
@@ -6062,12 +7234,13 @@ function ServerManagerModal({
           {!profiles.length && (
             <span className="server-profile-empty">还没有保存的服务器</span>
           )}
-          {!locked && (
+          {showDemo && !locked && (
             <button className="demo-server-button" type="button" onClick={onDemo}>
               演示连接
             </button>
           )}
-        </aside>
+          </aside>
+        )}
 
         <div className="server-connection-body">
           {gatewayStatus !== "connected" ? (
@@ -6095,63 +7268,93 @@ function ServerManagerModal({
                 </button>
               )}
             </div>
-          ) : connection.status === "connected" ? (
-            <div className="connected-panel server-connected-panel">
+          ) : (conversationScoped ||
+              (showFormConnect && connection.status === "connected")) &&
+            !configurationOpen &&
+            selectedProfile ? (
+            <div
+              className={`connected-panel server-connected-panel quick-connection-panel ${connection.status}`}
+            >
               <span className="connected-hero">
-                <Wifi size={24} />
+                {connection.status === "connecting" ? (
+                  <LoaderCircle className="spin" size={24} />
+                ) : connection.status === "connected" ? (
+                  <Wifi size={24} />
+                ) : (
+                  <WifiOff size={24} />
+                )}
               </span>
-              <h3>{selectedProfile?.name || connection.host}</h3>
+              <h3>{selectedProfile.name || selectedProfile.host}</h3>
               <p>
-                {connection.username}@{connection.host}
+                {selectedProfile.username}@{selectedProfile.host}
               </p>
               <div className="connection-facts">
                 <span>
-                  <strong>{connection.latency ?? "—"} ms</strong>
-                  <small>连接延迟</small>
+                  <strong>
+                    {connection.status === "connected"
+                      ? `${connection.latency ?? "—"} ms`
+                      : connection.status === "connecting"
+                        ? "连接中"
+                        : "未连接"}
+                  </strong>
+                  <small>连接状态</small>
                 </span>
                 <span>
-                  <strong>{connection.port || selectedProfile?.port || 22}</strong>
+                  <strong>{connection.port || selectedProfile.port || 22}</strong>
                   <small>SSH 端口</small>
                 </span>
               </div>
-              <div className="modal-actions">
+              {connection.status === "error" && (
+                <div className="form-error" role="alert">
+                  {connection.label}
+                </div>
+              )}
+              <div className="quick-connection-actions">
                 <button
-                  className="text-danger-button"
+                  className="secondary-button quick-config-button"
                   type="button"
-                  onClick={() => onDisconnect(serverId)}
+                  onClick={() => setConfigurationOpen(true)}
                 >
-                  <WifiOff size={15} />
-                  断开
+                  <Settings2 size={15} />
+                  配置
                 </button>
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={() =>
-                    onSave({
-                      id: serverId,
-                      name:
-                        selectedProfile?.name ||
-                        connection.host ||
-                        "远程服务器",
-                      host: connection.host || selectedProfile?.host || "",
-                      port:
-                        connection.port || selectedProfile?.port || 22,
-                      username:
-                        connection.username || selectedProfile?.username || "",
-                      keyName: selectedProfile?.keyName || "",
-                      authMethod: selectedProfile?.authMethod || "key",
-                      configured: Boolean(selectedProfile?.configured),
-                      lastConnectedAt:
-                        selectedProfile?.lastConnectedAt || now(),
-                    })
-                  }
-                >
-                  <Save size={15} />
-                  保存
-                </button>
-                <button className="primary-button" type="button" onClick={onClose}>
-                  完成
-                </button>
+                {connection.status === "connected" ? (
+                  <button
+                    className="secondary-button quick-disconnect-button"
+                    type="button"
+                    onClick={() => onDisconnect(serverId)}
+                  >
+                    <WifiOff size={15} />
+                    断开连接
+                  </button>
+                ) : (
+                  <>
+                    <input
+                      className="quick-otp-input"
+                      value={otp}
+                      inputMode="numeric"
+                      onChange={(event) =>
+                        setOtp(event.target.value.replace(/\D/g, ""))
+                      }
+                      placeholder="请输入2FA验证码（可选）"
+                      aria-label="2FA 验证码（可选）"
+                      autoComplete="one-time-code"
+                    />
+                    <button
+                      className="primary-button quick-connect-button"
+                      type="button"
+                      onClick={connectSavedProfile}
+                      disabled={connection.status === "connecting"}
+                    >
+                      {connection.status === "connecting" ? (
+                        <LoaderCircle className="spin" size={15} />
+                      ) : (
+                        <KeyRound size={15} />
+                      )}
+                      {connection.status === "connecting" ? "连接中" : "连接"}
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           ) : (
@@ -6159,6 +7362,7 @@ function ServerManagerModal({
               className="modal-form ssh-form server-form"
               onSubmit={(event) => {
                 event.preventDefault();
+                if (!showFormConnect && !conversationScoped) return;
                 onConnect({
                   serverId,
                   name: name.trim() || host,
@@ -6179,6 +7383,40 @@ function ServerManagerModal({
                 });
               }}
             >
+              {conversationScoped && profiles.length > 0 && !locked && (
+                <label className="field conversation-server-picker">
+                  <span>服务器</span>
+                  <select
+                    value={selectedProfile ? serverId : ""}
+                    onChange={(event) => {
+                      const profile = profiles.find(
+                        (item) => item.id === event.target.value,
+                      );
+                      if (profile) chooseProfile(profile);
+                    }}
+                  >
+                    <option value="" disabled>
+                      选择已保存的服务器
+                    </option>
+                    {profiles.map((profile) => (
+                      <option value={profile.id} key={profile.id}>
+                        {profile.name || profile.host}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {(conversationScoped || showFormConnect) &&
+                selectedProfile && (
+                <button
+                  className="server-config-back"
+                  type="button"
+                  onClick={() => setConfigurationOpen(false)}
+                >
+                  <ChevronLeft size={14} />
+                  返回连接
+                </button>
+                )}
               <label className="field">
                 <span>服务器名称</span>
                 <input
@@ -6395,7 +7633,9 @@ function ServerManagerModal({
                   {connection.label}
                 </div>
               )}
-              {connection.fingerprint && (
+              {(showFormConnect || conversationScoped) &&
+                connection.status === "error" &&
+                connection.fingerprint && (
                 <div className="host-key-confirm">
                   <span>
                     <ShieldCheck size={16} />
@@ -6411,40 +7651,143 @@ function ServerManagerModal({
                     我已核对并信任此主机
                   </label>
                 </div>
-              )}
+                )}
               <div className="modal-actions">
                 <button
                   className="secondary-button"
                   type="button"
-                  onClick={() => onSave(profileDraft())}
+                  onClick={() => {
+                    onSave(profileDraft());
+                    if (
+                      conversationScoped || showFormConnect
+                    ) {
+                      setConfigurationOpen(false);
+                    }
+                  }}
                   disabled={!host.trim() || !port || !username.trim()}
                 >
                   <Save size={15} />
                   保存
                 </button>
-                <button
-                  className="primary-button"
-                  type="submit"
-                  disabled={
-                    connection.status === "connecting" ||
-                    !host ||
-                    !port ||
-                    !username ||
-                    (authMethod === "key"
-                      ? !privateKey && !useSavedCredential
-                      : !password && !useSavedCredential) ||
-                    Boolean(connection.fingerprint && !trustHost)
-                  }
-                >
-                  {connection.status === "connecting" ? (
-                    <LoaderCircle className="spin" size={16} />
-                  ) : (
-                    <KeyRound size={16} />
-                  )}
-                  {connection.status === "connecting" ? "连接中" : "连接 SSH"}
-                </button>
+                {(showFormConnect || conversationScoped) && (
+                  <button
+                    className="primary-button form-connect-button"
+                    type="submit"
+                    disabled={
+                      connection.status === "connecting" ||
+                      !host ||
+                      !port ||
+                      !username ||
+                      (authMethod === "key"
+                        ? !privateKey && !useSavedCredential
+                        : !password && !useSavedCredential) ||
+                      Boolean(
+                        connection.status === "error" &&
+                          connection.fingerprint &&
+                          !trustHost,
+                      )
+                    }
+                  >
+                    {connection.status === "connecting" ? (
+                      <LoaderCircle className="spin" size={16} />
+                    ) : (
+                      <KeyRound size={16} />
+                    )}
+                    {connection.status === "connecting" ? "连接中" : "连接 SSH"}
+                  </button>
+                )}
               </div>
             </form>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function AgentUpdateModal({
+  state,
+  onUpdate,
+  onRetry,
+  onClose,
+}: {
+  state: AgentUpdateState;
+  onUpdate: () => void;
+  onRetry: () => void;
+  onClose: () => void;
+}) {
+  const busy = ["checking", "downloading", "updating", "configuring"].includes(
+    state.status,
+  );
+  const available = state.status === "available";
+  const failed = state.status === "error";
+  const done = state.status === "done";
+  return (
+    <Modal title="OpenCode 更新" onClose={onClose}>
+      <div className={`agent-update-dialog ${state.status}`}>
+        <span className="agent-update-hero">
+          {busy ? (
+            <LoaderCircle className="spin" size={24} />
+          ) : failed ? (
+            <X size={22} />
+          ) : (
+            <Check size={22} />
+          )}
+        </span>
+        <h3>
+          {available
+            ? "发现新版本"
+            : failed
+              ? "更新未完成"
+              : done
+                ? "更新完成"
+                : "正在检查 OpenCode"}
+        </h3>
+        <p>
+          {state.error ||
+            state.label ||
+            (busy ? "正在连接远端服务器…" : "OpenCode 已是最新版")}
+        </p>
+        {(state.currentVersion || state.latestVersion) && (
+          <div className="agent-update-versions">
+            <span>
+              <small>当前版本</small>
+              <strong>{state.currentVersion || "—"}</strong>
+            </span>
+            <ChevronRight size={16} />
+            <span>
+              <small>最新版本</small>
+              <strong>{state.latestVersion || "—"}</strong>
+            </span>
+          </div>
+        )}
+        <div className="modal-actions">
+          {available && (
+            <>
+              <button className="secondary-button" type="button" onClick={onClose}>
+                稍后
+              </button>
+              <button className="primary-button" type="button" onClick={onUpdate}>
+                <Download size={15} />
+                更新
+              </button>
+            </>
+          )}
+          {failed && (
+            <>
+              <button className="secondary-button" type="button" onClick={onClose}>
+                关闭
+              </button>
+              <button className="primary-button" type="button" onClick={onRetry}>
+                <RefreshCw size={15} />
+                重新检测
+              </button>
+            </>
+          )}
+          {done && (
+            <button className="primary-button" type="button" onClick={onClose}>
+              完成
+            </button>
           )}
         </div>
       </div>

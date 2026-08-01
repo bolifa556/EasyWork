@@ -3840,6 +3840,581 @@ textarea::placeholder {
   }
 }
 
+/* Final hierarchy pass: body copy, semantic fields, and compact remote controls. */
+.easywork-app.easywork-app .message.user .message-text,
+.easywork-app.easywork-app .message.assistant .message-text,
+.easywork-app.easywork-app .message.work.assistant .message-text,
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content {
+  font-size: 18px !important;
+  line-height: 1.76;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content
+  > p,
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content
+  > ul,
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content
+  > ol,
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content
+  > blockquote {
+  font-size: inherit !important;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .agent-activity
+  .markdown-content,
+.easywork-app.easywork-app
+  .message.assistant
+  .reasoning-content
+  .markdown-content {
+  font-size: 13px !important;
+  line-height: 1.66;
+}
+
+.easywork-app.easywork-app .message.user .message-meta strong {
+  color: #52653d;
+}
+
+.easywork-app.easywork-app .message.assistant .message-meta strong {
+  color: #80672d;
+}
+
+.easywork-app.easywork-app
+  .message-text
+  .markdown-content
+  code.inline-function-field {
+  display: inline-block;
+  margin: 0 0.06em;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 0.06em 0.38em 0.1em;
+  font-family: var(--font-mono, "SFMono-Regular", Consolas, monospace);
+  font-size: 0.82em !important;
+  font-weight: 620;
+  line-height: 1.35;
+  vertical-align: 0.04em;
+}
+
+.easywork-app.easywork-app
+  .message-text
+  .markdown-content
+  code.inline-function-field.tone-0 {
+  border-color: rgb(74 111 130 / 16%);
+  background: rgb(82 128 151 / 9%) !important;
+  color: #3f7089 !important;
+}
+
+.easywork-app.easywork-app
+  .message-text
+  .markdown-content
+  code.inline-function-field.tone-1 {
+  border-color: rgb(118 91 151 / 15%);
+  background: rgb(125 91 160 / 8%) !important;
+  color: #755697 !important;
+}
+
+.easywork-app.easywork-app
+  .message-text
+  .markdown-content
+  code.inline-function-field.tone-2 {
+  border-color: rgb(79 126 91 / 16%);
+  background: rgb(83 137 97 / 9%) !important;
+  color: #4b7956 !important;
+}
+
+.easywork-app.easywork-app
+  .message-text
+  .markdown-content
+  code.inline-function-field.tone-3 {
+  border-color: rgb(177 117 48 / 16%);
+  background: rgb(190 130 57 / 9%) !important;
+  color: #946522 !important;
+}
+
+.easywork-app.easywork-app
+  .message-text
+  .markdown-content
+  code.inline-function-field.tone-4 {
+  border-color: rgb(55 129 125 / 15%);
+  background: rgb(61 142 136 / 8%) !important;
+  color: #357a75 !important;
+}
+
+.easywork-app.easywork-app .agent-event.plan .agent-event-copy > strong {
+  color: #775391;
+}
+
+.easywork-app.easywork-app .agent-event.file_change .agent-event-copy > strong {
+  color: #4d70a0;
+}
+
+.easywork-app.easywork-app .agent-event.job_status .agent-event-copy > strong {
+  color: #936326;
+}
+
+.easywork-app.easywork-app .agent-event.artifact .agent-event-copy > strong {
+  color: #4f7853;
+}
+
+.easywork-app.easywork-app .agent-event.approval_request .agent-event-copy > strong {
+  color: #80518f;
+}
+
+.easywork-app.easywork-app .command-group-heading strong {
+  color: #3d716b;
+}
+
+.easywork-app.easywork-app .reasoning-disclosure > button strong,
+.easywork-app.easywork-app .reasoning-glyph {
+  color: #756286;
+}
+
+.quick-connection-actions {
+  display: grid;
+  width: min(560px, calc(100% - 32px));
+  grid-template-columns: auto minmax(210px, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  margin-top: 8px;
+}
+
+.quick-connection-actions .quick-config-button,
+.quick-connection-actions .quick-connect-button {
+  min-height: 40px;
+  padding-inline: 15px;
+}
+
+.quick-otp-input {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  border: 1px solid rgb(79 73 59 / 16%);
+  border-radius: 9px;
+  background: rgb(255 254 250 / 82%);
+  padding: 0 12px;
+  color: var(--ink);
+  font-size: 13px !important;
+}
+
+.quick-otp-input:focus {
+  border-color: rgb(83 99 63 / 34%);
+  box-shadow: 0 0 0 3px rgb(83 99 63 / 7%);
+}
+
+.easywork-app.easywork-app .quick-connect-button {
+  border-color: rgb(92 117 70 / 20%);
+  background: #71845e;
+  box-shadow: 0 6px 15px rgb(73 93 55 / 12%);
+  color: #fff;
+}
+
+.easywork-app.easywork-app .quick-connect-button:hover:not(:disabled) {
+  background: #657a52;
+}
+
+/* Sidebar density, section disclosures, and nested conversation actions. */
+.easywork-app.easywork-app .left-sidebar {
+  background:
+    linear-gradient(
+      90deg,
+      rgb(222 210 183 / 44%) 0%,
+      rgb(239 230 209 / 26%) 52%,
+      rgb(255 253 247 / 20%) 100%
+    ),
+    var(--sidebar);
+}
+
+.easywork-app.easywork-app .brand-button {
+  gap: 5.5px;
+}
+
+.easywork-app.easywork-app .sidebar-primary {
+  gap: 0.9px;
+  padding-bottom: 7px;
+}
+
+.easywork-app.easywork-app .new-chat-button,
+.easywork-app.easywork-app .sidebar-nav-item {
+  min-height: 34px;
+  gap: 5px;
+}
+
+.easywork-app.easywork-app .new-chat-button {
+  margin-bottom: 1.8px;
+}
+
+.easywork-app.easywork-app .sidebar-scroll {
+  padding-top: 4px;
+}
+
+.sidebar-content-section {
+  min-width: 0;
+}
+
+.easywork-app.easywork-app .section-label.sidebar-section-heading {
+  min-height: 32px;
+  gap: 3px;
+  border-radius: 8px;
+  padding: 8px 5px 4px 7px;
+  background: transparent;
+}
+
+.easywork-app.easywork-app .chat-section-label {
+  margin-top: 14px;
+}
+
+.easywork-app.easywork-app .sidebar-section-toggle {
+  display: flex;
+  min-width: 0;
+  min-height: 24px;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: space-between;
+  border-radius: 6px;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+}
+
+.easywork-app.easywork-app .sidebar-section-toggle:hover {
+  background: transparent;
+  color: inherit;
+}
+
+.sidebar-section-chevron {
+  flex: 0 0 auto;
+  color: var(--ink-faint);
+  opacity: 0;
+  transform: rotate(0deg);
+  transition:
+    opacity 130ms ease,
+    transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.sidebar-content-section.expanded .sidebar-section-chevron {
+  transform: rotate(90deg);
+}
+
+.sidebar-content-section:hover .sidebar-section-chevron,
+.sidebar-content-section:focus-within .sidebar-section-chevron {
+  opacity: 0.8;
+}
+
+.easywork-app.easywork-app .sidebar-section-add {
+  width: 24px;
+  height: 24px;
+  opacity: 0;
+  transition:
+    opacity 130ms ease,
+    color 130ms ease;
+}
+
+.easywork-app.easywork-app .section-label .sidebar-section-add:hover,
+.easywork-app.easywork-app .section-label .sidebar-section-add:focus-visible {
+  background: transparent;
+  color: inherit;
+}
+
+.easywork-app.easywork-app .sidebar-section-add svg {
+  transition: stroke-width 130ms ease;
+}
+
+.easywork-app.easywork-app .sidebar-section-add:hover svg,
+.easywork-app.easywork-app .sidebar-section-add:focus-visible svg {
+  stroke-width: 2.8;
+}
+
+.easywork-app.easywork-app
+  .sidebar-section-heading:hover
+  .sidebar-section-add,
+.easywork-app.easywork-app
+  .sidebar-section-heading:focus-within
+  .sidebar-section-add {
+  opacity: 1;
+}
+
+.sidebar-section-motion {
+  display: grid;
+  overflow: hidden;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-4px);
+  transition:
+    grid-template-rows 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 170ms ease,
+    transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.sidebar-section-motion > div {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar-content-section.expanded .sidebar-section-motion {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.sidebar-content-section:not(.expanded) .sidebar-section-motion {
+  pointer-events: none;
+}
+
+.easywork-app.easywork-app .project-list-item,
+.easywork-app.easywork-app .project-list-item .project-row {
+  min-height: 33px;
+}
+
+.easywork-app.easywork-app .project-list-item .project-row {
+  gap: 4.5px;
+}
+
+.easywork-app.easywork-app .project-sidebar-chats {
+  gap: 0.9px;
+  padding-left: 0;
+}
+
+.easywork-app.easywork-app .project-chat-row .chat-row-main {
+  padding-left: 32px;
+}
+
+.easywork-app.easywork-app .project-conversations-more {
+  padding-left: 32px;
+}
+
+.easywork-app.easywork-app .chat-row {
+  min-height: 34px;
+}
+
+.easywork-app.easywork-app .chat-row-main {
+  height: 34px;
+}
+
+.project-conversations-more {
+  min-height: 29px;
+  border-radius: 7px;
+  background: transparent;
+  padding: 0 7px;
+  color: var(--ink-faint);
+  font-size: 12px;
+  text-align: left;
+}
+
+.project-conversations-more:hover {
+  background: rgb(83 99 63 / 5%);
+  color: var(--ink-soft);
+}
+
+.easywork-app.easywork-app .conversation-menu {
+  width: 214px;
+  overflow: visible;
+}
+
+.easywork-app.easywork-app .conversation-menu button {
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.easywork-app.easywork-app .conversation-menu button > svg {
+  flex: 0 0 auto;
+}
+
+.conversation-menu-submenu {
+  position: relative;
+}
+
+.easywork-app.easywork-app .conversation-menu-submenu-trigger {
+  width: 100%;
+}
+
+.conversation-menu-submenu-chevron {
+  margin-left: auto;
+  color: var(--ink-faint);
+}
+
+.conversation-move-submenu {
+  position: absolute;
+  z-index: 2;
+  top: -6px;
+  left: calc(100% - 1px);
+  display: flex;
+  width: 214px;
+  max-height: min(360px, calc(100vh - 32px));
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  visibility: hidden;
+  border: 1px solid rgb(91 81 62 / 18%);
+  border-radius: 12px;
+  background: #fbf6e9;
+  box-shadow:
+    0 18px 46px rgb(55 46 30 / 14%),
+    0 2px 8px rgb(55 46 30 / 6%);
+  padding: 6px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-5px);
+  transition:
+    visibility 0s linear 130ms,
+    opacity 130ms ease,
+    transform 160ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.conversation-menu-submenu:hover .conversation-move-submenu,
+.conversation-menu-submenu:focus-within .conversation-move-submenu {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0);
+  transition-delay: 0s;
+}
+
+.conversation-menu-submenu:hover > .conversation-menu-submenu-trigger,
+.conversation-menu-submenu:focus-within > .conversation-menu-submenu-trigger {
+  background: rgb(83 99 63 / 9%);
+}
+
+/* The two side surfaces share a restrained, connected paper treatment. */
+.easywork-app.easywork-app .right-rail {
+  gap: 0;
+  border-left-color: rgb(79 73 59 / 10%);
+  background:
+    linear-gradient(90deg, rgb(255 253 247 / 88%), rgb(240 230 207 / 48%)),
+    var(--rail);
+  padding: 8px 8px 9px;
+}
+
+.easywork-app.easywork-app .remote-connection-panel {
+  margin: 0 0 7px;
+  border: 1px solid rgb(79 73 59 / 12%);
+  border-radius: 13px;
+  background: rgb(255 253 248 / 46%);
+  box-shadow: 0 1px 2px rgb(69 58 37 / 3%);
+}
+
+.easywork-app.easywork-app .remote-connection-panel.connected {
+  background:
+    linear-gradient(90deg, rgb(65 128 76 / 7%), transparent 68%),
+    rgb(255 253 248 / 50%);
+  box-shadow:
+    inset 2px 0 #5c8c62,
+    0 1px 2px rgb(69 58 37 / 3%);
+}
+
+.easywork-app.easywork-app .remote-connection-panel.disconnected,
+.easywork-app.easywork-app .remote-connection-panel.error {
+  background:
+    linear-gradient(90deg, rgb(172 66 54 / 6%), transparent 68%),
+    rgb(255 253 248 / 50%);
+  box-shadow:
+    inset 2px 0 #b8574e,
+    0 1px 2px rgb(69 58 37 / 3%);
+}
+
+.easywork-app.easywork-app .remote-connection-panel.connecting {
+  background:
+    linear-gradient(90deg, rgb(171 119 47 / 6%), transparent 68%),
+    rgb(255 253 248 / 50%);
+  box-shadow:
+    inset 2px 0 #b78645,
+    0 1px 2px rgb(69 58 37 / 3%);
+}
+
+.easywork-app.easywork-app .right-rail-header {
+  min-height: 42px;
+  margin: 0;
+  border: 1px solid rgb(79 73 59 / 11%);
+  border-bottom: 0;
+  border-radius: 13px 13px 0 0;
+  background: rgb(255 253 248 / 39%);
+  padding: 11px 12px 4px;
+}
+
+.easywork-app.easywork-app .trace-list {
+  min-height: 0;
+  margin: 0;
+  border: 1px solid rgb(79 73 59 / 11%);
+  border-top: 0;
+  border-radius: 0 0 13px 13px;
+  background: rgb(255 253 248 / 39%);
+  padding: 3px 7px 17px;
+}
+
+@media (max-width: 700px) {
+  .sidebar-section-chevron,
+  .easywork-app.easywork-app .sidebar-section-add {
+    opacity: 0.8;
+  }
+
+  .conversation-move-submenu {
+    right: calc(100% - 1px);
+    left: auto;
+  }
+}
+
+.rail-edge-toggle,
+.rail-edge-toggle.open {
+  top: calc(50% - 24px);
+  width: 16px;
+  height: 48px;
+  border-radius: 10px 0 0 10px;
+  background: rgb(205 208 205 / 48%);
+  color: #6d716d;
+  opacity: 0.72;
+  box-shadow: -2px 4px 10px rgb(44 46 44 / 7%);
+}
+
+.rail-edge-toggle:hover,
+.rail-edge-toggle:focus-visible,
+.rail-edge-toggle.open:hover,
+.rail-edge-toggle.open:focus-visible {
+  background: rgb(177 181 177 / 78%);
+  color: #424742;
+  opacity: 1;
+}
+
+.rail-edge-toggle svg {
+  width: 10px;
+  height: 10px;
+}
+
+@media (max-width: 700px) {
+  .quick-connection-actions {
+    width: calc(100% - 24px);
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 6px;
+  }
+
+  .quick-connection-actions .quick-config-button,
+  .quick-connection-actions .quick-connect-button {
+    padding-inline: 10px;
+  }
+
+  .rail-edge-toggle,
+  .rail-edge-toggle.open {
+    top: calc(50% - 22px);
+    width: 14px;
+    height: 44px;
+  }
+}
+
 /* 2026-07 interaction pass: one composer, complete titles, warm layered menus. */
 .easywork-app.easywork-app .unified-composer {
   position: relative;
@@ -4340,6 +4915,396 @@ textarea::placeholder {
 .command-group.expanded .command-group-chevron,
 .command-event.expanded .command-event-chevron {
   transform: rotate(90deg);
+}
+
+.command-group:not(.expanded) .command-group-chevron,
+.command-event:not(.expanded) .command-event-chevron {
+  transform: rotate(0deg);
+}
+
+.quick-connect-button,
+.form-connect-button,
+.quick-disconnect-button {
+  white-space: nowrap;
+}
+
+.quick-connection-panel.connected .quick-connection-actions {
+  width: auto;
+  grid-template-columns: auto auto;
+  justify-content: center;
+}
+
+.quick-disconnect-button {
+  min-height: 40px;
+  padding-inline: 15px;
+  color: #a14c43;
+}
+
+.easywork-app.easywork-app .unified-composer {
+  grid-template-columns: 38px minmax(0, 1fr) auto 38px;
+}
+
+.composer-model-wrap {
+  position: relative;
+  min-width: 0;
+}
+
+.composer-model-button {
+  display: inline-flex;
+  max-width: 170px;
+  height: 32px;
+  align-items: center;
+  gap: 4px;
+  border-radius: 9px;
+  background: transparent;
+  padding: 0 7px;
+  color: #777267;
+  font-size: 12px !important;
+}
+
+.composer-model-button:hover,
+.composer-model-button.active {
+  background: rgb(79 73 59 / 7%);
+  color: var(--ink-soft);
+}
+
+.composer-model-button > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-model-button > svg {
+  flex: 0 0 auto;
+}
+
+.composer-model-popover {
+  position: absolute;
+  z-index: 96;
+  right: 0;
+  width: min(310px, calc(100vw - 28px));
+  max-height: 330px;
+  overflow: hidden;
+  border: 1px solid rgb(79 73 59 / 14%);
+  border-radius: 14px;
+  background: var(--paper);
+  box-shadow:
+    0 16px 42px rgb(55 46 30 / 11%),
+    0 2px 7px rgb(55 46 30 / 5%);
+  animation: composer-menu-in 170ms ease-out both;
+}
+
+.composer-model-popover.up {
+  bottom: calc(100% + 10px);
+  transform-origin: right bottom;
+}
+
+.composer-model-popover.down {
+  top: calc(100% + 10px);
+  transform-origin: right top;
+}
+
+.composer-model-heading {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgb(79 73 59 / 9%);
+  padding: 0 8px 0 13px;
+}
+
+.composer-model-heading strong {
+  font-size: 13px !important;
+  font-weight: 620;
+}
+
+.composer-model-heading button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--ink-faint);
+}
+
+.composer-model-heading button:hover:not(:disabled) {
+  background: rgb(79 73 59 / 7%);
+  color: var(--ink);
+}
+
+.composer-model-list {
+  display: grid;
+  max-height: 286px;
+  gap: 2px;
+  overflow: auto;
+  padding: 7px;
+}
+
+.composer-model-list > button {
+  display: grid;
+  min-height: 38px;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 7px;
+  border-radius: 9px;
+  padding: 0 9px;
+  color: var(--ink-soft);
+  font-size: 13px !important;
+  text-align: left;
+}
+
+.composer-model-list > button:hover,
+.composer-model-list > button.selected {
+  background: rgb(79 73 59 / 7%);
+  color: var(--ink);
+}
+
+.composer-model-list > button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-model-list > button svg {
+  color: var(--green-deep);
+}
+
+.composer-model-state {
+  display: flex;
+  min-height: 62px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 10px;
+  color: var(--ink-faint);
+  font-size: 12.5px !important;
+  text-align: center;
+}
+
+.composer-model-state.error {
+  color: #a14c43;
+}
+
+.api-key-control {
+  position: relative;
+  display: block;
+}
+
+.easywork-app.easywork-app .api-key-control input {
+  width: 100%;
+  padding-right: 64px;
+}
+
+.api-key-control > button {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  min-width: 46px;
+  height: 30px;
+  transform: translateY(-50%);
+  border-radius: 8px;
+  background: rgb(79 73 59 / 7%);
+  color: var(--ink-soft);
+  font-size: 12px !important;
+}
+
+.api-key-control > button:hover:not(:disabled) {
+  background: rgb(79 73 59 / 11%);
+  color: var(--ink);
+}
+
+@media (max-width: 700px) {
+  .composer-model-button {
+    max-width: 104px;
+    padding-inline: 5px;
+  }
+}
+
+.easywork-app.easywork-app .agent-dropdown {
+  height: var(--agent-menu-height, 280px);
+  transition: height 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.agent-menu-track {
+  display: flex;
+  width: 300%;
+  height: 100%;
+  transform: translateX(0);
+  transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+.agent-dropdown.show-config .agent-menu-track {
+  transform: translateX(-33.333333%);
+}
+
+.agent-dropdown.show-models .agent-menu-track {
+  transform: translateX(-66.666667%);
+}
+
+.agent-menu-panel {
+  width: 33.333333%;
+  min-width: 0;
+  height: 100%;
+  flex: 0 0 33.333333%;
+  overflow: hidden;
+}
+
+.agent-root-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.easywork-app.easywork-app .agent-root-panel .agent-dropdown-list {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+.easywork-app.easywork-app .agent-dropdown-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.agent-row-actions {
+  display: flex;
+  align-items: center;
+  padding-right: 3px;
+}
+
+.agent-update-shortcut,
+.agent-config-shortcut {
+  display: grid;
+  width: 29px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-faint);
+}
+
+.agent-update-shortcut:hover:not(:disabled),
+.agent-config-shortcut:hover:not(:disabled) {
+  background: rgb(79 73 59 / 8%);
+  color: var(--green-deep);
+}
+
+.agent-update-shortcut.available {
+  color: #9b6c2e;
+}
+
+.agent-config-panel,
+.agent-model-panel {
+  padding: 7px;
+}
+
+.agent-menu-back,
+.agent-menu-option {
+  display: grid;
+  width: 100%;
+  min-height: 43px;
+  align-items: center;
+  gap: 8px;
+  border-radius: 9px;
+  background: transparent;
+  padding: 0 9px;
+  color: var(--ink-soft);
+  font-size: 13px !important;
+  text-align: left;
+}
+
+.agent-menu-back {
+  grid-template-columns: 18px minmax(0, 1fr);
+  border-bottom: 1px solid rgb(79 73 59 / 9%);
+  border-radius: 8px 8px 0 0;
+  color: var(--ink-faint);
+}
+
+.agent-menu-option {
+  grid-template-columns: 22px minmax(0, 1fr) 18px;
+}
+
+.agent-menu-option:hover,
+.agent-menu-back:hover {
+  background: rgb(79 73 59 / 7%);
+  color: var(--ink);
+}
+
+.agent-model-panel > p {
+  margin: 9px 9px 5px;
+  color: var(--ink-faint);
+  font-size: 11.5px !important;
+}
+
+.agent-model-progress {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  margin: 5px 2px;
+  border-radius: 9px;
+  background: rgb(83 99 63 / 8%);
+  padding: 0 9px;
+  color: var(--green-deep);
+  font-size: 12px !important;
+}
+
+.agent-model-progress.error {
+  background: rgb(172 66 54 / 7%);
+  color: #a14c43;
+}
+
+.agent-model-list {
+  display: grid;
+  max-height: 240px;
+  gap: 2px;
+  overflow: auto;
+  padding-top: 3px;
+}
+
+.agent-model-list > button {
+  display: grid;
+  min-height: 38px;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 7px;
+  border-radius: 9px;
+  padding: 0 9px;
+  color: var(--ink-soft);
+  font-size: 13px !important;
+  text-align: left;
+}
+
+.agent-model-list > button:hover:not(:disabled),
+.agent-model-list > button.selected {
+  background: rgb(79 73 59 / 7%);
+  color: var(--ink);
+}
+
+.agent-model-list > button > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-model-list > button > svg {
+  color: var(--green-deep);
+}
+
+.agent-model-empty {
+  display: flex;
+  min-height: 62px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 8px;
+  color: var(--ink-faint);
+  font-size: 12px !important;
+  text-align: center;
+}
+
+.agent-model-empty.error {
+  color: #a14c43;
 }
 
 .reasoning-disclosure.expanded > button svg:last-child {
@@ -9335,7 +10300,8 @@ body {
   background: transparent;
 }
 
-.rail-edge-toggle {
+.rail-edge-toggle,
+.rail-edge-toggle.open {
   position: fixed;
   z-index: 64;
   top: 50%;
@@ -9468,7 +10434,8 @@ body {
 }
 
 @media (max-width: 980px) {
-  .rail-edge-toggle {
+  .rail-edge-toggle,
+  .rail-edge-toggle.open {
     z-index: 62;
   }
 
@@ -10300,4 +11267,783 @@ body {
 .easywork-app.easywork-app .agent-dropdown-row:hover,
 .easywork-app.easywork-app .agent-dropdown-row.active {
   background: rgb(79 73 59 / 6%);
+}
+
+/* Work trace disclosures, remote controls, and update flow. */
+.easywork-app.easywork-app .agent-event {
+  display: block;
+  min-height: 0;
+  border-radius: 9px;
+  padding: 0;
+  transition: background 160ms ease;
+}
+
+.easywork-app.easywork-app .agent-event-summary {
+  display: grid;
+  width: 100%;
+  min-height: 36px;
+  grid-template-columns: 24px minmax(0, 1fr) auto 15px;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  padding: 5px 7px 5px 3px;
+  color: var(--ink-soft);
+  text-align: left;
+}
+
+.easywork-app.easywork-app .agent-event-summary:hover {
+  background: rgb(79 73 59 / 4.5%);
+}
+
+.easywork-app.easywork-app .agent-event-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.easywork-app.easywork-app .agent-event-copy > strong {
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 13.5px !important;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.easywork-app.easywork-app .agent-event-copy > small,
+.easywork-app.easywork-app .agent-event-status {
+  color: var(--ink-faint);
+  font-size: 11px !important;
+  font-weight: 500;
+}
+
+.agent-event-detail-motion {
+  display: grid;
+  overflow: hidden;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 170ms ease;
+}
+
+.agent-event-detail-motion > div {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.agent-event.expanded .agent-event-detail-motion {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.agent-event-chevron {
+  color: var(--ink-faint);
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.agent-event.expanded .agent-event-chevron {
+  transform: rotate(90deg);
+}
+
+.agent-event-detail {
+  margin: 0 7px 7px 34px;
+  border-left: 1px solid rgb(79 73 59 / 12%);
+  padding: 4px 0 4px 12px;
+}
+
+.agent-event-output {
+  color: var(--ink-soft);
+  font-size: 13px !important;
+  line-height: 1.62;
+}
+
+.agent-event.plan .agent-event-output ol {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.agent-event.plan .agent-event-output li::marker {
+  color: #8b61a8;
+  font-weight: 700;
+}
+
+.easywork-app.easywork-app .plan-event-steps {
+  gap: 8px;
+  padding: 2px 0 1px;
+}
+
+.easywork-app.easywork-app .plan-event-steps .trace-step-copy strong {
+  font-size: 13px !important;
+}
+
+.easywork-app.easywork-app .plan-event-steps .trace-step-copy small {
+  font-size: 11px !important;
+}
+
+.easywork-app.easywork-app .plan-event-steps .step-glyph {
+  background: var(--paper);
+}
+
+.easywork-app.easywork-app .plan-event-steps .step-glyph.done {
+  background: var(--green);
+}
+
+.easywork-app.easywork-app .plan-event-steps .step-glyph.running {
+  background: #e5eadc;
+}
+
+.easywork-app.easywork-app .agent-event.plan .agent-event-glyph,
+.easywork-app.easywork-app .agent-event.plan .agent-event-status {
+  color: #8b61a8;
+}
+
+.easywork-app.easywork-app .agent-event.tool_call .agent-event-glyph,
+.easywork-app.easywork-app .command-group-glyph,
+.easywork-app.easywork-app .command-status {
+  color: #407d75;
+}
+
+.easywork-app.easywork-app .agent-event.file_change .agent-event-glyph {
+  color: #537caf;
+}
+
+.easywork-app.easywork-app .agent-event.job_status .agent-event-glyph,
+.easywork-app.easywork-app .agent-event.job_status .agent-event-status {
+  color: #b4772c;
+}
+
+.easywork-app.easywork-app .agent-event.artifact .agent-event-glyph {
+  color: #55845a;
+}
+
+.easywork-app.easywork-app .agent-event.approval_request .agent-event-glyph {
+  color: #8b5aa0;
+}
+
+.easywork-app.easywork-app .agent-event.connection .agent-event-glyph {
+  color: #3b8295;
+}
+
+.easywork-app.easywork-app .agent-event.error .agent-event-glyph,
+.easywork-app.easywork-app .agent-event.error .agent-event-status {
+  color: #b34d43;
+}
+
+.easywork-app.easywork-app .message.user .message-text,
+.easywork-app.easywork-app .message.assistant .message-text,
+.easywork-app.easywork-app .message.work.assistant .message-text,
+.easywork-app.easywork-app .message.assistant .markdown-content {
+  font-size: 17px !important;
+}
+
+.work-connection-button,
+.agent-update-button {
+  display: inline-flex;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid rgb(79 73 59 / 13%);
+  border-radius: 9px;
+  background: rgb(255 253 248 / 82%);
+  color: var(--ink-faint);
+  padding: 0 9px;
+  font-size: 12px !important;
+  backdrop-filter: blur(10px);
+}
+
+.work-connection-button.connected {
+  border-color: rgb(65 128 76 / 24%);
+  background: rgb(231 246 234 / 82%);
+  color: #397347;
+}
+
+.work-connection-button.disconnected,
+.work-connection-button.error {
+  border-color: rgb(171 74 61 / 20%);
+  color: #a34c43;
+}
+
+.agent-update-button {
+  width: 32px;
+  padding: 0;
+}
+
+.agent-update-button:hover:not(:disabled),
+.work-connection-button:hover {
+  border-color: rgb(83 99 63 / 25%);
+  background: rgb(245 244 239 / 94%);
+  color: var(--green-deep);
+}
+
+.agent-update-button:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.agent-update-button.available {
+  border-color: rgb(180 119 44 / 28%);
+  background: rgb(251 240 218 / 88%);
+  color: #a46d28;
+  box-shadow: 0 0 0 3px rgb(180 119 44 / 7%);
+}
+
+.agent-update-dialog {
+  display: grid;
+  justify-items: center;
+  gap: 9px;
+  padding: 24px 22px 18px;
+  text-align: center;
+}
+
+.agent-update-hero {
+  display: grid;
+  width: 50px;
+  height: 50px;
+  place-items: center;
+  border-radius: 50%;
+  background: rgb(83 99 63 / 9%);
+  color: var(--green-deep);
+}
+
+.agent-update-dialog.error .agent-update-hero {
+  background: rgb(179 77 67 / 9%);
+  color: #b34d43;
+}
+
+.agent-update-dialog h3 {
+  margin: 4px 0 0;
+  font-size: 18px !important;
+  font-weight: 650;
+}
+
+.agent-update-dialog > p {
+  max-width: 430px;
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 13px !important;
+  line-height: 1.6;
+}
+
+.agent-update-versions {
+  display: grid;
+  width: min(390px, 100%);
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 12px;
+  margin-top: 5px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 11px 14px;
+}
+
+.agent-update-versions > span {
+  display: grid;
+  gap: 2px;
+}
+
+.agent-update-versions small {
+  color: var(--ink-faint);
+  font-size: 10.5px !important;
+}
+
+.agent-update-versions strong {
+  font-size: 13px !important;
+}
+
+.easywork-app.easywork-app .server-manager.compact {
+  min-height: 500px;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.easywork-app.easywork-app .server-manager.compact .server-connection-body {
+  min-width: 0;
+}
+
+.quick-connection-panel {
+  min-height: 500px;
+}
+
+.quick-connection-panel.disconnected .connected-hero,
+.quick-connection-panel.error .connected-hero {
+  background: rgb(179 77 67 / 8%);
+  color: #a94f46;
+}
+
+.quick-otp-field {
+  width: min(330px, 100%);
+  margin-top: 5px;
+  text-align: left;
+}
+
+.conversation-server-picker {
+  margin-bottom: 3px;
+}
+
+.conversation-server-picker select {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--input);
+  padding: 0 11px;
+  color: var(--ink);
+}
+
+.server-config-back {
+  display: inline-flex;
+  width: max-content;
+  align-items: center;
+  gap: 4px;
+  border-radius: 7px;
+  background: transparent;
+  padding: 4px 6px;
+  color: var(--ink-faint);
+  font-size: 12px !important;
+}
+
+.server-config-back:hover {
+  background: rgb(79 73 59 / 6%);
+  color: var(--ink-soft);
+}
+
+/* A quiet, translucent handle attached to the activity rail. */
+.rail-edge-toggle,
+.rail-edge-toggle.open {
+  top: calc(50% - 24px);
+  width: 16px;
+  height: 48px;
+  border: 1px solid rgb(101 104 101 / 18%);
+  border-right: 0;
+  border-radius: 9px 0 0 9px;
+  background: rgb(210 213 210 / 52%);
+  box-shadow:
+    -2px 4px 11px rgb(44 46 44 / 7%),
+    inset 0 1px rgb(255 255 255 / 48%);
+  clip-path: none;
+  color: #626662;
+  opacity: 0.72;
+  backdrop-filter: blur(9px);
+}
+
+.rail-edge-toggle:hover,
+.rail-edge-toggle:focus-visible {
+  background: rgb(190 194 190 / 76%);
+  color: #474b47;
+  opacity: 1;
+  filter: none;
+}
+
+.rail-edge-toggle svg {
+  width: 12px;
+  height: 12px;
+}
+
+@media (max-width: 700px) {
+  .work-connection-button span {
+    display: none;
+  }
+
+  .work-connection-button {
+    width: 32px;
+    padding: 0;
+  }
+
+  .rail-edge-toggle,
+  .rail-edge-toggle.open {
+    top: calc(50% - 22px);
+    width: 14px;
+    height: 44px;
+  }
+}
+
+/* Final message typography: one coherent scale for questions and Markdown. */
+.easywork-app.easywork-app .message.user .message-text {
+  font-size: 17px !important;
+  line-height: 1.68;
+}
+
+.easywork-app.easywork-app .message.assistant .message-text,
+.easywork-app.easywork-app .message.work.assistant .message-text,
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact) {
+  font-size: 17px !important;
+  line-height: 1.72;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact)
+  :where(p, ul, ol, li, blockquote) {
+  font-size: inherit !important;
+  line-height: 1.72;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact)
+  :where(strong, b, em, i, a, del) {
+  font-size: inherit !important;
+  line-height: inherit;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact)
+  h2 {
+  font-size: 20px !important;
+  line-height: 1.42;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact)
+  h3 {
+  font-size: 18px !important;
+  line-height: 1.45;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact)
+  h4 {
+  font-size: 17px !important;
+  line-height: 1.48;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact)
+  table {
+  font-size: 16px !important;
+  line-height: 1.55;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact)
+  :where(thead, tbody, tr, th, td) {
+  font-size: inherit !important;
+  line-height: inherit;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  .message-text
+  > .markdown-content:not(.compact)
+  code.inline-function-field {
+  font-size: 0.9em !important;
+  line-height: 1.4;
+}
+
+.easywork-app.easywork-app
+  .message.assistant
+  :where(.agent-activity, .reasoning-content)
+  .markdown-content {
+  font-size: 13px !important;
+  line-height: 1.66;
+}
+
+.easywork-app.easywork-app .quick-connect-button {
+  border-color: rgb(92 117 70 / 20%);
+  background: #71845e;
+  box-shadow: 0 6px 15px rgb(73 93 55 / 12%);
+  color: #fff;
+}
+
+.easywork-app.easywork-app .quick-connect-button:hover:not(:disabled) {
+  background: #657a52;
+}
+
+/* Final sidebar and activity-rail authority. */
+.easywork-app.easywork-app .left-sidebar {
+  background:
+    linear-gradient(
+      90deg,
+      rgb(222 210 183 / 44%) 0%,
+      rgb(239 230 209 / 26%) 52%,
+      rgb(255 253 247 / 20%) 100%
+    ),
+    var(--sidebar);
+}
+
+.easywork-app.easywork-app .brand-button {
+  gap: 5.5px;
+}
+
+.easywork-app.easywork-app .sidebar-primary {
+  gap: 0.9px;
+  padding-bottom: 7px;
+}
+
+.easywork-app.easywork-app .new-chat-button,
+.easywork-app.easywork-app .sidebar-nav-item {
+  min-height: 34px;
+  gap: 5px;
+}
+
+.easywork-app.easywork-app .new-chat-button {
+  margin-bottom: 1.8px;
+}
+
+.easywork-app.easywork-app .sidebar-scroll {
+  padding-top: 4px;
+}
+
+.easywork-app.easywork-app .section-label.sidebar-section-heading {
+  min-height: 32px;
+  gap: 3px;
+  border-radius: 0;
+  background: transparent;
+  padding: 8px 5px 4px 7px;
+  color: var(--ink-soft);
+}
+
+.easywork-app.easywork-app .section-label.sidebar-section-heading:hover {
+  background: transparent;
+  color: var(--ink-soft);
+}
+
+.easywork-app.easywork-app .chat-section-label {
+  margin-top: 14px;
+}
+
+.easywork-app.easywork-app
+  .section-label.sidebar-section-heading
+  > .sidebar-section-toggle {
+  display: flex;
+  width: auto;
+  min-width: 0;
+  min-height: 24px;
+  height: 24px;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 2px;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  opacity: 1;
+  text-align: left;
+}
+
+.easywork-app.easywork-app
+  .section-label.sidebar-section-heading
+  > .sidebar-section-toggle:hover,
+.easywork-app.easywork-app
+  .section-label.sidebar-section-heading
+  > .sidebar-section-toggle:focus-visible {
+  background: transparent;
+  color: inherit;
+}
+
+.easywork-app.easywork-app
+  .section-label.sidebar-section-heading
+  > .sidebar-section-add {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  opacity: 0;
+}
+
+.easywork-app.easywork-app
+  .section-label.sidebar-section-heading:hover
+  > .sidebar-section-add,
+.easywork-app.easywork-app
+  .section-label.sidebar-section-heading:focus-within
+  > .sidebar-section-add {
+  opacity: 1;
+}
+
+.easywork-app.easywork-app
+  .section-label.sidebar-section-heading
+  > .sidebar-section-add:hover,
+.easywork-app.easywork-app
+  .section-label.sidebar-section-heading
+  > .sidebar-section-add:focus-visible {
+  background: transparent;
+  color: inherit;
+}
+
+.easywork-app.easywork-app .project-list-item,
+.easywork-app.easywork-app .project-list-item .project-row {
+  min-height: 33px;
+}
+
+.easywork-app.easywork-app .project-list-item .project-row {
+  gap: 4.5px;
+}
+
+.easywork-app.easywork-app .project-sidebar-chats {
+  gap: 0.9px;
+  padding-left: 24px;
+}
+
+.easywork-app.easywork-app .chat-row {
+  min-height: 34px;
+}
+
+.easywork-app.easywork-app .chat-row-main {
+  height: 34px;
+}
+
+.easywork-app.easywork-app .conversation-menu {
+  width: 214px;
+  overflow: visible;
+}
+
+.easywork-app.easywork-app .right-rail {
+  gap: 0;
+  border-left-color: rgb(79 73 59 / 10%);
+  background:
+    linear-gradient(90deg, rgb(255 253 247 / 88%), rgb(240 230 207 / 48%)),
+    var(--rail);
+  padding: 8px 8px 9px;
+}
+
+.easywork-app.easywork-app .remote-connection-panel {
+  margin: 0 0 7px;
+  border: 1px solid rgb(79 73 59 / 12%);
+  border-radius: 13px;
+  background: rgb(255 253 248 / 46%);
+  box-shadow: 0 1px 2px rgb(69 58 37 / 3%);
+}
+
+.easywork-app.easywork-app .remote-connection-panel.connected {
+  background:
+    linear-gradient(90deg, rgb(65 128 76 / 7%), transparent 68%),
+    rgb(255 253 248 / 50%);
+  box-shadow:
+    inset 2px 0 #5c8c62,
+    0 1px 2px rgb(69 58 37 / 3%);
+}
+
+.easywork-app.easywork-app .remote-connection-panel.disconnected,
+.easywork-app.easywork-app .remote-connection-panel.error {
+  background:
+    linear-gradient(90deg, rgb(172 66 54 / 6%), transparent 68%),
+    rgb(255 253 248 / 50%);
+  box-shadow:
+    inset 2px 0 #b8574e,
+    0 1px 2px rgb(69 58 37 / 3%);
+}
+
+.easywork-app.easywork-app .remote-connection-panel.connecting {
+  background:
+    linear-gradient(90deg, rgb(171 119 47 / 6%), transparent 68%),
+    rgb(255 253 248 / 50%);
+  box-shadow:
+    inset 2px 0 #b78645,
+    0 1px 2px rgb(69 58 37 / 3%);
+}
+
+.easywork-app.easywork-app .right-rail-header {
+  min-height: 42px;
+  margin: 0;
+  border: 1px solid rgb(79 73 59 / 11%);
+  border-bottom: 0;
+  border-radius: 13px 13px 0 0;
+  background: rgb(255 253 248 / 39%);
+  padding: 11px 12px 4px;
+}
+
+.easywork-app.easywork-app .trace-list {
+  min-height: 0;
+  margin: 0;
+  border: 1px solid rgb(79 73 59 / 11%);
+  border-top: 0;
+  border-radius: 0 0 13px 13px;
+  background: rgb(255 253 248 / 39%);
+  padding: 3px 7px 17px;
+}
+
+@media (max-width: 700px) {
+  .easywork-app.easywork-app
+    .section-label.sidebar-section-heading
+    > .sidebar-section-add {
+    opacity: 0.8;
+  }
+}
+
+.conversation-menu-portal {
+  position: fixed;
+  z-index: 200;
+  width: 214px;
+  right: auto;
+  bottom: auto;
+  overflow: visible;
+  border-color: rgb(91 81 62 / 18%);
+  background: #fbf6e9;
+  box-shadow:
+    0 18px 46px rgb(55 46 30 / 14%),
+    0 2px 8px rgb(55 46 30 / 6%);
+  color: var(--ink);
+}
+
+.conversation-menu-portal .conversation-menu-submenu,
+.conversation-menu-portal .conversation-menu-submenu-trigger {
+  width: 100%;
+}
+
+.easywork-app.easywork-app .conversation-menu button,
+.conversation-menu-portal button,
+.conversation-move-submenu button {
+  min-height: 34px;
+  gap: 5px;
+  padding: 0 8px;
+  font-size: 13.5px !important;
+  line-height: 1.25;
+}
+
+.easywork-app.easywork-app .conversation-menu.project-menu button {
+  min-height: 34px;
+  gap: 5px;
+}
+
+.conversation-menu-portal button {
+  color: var(--ink);
+}
+
+.conversation-menu-portal button:hover,
+.conversation-menu-portal
+  .conversation-menu-submenu:focus-within
+  > .conversation-menu-submenu-trigger {
+  background: rgb(83 99 63 / 9%);
+}
+
+.conversation-menu-portal button.danger {
+  color: var(--red);
+}
+
+.easywork-app.easywork-app .project-sidebar-chats {
+  padding-left: 0;
+}
+
+.easywork-app.easywork-app .project-chat-row .chat-row-main {
+  padding-left: 32px;
+}
+
+.easywork-app.easywork-app .project-conversations-more {
+  padding-left: 32px;
 }
