@@ -36,8 +36,12 @@ test("work planning is prepared before execution and OpenCode events stay struct
     mergeOpenCodeAuthContent,
     mergeOpenCodeConfigContent,
     normalizeConversationTitle,
+    normalizeOpenCodeVersion,
+    openCodeUpdateApplyCommand,
+    openCodeUpdateProbeCommand,
     openCodeConfigurationStatus,
     parseOpenCodeLine,
+    parseOpenCodeUpdateVersions,
     parseWorkPlan,
     parseWorkflowPlan,
     providerConfigForOpenCode,
@@ -77,6 +81,20 @@ test("work planning is prepared before execution and OpenCode events stay struct
   assert.match(prompt, /EasyWork 网页端已编排的执行流程/);
   assert.match(prompt, /2\. 检查可用内存/);
   assert.match(prompt, /不要重新生成另一套计划/);
+  assert.match(prompt, /最终回答的提纲/);
+  assert.match(prompt, /综合所有证据给出总结性回答/);
+
+  assert.equal(normalizeOpenCodeVersion("opencode v1.2.34"), "1.2.34");
+  assert.deepEqual(
+    parseOpenCodeUpdateVersions(
+      "installer output\nEW_CURRENT_VERSION=1.2.30\nEW_LATEST_VERSION=v1.2.34\n",
+    ),
+    { currentVersion: "1.2.30", latestVersion: "1.2.34" },
+  );
+  assert.match(openCodeUpdateProbeCommand(), /https:\/\/opencode\.ai\/install/);
+  assert.match(openCodeUpdateProbeCommand(), /\.update-candidate/);
+  assert.match(openCodeUpdateApplyCommand(), /opencode\.easywork-backup/);
+  assert.match(openCodeUpdateApplyCommand(), /cp -p "\$EW_BACKUP" "\$EW_CURRENT"/);
 
   const parserState = {
     sessionId: "",
@@ -105,6 +123,24 @@ test("work planning is prepared before execution and OpenCode events stay struct
     workflowIndexForEvent(commandEvent, ["查看服务器内存", "查看可用资源", "判断结果"], 0),
     0,
   );
+
+  const schedulerEvent = parseOpenCodeLine(
+    JSON.stringify({
+      type: "tool_use",
+      part: {
+        id: "tool_sinfo",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "sinfo -o '%P %a %D %c %G %t'" },
+          output: "PARTITION AVAIL NODES CPUS GRES STATE",
+        },
+      },
+    }),
+    parserState,
+  );
+  assert.equal(schedulerEvent.kind, "job_status");
+  assert.match(schedulerEvent.command, /^sinfo /);
 
   const fileEvent = parseOpenCodeLine(
     JSON.stringify({
@@ -342,6 +378,24 @@ test("legacy EasyWork OpenCode is migrated and receives native configuration aut
       type: "api",
       key: "saved-provider-key",
     });
+    await gatewayTestHelpers.ensureOpenCodeNativeConfig(
+      {
+        client: fakeClient,
+        home,
+        host: "cluster.example.com",
+        port: 22,
+        username: "cluster-user",
+        serverId: "cluster-agent-test",
+      },
+      account.actor,
+      () => undefined,
+      "alternate-model",
+    );
+    const alternateConfig = JSON.parse(files.get(configPath).content.toString());
+    assert.deepEqual(
+      Object.keys(alternateConfig.provider.easywork.models),
+      ["alternate-model"],
+    );
   } finally {
     await new Promise((resolve) => server.close(resolve));
     const resolved = path.resolve(temporaryRoot);
@@ -481,6 +535,7 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       const socket = new WebSocket(
         `${base.replace("http:", "ws:")}/ws?deviceToken=${encodeURIComponent(initial.deviceToken)}`,
       );
+      let updateRequested = false;
       const timer = setTimeout(() => {
         socket.close();
         reject(new Error("demo websocket timed out"));
@@ -501,7 +556,24 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
             (event) =>
               event.type === "connection.status" && event.status === "connected",
           ) &&
-          events.some((event) => event.type === "agent.list")
+          events.some((event) => event.type === "agent.list") &&
+          !updateRequested
+        ) {
+          updateRequested = true;
+          socket.send(
+            JSON.stringify({
+              type: "agent.update.check",
+              serverId: "demo",
+              agentId: "opencode",
+            }),
+          );
+        }
+        if (
+          events.some(
+            (event) =>
+              event.type === "agent.update.status" &&
+              event.status === "current",
+          )
         ) {
           clearTimeout(timer);
           socket.close();
@@ -515,6 +587,12 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       events
         .find((event) => event.type === "agent.list")
         .agents.some((agent) => agent.id === "opencode"),
+    );
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === "agent.update.status" && event.status === "current",
+      ),
     );
 
     const resumedEvents = [];
@@ -574,6 +652,157 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     const authenticated = await authenticatedBootstrap.json();
     assert.equal(authenticated.actor.displayName, "测试用户");
     assert.equal(authenticated.state.settings.memoryEnabled, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    const resolved = path.resolve(temporaryRoot);
+    assert.ok(resolved.startsWith(path.resolve(os.tmpdir()) + path.sep));
+    await rm(resolved, { recursive: true, force: true });
+  }
+});
+
+test("account settings follow the user across devices and stay isolated from other users", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-account-sync-test-"));
+  process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
+  process.env.EASYWORK_SKILL_DIR = path.join(temporaryRoot, "skill");
+  const { createEasyWorkServer } = await import(
+    `../gateway/server.mjs?account-sync-test=${Date.now()}`
+  );
+  const { server } = await createEasyWorkServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const base = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const registration = await fetch(`${base}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "multi-device@example.com",
+        password: "correct-horse",
+        displayName: "多设备用户",
+      }),
+    });
+    assert.equal(registration.status, 200);
+    const firstDevice = await registration.json();
+    const firstAuthorization = `Bearer ${firstDevice.deviceToken}`;
+
+    const providerResponse = await fetch(`${base}/api/settings/provider`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: firstAuthorization,
+      },
+      body: JSON.stringify({
+        baseUrl: "https://llm.example.com/v1",
+        apiKey: "account-owned-api-key",
+        model: "shared-model",
+        protocol: "responses",
+      }),
+    });
+    assert.equal(providerResponse.status, 200);
+
+    const serverResponse = await fetch(
+      `${base}/api/settings/servers/shared-cluster`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: firstAuthorization,
+        },
+        body: JSON.stringify({
+          name: "学校集群",
+          host: "login.example.edu",
+          port: 22,
+          username: "researcher",
+          authMethod: "key",
+          keyName: "cluster_ed25519",
+          privateKey:
+            "-----BEGIN OPENSSH PRIVATE KEY-----\ndraft-account-key\n-----END OPENSSH PRIVATE KEY-----",
+        }),
+      },
+    );
+    assert.equal(serverResponse.status, 200);
+
+    const secondLogin = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "multi-device@example.com",
+        password: "correct-horse",
+      }),
+    });
+    assert.equal(secondLogin.status, 200);
+    const secondDevice = await secondLogin.json();
+    const secondBootstrap = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${secondDevice.deviceToken}` },
+    });
+    const sharedAccount = await secondBootstrap.json();
+    assert.equal(sharedAccount.state.settings.provider.baseUrl, "https://llm.example.com/v1");
+    assert.equal(sharedAccount.state.settings.provider.model, "shared-model");
+    assert.equal(sharedAccount.state.settings.provider.configured, true);
+    assert.equal("apiKey" in sharedAccount.state.settings.provider, false);
+    assert.deepEqual(
+      sharedAccount.state.settings.servers.find(
+        (profile) => profile.id === "shared-cluster",
+      ),
+      {
+        id: "shared-cluster",
+        name: "学校集群",
+        host: "login.example.edu",
+        port: 22,
+        username: "researcher",
+        authMethod: "key",
+        keyName: "cluster_ed25519",
+        configured: true,
+      },
+    );
+    assert.equal(JSON.stringify(sharedAccount).includes("draft-account-key"), false);
+
+    const staleState = structuredClone(sharedAccount.state);
+    staleState.settings.provider = {
+      ...staleState.settings.provider,
+      baseUrl: "https://stale-device.invalid/v1",
+      model: "stale-model",
+      configured: false,
+    };
+    staleState.settings.servers = [];
+    const staleSave = await fetch(`${base}/api/state`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: firstAuthorization,
+      },
+      body: JSON.stringify({ state: staleState }),
+    });
+    assert.equal(staleSave.status, 200);
+    const protectedBootstrap = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${secondDevice.deviceToken}` },
+    });
+    const protectedAccount = await protectedBootstrap.json();
+    assert.equal(protectedAccount.state.settings.provider.model, "shared-model");
+    assert.ok(
+      protectedAccount.state.settings.servers.some(
+        (profile) => profile.id === "shared-cluster",
+      ),
+    );
+
+    const otherRegistration = await fetch(`${base}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "isolated-user@example.com",
+        password: "correct-horse",
+        displayName: "隔离用户",
+      }),
+    });
+    assert.equal(otherRegistration.status, 200);
+    const otherAccount = await otherRegistration.json();
+    const otherBootstrap = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${otherAccount.deviceToken}` },
+    });
+    const isolated = await otherBootstrap.json();
+    assert.equal(isolated.state.settings?.provider, undefined);
+    assert.equal(isolated.state.settings?.servers, undefined);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     const resolved = path.resolve(temporaryRoot);
@@ -656,6 +885,34 @@ test("an SSH failure is not overwritten by a later close event", async () => {
   }
 });
 
+test("SSH authentication errors distinguish missing and expired OTP codes", async () => {
+  const { gatewayTestHelpers } = await import(
+    `../gateway/server.mjs?ssh-auth-copy-test=${Date.now()}`
+  );
+  const missingOtp = Object.assign(
+    new Error("All configured authentication methods failed"),
+    {
+      sshAuth: {
+        authMethod: "key",
+        otpPrompted: true,
+        otpProvided: false,
+      },
+    },
+  );
+  const expiredOtp = Object.assign(
+    new Error("All configured authentication methods failed"),
+    {
+      sshAuth: {
+        authMethod: "key",
+        otpPrompted: true,
+        otpProvided: true,
+      },
+    },
+  );
+  assert.match(gatewayTestHelpers.describeSshError(missingOtp), /要求动态验证码/);
+  assert.match(gatewayTestHelpers.describeSshError(expiredOtp), /可能已经过期/);
+});
+
 test("an authenticated account can reuse encrypted SSH keys and passwords", async () => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-ssh-profile-test-"));
   process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
@@ -718,6 +975,7 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
   const sshAddress = sshServer.address();
   const base = `http://127.0.0.1:${gatewayAddress.port}`;
   let socket;
+  let secondDeviceSocket;
 
   const waitForConnection = (
     payload,
@@ -817,6 +1075,50 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
       },
       { expectProfile: true },
     );
+
+    const secondDeviceLogin = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "ssh-profile@example.com",
+        password: "correct-horse",
+      }),
+    });
+    assert.equal(secondDeviceLogin.status, 200);
+    const secondDeviceAccount = await secondDeviceLogin.json();
+    const authenticationCountBeforeSecondDevice = authenticationCount;
+    const secondDeviceSnapshot = await new Promise((resolve, reject) => {
+      secondDeviceSocket = new WebSocket(
+        `${base.replace("http:", "ws:")}/ws?deviceToken=${encodeURIComponent(secondDeviceAccount.deviceToken)}`,
+      );
+      const timer = setTimeout(
+        () => reject(new Error("second device did not resume account SSH sessions")),
+        4_000,
+      );
+      secondDeviceSocket.on("message", (raw) => {
+        const event = JSON.parse(String(raw));
+        if (
+          event.type !== "connections.snapshot" ||
+          !event.connections?.some(
+            (connection) =>
+              connection.serverId === "cluster-a" && connection.resumed,
+          ) ||
+          !event.connections?.some(
+            (connection) =>
+              connection.serverId === "cluster-b" && connection.resumed,
+          )
+        ) {
+          return;
+        }
+        clearTimeout(timer);
+        resolve(event);
+      });
+      secondDeviceSocket.once("error", reject);
+    });
+    assert.equal(secondDeviceSnapshot.connections.length >= 2, true);
+    assert.equal(authenticationCount, authenticationCountBeforeSecondDevice);
+    secondDeviceSocket.close();
+    secondDeviceSocket = undefined;
 
     await new Promise((resolve) => {
       const onMessage = (raw) => {
@@ -963,6 +1265,9 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
       );
     });
   } finally {
+    if (secondDeviceSocket?.readyState === WebSocket.OPEN) {
+      secondDeviceSocket.close();
+    }
     if (socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "ssh.disconnect", serverId: "cluster-a" }));
       socket.send(JSON.stringify({ type: "ssh.disconnect", serverId: "cluster-b" }));
@@ -1020,7 +1325,17 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
         );
         res.write(
           `data: ${JSON.stringify({
-            choices: [{ delta: { content: "流式" } }],
+            choices: [{ delta: { content: "<thi" } }],
+          })}\n\n`,
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [{ delta: { content: "nk>再核对资源。</thi" } }],
+          })}\n\n`,
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [{ delta: { content: "nk>流式" } }],
           })}\n\n`,
         );
         res.write(
@@ -1137,6 +1452,28 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
       }),
     });
     assert.equal(saveProviderResponse.status, 200);
+    const storedKeyResponse = await fetch(
+      `${base}/api/settings/provider/key`,
+      { headers: { Authorization: authorization } },
+    );
+    assert.equal(storedKeyResponse.status, 200);
+    assert.equal((await storedKeyResponse.json()).apiKey, "test-key");
+    const storedCredentialModelsResponse = await fetch(
+      `${base}/api/settings/provider/models`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authorization,
+        },
+        body: JSON.stringify({ baseUrl: providerBase }),
+      },
+    );
+    assert.equal(storedCredentialModelsResponse.status, 200);
+    assert.deepEqual(
+      (await storedCredentialModelsResponse.json()).models,
+      ["chat-model"],
+    );
     const streamResponse = await fetch(`${base}/api/chat/stream`, {
       method: "POST",
       headers: {
@@ -1164,13 +1501,19 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
         .map((event) => event.delta),
       ["流式", "回答"],
     );
-    assert.equal(
-      streamEvents.find((event) => event.type === "reasoning_delta")?.delta,
-      "先检查上下文。",
+    assert.deepEqual(
+      streamEvents
+        .filter((event) => event.type === "reasoning_delta")
+        .map((event) => event.delta),
+      ["先检查上下文。", "再核对资源。"],
     );
     assert.equal(
       streamEvents.find((event) => event.type === "done")?.content,
       "流式回答",
+    );
+    assert.equal(
+      streamEvents.find((event) => event.type === "done")?.reasoning,
+      "先检查上下文。再核对资源。",
     );
 
     const plannedSteps = await gatewayTestHelpers.planWorkSteps(

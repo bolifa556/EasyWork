@@ -42,6 +42,8 @@ const BUILTIN_SKILLS = {
 
 const activeSockets = new Set();
 const sshSessionPool = new Map();
+const stateMutationQueues = new Map();
+const secretMutationQueues = new Map();
 let sessionSecret;
 let encryptionKey;
 
@@ -64,6 +66,18 @@ function safeSegment(value, fallback = "item") {
     .replace(/^[._-]+|[._-]+$/g, "")
     .slice(0, 90);
   return normalized || fallback;
+}
+
+async function enqueueActorMutation(queues, actor, mutation) {
+  const actorKey = `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
+  const previous = queues.get(actorKey) || Promise.resolve();
+  const operation = previous.catch(() => undefined).then(mutation);
+  queues.set(actorKey, operation);
+  try {
+    return await operation;
+  } finally {
+    if (queues.get(actorKey) === operation) queues.delete(actorKey);
+  }
 }
 
 function safeRelativePath(value) {
@@ -274,34 +288,40 @@ async function getSecrets(actor) {
 }
 
 async function updateSecrets(actor, patch) {
-  const secretPath = path.join(actorDirectory(actor), "secrets.json");
-  const stored = await readJson(secretPath, {});
-  const next = { ...stored };
-  if (typeof patch.providerApiKey === "string" && patch.providerApiKey) {
-    next.providerApiKey = encryptString(patch.providerApiKey);
-  }
-  if (typeof patch.embeddingApiKey === "string" && patch.embeddingApiKey) {
-    next.embeddingApiKey = encryptString(patch.embeddingApiKey);
-  }
-  if (typeof patch.sshPrivateKey === "string" && patch.sshPrivateKey) {
-    next.sshPrivateKey = encryptString(patch.sshPrivateKey);
-  }
-  if (
-    patch.sshCredential?.serverId &&
-    (patch.sshCredential?.privateKey || patch.sshCredential?.password)
-  ) {
-    next.sshCredentials ||= {};
-    next.sshCredentials[safeSegment(patch.sshCredential.serverId)] = {
-      privateKey: patch.sshCredential.privateKey
-        ? encryptString(patch.sshCredential.privateKey)
-        : undefined,
-      password: patch.sshCredential.password
-        ? encryptString(patch.sshCredential.password)
-        : undefined,
-      updatedAt: isoNow(),
-    };
-  }
-  await writeJson(secretPath, next);
+  return enqueueActorMutation(secretMutationQueues, actor, async () => {
+    const secretPath = path.join(actorDirectory(actor), "secrets.json");
+    const stored = await readJson(secretPath, {});
+    const next = { ...stored };
+    if (typeof patch.providerApiKey === "string" && patch.providerApiKey) {
+      next.providerApiKey = encryptString(patch.providerApiKey);
+    }
+    if (typeof patch.embeddingApiKey === "string" && patch.embeddingApiKey) {
+      next.embeddingApiKey = encryptString(patch.embeddingApiKey);
+    }
+    if (typeof patch.sshPrivateKey === "string" && patch.sshPrivateKey) {
+      next.sshPrivateKey = encryptString(patch.sshPrivateKey);
+    }
+    if (
+      patch.sshCredential?.serverId &&
+      (patch.sshCredential?.privateKey || patch.sshCredential?.password)
+    ) {
+      next.sshCredentials ||= {};
+      next.sshCredentials[safeSegment(patch.sshCredential.serverId)] = {
+        privateKey: patch.sshCredential.privateKey
+          ? encryptString(patch.sshCredential.privateKey)
+          : undefined,
+        password: patch.sshCredential.password
+          ? encryptString(patch.sshCredential.password)
+          : undefined,
+        updatedAt: isoNow(),
+      };
+    }
+    if (patch.removeSshCredentialId) {
+      const serverId = safeSegment(patch.removeSshCredentialId);
+      if (next.sshCredentials) delete next.sshCredentials[serverId];
+    }
+    await writeJson(secretPath, next);
+  });
 }
 
 async function getState(actor) {
@@ -316,9 +336,86 @@ async function saveState(actor, state) {
   return safeState;
 }
 
+async function updateState(actor, updater) {
+  return enqueueActorMutation(stateMutationQueues, actor, async () => {
+    const current = await getState(actor);
+    const next = (await updater(current)) || current;
+    return saveState(actor, next);
+  });
+}
+
+async function persistServerProfile(actor, input, requestedId) {
+  const serverId = safeSegment(requestedId || input.id || randomId("server-"));
+  const host = String(input.host || "").trim();
+  const username = String(input.username || "").trim();
+  const port = Number(input.port || 22);
+  const authMethod = input.authMethod === "password" ? "password" : "key";
+  if (!host || !username) throw new Error("服务器地址和用户名不能为空");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("SSH 端口无效");
+  }
+
+  let savedProfile;
+  await updateState(actor, async (state) => {
+    state.settings ||= {};
+    const profiles = Array.isArray(state.settings.servers)
+      ? state.settings.servers
+      : [];
+    const current = profiles.find((profile) => profile.id === serverId);
+    const credentialTargetChanged = Boolean(
+      current &&
+        (current.host !== host ||
+          Number(current.port || 22) !== port ||
+          current.username !== username ||
+          (current.authMethod || "key") !== authMethod),
+    );
+    if (credentialTargetChanged) {
+      await updateSecrets(actor, { removeSshCredentialId: serverId });
+    }
+    const incomingPrivateKey =
+      authMethod === "key" ? String(input.privateKey || "") : "";
+    const incomingPassword =
+      authMethod === "password" ? String(input.password || "") : "";
+    if (incomingPrivateKey || incomingPassword) {
+      await updateSecrets(actor, {
+        sshCredential: {
+          serverId,
+          privateKey: incomingPrivateKey || undefined,
+          password: incomingPassword || undefined,
+        },
+      });
+    }
+    const secrets = await getSecrets(actor);
+    const credential = secrets.sshCredentials?.[serverId];
+    savedProfile = {
+      id: serverId,
+      name: String(input.name || host).trim().slice(0, 80) || host,
+      host,
+      port,
+      username,
+      authMethod,
+      keyName: String(
+        authMethod === "key" ? input.keyName || current?.keyName || "" : "",
+      ).slice(0, 160),
+      configured: Boolean(
+        authMethod === "key" ? credential?.privateKey : credential?.password,
+      ),
+      lastConnectedAt: current?.lastConnectedAt,
+    };
+    state.settings.servers = [
+      savedProfile,
+      ...profiles.filter((profile) => profile.id !== serverId),
+    ];
+    state.settings.lastServerId = serverId;
+    delete state.settings.ssh;
+    return state;
+  });
+  return savedProfile;
+}
+
 async function stateForClient(actor) {
   const state = await getState(actor);
-  const secrets = await getSecrets(actor);
+  let secrets = await getSecrets(actor);
   if (state?.settings?.provider) {
     state.settings.provider.configured = Boolean(secrets.providerApiKey);
   }
@@ -356,6 +453,25 @@ async function stateForClient(actor) {
         configured: Boolean(secrets.sshPrivateKey),
       });
       state.settings.lastServerId ||= legacyId;
+    }
+    if (legacySsh && secrets.sshPrivateKey) {
+      const matchingProfiles = state.settings.servers.filter(
+        (profile) =>
+          (profile.authMethod || "key") === "key" &&
+          profile.host === legacySsh.host &&
+          Number(profile.port || 22) === Number(legacySsh.port || 22) &&
+          profile.username === legacySsh.username &&
+          !secrets.sshCredentials?.[safeSegment(profile.id)]?.privateKey,
+      );
+      for (const profile of matchingProfiles) {
+        await updateSecrets(actor, {
+          sshCredential: {
+            serverId: profile.id,
+            privateKey: secrets.sshPrivateKey,
+          },
+        });
+      }
+      if (matchingProfiles.length) secrets = await getSecrets(actor);
     }
     state.settings.servers = state.settings.servers.map((profile) => ({
       ...profile,
@@ -950,6 +1066,64 @@ function providerStreamDelta(payload, protocol) {
   return { content, reasoning };
 }
 
+function trailingTagPrefixLength(value, tag) {
+  const source = String(value || "").toLowerCase();
+  const target = tag.toLowerCase();
+  const maximum = Math.min(source.length, target.length - 1);
+  for (let length = maximum; length > 0; length -= 1) {
+    if (source.endsWith(target.slice(0, length))) return length;
+  }
+  return 0;
+}
+
+function createThinkTagRouter(onDelta) {
+  let pending = "";
+  let insideReasoning = false;
+  let content = "";
+  let reasoning = "";
+
+  const emit = (kind, value) => {
+    const delta = String(value || "");
+    if (!delta) return;
+    if (kind === "reasoning") reasoning += delta;
+    else content += delta;
+    onDelta(kind, delta);
+  };
+
+  const pushContent = (value) => {
+    pending += String(value || "");
+    while (pending) {
+      const tag = insideReasoning ? "</think>" : "<think>";
+      const index = pending.toLowerCase().indexOf(tag);
+      if (index >= 0) {
+        emit(insideReasoning ? "reasoning" : "content", pending.slice(0, index));
+        pending = pending.slice(index + tag.length);
+        insideReasoning = !insideReasoning;
+        continue;
+      }
+      const retainedLength = trailingTagPrefixLength(pending, tag);
+      const readyLength = pending.length - retainedLength;
+      emit(insideReasoning ? "reasoning" : "content", pending.slice(0, readyLength));
+      pending = pending.slice(readyLength);
+      break;
+    }
+  };
+
+  return {
+    pushContent,
+    pushReasoning(value) {
+      emit("reasoning", value);
+    },
+    flush() {
+      emit(insideReasoning ? "reasoning" : "content", pending);
+      pending = "";
+    },
+    result() {
+      return { content, reasoning };
+    },
+  };
+}
+
 async function callChatProviderStream(provider, apiKey, context, onDelta) {
   assertApiKeyShape(apiKey);
   const protocols =
@@ -982,19 +1156,20 @@ async function callChatProviderStream(provider, apiKey, context, onDelta) {
     const contentType = String(response.headers.get("content-type") || "");
     if (!response.body || /application\/json/i.test(contentType)) {
       const payload = await response.json();
-      const content = extractModelText(payload);
-      const reasoning = extractModelReasoning(payload);
-      if (reasoning) onDelta("reasoning", reasoning);
-      if (content) onDelta("content", content);
-      return { content, reasoning, protocol };
+      const router = createThinkTagRouter(onDelta);
+      router.pushReasoning(extractModelReasoning(payload));
+      router.pushContent(extractModelText(payload));
+      router.flush();
+      return { ...router.result(), protocol };
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let pending = "";
-    let content = "";
-    let reasoning = "";
+    let sawContentDelta = false;
+    let sawReasoningDelta = false;
     let completedPayload;
+    const router = createThinkTagRouter(onDelta);
 
     const consumeLine = (rawLine) => {
       const line = rawLine.trim();
@@ -1012,12 +1187,12 @@ async function callChatProviderStream(provider, apiKey, context, onDelta) {
       }
       const delta = providerStreamDelta(payload, protocol);
       if (delta.reasoning) {
-        reasoning += delta.reasoning;
-        onDelta("reasoning", delta.reasoning);
+        sawReasoningDelta = true;
+        router.pushReasoning(delta.reasoning);
       }
       if (delta.content) {
-        content += delta.content;
-        onDelta("content", delta.content);
+        sawContentDelta = true;
+        router.pushContent(delta.content);
       }
     };
 
@@ -1032,15 +1207,14 @@ async function callChatProviderStream(provider, apiKey, context, onDelta) {
     pending += decoder.decode();
     if (pending.trim()) consumeLine(pending);
 
-    if (!content && completedPayload) {
-      content = extractModelText(completedPayload);
-      if (content) onDelta("content", content);
+    if (!sawReasoningDelta && completedPayload) {
+      router.pushReasoning(extractModelReasoning(completedPayload));
     }
-    if (!reasoning && completedPayload) {
-      reasoning = extractModelReasoning(completedPayload);
-      if (reasoning) onDelta("reasoning", reasoning);
+    if (!sawContentDelta && completedPayload) {
+      router.pushContent(extractModelText(completedPayload));
     }
-    return { content, reasoning, protocol };
+    router.flush();
+    return { ...router.result(), protocol };
   }
   throw lastError || new Error("模型 API 请求失败");
 }
@@ -1069,25 +1243,26 @@ async function runChatModelStream(actor, context, state, onDelta) {
 
 async function captureMemory(actor, prompt, projectId, memoryMode) {
   if (!/(请记住|记住这|以后请|我的偏好|我习惯)/i.test(prompt)) return;
-  const state = await getState(actor);
-  if (!state?.settings?.autoCapture || !Array.isArray(state.memories)) return;
   const content = String(prompt)
     .replace(/^.*?(请记住|记住这|以后请)[：:，,\s]*/i, "")
     .trim()
     .slice(0, 280);
   if (!content) return;
-  state.memories.unshift({
-    id: randomId("memory_"),
-    content,
-    scope: memoryMode === "project-only" ? "project" : "global",
-    ...(memoryMode === "project-only" ? { projectId } : {}),
-    kind: "preference",
-    source: "用户明确要求",
-    confidence: 1,
-    enabled: true,
-    updatedAt: isoNow(),
+  await updateState(actor, (state) => {
+    if (!state?.settings?.autoCapture || !Array.isArray(state.memories)) return state;
+    state.memories.unshift({
+      id: randomId("memory_"),
+      content,
+      scope: memoryMode === "project-only" ? "project" : "global",
+      ...(memoryMode === "project-only" ? { projectId } : {}),
+      kind: "preference",
+      source: "用户明确要求",
+      confidence: 1,
+      enabled: true,
+      updatedAt: isoNow(),
+    });
+    return state;
   });
-  await saveState(actor, state);
 }
 
 async function copyGuestDataToUser(guestActor, userActor) {
@@ -1148,21 +1323,20 @@ async function handleHttp(req, res) {
     if (req.method === "PUT" && url.pathname === "/api/state") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
-      const nextState = body.state || {};
-      const storedState = await getState(actor);
-      const nextProvider = nextState?.settings?.provider;
-      const storedProvider = storedState?.settings?.provider;
-      if (
-        nextProvider &&
-        storedProvider &&
-        nextProvider.protocol === "auto" &&
-        ["chat-completions", "responses"].includes(storedProvider.protocol) &&
-        nextProvider.baseUrl === storedProvider.baseUrl &&
-        nextProvider.model === storedProvider.model
-      ) {
-        nextProvider.protocol = storedProvider.protocol;
-      }
-      await saveState(actor, nextState);
+      await updateState(actor, (storedState) => {
+        const nextState = JSON.parse(JSON.stringify(body.state || {}));
+        nextState.settings ||= {};
+        const storedSettings = storedState?.settings || {};
+        // These account-level settings have dedicated endpoints. Keeping the
+        // server copy prevents an older browser tab from erasing a key or SSH
+        // profile that was just saved on another device.
+        for (const key of ["provider", "embedding", "servers", "lastServerId"]) {
+          if (Object.hasOwn(storedSettings, key)) {
+            nextState.settings[key] = storedSettings[key];
+          }
+        }
+        return nextState;
+      });
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -1337,31 +1511,59 @@ async function handleHttp(req, res) {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/api/settings/provider/key") {
+      const actor = await resolveActor(req, res);
+      const secrets = await getSecrets(actor);
+      res.setHeader("Cache-Control", "no-store");
+      sendJson(res, 200, { apiKey: String(secrets.providerApiKey || "") });
+      return;
+    }
+
     if (req.method === "PUT" && url.pathname === "/api/settings/provider") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
       if (body.apiKey) await updateSecrets(actor, { providerApiKey: String(body.apiKey) });
-      const state = await getState(actor);
-      state.settings ||= {};
-      state.settings.provider = {
-        name: String(body.name || "OpenAI Compatible"),
-        baseUrl: String(body.baseUrl || "https://api.openai.com/v1"),
-        model: String(body.model || ""),
+      const currentState = await getState(actor);
+      const currentProvider = currentState?.settings?.provider || {};
+      const baseUrl = String(
+        body.baseUrl || currentProvider.baseUrl || "https://api.openai.com/v1",
+      );
+      const modelWasProvided = Object.prototype.hasOwnProperty.call(body, "model");
+      const provider = {
+        name: String(body.name || currentProvider.name || "OpenAI Compatible"),
+        baseUrl,
+        model: modelWasProvided
+          ? String(body.model || "")
+          : baseUrl !== currentProvider.baseUrl
+            ? ""
+            : String(currentProvider.model || ""),
         protocol:
           body.protocol === "chat-completions" || body.protocol === "responses"
             ? body.protocol
-            : "auto",
+            : currentProvider.protocol === "chat-completions" ||
+                currentProvider.protocol === "responses"
+              ? currentProvider.protocol
+              : "auto",
         configured: Boolean(body.apiKey || (await getSecrets(actor)).providerApiKey),
       };
-      await saveState(actor, state);
-      void syncManagedOpenCodeForActor(actor).catch((caught) => {
-        console.warn(
-          `[EasyWork Agent] provider sync skipped: ${
-            caught instanceof Error ? caught.message : "unknown error"
-          }`,
-        );
+      await updateState(actor, (state) => {
+        state.settings ||= {};
+        state.settings.provider = provider;
+        return state;
       });
-      sendJson(res, 200, { ok: true, provider: state.settings.provider });
+      const shouldSyncManagedAgents = Boolean(body.apiKey) ||
+        (Object.prototype.hasOwnProperty.call(body, "baseUrl") &&
+          baseUrl !== currentProvider.baseUrl);
+      if (shouldSyncManagedAgents) {
+        void syncManagedOpenCodeForActor(actor).catch((caught) => {
+          console.warn(
+            `[EasyWork Agent] provider sync skipped: ${
+              caught instanceof Error ? caught.message : "unknown error"
+            }`,
+          );
+        });
+      }
+      sendJson(res, 200, { ok: true, provider });
       return;
     }
 
@@ -1383,9 +1585,7 @@ async function handleHttp(req, res) {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
       if (body.apiKey) await updateSecrets(actor, { embeddingApiKey: String(body.apiKey) });
-      const state = await getState(actor);
-      state.settings ||= {};
-      state.settings.embedding = {
+      const embedding = {
         baseUrl: String(body.baseUrl || "https://api.openai.com/v1"),
         model: String(body.model || "text-embedding-3-small"),
         dimensions: String(body.dimensions || ""),
@@ -1393,8 +1593,23 @@ async function handleHttp(req, res) {
         hybridEnabled: body.hybridEnabled !== false,
         rerankEnabled: Boolean(body.rerankEnabled),
       };
-      await saveState(actor, state);
-      sendJson(res, 200, { ok: true, embedding: state.settings.embedding });
+      await updateState(actor, (state) => {
+        state.settings ||= {};
+        state.settings.embedding = embedding;
+        return state;
+      });
+      sendJson(res, 200, { ok: true, embedding });
+      return;
+    }
+
+    if (req.method === "PUT" && url.pathname.startsWith("/api/settings/servers/")) {
+      const actor = await resolveActor(req, res);
+      const serverId = decodeURIComponent(
+        url.pathname.slice("/api/settings/servers/".length),
+      );
+      const body = await parseJsonBody(req);
+      const profile = await persistServerProfile(actor, body, serverId);
+      sendJson(res, 200, { ok: true, profile });
       return;
     }
 
@@ -1912,7 +2127,9 @@ function agentPromptWithWorkflow(context, steps) {
     "## EasyWork 网页端已编排的执行流程",
     ...steps.map((step, index) => `${index + 1}. ${step}`),
     "",
-    "严格按以上顺序执行并验证。不要重新生成另一套计划；工具调用和最终回复应与这些步骤对应。",
+    "严格按以上顺序执行并验证，不要重新生成另一套计划。",
+    "这些步骤只用于控制执行顺序，不是最终回答的提纲。",
+    "完成工具调用后，请直接针对用户问题综合所有证据给出总结性回答：先说明结论，再组织关键数据、判断依据、限制和必要的下一步。不要按步骤逐项复述，也不要使用‘步骤一/步骤二’作为回答结构，除非用户明确要求。",
   ].join("\n");
 }
 
@@ -2225,6 +2442,7 @@ async function scanRemoteAgents(session, actor) {
       );
       agent.configured = configuration.configured;
       agent.configPath = configuration.configPath;
+      agent.model = configuration.model || undefined;
       if (configuration.error) agent.configurationError = configuration.error;
     } else {
       const configCheck = agent.configPath
@@ -2259,11 +2477,12 @@ async function ensureOpenCodeNativeConfig(
   session,
   actor,
   onProgress = () => undefined,
+  modelOverride = "",
 ) {
   const state = await getState(actor);
   const provider = state?.settings?.provider || {};
   const secrets = await getSecrets(actor);
-  if (!provider.baseUrl || !provider.model || !secrets.providerApiKey) {
+  if (!provider.baseUrl || !secrets.providerApiKey) {
     return {
       configured: false,
       changed: false,
@@ -2274,9 +2493,21 @@ async function ensureOpenCodeNativeConfig(
     ...agentConfigFor("opencode", session.home),
     managed: true,
   });
+  const selectedModel = String(
+    modelOverride || configuration.model || provider.model || "",
+  ).trim();
+  if (!selectedModel) {
+    return {
+      configured: false,
+      changed: false,
+      reason: "missing-model",
+      configPath: configuration.configPath,
+    };
+  }
+  const effectiveProvider = { ...provider, model: selectedModel };
   const nextConfig = mergeOpenCodeConfigContent(
     configuration.configContent,
-    provider,
+    effectiveProvider,
   );
   const nextAuth = mergeOpenCodeAuthContent(
     configuration.authContent,
@@ -2289,7 +2520,7 @@ async function ensureOpenCodeNativeConfig(
       configured: true,
       changed: false,
       configPath: configuration.configPath,
-      model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${provider.model}`,
+      model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${selectedModel}`,
     };
   }
   onProgress("configure", "同步 OpenCode 原生模型配置");
@@ -2320,7 +2551,48 @@ async function ensureOpenCodeNativeConfig(
     configured: true,
     changed: true,
     configPath: configuration.configPath,
-    model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${provider.model}`,
+    model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${selectedModel}`,
+  };
+}
+
+async function configureOpenCodeModel(
+  session,
+  actor,
+  payload,
+  onProgress = () => undefined,
+) {
+  const agent = await agentForSession(session, actor, payload.agentId);
+  if (agent.adapter !== "opencode" || agent.status !== "ready") {
+    throw new Error("当前 Agent 不是可配置的 OpenCode");
+  }
+  const model = String(payload.model || "").trim();
+  if (!model) throw new Error("请选择一个模型");
+  const state = await getState(actor);
+  const provider = state?.settings?.provider || {};
+  const secrets = await getSecrets(actor);
+  if (!provider.baseUrl || !secrets.providerApiKey) {
+    throw new Error("请先在个人资料中配置 API URL 和 API Key");
+  }
+  onProgress("正在核对模型");
+  const availableModels = await listProviderModels(
+    provider.baseUrl,
+    secrets.providerApiKey,
+  );
+  if (!availableModels.includes(model)) {
+    throw new Error("当前 API 已不再返回所选模型，请重新检测");
+  }
+  onProgress("正在写入 OpenCode 原生配置");
+  const result = await ensureOpenCodeNativeConfig(
+    session,
+    actor,
+    (_stage, label) => onProgress(label),
+    model,
+  );
+  if (!result.configured) throw new Error("OpenCode 配置未完成");
+  return {
+    model,
+    configPath: result.configPath,
+    agents: await scanRemoteAgents(session, actor),
   };
 }
 
@@ -2470,6 +2742,141 @@ async function installOpenCode(session, actor, onProgress = () => undefined) {
   return scanRemoteAgents(session, actor);
 }
 
+function normalizeOpenCodeVersion(value) {
+  const match = String(value || "").match(/\bv?(\d+(?:\.\d+){1,3}(?:[-+][\w.-]+)?)\b/i);
+  return match?.[1] || String(value || "").trim().split(/\s+/)[0] || "";
+}
+
+function parseOpenCodeUpdateVersions(output) {
+  const source = String(output || "");
+  const current = source.match(/^EW_CURRENT_VERSION=(.+)$/m)?.[1]?.trim() || "";
+  const latest = source.match(/^EW_LATEST_VERSION=(.+)$/m)?.[1]?.trim() || "";
+  return {
+    currentVersion: normalizeOpenCodeVersion(current),
+    latestVersion: normalizeOpenCodeVersion(latest),
+  };
+}
+
+function openCodeUpdateProbeCommand() {
+  return [
+    "set -eu",
+    'EW_AGENT_ROOT="$HOME/.easywork/agents/opencode"',
+    'EW_CURRENT="$EW_AGENT_ROOT/bin/opencode"',
+    'EW_UPDATE_ROOT="$EW_AGENT_ROOT/.update-candidate"',
+    'EW_UPDATE_HOME="$EW_UPDATE_ROOT/home"',
+    'EW_INSTALLER="$EW_UPDATE_ROOT/install.sh"',
+    'test -x "$EW_CURRENT"',
+    'rm -rf "$EW_UPDATE_ROOT"',
+    'mkdir -p "$EW_UPDATE_HOME"',
+    'curl --connect-timeout 15 --max-time 90 --retry 2 -fsSL https://opencode.ai/install -o "$EW_INSTALLER"',
+    'if command -v timeout >/dev/null 2>&1; then HOME="$EW_UPDATE_HOME" timeout 300 bash "$EW_INSTALLER" --no-modify-path; else HOME="$EW_UPDATE_HOME" bash "$EW_INSTALLER" --no-modify-path; fi',
+    'test -x "$EW_UPDATE_HOME/.opencode/bin/opencode"',
+    'mv "$EW_UPDATE_HOME/.opencode/bin/opencode" "$EW_UPDATE_ROOT/opencode"',
+    'chmod 755 "$EW_UPDATE_ROOT/opencode"',
+    'printf "EW_CURRENT_VERSION=%s\\n" "$("$EW_CURRENT" --version 2>/dev/null | head -n 1)"',
+    'printf "EW_LATEST_VERSION=%s\\n" "$("$EW_UPDATE_ROOT/opencode" --version 2>/dev/null | head -n 1)"',
+    'rm -rf "$EW_UPDATE_HOME" "$EW_INSTALLER"',
+  ].join("\n");
+}
+
+function openCodeUpdateApplyCommand() {
+  return [
+    "set -eu",
+    'EW_AGENT_ROOT="$HOME/.easywork/agents/opencode"',
+    'EW_CURRENT="$EW_AGENT_ROOT/bin/opencode"',
+    'EW_CANDIDATE="$EW_AGENT_ROOT/.update-candidate/opencode"',
+    'EW_BACKUP="$EW_AGENT_ROOT/bin/opencode.easywork-backup"',
+    'test -x "$EW_CURRENT"',
+    'test -x "$EW_CANDIDATE"',
+    'cp -p "$EW_CURRENT" "$EW_BACKUP"',
+    'if cp "$EW_CANDIDATE" "$EW_CURRENT" && chmod 755 "$EW_CURRENT" && "$EW_CURRENT" --version; then',
+    '  rm -f "$EW_BACKUP"',
+    '  rm -rf "$EW_AGENT_ROOT/.update-candidate"',
+    "else",
+    '  cp -p "$EW_BACKUP" "$EW_CURRENT"',
+    '  rm -f "$EW_BACKUP"',
+    '  exit 1',
+    "fi",
+  ].join("\n");
+}
+
+async function checkOpenCodeUpdate(
+  session,
+  actor,
+  onProgress = () => undefined,
+) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  if (session.activeStream) throw new Error("请等待当前远程任务结束后再检测更新");
+  const agents = await scanRemoteAgents(session, actor);
+  const openCode = agents.find(
+    (agent) =>
+      agent.adapter === "opencode" &&
+      agent.status === "ready" &&
+      agent.managed,
+  );
+  if (!openCode) throw new Error("只能自动更新由 EasyWork 部署的 OpenCode");
+  onProgress("checking", "读取当前版本");
+  onProgress("downloading", "下载并验证最新版本");
+  const result = await remoteExec(session.client, openCodeUpdateProbeCommand());
+  const versions = parseOpenCodeUpdateVersions(result.stdout);
+  if (!versions.currentVersion || !versions.latestVersion) {
+    throw new Error("未能识别 OpenCode 版本，候选文件已保留以便排查");
+  }
+  const update = {
+    ...versions,
+    updateAvailable: versions.currentVersion !== versions.latestVersion,
+    checkedAt: isoNow(),
+  };
+  session.agentUpdates ||= new Map();
+  session.agentUpdates.set("opencode", update);
+  if (!update.updateAvailable) {
+    await remoteExec(
+      session.client,
+      'rm -rf "$HOME/.easywork/agents/opencode/.update-candidate"',
+      { allowFailure: true },
+    );
+  }
+  return update;
+}
+
+async function applyOpenCodeUpdate(
+  session,
+  actor,
+  onProgress = () => undefined,
+) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  if (session.activeStream) throw new Error("请等待当前远程任务结束后再更新");
+  let update = session.agentUpdates?.get("opencode");
+  if (!update?.updateAvailable) {
+    update = await checkOpenCodeUpdate(session, actor, onProgress);
+  }
+  if (!update.updateAvailable) {
+    return { ...update, agents: await scanRemoteAgents(session, actor) };
+  }
+  onProgress("updating", `正在更新到 ${update.latestVersion}`);
+  await remoteExec(session.client, openCodeUpdateApplyCommand());
+  onProgress("configuring", "核对 OpenCode 原生配置");
+  await ensureOpenCodeNativeConfig(session, actor, onProgress);
+  const agents = await scanRemoteAgents(session, actor);
+  const installed = agents.find(
+    (agent) => agent.adapter === "opencode" && agent.managed,
+  );
+  const installedVersion = normalizeOpenCodeVersion(installed?.version);
+  if (installedVersion !== update.latestVersion) {
+    throw new Error(
+      `更新后版本校验失败：期望 ${update.latestVersion}，实际 ${installedVersion || "未知"}`,
+    );
+  }
+  const completed = {
+    currentVersion: update.currentVersion,
+    latestVersion: installedVersion,
+    updateAvailable: false,
+    checkedAt: isoNow(),
+  };
+  session.agentUpdates?.set("opencode", completed);
+  return { ...completed, agents };
+}
+
 function parseOpenCodeLine(line, state) {
   let payload;
   try {
@@ -2503,7 +2910,7 @@ function parseOpenCodeLine(line, state) {
           : "running";
     const kind = /write|edit|patch|apply|replace|create_file/.test(normalizedTool)
       ? "file_change"
-      : /\b(?:sbatch|srun|salloc|squeue|sacct|scancel|qsub|qstat|qdel)\b/.test(
+      : /\b(?:sbatch|srun|salloc|sinfo|squeue|sacct|scontrol|scancel|qsub|qstat|qdel)\b/.test(
             normalizedTool,
           )
         ? "job_status"
@@ -2720,6 +3127,7 @@ async function runRemoteWork(socket, session, actor, payload) {
       kind: "plan",
       title: `已编排 ${steps.length} 个步骤`,
       detail: usedFallbackPlan ? "已使用本地流程模板并发送给 Agent" : "流程已发送给 Agent",
+      output: steps.map((step, index) => `${index + 1}. ${step}`).join("\n"),
       status: "done",
       timestamp: isoNow(),
     },
@@ -3023,96 +3431,112 @@ async function connectSsh(socket, session, actor, payload) {
   session.client = client;
   let connectionPublished = false;
   let failureExpectedClose = false;
+  const sshAuth = {
+    authMethod,
+    otpPrompted: false,
+    otpProvided: Boolean(String(payload.otp || "").trim()),
+    passphrasePrompted: false,
+    passphraseProvided: Boolean(String(payload.passphrase || "")),
+  };
 
-  await new Promise((resolve, reject) => {
-    let settled = false;
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      failureExpectedClose = true;
-      client.end();
-      reject(error);
-    };
-    client
-      .on("keyboard-interactive", (_name, _instructions, _language, prompts, finish) => {
-        const replies = prompts.map((prompt) => {
-          const label = String(prompt.prompt || "");
-          if (/verification|code|otp|token|验证码/i.test(label)) return String(payload.otp || "");
-          if (/password|passphrase|口令|密码/i.test(label)) {
-            return authMethod === "password"
-              ? password
-              : String(payload.passphrase || "");
-          }
-          return String(payload.otp || "");
-        });
-        finish(replies);
-      })
-      .once("ready", async () => {
+  try {
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const fail = (error) => {
         if (settled) return;
-        try {
-          const homeResult = await remoteExec(client, 'printf "%s" "$HOME"');
+        settled = true;
+        failureExpectedClose = true;
+        client.end();
+        reject(error);
+      };
+      client
+        .on("keyboard-interactive", (_name, _instructions, _language, prompts, finish) => {
+          const replies = prompts.map((prompt) => {
+            const label = String(prompt.prompt || "");
+            if (/verification|code|otp|token|验证码/i.test(label)) {
+              sshAuth.otpPrompted = true;
+              return String(payload.otp || "");
+            }
+            if (/password|passphrase|口令|密码/i.test(label)) {
+              sshAuth.passphrasePrompted = true;
+              return authMethod === "password"
+                ? password
+                : String(payload.passphrase || "");
+            }
+            return String(payload.otp || "");
+          });
+          finish(replies);
+        })
+        .once("ready", async () => {
           if (settled) return;
-          session.home = homeResult.stdout.trim();
-          session.host = host;
-          session.username = username;
-          if (payload.trustHost && observedFingerprint) {
-            knownHosts[`${host}:${port}`] = observedFingerprint;
-            await writeJson(knownHostsPath, knownHosts);
+          try {
+            const homeResult = await remoteExec(client, 'printf "%s" "$HOME"');
+            if (settled) return;
+            session.home = homeResult.stdout.trim();
+            session.host = host;
+            session.username = username;
+            if (payload.trustHost && observedFingerprint) {
+              knownHosts[`${host}:${port}`] = observedFingerprint;
+              await writeJson(knownHostsPath, knownHosts);
+            }
+            settled = true;
+            resolve();
+          } catch (error) {
+            fail(error);
           }
-          settled = true;
-          resolve();
-        } catch (error) {
+        })
+        .on("error", (error) => {
+          if (settled) return;
+          if (
+            observedFingerprint &&
+            !payload.trustHost &&
+            knownHosts[`${host}:${port}`] !== observedFingerprint
+          ) {
+            const fingerprintError = new Error(
+              `首次连接需要确认主机指纹：${observedFingerprint}`,
+            );
+            fingerprintError.fingerprint = observedFingerprint;
+            fail(fingerprintError);
+            return;
+          }
           fail(error);
-        }
-      })
-      .on("error", (error) => {
-        if (settled) return;
-        if (
-          observedFingerprint &&
-          !payload.trustHost &&
-          knownHosts[`${host}:${port}`] !== observedFingerprint
-        ) {
-          const fingerprintError = new Error(
-            `首次连接需要确认主机指纹：${observedFingerprint}`,
-          );
-          fingerprintError.fingerprint = observedFingerprint;
-          fail(fingerprintError);
-          return;
-        }
-        fail(error);
-      })
-      .on("close", () => {
-        if (session.client === client) {
-          session.client = null;
-          if (connectionPublished && !failureExpectedClose) {
-            session.status = "disconnected";
-            sessionSend(session, {
-              type: "connection.status",
-              serverId: session.serverId,
-              status: "disconnected",
-              label: "SSH 连接已关闭",
-            });
+        })
+        .on("close", () => {
+          if (session.client === client) {
+            session.client = null;
+            if (connectionPublished && !failureExpectedClose) {
+              session.status = "disconnected";
+              sessionSend(session, {
+                type: "connection.status",
+                serverId: session.serverId,
+                status: "disconnected",
+                label: "SSH 连接已关闭",
+              });
+            }
           }
-        }
-      })
-      .connect({
-        host,
-        port,
-        username,
-        privateKey: authMethod === "key" ? privateKey : undefined,
-        password: authMethod === "password" ? password : undefined,
-        passphrase: payload.passphrase ? String(payload.passphrase) : undefined,
-        tryKeyboard: true,
-        readyTimeout: 25_000,
-        keepaliveInterval: 15_000,
-        keepaliveCountMax: 3,
-        hostVerifier: (key) => {
-          observedFingerprint = `SHA256:${crypto.createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
-          const known = knownHosts[`${host}:${port}`];
-          return Boolean(payload.trustHost || (known && known === observedFingerprint));
-        },
-      });
-  });
+        })
+        .connect({
+          host,
+          port,
+          username,
+          privateKey: authMethod === "key" ? privateKey : undefined,
+          password: authMethod === "password" ? password : undefined,
+          passphrase: payload.passphrase ? String(payload.passphrase) : undefined,
+          tryKeyboard: true,
+          readyTimeout: 25_000,
+          keepaliveInterval: 15_000,
+          keepaliveCountMax: 3,
+          hostVerifier: (key) => {
+            observedFingerprint = `SHA256:${crypto.createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
+            const known = knownHosts[`${host}:${port}`];
+            return Boolean(payload.trustHost || (known && known === observedFingerprint));
+          },
+        });
+    });
+  } catch (error) {
+    if (error && typeof error === "object") error.sshAuth = sshAuth;
+    throw error;
+  }
 
   if (session.client !== client) {
     throw new Error("SSH 连接在登录完成前已关闭");
@@ -3157,40 +3581,40 @@ async function connectSsh(socket, session, actor, payload) {
           },
         });
       }
-      const state = await getState(actor);
-      state.settings ||= {};
-      const profiles = Array.isArray(state.settings.servers)
-        ? state.settings.servers
-        : [];
-      const currentProfile =
-        profiles.find((profile) => profile.id === session.serverId) || {};
-      const profile = {
-        id: session.serverId,
-        name: String(
-          payload.name || currentProfile.name || host,
-        )
-          .trim()
-          .slice(0, 80),
-        host,
-        port,
-        username,
-        authMethod,
-        keyName: String(
-          authMethod === "key"
-            ? payload.privateKeyName || currentProfile.keyName || "SSH 私钥"
-            : "",
-        ).slice(0, 160),
-        configured: true,
-        lastConnectedAt: isoNow(),
-      };
-      state.settings.servers = [
-        profile,
-        ...profiles.filter((item) => item.id !== session.serverId),
-      ];
-      state.settings.lastServerId = session.serverId;
-      delete state.settings.ssh;
-      await saveState(actor, state);
-      wsSend(socket, {
+      let profile;
+      await updateState(actor, (state) => {
+        state.settings ||= {};
+        const profiles = Array.isArray(state.settings.servers)
+          ? state.settings.servers
+          : [];
+        const currentProfile =
+          profiles.find((item) => item.id === session.serverId) || {};
+        profile = {
+          id: session.serverId,
+          name: String(payload.name || currentProfile.name || host)
+            .trim()
+            .slice(0, 80),
+          host,
+          port,
+          username,
+          authMethod,
+          keyName: String(
+            authMethod === "key"
+              ? payload.privateKeyName || currentProfile.keyName || "SSH 私钥"
+              : "",
+          ).slice(0, 160),
+          configured: true,
+          lastConnectedAt: isoNow(),
+        };
+        state.settings.servers = [
+          profile,
+          ...profiles.filter((item) => item.id !== session.serverId),
+        ];
+        state.settings.lastServerId = session.serverId;
+        delete state.settings.ssh;
+        return state;
+      });
+      sessionSend(session, {
         type: "server.profile",
         profile,
       });
@@ -3388,8 +3812,15 @@ async function uploadRemoteFile(session, payload) {
 function describeSshError(caught) {
   const message = caught instanceof Error ? caught.message : "远端操作失败";
   if (caught?.fingerprint) return message;
+  if (caught?.sshAuth?.otpPrompted) {
+    return caught.sshAuth.otpProvided
+      ? "动态验证码未通过，可能已经过期；请输入当前最新的 6 位验证码后重试"
+      : "登录节点要求动态验证码，请在连接按钮左侧输入当前 6 位验证码后重试";
+  }
   if (/all configured authentication methods failed|authentication failed|permission denied/i.test(message)) {
-    return "SSH 认证失败，请检查用户名、私钥、私钥密码和动态验证码";
+    return caught?.sshAuth?.authMethod === "key"
+      ? "登录节点未接受当前私钥，请确认该公钥仍在服务器 authorized_keys 中"
+      : "登录节点未接受当前密码，请核对用户名和密码";
   }
   if (/cannot parse privatekey|unsupported key format|bad passphrase|encrypted private.*passphrase/i.test(message)) {
     return "无法使用此 SSH 私钥，请检查文件格式和私钥密码";
@@ -3465,6 +3896,7 @@ function attachWebSocketServer(server) {
           activeStream: null,
           activeRun: null,
           agentSessions: new Map(),
+          agentUpdates: new Map(),
           sockets: new Set(),
           disconnectTimer: null,
         };
@@ -3485,7 +3917,8 @@ function attachWebSocketServer(server) {
       port: session.port,
       username: session.username,
       latency: session.latency,
-      fingerprint: session.fingerprint || undefined,
+      fingerprint:
+        session.status === "error" ? session.fingerprint || undefined : undefined,
       demo: session.demo,
       resumed,
     });
@@ -3666,6 +4099,126 @@ function attachWebSocketServer(server) {
           });
           return;
         }
+        if (payload.type === "agent.update.check") {
+          if (targetSession.demo) {
+            wsSend(socket, {
+              type: "agent.update.status",
+              serverId: targetSession.serverId,
+              status: "current",
+              currentVersion: "demo",
+              latestVersion: "demo",
+              label: "演示环境无需更新",
+            });
+            return;
+          }
+          const update = await checkOpenCodeUpdate(
+            targetSession,
+            actor,
+            (status, label) => {
+              wsSend(socket, {
+                type: "agent.update.status",
+                serverId: targetSession.serverId,
+                status,
+                label,
+              });
+            },
+          );
+          wsSend(socket, {
+            type: "agent.update.status",
+            serverId: targetSession.serverId,
+            status: update.updateAvailable ? "available" : "current",
+            ...update,
+            label: update.updateAvailable
+              ? `发现 OpenCode ${update.latestVersion}`
+              : "OpenCode 已是最新版",
+          });
+          return;
+        }
+        if (payload.type === "agent.update.apply") {
+          if (targetSession.demo) {
+            wsSend(socket, {
+              type: "agent.update.status",
+              serverId: targetSession.serverId,
+              status: "done",
+              currentVersion: "demo",
+              latestVersion: "demo",
+              label: "演示环境无需更新",
+            });
+            return;
+          }
+          const update = await applyOpenCodeUpdate(
+            targetSession,
+            actor,
+            (status, label) => {
+              wsSend(socket, {
+                type: "agent.update.status",
+                serverId: targetSession.serverId,
+                status,
+                label,
+              });
+            },
+          );
+          wsSend(socket, {
+            type: "agent.update.status",
+            serverId: targetSession.serverId,
+            status: "done",
+            currentVersion: update.currentVersion,
+            latestVersion: update.latestVersion,
+            label: `OpenCode 已更新到 ${update.latestVersion}`,
+          });
+          sessionSend(targetSession, {
+            type: "agent.list",
+            serverId: targetSession.serverId,
+            agents: update.agents,
+          });
+          return;
+        }
+        if (payload.type === "agent.model.configure") {
+          if (targetSession.demo) {
+            wsSend(socket, {
+              type: "agent.model.status",
+              serverId: targetSession.serverId,
+              status: "done",
+              model: String(payload.model || "demo"),
+              label: "演示环境已完成配置",
+            });
+            return;
+          }
+          wsSend(socket, {
+            type: "agent.model.status",
+            serverId: targetSession.serverId,
+            status: "configuring",
+            model: String(payload.model || ""),
+            label: "正在准备 OpenCode 配置",
+          });
+          const configured = await configureOpenCodeModel(
+            targetSession,
+            actor,
+            payload,
+            (label) => {
+              wsSend(socket, {
+                type: "agent.model.status",
+                serverId: targetSession.serverId,
+                status: "configuring",
+                model: String(payload.model || ""),
+                label,
+              });
+            },
+          );
+          wsSend(socket, {
+            type: "agent.model.status",
+            serverId: targetSession.serverId,
+            status: "done",
+            model: configured.model,
+            label: `OpenCode 已切换到 ${configured.model}`,
+          });
+          sessionSend(targetSession, {
+            type: "agent.list",
+            serverId: targetSession.serverId,
+            agents: configured.agents,
+          });
+          return;
+        }
         if (payload.type === "agent.config.read") {
           const config = await readAgentConfig(
             targetSession,
@@ -3834,6 +4387,23 @@ function attachWebSocketServer(server) {
             ],
           });
           wsSend(socket, { type: "error", error: message });
+        } else if (String(payload.type || "").startsWith("agent.update.")) {
+          wsSend(socket, {
+            type: "agent.update.status",
+            serverId: targetSession?.serverId,
+            status: "error",
+            label: "OpenCode 更新失败",
+            error: message,
+          });
+        } else if (payload.type === "agent.model.configure") {
+          wsSend(socket, {
+            type: "agent.model.status",
+            serverId: targetSession?.serverId,
+            status: "error",
+            model: String(payload.model || ""),
+            label: "OpenCode 模型配置失败",
+            error: message,
+          });
         } else {
           wsSend(socket, {
             type: "error",
@@ -3877,6 +4447,13 @@ export async function createEasyWorkServer() {
 
 export const gatewayTestHelpers = {
   agentPromptWithWorkflow,
+  createThinkTagRouter,
+  describeSshError,
+  ensureOpenCodeNativeConfig,
+  normalizeOpenCodeVersion,
+  openCodeUpdateApplyCommand,
+  openCodeUpdateProbeCommand,
+  parseOpenCodeUpdateVersions,
   fallbackConversationTitle,
   mergeOpenCodeAuthContent,
   mergeOpenCodeConfigContent,
