@@ -155,7 +155,11 @@ test("keeps machine caches local while persistent EasyWork data remains shareabl
   assert.match(viteConfig, /proxy:/);
   assert.match(viteConfig, /"\/easywork-ws"/);
   assert.match(viteConfig, /easywork-websocket-tunnel/);
+  assert.doesNotMatch(viteConfig, /hosting\.json|sites\(\)/);
   assert.match(gitignore, /\/frp\/frpc\.local\.toml/);
   assert.match(example, /REPLACE_WITH_FRP_TOKEN/);
   assert.doesNotMatch(example, /auth\.token\s*=\s*"[a-f0-9]{32,}"/i);
+
+  await assert.rejects(access(new URL("../.openai/hosting.json", import.meta.url)));
+  await assert.rejects(access(new URL("../build/sites-vite-plugin.ts", import.meta.url)));
 });
