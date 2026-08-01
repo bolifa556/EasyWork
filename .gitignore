@@ -52,3 +52,4 @@ next-env.d.ts
 /.reference-chat.png
 /frp/frpc.local.toml
 /frp/*.log
+requirments.md
