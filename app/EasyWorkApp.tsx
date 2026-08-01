@@ -59,7 +59,6 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
-  KeyboardEvent,
   useCallback,
   useEffect,
   useId,
@@ -766,7 +765,7 @@ function CommandEventGroup({ events }: { events: WorkEvent[] }) {
         </span>
         <strong>{groupLabel}</strong>
         <span>{running ? "远程终端活动中" : failed ? "部分命令失败" : "远程终端"}</span>
-        <ChevronDown className="command-group-chevron" size={13} />
+        <ChevronRight className="command-group-chevron" size={13} />
       </button>
       <div className="command-list-motion">
         <div className="command-list">
@@ -804,7 +803,7 @@ function CommandEventGroup({ events }: { events: WorkEvent[] }) {
                   </span>
                   <code title={command}>{command}</code>
                   <small>{eventStatusLabel(event.status)}</small>
-                  <ChevronDown size={13} />
+                  <ChevronRight className="command-event-chevron" size={13} />
                 </button>
                 <div className="command-output-motion" id={panelId}>
                   <div>
@@ -943,7 +942,10 @@ function ScrollingTitle({ title }: { title: string }) {
       const text = textRef.current;
       setOffset(
         viewport && text
-          ? Math.max(0, Math.ceil(text.scrollWidth - viewport.clientWidth))
+          ? Math.max(
+              0,
+              Math.ceil(text.scrollWidth - viewport.clientWidth + 14),
+            )
           : 0,
       );
     };
@@ -992,12 +994,17 @@ function ConversationRow({
   return (
     <div
       className={`chat-row${nested ? " project-chat-row" : ""}${
+        conversation.mode === "work" ? " work" : ""
+      }${
         active ? " active" : ""
       }`}
     >
       <button className="chat-row-main" type="button" onClick={onSelect}>
         <ScrollingTitle title={conversation.title} />
       </button>
+      {conversation.mode === "work" && (
+        <span className="conversation-work-mark">工作</span>
+      )}
       <button
         className="chat-row-menu-button"
         type="button"
@@ -1047,6 +1054,197 @@ function ConversationRow({
   );
 }
 
+function UnifiedComposer({
+  value,
+  placeholder,
+  disabled = false,
+  sending = false,
+  skills,
+  selectedSkills,
+  textareaRef,
+  menuDirection = "up",
+  onChange,
+  onSubmit,
+  onStop,
+  onUpload,
+  onToggleSkill,
+}: {
+  value: string;
+  placeholder: string;
+  disabled?: boolean;
+  sending?: boolean;
+  skills: SkillItem[];
+  selectedSkills: string[];
+  textareaRef?: React.RefObject<HTMLTextAreaElement | null>;
+  menuDirection?: "up" | "down";
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  onStop: () => void;
+  onUpload: (files: FileList | null) => void;
+  onToggleSkill: (skillId: string) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPage, setMenuPage] = useState<"root" | "skills">("root");
+  const menuWrapRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const enabledSkills = skills.filter((skill) => skill.enabled);
+  const skillMenuHeight = Math.min(54 + Math.max(enabledSkills.length, 1) * 52, 314);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      if (!menuWrapRef.current?.contains(event.target as Node)) {
+        setMenuOpen(false);
+        window.setTimeout(() => setMenuPage("root"), 220);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePress);
+  }, [menuOpen]);
+
+  const closeMenu = () => {
+    setMenuOpen(false);
+    window.setTimeout(() => setMenuPage("root"), 220);
+  };
+
+  return (
+    <div className={`unified-composer${sending ? " busy" : ""}`}>
+      <div className="composer-add-wrap" ref={menuWrapRef}>
+        <button
+          className={`composer-add-button${menuOpen ? " active" : ""}`}
+          type="button"
+          aria-label="添加内容"
+          aria-expanded={menuOpen}
+          onClick={() => {
+            if (menuOpen) {
+              closeMenu();
+            } else {
+              setMenuPage("root");
+              setMenuOpen(true);
+            }
+          }}
+        >
+          <Plus size={19} />
+        </button>
+        <input
+          ref={fileInputRef}
+          hidden
+          multiple
+          type="file"
+          onChange={(event) => {
+            onUpload(event.currentTarget.files);
+            event.currentTarget.value = "";
+            closeMenu();
+          }}
+        />
+        {menuOpen && (
+          <div
+            className={`composer-menu-popover ${menuDirection} ${
+              menuPage === "skills" ? "show-skills" : ""
+            }`}
+            style={
+              {
+                "--composer-skill-height": `${skillMenuHeight}px`,
+              } as React.CSSProperties
+            }
+          >
+            <div className="composer-menu-track">
+              <div className="composer-menu-panel root-panel">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <span className="composer-menu-icon">
+                    <Paperclip size={17} />
+                  </span>
+                  <span>上传文件</span>
+                </button>
+                <button type="button" onClick={() => setMenuPage("skills")}>
+                  <span className="composer-menu-icon">
+                    <Sparkles size={17} />
+                  </span>
+                  <span>选择技能</span>
+                  <ChevronRight className="composer-menu-next" size={16} />
+                </button>
+              </div>
+              <div className="composer-menu-panel skills-panel">
+                <button
+                  className="composer-menu-back"
+                  type="button"
+                  onClick={() => setMenuPage("root")}
+                >
+                  <ChevronLeft size={16} />
+                  <span>返回</span>
+                </button>
+                <div className="composer-skill-list">
+                  {enabledSkills.map((skill) => {
+                    const selected = selectedSkills.includes(skill.id);
+                    return (
+                      <button
+                        className={selected ? "selected" : ""}
+                        type="button"
+                        key={skill.id}
+                        onClick={() => onToggleSkill(skill.id)}
+                      >
+                        <span className="composer-menu-icon">{skillIcon(skill)}</span>
+                        <span className="composer-skill-copy">
+                          <strong>{skill.name}</strong>
+                          {skill.description && <small>{skill.description}</small>}
+                        </span>
+                        <span className="composer-skill-check">
+                          {selected && <Check size={14} />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                  {!enabledSkills.length && (
+                    <span className="composer-menu-empty">暂无已安装的技能</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+      <textarea
+        ref={textareaRef}
+        value={value}
+        disabled={disabled}
+        rows={1}
+        aria-label="消息输入框"
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            if (!disabled && value.trim()) onSubmit();
+          }
+        }}
+      />
+      {sending ? (
+        <button
+          className="unified-send-button stop"
+          type="button"
+          onClick={onStop}
+          aria-label="停止"
+        >
+          <Square size={13} fill="currentColor" />
+        </button>
+      ) : (
+        <button
+          className="unified-send-button"
+          type="button"
+          onClick={onSubmit}
+          disabled={disabled || !value.trim()}
+          aria-label="发送"
+        >
+          <ArrowUp size={18} />
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function EasyWorkApp() {
   const [state, setState] = useState<EasyWorkState>(DEFAULT_STATE);
   const [actor, setActor] = useState<Actor>(DEFAULT_ACTOR);
@@ -1057,7 +1255,6 @@ export default function EasyWorkApp() {
   const [view, setView] = useState<ViewName>("chat");
   const [draft, setDraft] = useState("");
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
-  const [skillsPopover, setSkillsPopover] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightRailOpen, setRightRailOpen] = useState(false);
   const [expandedTraces, setExpandedTraces] = useState<Set<string>>(new Set());
@@ -1137,7 +1334,6 @@ export default function EasyWorkApp() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const composerFileInputRef = useRef<HTMLInputElement | null>(null);
   const projectFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillInputRef = useRef<HTMLInputElement | null>(null);
   const skillFolderInputRef = useRef<HTMLInputElement | null>(null);
@@ -2028,6 +2224,8 @@ export default function EasyWorkApp() {
     setDraftServerId("");
     setActiveProjectId(projectId ?? "");
     setMode(nextMode);
+    setDraft("");
+    setSelectedSkills([]);
     setView("chat");
     setRightRailOpen(false);
     setConversationMenuId("");
@@ -2050,6 +2248,8 @@ export default function EasyWorkApp() {
     setDraftProjectId(undefined);
     setDraftServerId("");
     setMode("chat");
+    setDraft("");
+    setSelectedSkills([]);
     setView("project");
     setRightRailOpen(false);
     setConversationMenuId("");
@@ -2248,16 +2448,23 @@ export default function EasyWorkApp() {
     showToast("对话已删除");
   };
 
-  const submitMessage = async () => {
+  const submitMessage = async (
+    options: {
+      projectId?: string;
+      requestedMode?: Mode;
+      openChat?: boolean;
+    } = {},
+  ) => {
     const content = draft.trim();
     if (!content || sending) return;
-    if (mode === "work" && connection.status !== "connected") {
+    const submissionMode = options.requestedMode ?? mode;
+    if (submissionMode === "work" && connection.status !== "connected") {
       openConversationServerManager();
       showToast("请先连接一台远程服务器");
       return;
     }
     if (
-      mode === "work" &&
+      submissionMode === "work" &&
       (activeAgent?.status !== "ready" || !activeAgent.configured)
     ) {
       setAgentMenuOpen(true);
@@ -2269,13 +2476,14 @@ export default function EasyWorkApp() {
       return;
     }
 
-    const conversation = activeConversation;
+    const conversation = options.projectId ? undefined : activeConversation;
     const firstTurn = !conversation?.messages.length;
     const conversationId = conversation?.id ?? uid("chat");
-    const projectId = conversation?.projectId ?? draftProjectId;
+    const projectId =
+      options.projectId ?? conversation?.projectId ?? draftProjectId;
     const conversationProject = state.projects.find((project) => project.id === projectId);
     const work =
-      mode === "work"
+      submissionMode === "work"
         ? {
             ...(conversation?.work ?? {}),
             agentId: conversation?.work?.agentId || activeAgentId,
@@ -2290,18 +2498,18 @@ export default function EasyWorkApp() {
       role: "user",
       content,
       createdAt: now(),
-      mode,
+      mode: submissionMode,
       selectedSkills,
-      runId: mode === "work" ? runId : undefined,
+      runId: submissionMode === "work" ? runId : undefined,
     };
     const assistantMessage: Message = {
       id: uid("message"),
       role: "assistant",
       content: "",
       createdAt: now(),
-      mode,
-      events: mode === "work" ? [] : undefined,
-      runId: mode === "work" ? runId : undefined,
+      mode: submissionMode,
+      events: submissionMode === "work" ? [] : undefined,
+      runId: submissionMode === "work" ? runId : undefined,
     };
 
     setState((current) => {
@@ -2310,7 +2518,7 @@ export default function EasyWorkApp() {
         const created: Conversation = {
           id: conversationId,
           title: "新对话",
-          mode,
+          mode: submissionMode,
           projectId,
           messages: [userMessage, assistantMessage],
           updatedAt: now(),
@@ -2328,10 +2536,10 @@ export default function EasyWorkApp() {
             ? {
                 ...item,
                 title: item.messages.length ? item.title : "新对话",
-                mode,
+                mode: submissionMode,
                 updatedAt: now(),
                 work:
-                  mode === "work"
+                  submissionMode === "work"
                     ? { ...(item.work ?? {}), ...(work ?? {}) }
                     : item.work,
                 messages: [...item.messages, userMessage, assistantMessage],
@@ -2341,13 +2549,19 @@ export default function EasyWorkApp() {
       };
     });
     setActiveConversationId(conversationId);
+    setActiveProjectId(projectId ?? "");
     setDraftProjectId(undefined);
     setDraftServerId("");
+    setMode(submissionMode);
+    if (options.openChat) {
+      setView("chat");
+      setRightRailOpen(false);
+      setSidebarOpen(false);
+    }
     setDraft("");
-    setSkillsPopover(false);
     setSending(true);
 
-    if (mode === "work") {
+    if (submissionMode === "work") {
       const socket = socketRef.current;
       if (socket?.readyState === WebSocket.OPEN && !connection.demo) {
         socket.send(
@@ -2548,13 +2762,6 @@ export default function EasyWorkApp() {
     },
     [activeConversation?.work?.serverId, effectiveServerId, updateMessage],
   );
-
-  const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      void submitMessage();
-    }
-  };
 
   const connectDemo = () => {
     const serverId = "demo";
@@ -2978,7 +3185,6 @@ export default function EasyWorkApp() {
     }
     showToast(`已接收 ${files.length} 个文件`);
     if (fileInputRef.current) fileInputRef.current.value = "";
-    if (composerFileInputRef.current) composerFileInputRef.current.value = "";
     if (projectFileInputRef.current) projectFileInputRef.current.value = "";
   };
 
@@ -3160,6 +3366,14 @@ export default function EasyWorkApp() {
       method: "DELETE",
     }).catch(() => undefined);
     showToast("已删除上传的技能");
+  };
+
+  const toggleSelectedSkill = (skillId: string) => {
+    setSelectedSkills((current) =>
+      current.includes(skillId)
+        ? current.filter((id) => id !== skillId)
+        : [...current, skillId],
+    );
   };
 
   return (
@@ -3418,34 +3632,43 @@ export default function EasyWorkApp() {
                       </div>
                     )}
                   </div>
-                  {expanded && conversations.length > 0 && (
-                    <div className="project-sidebar-chats">
-                      {conversations.map((conversation) => (
-                        <ConversationRow
-                          key={conversation.id}
-                          conversation={conversation}
-                          active={
-                            conversation.id === activeConversationId &&
-                            view === "chat"
-                          }
-                          nested
-                          projects={state.projects}
-                          menuOpen={conversationMenuId === conversation.id}
-                          onSelect={() => selectConversation(conversation)}
-                          onToggleMenu={() =>
-                            setConversationMenuId((current) =>
-                              current === conversation.id ? "" : conversation.id,
-                            )
-                          }
-                          onMove={(projectId) =>
-                            moveConversation(conversation.id, projectId)
-                          }
-                          onDelete={() => {
-                            setConversationPendingDelete(conversation);
-                            setConversationMenuId("");
-                          }}
-                        />
-                      ))}
+                  {conversations.length > 0 && (
+                    <div
+                      className={`project-sidebar-chats-motion${
+                        expanded ? " expanded" : ""
+                      }`}
+                      aria-hidden={!expanded}
+                    >
+                      <div>
+                        <div className="project-sidebar-chats">
+                          {conversations.map((conversation) => (
+                            <ConversationRow
+                              key={conversation.id}
+                              conversation={conversation}
+                              active={
+                                conversation.id === activeConversationId &&
+                                view === "chat"
+                              }
+                              nested
+                              projects={state.projects}
+                              menuOpen={conversationMenuId === conversation.id}
+                              onSelect={() => selectConversation(conversation)}
+                              onToggleMenu={() =>
+                                setConversationMenuId((current) =>
+                                  current === conversation.id ? "" : conversation.id,
+                                )
+                              }
+                              onMove={(projectId) =>
+                                moveConversation(conversation.id, projectId)
+                              }
+                              onDelete={() => {
+                                setConversationPendingDelete(conversation);
+                                setConversationMenuId("");
+                              }}
+                            />
+                          ))}
+                        </div>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -3455,6 +3678,13 @@ export default function EasyWorkApp() {
 
           <div className="section-label chat-section-label">
             <span>聊天</span>
+            <button
+              type="button"
+              onClick={() => beginConversation()}
+              aria-label="新建聊天"
+            >
+              <Plus size={15} />
+            </button>
           </div>
           <div className="general-chats">
             {generalConversations.map((conversation) => (
@@ -3972,124 +4202,33 @@ export default function EasyWorkApp() {
             </div>
 
             <div className="composer-zone">
-              <div className={`composer-shell${sending ? " busy" : ""}`}>
-                <textarea
-                  ref={textareaRef}
-                  value={draft}
-                  disabled={mode === "work" && !workReady}
-                  onChange={(event) => setDraft(event.target.value)}
-                  onKeyDown={handleComposerKeyDown}
-                  placeholder={
-                    mode === "chat"
-                      ? "给 EasyWork 发消息"
-                      : connection.status !== "connected"
-                        ? "请先连接远程服务器"
-                        : !activeAgent || activeAgent.status === "missing"
-                          ? "请先安装或选择 Agent"
-                          : !activeAgent.configured
-                            ? "请先完成 Agent 模型配置"
-                            : "描述要在远程服务器完成的工作"
-                  }
-                  rows={1}
-                  aria-label="消息输入框"
-                />
-                <div className="composer-toolbar">
-                  <div className="composer-tools">
-                    <button
-                      type="button"
-                      aria-label="添加附件"
-                      onClick={() => composerFileInputRef.current?.click()}
-                    >
-                      <Paperclip size={16} />
-                    </button>
-                    <input
-                      ref={composerFileInputRef}
-                      hidden
-                      multiple
-                      type="file"
-                      onChange={(event) => void handleLibraryUpload(event.target.files)}
-                    />
-                    <div className="skills-trigger-wrap">
-                      <button
-                        className={selectedSkills.length ? "selected" : ""}
-                        type="button"
-                        onClick={() => setSkillsPopover((value) => !value)}
-                      >
-                        <Sparkles size={15} />
-                        技能
-                        {selectedSkills.length > 0 && <b>{selectedSkills.length}</b>}
-                        <ChevronDown size={12} />
-                      </button>
-                      {skillsPopover && (
-                        <div className="skills-popover">
-                          <div className="popover-heading">
-                            <span>本轮使用的技能</span>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setView("skills");
-                                setSkillsPopover(false);
-                              }}
-                            >
-                              管理
-                            </button>
-                          </div>
-                          {state.skills
-                            .filter((skill) => skill.enabled)
-                            .map((skill) => {
-                              const selected = selectedSkills.includes(skill.id);
-                              return (
-                                <button
-                                  className={selected ? "active" : ""}
-                                  type="button"
-                                  key={skill.id}
-                                  onClick={() =>
-                                    setSelectedSkills((current) =>
-                                      selected
-                                        ? current.filter((id) => id !== skill.id)
-                                        : [...current, skill.id],
-                                    )
-                                  }
-                                >
-                                  <span>{skillIcon(skill)}</span>
-                                  <span>
-                                    <strong>{skill.name}</strong>
-                                    <small>{skill.description}</small>
-                                  </span>
-                                  <span className="skill-check">
-                                    {selected && <Check size={13} />}
-                                  </span>
-                                </button>
-                              );
-                            })}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  <div className="composer-submit">
-                    {sending ? (
-                      <button
-                        className="send-button stop"
-                        type="button"
-                        onClick={stopCurrentRun}
-                        aria-label="停止"
-                      >
-                        <Square size={13} fill="currentColor" />
-                      </button>
-                    ) : (
-                      <button
-                        className="send-button"
-                        type="button"
-                        onClick={() => void submitMessage()}
-                        disabled={!draft.trim() || (mode === "work" && !workReady)}
-                        aria-label="发送"
-                      >
-                        <ArrowUp size={17} />
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
+              <UnifiedComposer
+                value={draft}
+                textareaRef={textareaRef}
+                disabled={mode === "work" && !workReady}
+                sending={sending}
+                skills={state.skills}
+                selectedSkills={selectedSkills}
+                menuDirection="up"
+                onChange={setDraft}
+                onSubmit={() => void submitMessage()}
+                onStop={stopCurrentRun}
+                onUpload={(files) =>
+                  void handleLibraryUpload(files, activeProject?.id)
+                }
+                onToggleSkill={toggleSelectedSkill}
+                placeholder={
+                  mode === "chat"
+                    ? "给 EasyWork 发消息"
+                    : connection.status !== "connected"
+                      ? "请先连接远程服务器"
+                      : !activeAgent || activeAgent.status === "missing"
+                        ? "请先安装或选择 Agent"
+                        : !activeAgent.configured
+                          ? "请先完成 Agent 模型配置"
+                          : "描述要在远程服务器完成的工作"
+                }
+              />
               {mode === "chat" && <p>EasyWork 可能会出错，请核对重要信息。</p>}
             </div>
           </section>
@@ -4106,7 +4245,7 @@ export default function EasyWorkApp() {
               </div>
             </header>
 
-            <div className="project-chat-launcher">
+            <div className="project-composer-area">
               <div
                 className="project-launch-mode"
                 role="group"
@@ -4127,16 +4266,34 @@ export default function EasyWorkApp() {
                   工作
                 </button>
               </div>
-              <label className="project-launch-field">
-                <Plus size={20} />
-                <input
-                  value=""
-                  readOnly
-                  aria-label={`在 ${projectPage.name} 中新建聊天`}
-                  placeholder={`在 ${projectPage.name} 中新建聊天`}
-                  onFocus={() => beginConversation(projectPage.id, mode)}
-                />
-              </label>
+              <UnifiedComposer
+                value={draft}
+                disabled={
+                  mode === "work" &&
+                  connection.status === "connected" &&
+                  !workReady
+                }
+                sending={sending}
+                skills={state.skills}
+                selectedSkills={selectedSkills}
+                menuDirection="down"
+                onChange={setDraft}
+                onSubmit={() =>
+                  void submitMessage({
+                    projectId: projectPage.id,
+                    requestedMode: mode,
+                    openChat: true,
+                  })
+                }
+                onStop={stopCurrentRun}
+                onUpload={(files) =>
+                  void handleLibraryUpload(files, projectPage.id)
+                }
+                onToggleSkill={toggleSelectedSkill}
+                placeholder={`在 ${projectPage.name} 中发起${
+                  mode === "work" ? "工作" : "聊天"
+                }`}
+              />
             </div>
 
             <nav className="project-home-tabs" aria-label="项目内容">
@@ -4172,9 +4329,14 @@ export default function EasyWorkApp() {
                         <strong>{conversation.title}</strong>
                         <small>{conversationPreview(conversation)}</small>
                       </span>
-                      <time dateTime={conversation.updatedAt}>
-                        {formatProjectDate(conversation.updatedAt)}
-                      </time>
+                      <span className="project-conversation-meta">
+                        <em className={`project-conversation-mode ${conversation.mode}`}>
+                          {conversation.mode === "work" ? "工作" : "聊天"}
+                        </em>
+                        <time dateTime={conversation.updatedAt}>
+                          {formatProjectDate(conversation.updatedAt)}
+                        </time>
+                      </span>
                     </button>
                   ))}
                   {!projectConversations(projectPage.id).length && (

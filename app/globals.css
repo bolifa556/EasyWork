@@ -3840,6 +3840,559 @@ textarea::placeholder {
   }
 }
 
+/* 2026-07 interaction pass: one composer, complete titles, warm layered menus. */
+.easywork-app.easywork-app .unified-composer {
+  position: relative;
+  display: grid;
+  width: 100%;
+  min-height: 58px;
+  grid-template-columns: 38px minmax(0, 1fr) 38px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgb(79 73 59 / 17%);
+  border-radius: 21px;
+  background: rgb(255 253 247 / 88%);
+  box-shadow:
+    0 1px 2px rgb(69 58 37 / 4%),
+    0 10px 30px rgb(69 58 37 / 6%);
+  padding: 8px 10px;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    background 160ms ease;
+}
+
+.easywork-app.easywork-app .unified-composer:focus-within {
+  border-color: rgb(83 99 63 / 31%);
+  background: var(--paper);
+  box-shadow:
+    0 0 0 3px rgb(83 99 63 / 6%),
+    0 12px 32px rgb(69 58 37 / 7%);
+}
+
+.easywork-app.easywork-app .unified-composer textarea {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  min-height: 30px;
+  max-height: 30px;
+  overflow: hidden;
+  resize: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  padding: 4px 2px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 15.5px !important;
+  line-height: 22px;
+}
+
+.easywork-app.easywork-app .unified-composer textarea::placeholder {
+  color: #8b8578;
+  opacity: 1;
+}
+
+.easywork-app.easywork-app .unified-composer textarea:disabled {
+  cursor: not-allowed;
+  color: var(--ink-faint);
+  -webkit-text-fill-color: var(--ink-faint);
+}
+
+.composer-add-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+.composer-add-button,
+.unified-send-button {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: 50%;
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    transform 140ms ease;
+}
+
+.composer-add-button {
+  background: transparent;
+  color: #696357;
+}
+
+.composer-add-button:hover,
+.composer-add-button.active {
+  background: rgb(83 99 63 / 9%);
+  color: var(--green-deep);
+}
+
+.composer-add-button.active svg {
+  transform: rotate(45deg);
+}
+
+.composer-add-button svg {
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.unified-send-button {
+  background: var(--green-deep);
+  color: #fffdf7;
+}
+
+.unified-send-button:not(:disabled):hover {
+  background: #354226;
+  transform: translateY(-1px);
+}
+
+.unified-send-button:disabled {
+  background: rgb(79 73 59 / 13%);
+  color: rgb(79 73 59 / 35%);
+}
+
+.unified-send-button.stop {
+  background: #665f53;
+}
+
+.composer-menu-popover {
+  position: absolute;
+  z-index: 96;
+  left: -4px;
+  width: 292px;
+  height: 106px;
+  overflow: hidden;
+  border: 1px solid rgb(91 81 62 / 18%);
+  border-radius: 15px;
+  background: #fbf6e9;
+  box-shadow:
+    0 18px 46px rgb(55 46 30 / 14%),
+    0 2px 8px rgb(55 46 30 / 6%);
+  transition:
+    height 250ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 150ms ease,
+    transform 180ms ease;
+  animation: composer-menu-in 170ms ease-out both;
+}
+
+.composer-menu-popover.up {
+  bottom: calc(100% + 10px);
+  transform-origin: left bottom;
+}
+
+.composer-menu-popover.down {
+  top: calc(100% + 10px);
+  transform-origin: left top;
+}
+
+.composer-menu-popover.show-skills {
+  height: var(--composer-skill-height);
+}
+
+.composer-menu-track {
+  display: flex;
+  width: 200%;
+  height: 100%;
+  transform: translateX(0);
+  transition: transform 270ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+.composer-menu-popover.show-skills .composer-menu-track {
+  transform: translateX(-50%);
+}
+
+.composer-menu-panel {
+  width: 50%;
+  min-width: 0;
+  flex: 0 0 50%;
+  padding: 7px;
+}
+
+.composer-menu-panel button {
+  display: grid;
+  width: 100%;
+  min-height: 45px;
+  grid-template-columns: 31px minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 8px;
+  border-radius: 10px;
+  background: transparent;
+  padding: 5px 8px;
+  color: var(--ink);
+  font-size: 13.5px;
+  text-align: left;
+}
+
+.composer-menu-panel button:hover,
+.composer-menu-panel button.selected {
+  background: rgb(83 99 63 / 9%);
+}
+
+.composer-menu-icon {
+  display: grid;
+  width: 29px;
+  height: 29px;
+  place-items: center;
+  border-radius: 8px;
+  background: rgb(83 99 63 / 8%);
+  color: var(--green-deep);
+}
+
+.composer-menu-next,
+.composer-skill-check {
+  justify-self: end;
+  color: var(--ink-faint);
+}
+
+.composer-menu-panel .composer-menu-back {
+  min-height: 39px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  border-bottom: 1px solid rgb(91 81 62 / 10%);
+  border-radius: 8px 8px 4px 4px;
+  padding-inline: 7px;
+  color: var(--ink-soft);
+  font-weight: 560;
+}
+
+.composer-skill-list {
+  max-height: 253px;
+  overflow-y: auto;
+  padding-top: 3px;
+}
+
+.composer-skill-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.composer-skill-copy strong {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 580;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-skill-copy small {
+  overflow: hidden;
+  color: var(--ink-faint);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-skill-check {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--green-deep);
+}
+
+.composer-menu-empty {
+  display: grid;
+  min-height: 54px;
+  place-items: center;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+@keyframes composer-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.easywork-app.easywork-app .project-composer-area {
+  position: relative;
+  display: grid;
+  width: 100%;
+  gap: 8px;
+  margin-top: 30px;
+}
+
+.easywork-app.easywork-app .project-composer-area .project-launch-mode {
+  position: static;
+  top: auto;
+  right: auto;
+  justify-self: end;
+  border: 1px solid rgb(79 73 59 / 11%);
+  background: rgb(83 99 63 / 6%);
+}
+
+.easywork-app.easywork-app .project-composer-area .unified-composer {
+  min-height: 62px;
+}
+
+.easywork-app.easywork-app .project-home-tabs {
+  margin-top: 30px;
+  border-bottom: 0;
+  padding-bottom: 9px;
+}
+
+.easywork-app.easywork-app .project-home-conversation {
+  min-height: 82px;
+  border: 0;
+  border-radius: 0;
+  padding-inline: 12px;
+}
+
+.easywork-app.easywork-app
+  .project-home-conversation
+  + .project-home-conversation {
+  border-top: 1px solid var(--line-soft);
+}
+
+.project-conversation-meta {
+  display: inline-flex !important;
+  min-width: 94px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px !important;
+}
+
+.project-conversation-mode {
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.project-conversation-mode.work {
+  color: var(--green-deep);
+  font-weight: 600;
+}
+
+/* Sidebar rows only reserve space when controls are actually visible. */
+.easywork-app.easywork-app .section-label {
+  min-height: 38px;
+  padding: 10px 7px 5px;
+}
+
+.easywork-app.easywork-app .section-label > button {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-faint);
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    background 120ms ease,
+    color 120ms ease;
+}
+
+.easywork-app.easywork-app .section-label:hover > button,
+.easywork-app.easywork-app .section-label > button:focus-visible {
+  opacity: 1;
+}
+
+.easywork-app.easywork-app .section-label > button:hover {
+  background: rgb(83 99 63 / 9%);
+  color: var(--green-deep);
+}
+
+.easywork-app.easywork-app .chat-row {
+  position: relative;
+  display: block;
+  min-height: 38px;
+  padding: 0 3px;
+}
+
+.easywork-app.easywork-app .chat-row-main {
+  width: 100%;
+  height: 38px;
+  padding: 0 7px;
+  transition: padding-right 150ms ease;
+}
+
+.easywork-app.easywork-app .chat-row.work .chat-row-main {
+  padding-right: 43px;
+}
+
+.easywork-app.easywork-app .chat-row:hover .chat-row-main,
+.easywork-app.easywork-app .chat-row:focus-within .chat-row-main {
+  padding-right: 35px;
+}
+
+.easywork-app.easywork-app .chat-row.work:hover .chat-row-main,
+.easywork-app.easywork-app .chat-row.work:focus-within .chat-row-main {
+  padding-right: 67px;
+}
+
+.easywork-app.easywork-app .chat-title-viewport {
+  mask-image: none;
+}
+
+.easywork-app.easywork-app .chat-row:hover .chat-title-viewport.scrollable,
+.easywork-app.easywork-app
+  .chat-row:focus-within
+  .chat-title-viewport.scrollable {
+  mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
+}
+
+.easywork-app.easywork-app .chat-row-menu-button {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  right: 5px;
+  opacity: 0;
+  transform: translateY(-50%);
+}
+
+.easywork-app.easywork-app .chat-row:hover .chat-row-menu-button,
+.easywork-app.easywork-app .chat-row:focus-within .chat-row-menu-button,
+.easywork-app.easywork-app
+  .chat-row
+  .chat-row-menu-button[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.conversation-work-mark {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  color: var(--green-deep);
+  font-size: 11px;
+  font-weight: 620;
+  line-height: 1;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: right 150ms ease;
+}
+
+.chat-row:hover .conversation-work-mark,
+.chat-row:focus-within .conversation-work-mark,
+.chat-row:has(.chat-row-menu-button[aria-expanded="true"])
+  .conversation-work-mark {
+  right: 39px;
+}
+
+/* Warm paper menus sit naturally on the existing EasyWork palette. */
+.easywork-app.easywork-app .conversation-menu,
+.easywork-app.easywork-app .mode-convert-popover {
+  border-color: rgb(91 81 62 / 18%);
+  background: #fbf6e9;
+  box-shadow:
+    0 18px 46px rgb(55 46 30 / 14%),
+    0 2px 8px rgb(55 46 30 / 6%);
+  color: var(--ink);
+}
+
+.easywork-app.easywork-app .conversation-menu button,
+.easywork-app.easywork-app .mode-convert-popover button {
+  color: var(--ink);
+}
+
+.easywork-app.easywork-app .conversation-menu button:hover,
+.easywork-app.easywork-app .mode-convert-popover button:hover {
+  background: rgb(83 99 63 / 9%);
+}
+
+.easywork-app.easywork-app .conversation-menu button.danger {
+  color: var(--red);
+}
+
+.easywork-app.easywork-app .conversation-menu-label,
+.easywork-app.easywork-app .mode-convert-popover > span {
+  color: var(--ink-faint);
+}
+
+.easywork-app.easywork-app .conversation-menu-separator {
+  background: rgb(91 81 62 / 12%);
+}
+
+.easywork-app.easywork-app .menu-project-avatar {
+  background: rgb(83 99 63 / 10%);
+  color: var(--green-deep);
+}
+
+/* Keep type conversion anchored to the control instead of sliding below the sidebar. */
+.easywork-app.easywork-app .conversation-toolbar,
+.easywork-app.easywork-app .conversation-toolbar-left,
+.easywork-app.easywork-app .conversation-mode-menu {
+  overflow: visible;
+}
+
+.easywork-app.easywork-app .conversation-toolbar .mode-convert-popover {
+  z-index: 100;
+  left: 0;
+  transform: none;
+}
+
+/* A collapsed command points left; an expanded command points down. */
+.command-group-chevron,
+.command-event-chevron {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.command-group.expanded .command-group-chevron,
+.command-event.expanded .command-event-chevron {
+  transform: rotate(90deg);
+}
+
+.reasoning-disclosure.expanded > button svg:last-child {
+  transform: rotate(180deg);
+}
+
+/* LLMGame-like hierarchy with equal prompt and response reading sizes. */
+.easywork-app.easywork-app .message-meta strong {
+  font-size: 14px !important;
+}
+
+.easywork-app.easywork-app .message.user .message-text,
+.easywork-app.easywork-app .message.assistant .message-text,
+.easywork-app.easywork-app .message.work.assistant .message-text {
+  font-size: 17px !important;
+}
+
+.easywork-app.easywork-app .message.user .message-text {
+  line-height: 1.7;
+}
+
+.easywork-app.easywork-app .message.assistant .message-text,
+.easywork-app.easywork-app .message.work.assistant .message-text {
+  line-height: 1.76;
+}
+
+@media (max-width: 700px) {
+  .easywork-app.easywork-app .section-label > button,
+  .easywork-app.easywork-app .chat-row-menu-button {
+    opacity: 1;
+  }
+
+  .easywork-app.easywork-app .project-composer-area {
+    margin-top: 24px;
+  }
+
+  .easywork-app.easywork-app .project-home-conversation {
+    min-height: 74px;
+  }
+
+  .project-conversation-meta {
+    min-width: 44px;
+  }
+
+  .project-conversation-meta time {
+    display: none;
+  }
+
+  .composer-menu-popover {
+    width: min(292px, calc(100vw - 44px));
+  }
+}
+
 /* LLMGame-inspired conversation and remote-work language. */
 body {
   background: var(--canvas);
@@ -9536,4 +10089,215 @@ body {
     width: 12px;
     height: 54px;
   }
+}
+
+/* Final authority for the 2026-07 interaction pass. */
+.easywork-app.easywork-app .section-label {
+  min-height: 38px;
+  padding: 10px 7px 5px;
+}
+
+.easywork-app.easywork-app .section-label > button {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-faint);
+  opacity: 0;
+}
+
+.easywork-app.easywork-app .section-label:hover > button,
+.easywork-app.easywork-app .section-label > button:focus-visible {
+  opacity: 1;
+}
+
+.easywork-app.easywork-app .section-label > button:hover {
+  background: rgb(83 99 63 / 9%);
+  color: var(--green-deep);
+}
+
+.easywork-app.easywork-app .chat-row {
+  position: relative;
+  display: block;
+  min-height: 38px;
+  padding: 0 3px;
+}
+
+.easywork-app.easywork-app .chat-row-main {
+  width: 100%;
+  height: 38px;
+  padding: 0 7px;
+  transition: padding-right 150ms ease;
+}
+
+.easywork-app.easywork-app .chat-row.work .chat-row-main {
+  padding-right: 43px;
+}
+
+.easywork-app.easywork-app .chat-row:hover .chat-row-main,
+.easywork-app.easywork-app .chat-row:focus-within .chat-row-main {
+  padding-right: 35px;
+}
+
+.easywork-app.easywork-app .chat-row.work:hover .chat-row-main,
+.easywork-app.easywork-app .chat-row.work:focus-within .chat-row-main {
+  padding-right: 67px;
+}
+
+.easywork-app.easywork-app .chat-title-viewport {
+  mask-image: none;
+}
+
+.easywork-app.easywork-app .chat-row:hover .chat-title-viewport.scrollable,
+.easywork-app.easywork-app
+  .chat-row:focus-within
+  .chat-title-viewport.scrollable {
+  mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
+}
+
+.easywork-app.easywork-app .chat-row-menu-button {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  right: 5px;
+  opacity: 0;
+  transform: translateY(-50%);
+}
+
+.easywork-app.easywork-app .chat-row:hover .chat-row-menu-button,
+.easywork-app.easywork-app .chat-row:focus-within .chat-row-menu-button,
+.easywork-app.easywork-app
+  .chat-row
+  .chat-row-menu-button[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.easywork-app.easywork-app .conversation-menu,
+.easywork-app.easywork-app .mode-convert-popover {
+  border-color: rgb(91 81 62 / 18%);
+  background: #fbf6e9;
+  box-shadow:
+    0 18px 46px rgb(55 46 30 / 14%),
+    0 2px 8px rgb(55 46 30 / 6%);
+}
+
+.easywork-app.easywork-app .conversation-menu button:hover,
+.easywork-app.easywork-app .mode-convert-popover button:hover {
+  background: rgb(83 99 63 / 9%);
+}
+
+.easywork-app.easywork-app .conversation-toolbar .mode-convert-popover {
+  z-index: 100;
+  left: 0;
+  transform: none;
+}
+
+.command-group.expanded .command-group-chevron,
+.command-event.expanded .command-event-chevron {
+  transform: rotate(90deg);
+}
+
+.easywork-app.easywork-app .message-meta strong {
+  font-size: 14px !important;
+}
+
+.easywork-app.easywork-app .message.user .message-text,
+.easywork-app.easywork-app .message.assistant .message-text,
+.easywork-app.easywork-app .message.work.assistant .message-text {
+  font-size: 17px !important;
+}
+
+.easywork-app.easywork-app .message.user .message-text {
+  line-height: 1.7;
+}
+
+.easywork-app.easywork-app .message.assistant .message-text,
+.easywork-app.easywork-app .message.work.assistant .message-text {
+  line-height: 1.76;
+}
+
+@media (max-width: 700px) {
+  .easywork-app.easywork-app .section-label > button,
+  .easywork-app.easywork-app .chat-row-menu-button {
+    opacity: 1;
+  }
+}
+
+.project-sidebar-chats-motion {
+  display: grid;
+  overflow: hidden;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-5px);
+  transition:
+    grid-template-rows 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 180ms ease,
+    transform 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.project-sidebar-chats-motion > div {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.project-sidebar-chats-motion.expanded {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.project-sidebar-chats-motion:not(.expanded) {
+  pointer-events: none;
+}
+
+.easywork-app.easywork-app .chat-row.work .chat-row-main {
+  padding-right: 7px;
+}
+
+.easywork-app.easywork-app .chat-row.work:hover .chat-row-main,
+.easywork-app.easywork-app .chat-row.work:focus-within .chat-row-main {
+  padding-right: 67px;
+}
+
+.conversation-work-mark {
+  color: #8a857a;
+  font-weight: 520;
+  opacity: 0;
+}
+
+.chat-row:hover .conversation-work-mark,
+.chat-row:focus-within .conversation-work-mark,
+.chat-row:has(.chat-row-menu-button[aria-expanded="true"])
+  .conversation-work-mark {
+  opacity: 1;
+}
+
+/* Main workspace overlays follow the light chat canvas; navigation overlays stay warm. */
+.easywork-app.easywork-app .conversation-surface {
+  background: var(--paper);
+}
+
+.easywork-app.easywork-app .conversation-toolbar::after {
+  display: none;
+  content: none;
+}
+
+.easywork-app.easywork-app .composer-menu-popover,
+.easywork-app.easywork-app .conversation-toolbar .mode-convert-popover,
+.easywork-app.easywork-app .agent-dropdown {
+  border-color: rgb(79 73 59 / 14%);
+  background: var(--paper);
+  box-shadow:
+    0 16px 42px rgb(55 46 30 / 11%),
+    0 2px 7px rgb(55 46 30 / 5%);
+}
+
+.easywork-app.easywork-app .composer-menu-panel button:hover,
+.easywork-app.easywork-app .composer-menu-panel button.selected,
+.easywork-app.easywork-app .conversation-toolbar .mode-convert-popover button:hover,
+.easywork-app.easywork-app .agent-dropdown-row:hover,
+.easywork-app.easywork-app .agent-dropdown-row.active {
+  background: rgb(79 73 59 / 6%);
 }
