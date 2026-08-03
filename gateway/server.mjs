@@ -32,7 +32,9 @@ const HOST = process.env.EASYWORK_GATEWAY_HOST || "127.0.0.1";
 const PORT = Number(process.env.EASYWORK_GATEWAY_PORT || 8789);
 const BODY_LIMIT = 36 * 1024 * 1024;
 const SESSION_MAX_AGE = 60 * 60 * 24 * 180;
-const SSH_RECONNECT_GRACE_MS = 2 * 60 * 1000;
+const SSH_KEEPALIVE_INTERVAL_MS = 60 * 1000;
+const SSH_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SSH_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const EASYWORK_OPENCODE_PROVIDER_ID = "easywork";
 const BUILTIN_SKILLS = {
   skill_cluster: path.join(SKILL_ROOT, "built-in", "cluster-ops"),
@@ -41,7 +43,7 @@ const BUILTIN_SKILLS = {
 };
 
 const activeSockets = new Set();
-const sshSessionPool = new Map();
+const sshWorkerPool = new Map();
 const stateMutationQueues = new Map();
 const secretMutationQueues = new Map();
 let sessionSecret;
@@ -66,6 +68,20 @@ function safeSegment(value, fallback = "item") {
     .replace(/^[._-]+|[._-]+$/g, "")
     .slice(0, 90);
   return normalized || fallback;
+}
+
+async function renderPromptTemplate(relativePath, variables = {}) {
+  const promptPath = path.resolve(PROMPT_ROOT, relativePath);
+  const promptPrefix = `${path.resolve(PROMPT_ROOT)}${path.sep}`;
+  if (!promptPath.startsWith(promptPrefix)) {
+    throw new Error("提示词路径超出 prompts 目录");
+  }
+  const template = await readFile(promptPath, "utf8");
+  return template
+    .replace(/\{\{\s*([A-Z0-9_]+)\s*\}\}/g, (_match, name) =>
+      String(variables[name] ?? ""),
+    )
+    .trim();
 }
 
 async function enqueueActorMutation(queues, actor, mutation) {
@@ -236,6 +252,142 @@ function actorDirectory(actor) {
 function actorSkillDirectory(actor) {
   const family = actor.authenticated ? "users" : "guests";
   return path.join(SKILL_ROOT, family, safeSegment(actor.id));
+}
+
+function sshWorkerKey(actor) {
+  return `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
+}
+
+function sshWorkerRuntimePath(actor) {
+  return path.join(actorDirectory(actor), "ssh-worker.json");
+}
+
+function createSshSession(worker, serverId, stored = {}) {
+  const safeServerId = safeSegment(serverId || "default-server");
+  return {
+    poolKey: `${worker.key}:${safeServerId}`,
+    actorKey: worker.key,
+    worker,
+    serverId: safeServerId,
+    socketId: crypto.randomUUID(),
+    client: null,
+    demo: Boolean(stored.demo),
+    status: "disconnected",
+    home: "",
+    host: String(stored.host || ""),
+    port: Number(stored.port || 22),
+    username: String(stored.username || ""),
+    latency: undefined,
+    fingerprint: "",
+    activeStream: null,
+    activeRun: null,
+    agentSessions: new Map(Object.entries(stored.agentSessions || {})),
+    agentUpdates: new Map(),
+    lastConnectedAt: String(stored.lastConnectedAt || ""),
+    lastDisconnectedAt: String(stored.lastDisconnectedAt || ""),
+    lastUserActivityAt: String(
+      stored.lastUserActivityAt || stored.lastConnectedAt || isoNow(),
+    ),
+    disconnectReason: String(stored.disconnectReason || ""),
+  };
+}
+
+function serializeSshWorker(worker) {
+  return {
+    version: 1,
+    workerId: worker.id,
+    actorKey: worker.key,
+    updatedAt: isoNow(),
+    sessions: [...worker.sessions.values()].map((session) => ({
+      serverId: session.serverId,
+      status: session.status,
+      host: session.host,
+      port: session.port,
+      username: session.username,
+      demo: session.demo,
+      lastConnectedAt: session.lastConnectedAt,
+      lastDisconnectedAt: session.lastDisconnectedAt,
+      lastUserActivityAt: session.lastUserActivityAt,
+      disconnectReason: session.disconnectReason,
+      agentSessions: Object.fromEntries(session.agentSessions || []),
+    })),
+    tasks: [...worker.tasks.values()].map((task) => ({
+      ...task,
+      events: Array.isArray(task.events) ? task.events.slice(-600) : [],
+    })),
+  };
+}
+
+function persistSshWorker(worker) {
+  const snapshot = serializeSshWorker(worker);
+  worker.persistQueue = worker.persistQueue
+    .catch(() => undefined)
+    .then(() => writeJson(sshWorkerRuntimePath(worker.actor), snapshot));
+  return worker.persistQueue;
+}
+
+function scheduleSshWorkerPersist(worker, delay = 120) {
+  if (worker.persistTimer) return;
+  worker.persistTimer = setTimeout(() => {
+    worker.persistTimer = null;
+    void persistSshWorker(worker).catch(() => undefined);
+  }, delay);
+  worker.persistTimer.unref?.();
+}
+
+async function getSshWorker(actor) {
+  const key = sshWorkerKey(actor);
+  let worker = sshWorkerPool.get(key);
+  if (!worker) {
+    worker = {
+      id: randomId("ssh-worker-"),
+      key,
+      actor: { ...actor },
+      sockets: new Set(),
+      sessions: new Map(),
+      tasks: new Map(),
+      hydrated: false,
+      persistTimer: null,
+      persistQueue: Promise.resolve(),
+    };
+    sshWorkerPool.set(key, worker);
+  } else {
+    worker.actor = { ...actor };
+  }
+  if (!worker.hydrated) {
+    const stored = await readJson(sshWorkerRuntimePath(actor), {});
+    worker.id = String(stored.workerId || worker.id);
+    for (const item of Array.isArray(stored.sessions) ? stored.sessions : []) {
+      const session = createSshSession(worker, item.serverId, item);
+      worker.sessions.set(session.serverId, session);
+    }
+    for (const task of Array.isArray(stored.tasks) ? stored.tasks : []) {
+      if (!task?.runId || !task?.conversationId) continue;
+      worker.tasks.set(String(task.runId), {
+        ...task,
+        recoveredAfterRestart: task.status === "running",
+        status: task.status === "running" ? "error" : task.status,
+        error:
+          task.status === "running"
+            ? "主机服务已重启，远程任务状态无法继续跟踪"
+            : task.error,
+        result:
+          task.status === "running"
+            ? "主机服务已重启，远程任务状态无法继续跟踪"
+            : task.result,
+        events: Array.isArray(task.events) ? task.events : [],
+      });
+    }
+    worker.hydrated = true;
+    scheduleSshWorkerPersist(worker, 0);
+  }
+  return worker;
+}
+
+function touchSshSession(session) {
+  session.lastUserActivityAt = isoNow();
+  session.disconnectReason = "";
+  scheduleSshWorkerPersist(session.worker);
 }
 
 async function resolveActor(req, res, createGuest = true) {
@@ -853,7 +1005,14 @@ async function selectedSkillContext(actor, skillIds = []) {
     const builtIn = BUILTIN_SKILLS[skillId];
     const directory = builtIn || path.join(actorSkillDirectory(actor), safeSegment(skillId));
     const content = await readMarkdownTree(directory);
-    if (content) pieces.push(`### 技能 ${skillId}\n${content}`);
+    if (content) {
+      pieces.push(
+        await renderPromptTemplate("context/skill.md", {
+          SKILL_ID: skillId,
+          CONTENT: content,
+        }),
+      );
+    }
   }
   return pieces.join("\n\n");
 }
@@ -912,24 +1071,36 @@ async function buildContext({
   const memories = memoryContext(state, projectId, memoryMode);
   const history = historyContext(state, conversationId, projectId, memoryMode);
   const knowledge = await retrieveKnowledge(actor, prompt, state).catch(() => []);
-  const knowledgeText = knowledge
-    .map(
-      (item, indexValue) =>
-        `[文件片段 ${indexValue + 1} · ${item.file}]\n${item.chunk.text.slice(0, 1800)}`,
+  const knowledgeText = (
+    await Promise.all(
+      knowledge.map((item, indexValue) =>
+        renderPromptTemplate("context/knowledge-item.md", {
+          INDEX: indexValue + 1,
+          FILE: item.file,
+          CONTENT: item.chunk.text.slice(0, 1800),
+        }),
+      ),
     )
-    .join("\n\n");
+  ).join("\n\n");
+  const optionalSection = async (template, content) =>
+    content
+      ? renderPromptTemplate(template, {
+          CONTENT: content,
+        })
+      : "";
+  const text = await renderPromptTemplate("context/layout.md", {
+    SYSTEM: system,
+    MEMORY_SECTION: await optionalSection("context/memory.md", memories),
+    HISTORY_SECTION: await optionalSection("context/history.md", history),
+    SKILLS_SECTION: await optionalSection("context/skills.md", skills),
+    KNOWLEDGE_SECTION: await optionalSection("context/knowledge.md", knowledgeText),
+    REQUEST_SECTION: await renderPromptTemplate("context/request.md", {
+      CONTENT: prompt,
+    }),
+  });
   return {
     state,
-    text: [
-      system,
-      memories ? `## 可用记忆\n${memories}` : "",
-      history ? `## 允许引用的历史\n${history}` : "",
-      skills ? `## 本轮已选技能\n${skills}` : "",
-      knowledgeText ? `## 文件库检索结果\n${knowledgeText}` : "",
-      `## 用户本轮请求\n${prompt}`,
-    ]
-      .filter(Boolean)
-      .join("\n\n"),
+    text,
     sources: [...new Set(knowledge.map((item) => item.file))],
   };
 }
@@ -941,22 +1112,32 @@ function extractModelText(payload) {
   }
   const blocks = Array.isArray(payload?.output) ? payload.output : [];
   return blocks
-    .flatMap((item) => item.content || [])
+    .filter(
+      (item) => !/reasoning|thinking/i.test(String(item?.type || "")),
+    )
+    .flatMap((item) =>
+      Array.isArray(item?.content) ? item.content : [item],
+    )
+    .filter(
+      (item) => !/reasoning|thinking/i.test(String(item?.type || "")),
+    )
     .map((item) => item.text || item.output_text || "")
     .filter(Boolean)
     .join("\n");
 }
 
-function modelRequest(protocol, model, context, test = false) {
+async function modelRequest(protocol, model, context, test = false) {
+  const systemPrompt = await renderPromptTemplate("model/request-system.md");
+  const connectivityPrompt = await renderPromptTemplate("model/connectivity-test.md");
   if (protocol === "chat-completions") {
     return {
       endpoint: "chat/completions",
       body: {
         model,
         messages: test
-          ? [{ role: "user", content: "Reply with OK." }]
+          ? [{ role: "user", content: connectivityPrompt }]
           : [
-              { role: "system", content: "请严格遵守以下 EasyWork 上下文。" },
+              { role: "system", content: systemPrompt },
               { role: "user", content: context },
             ],
         ...(test ? { max_tokens: 4 } : {}),
@@ -968,9 +1149,9 @@ function modelRequest(protocol, model, context, test = false) {
     body: {
       model,
       input: test
-        ? "Reply with OK."
+        ? connectivityPrompt
         : [
-            { role: "system", content: "请严格遵守以下 EasyWork 上下文。" },
+            { role: "system", content: systemPrompt },
             { role: "user", content: context },
           ],
       ...(test ? { max_output_tokens: 4 } : {}),
@@ -986,7 +1167,7 @@ async function callChatProvider(provider, apiKey, context, { test = false } = {}
       : ["responses", "chat-completions"];
   let lastError;
   for (const protocol of protocols) {
-    const request = modelRequest(protocol, provider.model, context, test);
+    const request = await modelRequest(protocol, provider.model, context, test);
     const response = await fetch(apiUrl(provider.baseUrl, request.endpoint), {
       method: "POST",
       headers: {
@@ -1011,6 +1192,11 @@ async function callChatProvider(provider, apiKey, context, { test = false } = {}
 
 function textFromContentPart(value) {
   if (typeof value === "string") return value;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return textFromContentPart(
+      value.text || value.content || value.output_text || value.delta || "",
+    );
+  }
   if (!Array.isArray(value)) return "";
   return value
     .map((item) =>
@@ -1057,6 +1243,16 @@ function providerStreamDelta(payload, protocol) {
     type === "response.content_part.delta"
   ) {
     content = textFromContentPart(payload.delta || payload.text);
+  } else if (type === "response.content_part.added") {
+    const part = payload.part || payload.content_part;
+    if (/output_text|text/i.test(String(part?.type || "output_text"))) {
+      content = textFromContentPart(part);
+    }
+  } else if (type === "response.output_item.added") {
+    const item = payload.item || payload.output_item;
+    if (/message|output_text|text/i.test(String(item?.type || ""))) {
+      content = textFromContentPart(item?.content || item);
+    }
   } else if (
     /reasoning.*delta|thinking.*delta/i.test(type) ||
     type === "response.reasoning_summary_text.delta"
@@ -1133,7 +1329,7 @@ async function callChatProviderStream(provider, apiKey, context, onDelta) {
   let lastError;
 
   for (const protocol of protocols) {
-    const request = modelRequest(protocol, provider.model, context, false);
+    const request = await modelRequest(protocol, provider.model, context, false);
     const response = await fetch(apiUrl(provider.baseUrl, request.endpoint), {
       method: "POST",
       headers: {
@@ -1166,9 +1362,9 @@ async function callChatProviderStream(provider, apiKey, context, onDelta) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let pending = "";
-    let sawContentDelta = false;
-    let sawReasoningDelta = false;
     let completedPayload;
+    let completedContent = "";
+    let completedReasoning = "";
     const router = createThinkTagRouter(onDelta);
 
     const consumeLine = (rawLine) => {
@@ -1185,13 +1381,21 @@ async function callChatProviderStream(provider, apiKey, context, onDelta) {
       if (payload?.type === "response.completed") {
         completedPayload = payload.response;
       }
+      if (payload?.type === "response.output_text.done") {
+        completedContent = textFromContentPart(payload.text || payload.delta);
+      } else if (payload?.type === "response.content_part.done") {
+        const part = payload.part || payload.content_part;
+        if (/output_text|text/i.test(String(part?.type || "output_text"))) {
+          completedContent = textFromContentPart(part);
+        }
+      } else if (/reasoning.*done|thinking.*done/i.test(String(payload?.type || ""))) {
+        completedReasoning = textFromContentPart(payload.text || payload.delta);
+      }
       const delta = providerStreamDelta(payload, protocol);
       if (delta.reasoning) {
-        sawReasoningDelta = true;
         router.pushReasoning(delta.reasoning);
       }
       if (delta.content) {
-        sawContentDelta = true;
         router.pushContent(delta.content);
       }
     };
@@ -1207,14 +1411,25 @@ async function callChatProviderStream(provider, apiKey, context, onDelta) {
     pending += decoder.decode();
     if (pending.trim()) consumeLine(pending);
 
-    if (!sawReasoningDelta && completedPayload) {
-      router.pushReasoning(extractModelReasoning(completedPayload));
-    }
-    if (!sawContentDelta && completedPayload) {
-      router.pushContent(extractModelText(completedPayload));
-    }
     router.flush();
-    return { ...router.result(), protocol };
+    const streamedResult = router.result();
+    const exactContent =
+      extractModelText(completedPayload) || completedContent;
+    const exactReasoning =
+      extractModelReasoning(completedPayload) || completedReasoning;
+    if (!exactContent && !exactReasoning) {
+      return { ...streamedResult, protocol };
+    }
+    const exactRouter = createThinkTagRouter(() => undefined);
+    exactRouter.pushReasoning(exactReasoning);
+    exactRouter.pushContent(exactContent);
+    exactRouter.flush();
+    const exactResult = exactRouter.result();
+    return {
+      content: exactResult.content || streamedResult.content,
+      reasoning: exactResult.reasoning || streamedResult.reasoning,
+      protocol,
+    };
   }
   throw lastError || new Error("模型 API 请求失败");
 }
@@ -1239,6 +1454,26 @@ async function runChatModelStream(actor, context, state, onDelta) {
     onDelta("content", result.content);
   }
   return { ...result, demo: false };
+}
+
+async function runWorkHandoffModel(actor, context, state, onReasoning) {
+  const provider = state?.settings?.provider || {};
+  const secrets = await getSecrets(actor);
+  if (!provider.configured || !provider.model || !secrets.providerApiKey) {
+    return { content: "", reasoning: "", skipped: true };
+  }
+  const handoffPrompt = await renderPromptTemplate("tasks/work-handoff.md", {
+    CONTEXT: context,
+  });
+  const result = await callChatProviderStream(
+    provider,
+    secrets.providerApiKey,
+    handoffPrompt,
+    (kind, delta) => {
+      if (kind === "reasoning") onReasoning(delta);
+    },
+  );
+  return { ...result, skipped: false };
 }
 
 async function captureMemory(actor, prompt, projectId, memoryMode) {
@@ -1270,6 +1505,14 @@ async function copyGuestDataToUser(guestActor, userActor) {
   const guestSkills = actorSkillDirectory(guestActor);
   const userData = actorDirectory(userActor);
   const userSkills = actorSkillDirectory(userActor);
+  const guestWorker = sshWorkerPool.get(sshWorkerKey(guestActor));
+  if (guestWorker?.persistTimer) {
+    clearTimeout(guestWorker.persistTimer);
+    guestWorker.persistTimer = null;
+  }
+  if (guestWorker) {
+    await persistSshWorker(guestWorker).catch(() => undefined);
+  }
   try {
     await access(guestData, fsConstants.F_OK);
     await mkdir(userData, { recursive: true });
@@ -1283,6 +1526,18 @@ async function copyGuestDataToUser(guestActor, userActor) {
     await cp(guestSkills, userSkills, { recursive: true, force: false, errorOnExist: false });
   } catch {
     // No uploaded guest skills.
+  }
+  if (guestWorker) {
+    sshWorkerPool.delete(sshWorkerKey(guestActor));
+    guestWorker.key = sshWorkerKey(userActor);
+    guestWorker.actor = { ...userActor };
+    for (const session of guestWorker.sessions.values()) {
+      session.worker = guestWorker;
+      session.actorKey = guestWorker.key;
+      session.poolKey = `${guestWorker.key}:${session.serverId}`;
+    }
+    sshWorkerPool.set(guestWorker.key, guestWorker);
+    await persistSshWorker(guestWorker).catch(() => undefined);
   }
 }
 
@@ -1337,6 +1592,12 @@ async function handleHttp(req, res) {
         }
         return nextState;
       });
+      const worker = sshWorkerPool.get(sshWorkerKey(actor));
+      for (const task of worker?.tasks.values() || []) {
+        if (task.status === "running") {
+          await persistWorkerTaskConversation(actor, task);
+        }
+      }
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -1803,7 +2064,253 @@ function wsSend(socket, payload) {
 }
 
 function sessionSend(session, payload) {
-  for (const socket of session.sockets || []) wsSend(socket, payload);
+  for (const socket of session.worker?.sockets || []) wsSend(socket, payload);
+}
+
+function createWorkerTask(session, payload) {
+  const now = isoNow();
+  const task = {
+    runId: String(payload.runId || randomId("run-")),
+    conversationId: String(payload.conversationId || randomId("chat-")),
+    serverId: session.serverId,
+    agentId: String(payload.agentId || "opencode"),
+    projectId: payload.projectId ? String(payload.projectId) : undefined,
+    memoryMode: payload.memoryMode === "project-only" ? "project-only" : "default",
+    workspace: String(payload.workspace || "~"),
+    prompt: String(payload.prompt || ""),
+    firstTurn: Boolean(payload.firstTurn),
+    userMessageId: String(payload.userMessageId || `${payload.runId}_user`),
+    assistantMessageId: String(
+      payload.assistantMessageId || `${payload.runId}_assistant`,
+    ),
+    title: "",
+    status: "running",
+    steps: [],
+    events: [],
+    result: "",
+    error: "",
+    startedAt: now,
+    updatedAt: now,
+    finishedAt: "",
+  };
+  session.worker.tasks.set(task.runId, task);
+  scheduleSshWorkerPersist(session.worker, 0);
+  return task;
+}
+
+function recordWorkerEvent(session, payload) {
+  const runId = String(payload.runId || "");
+  if (!runId) return;
+  const task = session.worker?.tasks.get(runId);
+  if (!task) return;
+  task.updatedAt = isoNow();
+  if (payload.type === "conversation.title") {
+    task.title = String(payload.title || "");
+  } else if (payload.type === "workflow") {
+    task.steps = Array.isArray(payload.steps)
+      ? payload.steps.map((step, index) => ({
+          id: String(step?.id || `${runId}_step_${index}`),
+          title: String(step?.title || step || ""),
+          status: String(step?.status || "pending"),
+        }))
+      : [];
+  } else if (payload.type === "agent.event" && payload.event?.id) {
+    const incoming = JSON.parse(JSON.stringify(payload.event));
+    const existingIndex = task.events.findIndex(
+      (event) => event.id === incoming.id,
+    );
+    if (existingIndex >= 0) task.events[existingIndex] = incoming;
+    else task.events.push(incoming);
+  } else if (payload.type === "task.complete") {
+    task.status = "done";
+    task.result = String(payload.result || "");
+    task.finishedAt = isoNow();
+  } else if (payload.type === "task.error") {
+    task.status = "error";
+    task.error = String(payload.result || "远程任务执行失败");
+    task.result = task.error;
+    task.finishedAt = isoNow();
+    task.steps = task.steps.map((step) => ({
+      ...step,
+      status: step.status === "running" ? "error" : step.status,
+    }));
+  }
+  scheduleSshWorkerPersist(session.worker);
+}
+
+function publishWorkerEvent(session, payload) {
+  recordWorkerEvent(session, payload);
+  sessionSend(session, payload);
+}
+
+function replayWorkerTasks(socket, worker) {
+  const tasks = [...worker.tasks.values()]
+    .filter((task) => task.status === "running")
+    .sort((left, right) =>
+      String(left.startedAt || "").localeCompare(String(right.startedAt || "")),
+    );
+  for (const task of tasks) {
+    if (task.title) {
+      wsSend(socket, {
+        type: "conversation.title",
+        conversationId: task.conversationId,
+        runId: task.runId,
+        title: task.title,
+      });
+    }
+    if (task.steps.length) {
+      wsSend(socket, {
+        type: "workflow",
+        conversationId: task.conversationId,
+        runId: task.runId,
+        steps: task.steps,
+      });
+    }
+    for (const event of task.events) {
+      wsSend(socket, {
+        type: "agent.event",
+        conversationId: task.conversationId,
+        runId: task.runId,
+        event,
+      });
+    }
+  }
+}
+
+async function ensureWorkerTaskConversation(actor, task) {
+  await updateState(actor, (state) => {
+    state.conversations = Array.isArray(state.conversations)
+      ? state.conversations
+      : [];
+    let conversation = state.conversations.find(
+      (item) => item.id === task.conversationId,
+    );
+    if (!conversation) {
+      conversation = {
+        id: task.conversationId,
+        title: task.title || "新对话",
+        mode: "work",
+        projectId: task.projectId,
+        messages: [],
+        updatedAt: task.updatedAt,
+        work: {
+          agentId: task.agentId,
+          serverId: task.serverId,
+          connectionEnabled: true,
+          workspace: task.workspace,
+        },
+      };
+      state.conversations.unshift(conversation);
+    }
+    conversation.mode = "work";
+    conversation.updatedAt = task.updatedAt;
+    conversation.projectId ||= task.projectId;
+    conversation.work = {
+      ...(conversation.work || {}),
+      agentId: task.agentId,
+      serverId: task.serverId,
+      connectionEnabled: true,
+      workspace: task.workspace,
+    };
+    conversation.messages = Array.isArray(conversation.messages)
+      ? conversation.messages
+      : [];
+    let userMessage = conversation.messages.find(
+      (message) => message.runId === task.runId && message.role === "user",
+    );
+    if (!userMessage) {
+      userMessage = {
+        id: task.userMessageId,
+        role: "user",
+        content: task.prompt,
+        createdAt: task.startedAt,
+        mode: "work",
+        runId: task.runId,
+        trace: {
+          runId: task.runId,
+          status: "running",
+          steps: [],
+          startedAt: task.startedAt,
+        },
+      };
+      conversation.messages.push(userMessage);
+    }
+    let assistantMessage = conversation.messages.find(
+      (message) => message.runId === task.runId && message.role === "assistant",
+    );
+    if (!assistantMessage) {
+      assistantMessage = {
+        id: task.assistantMessageId,
+        role: "assistant",
+        content: "",
+        createdAt: task.startedAt,
+        mode: "work",
+        runId: task.runId,
+        reasoningStatus: "running",
+        events: [],
+      };
+      conversation.messages.push(assistantMessage);
+    }
+    return state;
+  });
+}
+
+async function persistWorkerTaskConversation(actor, task) {
+  await ensureWorkerTaskConversation(actor, task);
+  await updateState(actor, (state) => {
+    const conversation = (state.conversations || []).find(
+      (item) => item.id === task.conversationId,
+    );
+    if (!conversation) return state;
+    if (task.title) conversation.title = task.title;
+    conversation.updatedAt = task.updatedAt;
+    const userMessage = (conversation.messages || []).find(
+      (message) => message.runId === task.runId && message.role === "user",
+    );
+    const assistantMessage = (conversation.messages || []).find(
+      (message) => message.runId === task.runId && message.role === "assistant",
+    );
+    if (userMessage) {
+      userMessage.trace = {
+        runId: task.runId,
+        status:
+          task.status === "done"
+            ? "done"
+            : task.status === "error"
+              ? "error"
+              : "running",
+        steps: task.steps,
+        result: task.result || undefined,
+        startedAt: task.startedAt,
+      };
+    }
+    if (assistantMessage) {
+      const reasoning = task.events
+        .filter((event) => event.kind === "reasoning")
+        .map((event) => event.output || event.detail)
+        .filter(Boolean)
+        .at(-1);
+      const finalMessage = task.events
+        .filter((event) => event.kind === "message" && event.output)
+        .at(-1);
+      assistantMessage.content =
+        finalMessage?.output ||
+        (task.status === "error" ? task.error : task.result) ||
+        assistantMessage.content ||
+        "";
+      assistantMessage.reasoning = reasoning || assistantMessage.reasoning;
+      assistantMessage.reasoningStatus =
+        task.status === "running"
+          ? "running"
+          : task.status === "error"
+            ? "error"
+            : "done";
+      assistantMessage.events = task.events.filter(
+        (event) => !["message", "reasoning"].includes(event.kind),
+      );
+    }
+    return state;
+  });
 }
 
 function remoteExec(client, command, options = {}) {
@@ -1976,59 +2483,6 @@ async function readOpenCodeFailureLog(session) {
   return redacted.slice(-4_000);
 }
 
-function workflowFor(prompt) {
-  if (/内存|显存|资源|gpu|memory|磁盘|cpu/i.test(prompt)) {
-    return ["查看服务器内存", "查看可用资源", "判断任务所需资源是否满足"];
-  }
-  if (/文件|代码|修改|实现|修复|编辑/i.test(prompt)) {
-    return ["确认工作目录与约束", "检查相关文件", "执行修改", "验证结果"];
-  }
-  return ["理解请求并确认环境", "执行任务", "检查结果并整理回复"];
-}
-
-function cleanWorkflowSteps(steps, fallback) {
-  const normalized = Array.isArray(steps)
-    ? steps
-        .map((step) =>
-          String(
-            typeof step === "object" && step
-              ? step.title || step.name || step.step || ""
-              : step,
-          )
-            .replace(/^[\s\d.)、\-*]+/, "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 42),
-        )
-        .filter(Boolean)
-    : [];
-  const unique = [...new Set(normalized)].slice(0, 6);
-  return unique.length >= 2 ? unique : fallback;
-}
-
-function parseWorkflowPlan(raw, fallback) {
-  const source = String(raw || "")
-    .replace(/```(?:json)?/gi, "")
-    .replace(/```/g, "")
-    .trim();
-  const candidates = [source];
-  const objectMatch = source.match(/\{[\s\S]*\}/);
-  const arrayMatch = source.match(/\[[\s\S]*\]/);
-  if (objectMatch?.[0] && objectMatch[0] !== source) candidates.push(objectMatch[0]);
-  if (arrayMatch?.[0] && arrayMatch[0] !== source) candidates.push(arrayMatch[0]);
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate);
-      const steps = Array.isArray(parsed) ? parsed : parsed?.steps;
-      const cleaned = cleanWorkflowSteps(steps, fallback);
-      if (cleaned !== fallback) return cleaned;
-    } catch {
-      // Try the next JSON-shaped fragment.
-    }
-  }
-  return fallback;
-}
-
 function fallbackConversationTitle(prompt) {
   const compact = String(prompt || "")
     .replace(/[`*_>#\[\]()]/g, "")
@@ -2039,61 +2493,39 @@ function fallbackConversationTitle(prompt) {
 }
 
 function normalizeConversationTitle(value, prompt) {
-  const normalized = String(value || "")
+  let source = String(value || "").trim();
+  const objectMatch = source.match(/\{[\s\S]*\}/);
+  if (objectMatch) {
+    try {
+      const parsed = JSON.parse(objectMatch[0]);
+      if (typeof parsed?.title === "string") source = parsed.title;
+    } catch {
+      // Continue with the plain-text title candidate.
+    }
+  }
+  const normalized = source
     .replace(/```[\s\S]*?```/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean)
+    ?.replace(/^[#*`_\-]+\s*/, "")
     .replace(/^[\s"'“”‘’《》【】]+|[\s"'“”‘’《》【】。！？!?：:]+$/g, "")
     .replace(/^(标题|title)\s*[：:]\s*/i, "")
     .replace(/\s+/g, " ")
-    .trim();
-  if (!normalized) return fallbackConversationTitle(prompt);
-  return [...normalized].slice(0, 14).join("");
-}
-
-function parseWorkPlan(raw, prompt) {
-  const fallback = workflowFor(prompt);
-  const source = String(raw || "")
-    .replace(/```(?:json)?/gi, "")
-    .replace(/```/g, "")
-    .trim();
-  const objectMatch = source.match(/\{[\s\S]*\}/);
-  try {
-    const parsed = JSON.parse(objectMatch?.[0] || source);
-    return {
-      title: normalizeConversationTitle(parsed?.title, prompt),
-      steps: cleanWorkflowSteps(parsed?.steps, fallback),
-    };
-  } catch {
-    return {
-      title: fallbackConversationTitle(prompt),
-      steps: parseWorkflowPlan(source, fallback),
-    };
+    .trim() || "";
+  const metaTitle =
+    /(?:生成|拟定|概括|总结).{0,8}(?:标题|题目)|(?:标题|题目).{0,6}(?:是|为)|根据.{0,16}(?:对话|请求|回答)|(?:用户|助手).{0,8}(?:请求|回答|询问)|(?:不超过|不要|要求)[一二三四五六七八九十\d]/.test(
+      normalized,
+    );
+  if (
+    !normalized ||
+    [...normalized].length > 22 ||
+    /[。！？!?；;]/.test(normalized) ||
+    metaTitle
+  ) {
+    return fallbackConversationTitle(prompt);
   }
-}
-
-async function planWorkSteps(provider, apiKey, prompt) {
-  const fallback = workflowFor(prompt);
-  const planningPrompt = [
-    "你是 EasyWork 网页端的任务编排器。",
-    "把用户请求拆成 2 到 6 个按顺序执行、可以验证的简短步骤。",
-    "步骤必须是动作，不得假设尚未得到的结果；高风险操作前必须安排确认。",
-    '只返回严格 JSON：{"steps":["步骤一","步骤二"]}，不要 Markdown 或解释。',
-    `用户请求：${String(prompt || "").slice(0, 4_000)}`,
-  ].join("\n");
-  const { payload } = await callChatProvider(provider, apiKey, planningPrompt);
-  return parseWorkflowPlan(extractModelText(payload), fallback);
-}
-
-async function planWorkRequest(provider, apiKey, prompt) {
-  const planningPrompt = [
-    "你是 EasyWork 网页端的任务编排器。",
-    "根据用户的第一条请求，生成一个简洁、具体的中文对话标题，最多 14 个汉字。",
-    "再把请求拆成 2 到 6 个按顺序执行、可以验证的简短步骤。",
-    "步骤必须是动作，不得假设尚未得到的结果；高风险操作前必须安排确认。",
-    '只返回严格 JSON：{"title":"短标题","steps":["步骤一","步骤二"]}，不要 Markdown 或解释。',
-    `用户请求：${String(prompt || "").slice(0, 4_000)}`,
-  ].join("\n");
-  const { payload } = await callChatProvider(provider, apiKey, planningPrompt);
-  return parseWorkPlan(extractModelText(payload), prompt);
+  return [...normalized].slice(0, 14).join("");
 }
 
 async function generateConversationTitle(actor, prompt, response = "") {
@@ -2103,12 +2535,10 @@ async function generateConversationTitle(actor, prompt, response = "") {
   if (!provider.configured || !provider.model || !secrets.providerApiKey) {
     return fallbackConversationTitle(prompt);
   }
-  const titlePrompt = [
-    "请根据下面第一轮用户请求和回答，为这段对话生成一个具体的中文标题。",
-    "要求：不超过 14 个汉字；不要引号、句号、前缀或解释；避免“关于”“问题讨论”等空泛表达。",
-    `用户：${String(prompt || "").slice(0, 1_500)}`,
-    `回答：${String(response || "").slice(0, 1_500)}`,
-  ].join("\n");
+  const titlePrompt = await renderPromptTemplate("tasks/conversation-title.md", {
+    USER_PROMPT: String(prompt || "").slice(0, 1_500),
+    ASSISTANT_RESPONSE: String(response || "").slice(0, 1_500),
+  });
   try {
     const { payload } = await callChatProvider(
       provider,
@@ -2121,16 +2551,16 @@ async function generateConversationTitle(actor, prompt, response = "") {
   }
 }
 
-function agentPromptWithWorkflow(context, steps) {
-  return [
-    context,
-    "## EasyWork 网页端已编排的执行流程",
-    ...steps.map((step, index) => `${index + 1}. ${step}`),
-    "",
-    "严格按以上顺序执行并验证，不要重新生成另一套计划。",
-    "这些步骤只用于控制执行顺序，不是最终回答的提纲。",
-    "完成工具调用后，请直接针对用户问题综合所有证据给出总结性回答：先说明结论，再组织关键数据、判断依据、限制和必要的下一步。不要按步骤逐项复述，也不要使用‘步骤一/步骤二’作为回答结构，除非用户明确要求。",
-  ].join("\n");
+async function agentPromptWithNativePlanning(context, webHandoff = "") {
+  const handoffSection = webHandoff
+    ? await renderPromptTemplate("agents/web-handoff.md", {
+        CONTENT: webHandoff,
+      })
+    : "";
+  return renderPromptTemplate("agents/opencode-bridge.md", {
+    CONTEXT: context,
+    WEB_HANDOFF: handoffSection,
+  });
 }
 
 function providerConfigForOpenCode(provider) {
@@ -2659,11 +3089,44 @@ async function prepareRemoteAgents(
   return agents;
 }
 
+async function publishRemoteAgentScan(
+  session,
+  actor,
+  send = (payload) => sessionSend(session, payload),
+) {
+  send({
+    type: "agent.scan.status",
+    serverId: session.serverId,
+    status: "scanning",
+  });
+  try {
+    const agents = await prepareRemoteAgents(session, actor);
+    send({
+      type: "agent.list",
+      serverId: session.serverId,
+      agents,
+    });
+    send({
+      type: "agent.scan.status",
+      serverId: session.serverId,
+      status: "done",
+    });
+    return agents;
+  } catch (error) {
+    send({
+      type: "agent.scan.status",
+      serverId: session.serverId,
+      status: "error",
+      label: error instanceof Error ? error.message : "Agent 扫描失败",
+    });
+    throw error;
+  }
+}
+
 async function syncManagedOpenCodeForActor(actor) {
-  const actorKey = `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
-  const sessions = [...sshSessionPool.values()].filter(
+  const worker = await getSshWorker(actor);
+  const sessions = [...worker.sessions.values()].filter(
     (session) =>
-      session.actorKey === actorKey &&
       session.status === "connected" &&
       session.client &&
       !session.demo &&
@@ -2877,6 +3340,248 @@ async function applyOpenCodeUpdate(
   return { ...completed, agents };
 }
 
+function diffPathLabel(filePath) {
+  const normalized = String(filePath || "file")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "");
+  return normalized || "file";
+}
+
+function unifiedTextDiff(filePath, before, after, { created = false } = {}) {
+  const oldText = String(before ?? "").replace(/\r\n/g, "\n");
+  const newText = String(after ?? "").replace(/\r\n/g, "\n");
+  if (!oldText && !newText) return "";
+  const oldLines = oldText ? oldText.split("\n") : [];
+  const newLines = newText ? newText.split("\n") : [];
+  const label = diffPathLabel(filePath);
+  return [
+    `--- ${created ? "/dev/null" : `a/${label}`}`,
+    `+++ b/${label}`,
+    `@@ -${oldLines.length ? `1,${oldLines.length}` : "0,0"} +${
+      newLines.length ? `1,${newLines.length}` : "0,0"
+    } @@`,
+    ...oldLines.map((line) => `-${line}`),
+    ...newLines.map((line) => `+${line}`),
+  ]
+    .join("\n")
+    .slice(0, 48_000);
+}
+
+function openCodeFileDiff(tool, input, part, filePath) {
+  const explicit =
+    input?.diff ||
+    input?.patch ||
+    input?.unifiedDiff ||
+    input?.unified_diff ||
+    part?.diff ||
+    part?.patch;
+  if (explicit) return String(explicit).slice(0, 48_000);
+
+  const before =
+    input?.oldString ??
+    input?.old_string ??
+    input?.oldText ??
+    input?.before;
+  const after =
+    input?.newString ??
+    input?.new_string ??
+    input?.newText ??
+    input?.after ??
+    input?.content;
+  if (before !== undefined || after !== undefined) {
+    return unifiedTextDiff(filePath, before, after, {
+      created: before === undefined && /write|create/.test(String(tool).toLowerCase()),
+    });
+  }
+  return "";
+}
+
+function mergeStreamPart(state, mapName, orderName, sourceId, text, fallback) {
+  if (!(state[mapName] instanceof Map)) state[mapName] = new Map();
+  if (!Array.isArray(state[orderName])) state[orderName] = [];
+  const key = sourceId || fallback;
+  const previous = String(state[mapName].get(key) || "");
+  const incoming = String(text || "");
+  const merged = !previous
+    ? incoming
+    : incoming === previous || incoming.startsWith(previous)
+      ? incoming
+      : previous.endsWith(incoming)
+        ? previous
+        : `${previous}${incoming}`;
+  if (!state[mapName].has(key)) state[orderName].push(key);
+  state[mapName].set(key, merged);
+  return { key, text: merged };
+}
+
+const EASYWORK_PROGRESS_MARKER = "[[EASYWORK_PROGRESS]]";
+const EASYWORK_FINAL_MARKER = "[[EASYWORK_FINAL]]";
+
+function stripEasyWorkProtocolMarkers(value, preferFinal = false) {
+  const source = String(value || "");
+  const finalIndex = source.lastIndexOf(EASYWORK_FINAL_MARKER);
+  if (preferFinal && finalIndex >= 0) {
+    return source.slice(finalIndex + EASYWORK_FINAL_MARKER.length).trimStart();
+  }
+  return source
+    .replaceAll(EASYWORK_FINAL_MARKER, "")
+    .replaceAll(EASYWORK_PROGRESS_MARKER, "")
+    .trimStart();
+}
+
+function classifyOpenCodeText(value) {
+  const source = String(value || "");
+  const finalIndex = source.lastIndexOf(EASYWORK_FINAL_MARKER);
+  if (finalIndex >= 0) {
+    const output = source
+      .slice(finalIndex + EASYWORK_FINAL_MARKER.length)
+      .trimStart();
+    return { kind: "message", output, pending: !output.trim() };
+  }
+  const progressIndex = source.lastIndexOf(EASYWORK_PROGRESS_MARKER);
+  if (progressIndex >= 0) {
+    const output = source
+      .slice(progressIndex + EASYWORK_PROGRESS_MARKER.length)
+      .trimStart();
+    return { kind: "agent_message", output, pending: !output.trim() };
+  }
+  let leading = source.trimStart();
+  const waitingForMarker = [
+    EASYWORK_FINAL_MARKER,
+    EASYWORK_PROGRESS_MARKER,
+  ].some((marker) => leading.startsWith("[") && marker.startsWith(leading));
+  if (waitingForMarker) {
+    return { kind: "agent_message", output: "", pending: true };
+  }
+  const partialMarkerIndex = leading.lastIndexOf("[[EASY");
+  if (partialMarkerIndex >= 0) {
+    const possibleMarker = leading.slice(partialMarkerIndex);
+    if (
+      [EASYWORK_FINAL_MARKER, EASYWORK_PROGRESS_MARKER].some((marker) =>
+        marker.startsWith(possibleMarker),
+      )
+    ) {
+      leading = leading.slice(0, partialMarkerIndex);
+    }
+  }
+  return {
+    kind: "agent_message",
+    output: stripEasyWorkProtocolMarkers(leading),
+    pending: false,
+  };
+}
+
+function isNativePlanTool(tool) {
+  const normalized = String(tool || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+  return [
+    "todo",
+    "todoupdated",
+    "todowrite",
+    "updatetodo",
+    "updatetodos",
+    "plan",
+    "planupdated",
+    "planwrite",
+    "writeplan",
+    "setplan",
+    "updateplan",
+  ].includes(normalized);
+}
+
+function nativePlanItems(input) {
+  if (Array.isArray(input)) return input;
+  if (!input || typeof input !== "object") return null;
+  for (const key of ["todos", "plan", "steps", "items", "goals", "tasks"]) {
+    const value = input[key];
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === "object") {
+      for (const nestedKey of ["todos", "steps", "items", "goals", "tasks"]) {
+        if (Array.isArray(value[nestedKey])) return value[nestedKey];
+      }
+    }
+  }
+  return null;
+}
+
+function normalizeAgentPlanStatus(value) {
+  const normalized = String(value || "pending")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (["completed", "complete", "done", "success", "succeeded"].includes(normalized)) {
+    return "done";
+  }
+  if (["in_progress", "running", "active", "started", "doing"].includes(normalized)) {
+    return "running";
+  }
+  if (["cancelled", "canceled", "skipped"].includes(normalized)) return "cancelled";
+  if (["error", "failed", "blocked"].includes(normalized)) return "error";
+  return "pending";
+}
+
+function normalizeAgentPlanSteps(tool, input) {
+  if (!isNativePlanTool(tool)) return null;
+  const items = nativePlanItems(input);
+  if (!items) return null;
+  return items
+    .map((item, index) => {
+      const value = item && typeof item === "object" ? item : { content: item };
+      const title = String(
+        value.content ||
+          value.step ||
+          value.title ||
+          value.text ||
+          value.description ||
+          value.goal ||
+          value.name ||
+          "",
+      )
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!title) return null;
+      return {
+        id: String(value.id || value.key || `${safeSegment(title, "step")}_${index}`),
+        title,
+        status: normalizeAgentPlanStatus(value.status || value.state),
+      };
+    })
+    .filter(Boolean);
+}
+
+function agentPlanEventStatus(steps, toolStatus) {
+  if (toolStatus === "error" || steps.some((step) => step.status === "error")) {
+    return "error";
+  }
+  if (
+    steps.length > 0 &&
+    steps.every((step) => ["done", "cancelled"].includes(step.status))
+  ) {
+    return "done";
+  }
+  return "running";
+}
+
+function trailingFinalMessages(eventOrder) {
+  const ordered = Array.isArray(eventOrder) ? eventOrder : [];
+  const lastExplicitFinal = ordered.findLast((item) => item.kind === "message");
+  if (lastExplicitFinal) return [lastExplicitFinal];
+
+  const trailing = [];
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const item = ordered[index];
+    if (item.kind !== "agent_message") break;
+    trailing.unshift(item);
+  }
+  if (trailing.length) return trailing;
+
+  const lastAgentMessage = ordered.findLast(
+    (item) => item.kind === "agent_message",
+  );
+  return lastAgentMessage ? [lastAgentMessage] : [];
+}
+
 function parseOpenCodeLine(line, state) {
   let payload;
   try {
@@ -2908,6 +3613,16 @@ function parseOpenCodeLine(line, state) {
         : ["completed", "done", "success"].includes(statusValue)
           ? "done"
           : "running";
+    const planSteps = normalizeAgentPlanSteps(tool, input);
+    if (planSteps) {
+      return {
+        sourceId: "agent-native-plan",
+        kind: "plan",
+        title: "执行计划",
+        planSteps,
+        status: agentPlanEventStatus(planSteps, status),
+      };
+    }
     const kind = /write|edit|patch|apply|replace|create_file/.test(normalizedTool)
       ? "file_change"
       : /\b(?:sbatch|srun|salloc|sinfo|squeue|sacct|scontrol|scancel|qsub|qstat|qdel)\b/.test(
@@ -2933,47 +3648,76 @@ function parseOpenCodeLine(line, state) {
       title,
       detail: `OpenCode · ${tool}`,
       output: String(output || "").slice(0, 12_000),
+      diff:
+        kind === "file_change"
+          ? openCodeFileDiff(tool, input, part, filePath)
+          : undefined,
       command: command || undefined,
       path: filePath || undefined,
       status,
     };
   }
+  if (/^(?:todo|plan)[._-](?:updated|changed)$/.test(type.toLowerCase())) {
+    const planSteps = normalizeAgentPlanSteps(
+      type,
+      part.input || part.properties || part,
+    );
+    if (planSteps) {
+      return {
+        sourceId: "agent-native-plan",
+        kind: "plan",
+        title: "执行计划",
+        planSteps,
+        status: agentPlanEventStatus(planSteps, part.status),
+      };
+    }
+  }
   if (type === "text") {
     const text = String(part.text || payload.text || "");
-    if (!text) return null;
-    state.finalText += text;
+    if (!text.trim()) return null;
+    const textPart = mergeStreamPart(
+      state,
+      "textParts",
+      "textOrder",
+      sourceId,
+      text,
+      "message",
+    );
+    const classified = classifyOpenCodeText(textPart.text);
+    if (classified.pending) return null;
+    state.latestText = classified.output;
+    if (classified.kind === "message") state.finalText = classified.output;
     return {
-      sourceId: sourceId || "message",
-      kind: "message",
-      title: "Agent 回复",
-      output: state.finalText.slice(-16_000),
+      sourceId: textPart.key,
+      kind: classified.kind,
+      title:
+        classified.kind === "message" ? "Agent 最终回复" : "Agent思考中",
+      output: classified.output.slice(-16_000),
       status: "running",
     };
   }
   if (type === "reasoning") {
-    if (!(state.reasoningParts instanceof Map)) {
-      state.reasoningParts = new Map();
-    }
     const reasoningText = String(part.text || payload.text || "");
-    const reasoningKey = sourceId || `reasoning-${state.reasoningParts.size}`;
-    if (reasoningText) state.reasoningParts.set(reasoningKey, reasoningText);
-    state.reasoningText = [...state.reasoningParts.values()].join("\n\n");
-    return {
+    if (!reasoningText.trim()) return null;
+    const reasoningPart = mergeStreamPart(
+      state,
+      "reasoningParts",
+      "reasoningOrder",
       sourceId,
-      kind: "reasoning",
-      title: "思考",
-      output: state.reasoningText.slice(-16_000),
+      reasoningText,
+      "agent_reasoning",
+    );
+    state.reasoningText = reasoningPart.text;
+    return {
+      sourceId: reasoningPart.key,
+      kind: "agent_reasoning",
+      title: "Agent思考中",
+      output: reasoningPart.text.slice(-16_000),
       status: "running",
     };
   }
   if (type === "step_start") {
-    return {
-      sourceId,
-      kind: "plan",
-      title: "Agent 开始推进下一步",
-      detail: part.title || "正在按网页端流程继续执行",
-      status: "running",
-    };
+    return null;
   }
   if (/permission|approval|question/.test(type)) {
     return {
@@ -2992,6 +3736,7 @@ function parseOpenCodeLine(line, state) {
       title: `${part.status === "completed" ? "已修改" : "正在修改"} ${path.basename(filePath || "文件")}`,
       detail: String(part.summary || "").slice(0, 500),
       path: filePath || undefined,
+      diff: openCodeFileDiff("file_change", part, part, filePath),
       status: part.status === "completed" ? "done" : "running",
     };
   }
@@ -3025,33 +3770,19 @@ function parseOpenCodeLine(line, state) {
   return null;
 }
 
-function workflowIndexForEvent(event, steps, currentIndex = 0) {
-  if (!steps.length) return 0;
-  const kind = String(event.kind || "");
-  if (kind === "message" || kind === "artifact") return steps.length - 1;
-  const text = [event.title, event.command, event.path, event.output]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  const find = (pattern) => steps.findIndex((step) => pattern.test(step));
-  const candidates = [
-    [/\bfree\b|meminfo|vmstat|内存|显存/, /内存|显存/],
-    [/\bnvidia-smi\b|\bsinfo\b|\bnproc\b|\blscpu\b|\bdf\b|gpu|cpu|资源/, /资源|GPU|CPU|磁盘/],
-    [/apply_patch|\bwrite\b|\bedit\b|\bsed\b|\btee\b|修改|编辑/, /修改|编辑|执行/],
-    [/\btest\b|\blint\b|pytest|验证|检查结果/, /验证|检查结果|整理回复|判断/],
-    [/\bls\b|\bfind\b|\brg\b|\bgrep\b|\bcat\b|\bread\b|检查相关|工作目录/, /检查|确认|目录/],
-  ];
-  for (const [eventPattern, stepPattern] of candidates) {
-    if (!eventPattern.test(text)) continue;
-    const index = find(stepPattern);
-    if (index >= 0) return Math.max(currentIndex, index);
-  }
-  return Math.min(currentIndex, steps.length - 1);
-}
-
 async function runRemoteWork(socket, session, actor, payload) {
   if (!session.client) throw new Error("SSH 尚未连接");
-  if (session.activeStream) throw new Error("该服务器上仍有任务在运行");
+  if (session.activeRun || session.activeStream) {
+    throw new Error("该服务器上仍有任务在运行");
+  }
+  touchSshSession(session);
+  const workerTask = createWorkerTask(session, payload);
+  session.activeRun = {
+    conversationId: workerTask.conversationId,
+    runId: workerTask.runId,
+  };
+  await ensureWorkerTaskConversation(actor, workerTask);
+  const emit = (event) => publishWorkerEvent(session, event);
   const availableAgents = await prepareRemoteAgents(session, actor);
   const selectedAgent = availableAgents.find(
     (agent) => agent.id === String(payload.agentId || "opencode"),
@@ -3072,66 +3803,19 @@ async function runRemoteWork(socket, session, actor, payload) {
     selectedAgent.managed && provider.model && secrets.providerApiKey
       ? `${EASYWORK_OPENCODE_PROVIDER_ID}/${provider.model}`
       : "";
-  const planningEventId = `${payload.runId}_planning`;
-  wsSend(socket, {
-    type: "agent.event",
-    conversationId: payload.conversationId,
-    runId: payload.runId,
-    event: {
-      id: planningEventId,
-      kind: "job_status",
-      title: "正在编排执行流程",
-      detail: "EasyWork 网页端",
-      status: "running",
-      timestamp: isoNow(),
-    },
-  });
-  let plan = {
-    title: fallbackConversationTitle(payload.prompt),
-    steps: workflowFor(String(payload.prompt || "")),
-  };
-  let usedFallbackPlan = false;
-  if (provider.configured && provider.model && secrets.providerApiKey) {
-    try {
-      plan = await planWorkRequest(provider, secrets.providerApiKey, payload.prompt);
-    } catch {
-      usedFallbackPlan = true;
-    }
-  } else {
-    usedFallbackPlan = true;
-  }
-  const steps = plan.steps;
+  let titlePromise;
   if (payload.firstTurn) {
-    wsSend(socket, {
+    const fallbackTitle = fallbackConversationTitle(payload.prompt);
+    emit({
       type: "conversation.title",
       conversationId: payload.conversationId,
-      title: plan.title,
+      runId: payload.runId,
+      title: fallbackTitle,
     });
+    titlePromise = generateConversationTitle(actor, payload.prompt).catch(
+      () => fallbackTitle,
+    );
   }
-  wsSend(socket, {
-    type: "workflow",
-    conversationId: payload.conversationId,
-    runId: payload.runId,
-    steps: steps.map((title, index) => ({
-      id: `${payload.runId}_step_${index}`,
-      title,
-      status: index === 0 ? "running" : "pending",
-    })),
-  });
-  wsSend(socket, {
-    type: "agent.event",
-    conversationId: payload.conversationId,
-    runId: payload.runId,
-    event: {
-      id: planningEventId,
-      kind: "plan",
-      title: `已编排 ${steps.length} 个步骤`,
-      detail: usedFallbackPlan ? "已使用本地流程模板并发送给 Agent" : "流程已发送给 Agent",
-      output: steps.map((step, index) => `${index + 1}. ${step}`).join("\n"),
-      status: "done",
-      timestamp: isoNow(),
-    },
-  });
   const context = await buildContext({
     actor,
     mode: "work",
@@ -3141,7 +3825,75 @@ async function runRemoteWork(socket, session, actor, payload) {
     memoryMode: payload.memoryMode === "project-only" ? "project-only" : "default",
     conversationId: String(payload.conversationId || ""),
   });
-  const agentPrompt = agentPromptWithWorkflow(context.text, steps);
+  const webReasoningEventId = `${payload.runId}_web_reasoning`;
+  let webReasoning = "";
+  let reasoningStarted = false;
+  let webHandoff = "";
+  try {
+    const handoffResult = await runWorkHandoffModel(
+      actor,
+      context.text,
+      context.state,
+      (delta) => {
+        const nextDelta = String(delta || "");
+        if (!nextDelta) return;
+        reasoningStarted = true;
+        webReasoning += nextDelta;
+        emit({
+          type: "agent.event",
+          conversationId: payload.conversationId,
+          runId: payload.runId,
+          event: {
+            id: webReasoningEventId,
+            kind: "reasoning",
+            title: "网页模型思考",
+            output: webReasoning,
+            status: "running",
+            timestamp: isoNow(),
+          },
+        });
+      },
+    );
+    webHandoff = String(handoffResult.content || "").trim();
+    const completedReasoning = String(
+      handoffResult.reasoning || webReasoning,
+    ).trim();
+    if (completedReasoning) {
+      reasoningStarted = true;
+      webReasoning = completedReasoning;
+    }
+    emit({
+      type: "agent.event",
+      conversationId: payload.conversationId,
+      runId: payload.runId,
+      event: {
+        id: webReasoningEventId,
+        kind: "reasoning",
+        title: "网页模型思考",
+        output: webReasoning || undefined,
+        status: "done",
+        timestamp: isoNow(),
+      },
+    });
+  } catch {
+    emit({
+      type: "agent.event",
+      conversationId: payload.conversationId,
+      runId: payload.runId,
+      event: {
+        id: webReasoningEventId,
+        kind: "reasoning",
+        title: "网页模型思考",
+        output: reasoningStarted ? webReasoning : undefined,
+        status: "done",
+        timestamp: isoNow(),
+      },
+    });
+  }
+  const agentPrompt = await agentPromptWithNativePlanning(
+    context.text,
+    webHandoff,
+  );
   const workspaceEncoded = Buffer.from(
     String(payload.workspace || "~"),
     "utf8",
@@ -3177,11 +3929,18 @@ async function runRemoteWork(socket, session, actor, payload) {
   const parserState = {
     sessionId: boundSessionId,
     finalText: "",
+    latestText: "",
+    textParts: new Map(),
+    textOrder: [],
     reasoningText: "",
     reasoningParts: new Map(),
+    reasoningOrder: [],
     lastError: "",
     eventIndex: 0,
-    stepIndex: 0,
+    eventOrder: [],
+    forwardedEvents: new Map(),
+    activeThought: null,
+    activeFinal: null,
   };
   let pending = "";
   let stderrOutput = "";
@@ -3201,62 +3960,107 @@ async function runRemoteWork(socket, session, actor, payload) {
       for (const line of lines) {
         const event = parseOpenCodeLine(line, parserState);
         if (!event) continue;
-        const { sourceId, ...eventPayload } = event;
+        const { sourceId, planSteps, ...eventPayload } = event;
         const eventId =
-          event.kind === "message"
-            ? `${payload.runId}_message`
-            : sourceId
-              ? `${payload.runId}_${safeSegment(sourceId)}`
-              : `${payload.runId}_event_${parserState.eventIndex++}`;
-        const stepIndex = workflowIndexForEvent(
-          event,
-          steps,
-          parserState.stepIndex,
-        );
-        parserState.stepIndex = Math.max(parserState.stepIndex, stepIndex);
-        if (!["plan", "reasoning"].includes(event.kind)) {
-          wsSend(socket, {
-            type: "workflow.step",
+          sourceId
+            ? `${payload.runId}_${safeSegment(event.kind)}_${safeSegment(sourceId)}`
+            : `${payload.runId}_event_${parserState.eventIndex++}`;
+        if (
+          parserState.activeFinal &&
+          parserState.activeFinal.id !== eventId
+        ) {
+          const retractedFinal = {
+            ...parserState.activeFinal.event,
+            kind: "agent_message",
+            title: "Agent思考中",
+            status: "done",
+            retractFinal: true,
+            timestamp: isoNow(),
+          };
+          emit({
+            type: "agent.event",
             conversationId: payload.conversationId,
             runId: payload.runId,
-            stepIndex,
-            status:
-              event.status === "error"
-                ? "error"
-                : event.kind === "message"
-                  ? "running"
-                  : event.status,
-            detail:
-              event.kind === "tool_call" && event.command
-                ? event.command.slice(0, 90)
-                : undefined,
+            event: retractedFinal,
           });
-          if (
-            event.status === "done" &&
-            ["tool_call", "file_change", "job_status"].includes(event.kind) &&
-            stepIndex < steps.length - 1
-          ) {
-            parserState.stepIndex = stepIndex + 1;
-            wsSend(socket, {
-              type: "workflow.step",
-              conversationId: payload.conversationId,
-              runId: payload.runId,
-              stepIndex: parserState.stepIndex,
-              status: "running",
-            });
-          }
+          parserState.forwardedEvents.set(
+            parserState.activeFinal.id,
+            retractedFinal,
+          );
+          const orderedFinal = parserState.eventOrder.find(
+            (item) => item.id === parserState.activeFinal.id,
+          );
+          if (orderedFinal) orderedFinal.kind = "agent_message";
+          parserState.activeFinal = null;
         }
-        wsSend(socket, {
+        if (
+          parserState.activeThought &&
+          parserState.activeThought.id !== eventId
+        ) {
+          emit({
+            type: "agent.event",
+            conversationId: payload.conversationId,
+            runId: payload.runId,
+            event: {
+              ...parserState.activeThought.event,
+              status: "done",
+              timestamp: isoNow(),
+            },
+          });
+          parserState.forwardedEvents.set(parserState.activeThought.id, {
+            ...parserState.activeThought.event,
+            status: "done",
+          });
+          parserState.activeThought = null;
+        }
+        if (Array.isArray(planSteps)) {
+          emit({
+            type: "workflow",
+            conversationId: payload.conversationId,
+            runId: payload.runId,
+            steps: planSteps,
+          });
+        }
+        emit({
           type: "agent.event",
           conversationId: payload.conversationId,
           runId: payload.runId,
-          stepIndex,
           event: {
             id: eventId,
             ...eventPayload,
             timestamp: isoNow(),
           },
         });
+        if (!parserState.forwardedEvents.has(eventId)) {
+          parserState.eventOrder.push({
+            id: eventId,
+            kind: event.kind,
+          });
+        } else {
+          const orderedEvent = parserState.eventOrder.find(
+            (item) => item.id === eventId,
+          );
+          if (orderedEvent) orderedEvent.kind = event.kind;
+        }
+        parserState.forwardedEvents.set(eventId, eventPayload);
+        if (["agent_message", "agent_reasoning"].includes(event.kind)) {
+          parserState.activeThought = {
+            id: eventId,
+            event: {
+              id: eventId,
+              ...eventPayload,
+            },
+          };
+        }
+        if (event.kind === "message") {
+          parserState.activeFinal = {
+            id: eventId,
+            event: {
+              id: eventId,
+              ...eventPayload,
+            },
+          };
+        }
       }
     },
     onStderr: (text) => {
@@ -3310,51 +4114,94 @@ async function runRemoteWork(socket, session, actor, payload) {
         : primaryError,
     );
   }
-  const finalText = parserState.finalText.trim() || "Agent 已完成任务，未返回额外文本。";
-  wsSend(socket, {
-    type: "workflow.step",
-    conversationId: payload.conversationId,
-    runId: payload.runId,
-    stepIndex: steps.length - 1,
-    status: "done",
-  });
-  wsSend(socket, {
-    type: "agent.event",
-    conversationId: payload.conversationId,
-    runId: payload.runId,
-    stepIndex: steps.length - 1,
-    event: {
-      id: `${payload.runId}_message`,
-      kind: "message",
-      title: "Agent 回复",
-      output: finalText,
-      status: "done",
-      timestamp: isoNow(),
-    },
-  });
-  wsSend(socket, {
+  const trailingMessages = trailingFinalMessages(parserState.eventOrder);
+  const rawFinalText =
+    trailingMessages
+      .map((item) => parserState.forwardedEvents.get(item.id)?.output)
+      .filter(Boolean)
+      .join("\n\n")
+      .trim() ||
+    parserState.finalText.trim() ||
+    parserState.latestText.trim() ||
+    "Agent 已完成任务，未返回额外文本。";
+  const finalText =
+    stripEasyWorkProtocolMarkers(rawFinalText, true) ||
+    "Agent 已完成任务，未返回额外文本。";
+  const finalMessageEvents = trailingMessages.length
+    ? trailingMessages
+    : [{ id: `${payload.runId}_message`, kind: "agent_message" }];
+  for (const [index, item] of finalMessageEvents.entries()) {
+    emit({
+      type: "agent.event",
+      conversationId: payload.conversationId,
+      runId: payload.runId,
+      event: {
+        id: item.id,
+        kind: "message",
+        title: "Agent 最终回复",
+        output:
+          index === finalMessageEvents.length - 1 ? finalText : undefined,
+        status: "done",
+        timestamp: isoNow(),
+      },
+    });
+  }
+  if (titlePromise) {
+    emit({
+      type: "conversation.title",
+      conversationId: payload.conversationId,
+      runId: payload.runId,
+      title: await titlePromise,
+    });
+  }
+  emit({
     type: "task.complete",
     conversationId: payload.conversationId,
     runId: payload.runId,
     result: finalText,
   });
+  await persistWorkerTaskConversation(actor, workerTask);
+  await persistSshWorker(session.worker);
 }
 
 async function closeSshSession(session) {
   if (session.activeStream) session.activeStream.close();
   if (session.client) {
     const client = session.client;
+    session.client = null;
     client.end();
   }
-  session.client = null;
   session.activeStream = null;
   session.activeRun = null;
   session.status = "disconnected";
   session.demo = false;
+  session.lastDisconnectedAt = isoNow();
+  scheduleSshWorkerPersist(session.worker, 0);
 }
 
 async function connectSsh(socket, session, actor, payload) {
+  if (
+    session.status === "connected" &&
+    (session.client || session.demo) &&
+    !payload.forceReconnect
+  ) {
+    touchSshSession(session);
+    sessionSend(session, {
+      type: "connection.status",
+      serverId: session.serverId,
+      status: "connected",
+      label: session.demo ? "演示登录节点在线" : "算力平台登录节点在线",
+      host: session.host,
+      port: session.port,
+      username: session.username,
+      latency: session.latency,
+      demo: session.demo,
+      reused: true,
+    });
+    return;
+  }
   await closeSshSession(session);
+  touchSshSession(session);
   session.serverId = safeSegment(payload.serverId || session.serverId || randomId("server-"));
   if (payload.demo) {
     session.demo = true;
@@ -3362,7 +4209,9 @@ async function connectSsh(socket, session, actor, payload) {
     session.host = "demo.easywork.local";
     session.username = "demo";
     session.latency = 18;
-    wsSend(socket, {
+    session.lastConnectedAt = isoNow();
+    session.lastDisconnectedAt = "";
+    sessionSend(session, {
       type: "connection.status",
       serverId: session.serverId,
       status: "connected",
@@ -3372,7 +4221,7 @@ async function connectSsh(socket, session, actor, payload) {
       latency: 18,
       demo: true,
     });
-    wsSend(socket, {
+    sessionSend(session, {
       type: "agent.list",
       agents: [
         {
@@ -3389,6 +4238,7 @@ async function connectSsh(socket, session, actor, payload) {
       ],
       serverId: session.serverId,
     });
+    await persistSshWorker(session.worker);
     return;
   }
 
@@ -3504,6 +4354,8 @@ async function connectSsh(socket, session, actor, payload) {
         .on("close", () => {
           if (session.client === client) {
             session.client = null;
+            session.lastDisconnectedAt = isoNow();
+            session.disconnectReason = "SSH 连接已关闭";
             if (connectionPublished && !failureExpectedClose) {
               session.status = "disconnected";
               sessionSend(session, {
@@ -3513,6 +4365,7 @@ async function connectSsh(socket, session, actor, payload) {
                 label: "SSH 连接已关闭",
               });
             }
+            scheduleSshWorkerPersist(session.worker, 0);
           }
         })
         .connect({
@@ -3524,7 +4377,7 @@ async function connectSsh(socket, session, actor, payload) {
           passphrase: payload.passphrase ? String(payload.passphrase) : undefined,
           tryKeyboard: true,
           readyTimeout: 25_000,
-          keepaliveInterval: 15_000,
+          keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
           keepaliveCountMax: 3,
           hostVerifier: (key) => {
             observedFingerprint = `SHA256:${crypto.createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
@@ -3541,7 +4394,7 @@ async function connectSsh(socket, session, actor, payload) {
   if (session.client !== client) {
     throw new Error("SSH 连接在登录完成前已关闭");
   }
-  wsSend(socket, {
+  sessionSend(session, {
     type: "connection.status",
     serverId: session.serverId,
     status: "connected",
@@ -3556,6 +4409,9 @@ async function connectSsh(socket, session, actor, payload) {
   session.port = port;
   session.latency = Date.now() - startedAt;
   session.fingerprint = observedFingerprint;
+  session.lastConnectedAt = isoNow();
+  session.lastDisconnectedAt = "";
+  session.disconnectReason = "";
   if (
     actor.authenticated &&
     (useSavedCredential ||
@@ -3619,17 +4475,14 @@ async function connectSsh(socket, session, actor, payload) {
         profile,
       });
     } catch {
-      wsSend(socket, {
+      sessionSend(session, {
         type: "error",
         error: "SSH 已连接，但账号连接配置未能保存",
       });
     }
   }
-  wsSend(socket, {
-    type: "agent.list",
-    serverId: session.serverId,
-    agents: await prepareRemoteAgents(session, actor),
-  });
+  await publishRemoteAgentScan(session, actor);
+  await persistSshWorker(session.worker);
 }
 
 async function addRemoteAgent(session, actor, payload) {
@@ -3859,51 +4712,49 @@ function attachWebSocketServer(server) {
   });
 
   wss.on("connection", async (socket, req) => {
+    const pendingMessages = [];
+    let workerMessageHandler = null;
+    let socketClosed = false;
+    socket.on("message", (raw) => {
+      if (workerMessageHandler) void workerMessageHandler(raw);
+      else pendingMessages.push(raw);
+    });
+    socket.once("close", () => {
+      socketClosed = true;
+    });
     const responseShim = {
       setHeader() {},
     };
     const actor = await resolveActor(req, responseShim, false);
-    const actorKey = `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
-    const actorSessions = () =>
-      [...sshSessionPool.values()].filter((session) => session.actorKey === actorKey);
-    const attachSocket = (session) => {
-      if (session.disconnectTimer) {
-        clearTimeout(session.disconnectTimer);
-        session.disconnectTimer = null;
-      }
-      session.sockets.add(socket);
-      return session;
-    };
+    const worker = await getSshWorker(actor);
+    for (const task of worker.tasks.values()) {
+      if (!task.recoveredAfterRestart) continue;
+      await persistWorkerTaskConversation(actor, task).catch(() => undefined);
+      task.recoveredAfterRestart = false;
+    }
+    scheduleSshWorkerPersist(worker, 0);
+    worker.sockets.add(socket);
+    const actorSessions = () => [...worker.sessions.values()];
     const getSession = (serverId, create = false) => {
       const safeServerId = safeSegment(serverId || "default-server");
-      const poolKey = `${actorKey}:${safeServerId}`;
-      let session = sshSessionPool.get(poolKey);
+      let session = worker.sessions.get(safeServerId);
       if (!session && create) {
-        session = {
-          poolKey,
-          actorKey,
-          serverId: safeServerId,
-          socketId: crypto.randomUUID(),
-          client: null,
-          demo: false,
-          status: "disconnected",
-          home: "",
-          host: "",
-          port: 22,
-          username: "",
-          latency: undefined,
-          fingerprint: "",
-          activeStream: null,
-          activeRun: null,
-          agentSessions: new Map(),
-          agentUpdates: new Map(),
-          sockets: new Set(),
-          disconnectTimer: null,
-        };
-        sshSessionPool.set(poolKey, session);
+        session = createSshSession(worker, safeServerId);
+        worker.sessions.set(safeServerId, session);
+        scheduleSshWorkerPersist(worker, 0);
       }
-      return session ? attachSocket(session) : null;
+      return session || null;
     };
+    const storedState = await getState(actor);
+    const conversationCounts = new Map();
+    for (const conversation of storedState.conversations || []) {
+      const serverId = conversation?.work?.serverId;
+      if (!serverId || conversation?.work?.connectionEnabled === false) continue;
+      conversationCounts.set(
+        serverId,
+        Number(conversationCounts.get(serverId) || 0) + 1,
+      );
+    }
     const connectionPayload = (session, resumed = false) => ({
       serverId: session.serverId,
       status: session.status,
@@ -3921,17 +4772,18 @@ function attachWebSocketServer(server) {
         session.status === "error" ? session.fingerprint || undefined : undefined,
       demo: session.demo,
       resumed,
+      conversationCount: Number(conversationCounts.get(session.serverId) || 0),
+      activeTaskCount: session.activeRun ? 1 : 0,
     });
 
     activeSockets.add(socket);
     const resumedSessions = actorSessions();
-    for (const session of resumedSessions) attachSocket(session);
     wsSend(socket, {
       type: "connections.snapshot",
       connections: resumedSessions
-        .filter((session) => session.status === "connected")
         .map((session) => connectionPayload(session, true)),
     });
+    replayWorkerTasks(socket, worker);
     for (const session of resumedSessions.filter(
       (item) => item.status === "connected",
     )) {
@@ -3954,19 +4806,12 @@ function attachWebSocketServer(server) {
           ],
         });
       } else {
-        prepareRemoteAgents(session, actor)
-          .then((agents) =>
-            wsSend(socket, {
-              type: "agent.list",
-              serverId: session.serverId,
-              agents,
-            }),
-          )
+        publishRemoteAgentScan(session, actor, (payload) => wsSend(socket, payload))
           .catch(() => undefined);
       }
     }
 
-    socket.on("message", async (raw) => {
+    workerMessageHandler = async (raw) => {
       let payload;
       let targetSession = null;
       try {
@@ -4003,6 +4848,7 @@ function attachWebSocketServer(server) {
               )
             : null);
         if (!targetSession) throw new Error("没有找到对应的远程连接");
+        touchSshSession(targetSession);
 
         if (payload.type === "ssh.disconnect") {
           await closeSshSession(targetSession);
@@ -4015,8 +4861,11 @@ function attachWebSocketServer(server) {
           return;
         }
         if (payload.type === "agent.scan") {
-          const agents = targetSession.demo
-            ? [
+          if (targetSession.demo) {
+            wsSend(socket, {
+              type: "agent.list",
+              serverId: targetSession.serverId,
+              agents: [
                 {
                   id: "opencode",
                   name: "OpenCode",
@@ -4028,13 +4877,11 @@ function attachWebSocketServer(server) {
                   managed: true,
                   configured: true,
                 },
-              ]
-            : await prepareRemoteAgents(targetSession, actor);
-          wsSend(socket, {
-            type: "agent.list",
-            serverId: targetSession.serverId,
-            agents,
-          });
+              ],
+            });
+          } else {
+            await publishRemoteAgentScan(targetSession, actor);
+          }
           return;
         }
         if (payload.type === "agent.add") {
@@ -4303,7 +5150,7 @@ function attachWebSocketServer(server) {
         }
         if (payload.type === "work.abort") {
           if (targetSession.activeStream) targetSession.activeStream.close();
-          wsSend(socket, {
+          publishWorkerEvent(targetSession, {
             type: "agent.event",
             conversationId: payload.conversationId,
             runId: payload.runId,
@@ -4316,7 +5163,7 @@ function attachWebSocketServer(server) {
               timestamp: isoNow(),
             },
           });
-          wsSend(socket, {
+          publishWorkerEvent(targetSession, {
             type: "task.error",
             conversationId: payload.conversationId,
             runId: payload.runId,
@@ -4336,7 +5183,14 @@ function attachWebSocketServer(server) {
               ? caught.message.replace(/\s+/g, " ").trim()
               : "unknown";
           console.warn(`[EasyWork SSH] connection failed: ${diagnostic}`);
-          wsSend(socket, {
+          if (targetSession) {
+            targetSession.status = "error";
+            targetSession.fingerprint = caught?.fingerprint || "";
+            targetSession.disconnectReason = message;
+            targetSession.lastDisconnectedAt = isoNow();
+            scheduleSshWorkerPersist(worker, 0);
+          }
+          sessionSend(targetSession || { worker }, {
             type: "connection.status",
             serverId:
               targetSession?.serverId ||
@@ -4350,7 +5204,7 @@ function attachWebSocketServer(server) {
             targetSession.activeStream = null;
             targetSession.activeRun = null;
           }
-          wsSend(socket, {
+          if (targetSession) publishWorkerEvent(targetSession, {
             type: "agent.event",
             conversationId: payload.conversationId,
             runId: payload.runId,
@@ -4363,12 +5217,19 @@ function attachWebSocketServer(server) {
               timestamp: isoNow(),
             },
           });
-          wsSend(socket, {
+          if (targetSession) publishWorkerEvent(targetSession, {
             type: "task.error",
             conversationId: payload.conversationId,
             runId: payload.runId,
             result: message,
           });
+          const failedTask = worker.tasks.get(String(payload.runId || ""));
+          if (failedTask) {
+            await persistWorkerTaskConversation(actor, failedTask).catch(
+              () => undefined,
+            );
+            await persistSshWorker(worker).catch(() => undefined);
+          }
         } else if (payload.type === "agent.install") {
           wsSend(socket, {
             type: "agent.list",
@@ -4413,24 +5274,52 @@ function attachWebSocketServer(server) {
           });
         }
       }
-    });
+    };
+    for (const raw of pendingMessages.splice(0)) {
+      void workerMessageHandler(raw);
+    }
     socket.on("close", () => {
       activeSockets.delete(socket);
-      for (const session of actorSessions()) {
-        session.sockets.delete(socket);
-        if (session.sockets.size || session.disconnectTimer) continue;
-        session.disconnectTimer = setTimeout(() => {
-          session.disconnectTimer = null;
-          if (session.sockets.size) return;
-          void closeSshSession(session)
-            .catch(() => undefined)
-            .finally(() => sshSessionPool.delete(session.poolKey));
-        }, SSH_RECONNECT_GRACE_MS);
-        session.disconnectTimer.unref?.();
-      }
+      worker.sockets.delete(socket);
     });
+    if (socketClosed) {
+      activeSockets.delete(socket);
+      worker.sockets.delete(socket);
+    }
   });
   return wss;
+}
+
+async function cleanupIdleSshWorkers(now = Date.now()) {
+  const cutoff = now - SSH_IDLE_TTL_MS;
+  for (const [workerKey, worker] of sshWorkerPool) {
+    let changed = false;
+    for (const [serverId, session] of worker.sessions) {
+      const lastActivity = Date.parse(session.lastUserActivityAt || "") || 0;
+      if (session.activeRun || lastActivity >= cutoff) continue;
+      await closeSshSession(session).catch(() => undefined);
+      worker.sessions.delete(serverId);
+      changed = true;
+    }
+    for (const [runId, task] of worker.tasks) {
+      if (task.status === "running") continue;
+      const finishedAt = Date.parse(task.finishedAt || task.updatedAt || "") || 0;
+      if (finishedAt && finishedAt < cutoff) {
+        worker.tasks.delete(runId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      if (worker.persistTimer) {
+        clearTimeout(worker.persistTimer);
+        worker.persistTimer = null;
+      }
+      await persistSshWorker(worker).catch(() => undefined);
+    }
+    if (!worker.sockets.size && !worker.sessions.size && !worker.tasks.size) {
+      sshWorkerPool.delete(workerKey);
+    }
+  }
 }
 
 export async function createEasyWorkServer() {
@@ -4442,11 +5331,19 @@ export async function createEasyWorkServer() {
     void handleHttp(req, res);
   });
   const wss = attachWebSocketServer(server);
+  const cleanupTimer = setInterval(() => {
+    void cleanupIdleSshWorkers();
+  }, SSH_CLEANUP_INTERVAL_MS);
+  cleanupTimer.unref?.();
+  server.once("close", () => {
+    clearInterval(cleanupTimer);
+  });
   return { server, wss };
 }
 
 export const gatewayTestHelpers = {
-  agentPromptWithWorkflow,
+  agentPromptWithNativePlanning,
+  agentPlanEventStatus,
   createThinkTagRouter,
   describeSshError,
   ensureOpenCodeNativeConfig,
@@ -4455,18 +5352,25 @@ export const gatewayTestHelpers = {
   openCodeUpdateProbeCommand,
   parseOpenCodeUpdateVersions,
   fallbackConversationTitle,
+  extractModelText,
+  getSshWorker,
   mergeOpenCodeAuthContent,
   mergeOpenCodeConfigContent,
   normalizeConversationTitle,
+  normalizeAgentPlanStatus,
+  normalizeAgentPlanSteps,
   openCodeConfigurationStatus,
+  classifyOpenCodeText,
+  cleanupIdleSshWorkers,
+  createSshSession,
+  createWorkerTask,
   parseOpenCodeLine,
-  parseWorkPlan,
-  parseWorkflowPlan,
-  planWorkSteps,
   prepareRemoteAgents,
+  persistWorkerTaskConversation,
+  publishWorkerEvent,
   providerConfigForOpenCode,
-  workflowFor,
-  workflowIndexForEvent,
+  stripEasyWorkProtocolMarkers,
+  trailingFinalMessages,
 };
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

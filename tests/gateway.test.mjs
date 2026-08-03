@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import os from "node:os";
@@ -27,14 +27,17 @@ function mergeCookies(current, response) {
   return [...next.values()].join("; ");
 }
 
-test("work planning is prepared before execution and OpenCode events stay structured", async () => {
+test("Agent-native plans mirror todo snapshots and OpenCode events stay structured", async () => {
   const { gatewayTestHelpers } = await import(
     `../gateway/server.mjs?work-events=${Date.now()}`
   );
   const {
-    agentPromptWithWorkflow,
+    agentPromptWithNativePlanning,
+    classifyOpenCodeText,
+    extractModelText,
     mergeOpenCodeAuthContent,
     mergeOpenCodeConfigContent,
+    normalizeAgentPlanSteps,
     normalizeConversationTitle,
     normalizeOpenCodeVersion,
     openCodeUpdateApplyCommand,
@@ -42,47 +45,80 @@ test("work planning is prepared before execution and OpenCode events stay struct
     openCodeConfigurationStatus,
     parseOpenCodeLine,
     parseOpenCodeUpdateVersions,
-    parseWorkPlan,
-    parseWorkflowPlan,
     providerConfigForOpenCode,
-    workflowFor,
-    workflowIndexForEvent,
+    stripEasyWorkProtocolMarkers,
+    trailingFinalMessages,
   } = gatewayTestHelpers;
-  const fallback = workflowFor("查看内存和 CPU");
-  const planned = parseWorkflowPlan(
-    '```json\n{"steps":["确认登录节点","检查可用内存","核对 CPU 资源","给出判断"]}\n```',
-    fallback,
-  );
-  assert.deepEqual(planned, [
-    "确认登录节点",
-    "检查可用内存",
-    "核对 CPU 资源",
-    "给出判断",
-  ]);
   assert.equal(
     normalizeConversationTitle("“查看登录节点资源是否充足”", "查看资源"),
     "查看登录节点资源是否充足",
   );
   assert.equal(
+    normalizeConversationTitle(
+      "我们根据对话内容生成标题。用户希望了解助手能力。",
+      "介绍一下你自己",
+    ),
+    "介绍一下你自己",
+  );
+  assert.equal(
+    extractModelText({
+      output: [
+        {
+          type: "reasoning",
+          content: [{ type: "reasoning_text", text: "先分析如何命名。" }],
+        },
+        {
+          type: "message",
+          content: [{ type: "output_text", text: "EasyWork助手介绍" }],
+        },
+      ],
+    }),
+    "EasyWork助手介绍",
+  );
+  assert.equal(
     [...normalizeConversationTitle("", "请帮我查看服务器内存、GPU、磁盘与作业队列是否满足训练要求")].length,
     14,
   );
+  assert.equal(
+    classifyOpenCodeText("[[EASYWORK_FINAL]]\n最终正文").kind,
+    "message",
+  );
   assert.deepEqual(
-    parseWorkPlan(
-      '{"title":"训练资源检查","steps":["查看内存","检查 GPU","给出判断"]}',
-      "检查训练资源",
+    classifyOpenCodeText(
+      "正在整理结果。[[EASYWORK_FINAL]]结论：资源可以使用。",
     ),
     {
-      title: "训练资源检查",
-      steps: ["查看内存", "检查 GPU", "给出判断"],
+      kind: "message",
+      output: "结论：资源可以使用。",
+      pending: false,
     },
   );
-  const prompt = agentPromptWithWorkflow("用户请求：检查资源", planned);
-  assert.match(prompt, /EasyWork 网页端已编排的执行流程/);
-  assert.match(prompt, /2\. 检查可用内存/);
-  assert.match(prompt, /不要重新生成另一套计划/);
-  assert.match(prompt, /最终回答的提纲/);
-  assert.match(prompt, /综合所有证据给出总结性回答/);
+  assert.equal(
+    stripEasyWorkProtocolMarkers("[[EASYWORK_FINAL]]结论", true),
+    "结论",
+  );
+  const prompt = await agentPromptWithNativePlanning(
+    "用户请求：检查资源",
+    "保留用户的资源检查目标。",
+  );
+  assert.match(prompt, /Agent 原生计划联动/);
+  assert.match(prompt, /不会在网页端预先生成或注入执行步骤/);
+  assert.match(prompt, /原生 todo\/plan 工具及时维护真实状态/);
+  assert.match(prompt, /简单任务无需为了界面展示而额外创建计划/);
+  assert.match(prompt, /保留用户的资源检查目标/);
+  assert.match(prompt, /两个标记只用于前端路由/);
+  assert.doesNotMatch(prompt, /先说明结论|必须以.*结论/);
+  assert.match(prompt, /\[\[EASYWORK_PROGRESS\]\]/);
+  assert.match(prompt, /\[\[EASYWORK_FINAL\]\]/);
+  assert.deepEqual(
+    trailingFinalMessages([
+      { id: "progress", kind: "agent_message" },
+      { id: "premature-final", kind: "message" },
+      { id: "later-tool", kind: "tool_call" },
+      { id: "actual-final", kind: "message" },
+    ]),
+    [{ id: "actual-final", kind: "message" }],
+  );
 
   assert.equal(normalizeOpenCodeVersion("opencode v1.2.34"), "1.2.34");
   assert.deepEqual(
@@ -101,6 +137,51 @@ test("work planning is prepared before execution and OpenCode events stay struct
     finalText: "",
     lastError: "",
   };
+  const todoEvent = parseOpenCodeLine(
+    JSON.stringify({
+      type: "tool_use",
+      part: {
+        id: "todo_1",
+        tool: "todowrite",
+        state: {
+          status: "completed",
+          input: {
+            todos: [
+              { id: "inspect", content: "检查训练脚本", status: "completed", priority: "high" },
+              { id: "update", content: "修改参数校验", status: "in_progress", priority: "high" },
+              { id: "verify", content: "运行验证", status: "pending", priority: "medium" },
+              { id: "obsolete", content: "旧方案", status: "cancelled", priority: "low" },
+            ],
+          },
+          output: "4 todos",
+        },
+      },
+    }),
+    parserState,
+  );
+  assert.equal(todoEvent.kind, "plan");
+  assert.equal(todoEvent.title, "执行计划");
+  assert.equal(todoEvent.sourceId, "agent-native-plan");
+  assert.equal(todoEvent.status, "running");
+  assert.deepEqual(todoEvent.planSteps, [
+    { id: "inspect", title: "检查训练脚本", status: "done" },
+    { id: "update", title: "修改参数校验", status: "running" },
+    { id: "verify", title: "运行验证", status: "pending" },
+    { id: "obsolete", title: "旧方案", status: "cancelled" },
+  ]);
+  assert.deepEqual(
+    normalizeAgentPlanSteps("update_plan", {
+      plan: [
+        { step: "定位问题", status: "completed" },
+        { step: "实施修复", status: "in_progress" },
+      ],
+    }).map(({ title, status }) => ({ title, status })),
+    [
+      { title: "定位问题", status: "done" },
+      { title: "实施修复", status: "running" },
+    ],
+  );
+  assert.equal(normalizeAgentPlanSteps("bash", { todos: [] }), null);
   const commandEvent = parseOpenCodeLine(
     JSON.stringify({
       type: "tool_use",
@@ -119,10 +200,6 @@ test("work planning is prepared before execution and OpenCode events stay struct
   assert.equal(commandEvent.kind, "tool_call");
   assert.equal(commandEvent.command, "free -h");
   assert.equal(commandEvent.sourceId, "tool_1");
-  assert.equal(
-    workflowIndexForEvent(commandEvent, ["查看服务器内存", "查看可用资源", "判断结果"], 0),
-    0,
-  );
 
   const schedulerEvent = parseOpenCodeLine(
     JSON.stringify({
@@ -150,7 +227,11 @@ test("work planning is prepared before execution and OpenCode events stay struct
         tool: "edit",
         state: {
           status: "completed",
-          input: { filePath: "/work/train.py" },
+          input: {
+            filePath: "/work/train.py",
+            oldString: "epochs = 10",
+            newString: "epochs = 20",
+          },
           output: "updated",
         },
       },
@@ -160,7 +241,71 @@ test("work planning is prepared before execution and OpenCode events stay struct
   assert.equal(fileEvent.kind, "file_change");
   assert.equal(fileEvent.path, "/work/train.py");
   assert.equal(fileEvent.status, "done");
+  assert.match(fileEvent.diff, /--- a\/work\/train\.py/);
+  assert.match(fileEvent.diff, /-epochs = 10/);
+  assert.match(fileEvent.diff, /\+epochs = 20/);
 
+  const agentMessage = parseOpenCodeLine(
+    JSON.stringify({
+      type: "text",
+      part: { id: "text_1", text: "资源检查完成。" },
+    }),
+    parserState,
+  );
+  assert.equal(agentMessage.kind, "agent_message");
+  assert.equal(agentMessage.output, "资源检查完成。");
+  const streamedAgentMessage = parseOpenCodeLine(
+    JSON.stringify({
+      type: "text",
+      part: { id: "text_1", text: "资源检查完成。正在核对结果。" },
+    }),
+    parserState,
+  );
+  assert.equal(streamedAgentMessage.sourceId, "text_1");
+  assert.equal(streamedAgentMessage.output, "资源检查完成。正在核对结果。");
+  const nextAgentMessage = parseOpenCodeLine(
+    JSON.stringify({
+      type: "text",
+      part: { id: "text_2", text: "结果可信，准备汇总。" },
+    }),
+    parserState,
+  );
+  assert.equal(nextAgentMessage.sourceId, "text_2");
+  assert.equal(nextAgentMessage.output, "结果可信，准备汇总。");
+  assert.equal(
+    parseOpenCodeLine(
+      JSON.stringify({
+        type: "text",
+        part: { id: "text_final", text: "[[EASY" },
+      }),
+      parserState,
+    ),
+    null,
+  );
+  const streamedFinalMessage = parseOpenCodeLine(
+    JSON.stringify({
+      type: "text",
+      part: {
+        id: "text_final",
+        text: "WORK_FINAL]]\n可用资源充足。",
+      },
+    }),
+    parserState,
+  );
+  assert.equal(streamedFinalMessage.kind, "message");
+  assert.equal(streamedFinalMessage.output, "可用资源充足。");
+  assert.equal(parserState.finalText, "可用资源充足。");
+  assert.deepEqual(parserState.textOrder, ["text_1", "text_2", "text_final"]);
+  assert.equal(
+    parseOpenCodeLine(
+      JSON.stringify({
+        type: "text",
+        part: { id: "empty_text", text: "\n\n" },
+      }),
+      parserState,
+    ),
+    null,
+  );
   const errorEvent = parseOpenCodeLine(
     JSON.stringify({
       type: "error",
@@ -660,6 +805,115 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
   }
 });
 
+test("host worker persists a Work result without any browser subscriber", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-worker-task-test-"));
+  process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
+  process.env.EASYWORK_SKILL_DIR = path.join(temporaryRoot, "skill");
+  const { createEasyWorkServer, gatewayTestHelpers } = await import(
+    `../gateway/server.mjs?worker-task=${Date.now()}`
+  );
+  const { server } = await createEasyWorkServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const registration = await fetch(`${base}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "background-work@example.com",
+        password: "correct-horse",
+        displayName: "后台任务用户",
+      }),
+    });
+    const account = await registration.json();
+    const actor = account.actor;
+    const worker = await gatewayTestHelpers.getSshWorker(actor);
+    const session = gatewayTestHelpers.createSshSession(worker, "cluster-bg");
+    worker.sessions.set(session.serverId, session);
+    const task = gatewayTestHelpers.createWorkerTask(session, {
+      conversationId: "conversation-background",
+      runId: "run-background",
+      userMessageId: "message-background-user",
+      assistantMessageId: "message-background-assistant",
+      prompt: "检查后台任务是否继续执行",
+      agentId: "opencode",
+      workspace: "~",
+      firstTurn: true,
+    });
+    gatewayTestHelpers.publishWorkerEvent(session, {
+      type: "conversation.title",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      title: "后台 Work 任务",
+    });
+    gatewayTestHelpers.publishWorkerEvent(session, {
+      type: "workflow",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      steps: [
+        { id: "step-bg", title: "执行远程检查", status: "done" },
+        { id: "step-follow-up", title: "可选后续检查", status: "pending" },
+      ],
+    });
+    gatewayTestHelpers.publishWorkerEvent(session, {
+      type: "agent.event",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      event: {
+        id: "message-bg",
+        kind: "message",
+        title: "Agent 最终回复",
+        output: "网页关闭后任务仍已完成。",
+        status: "done",
+        timestamp: new Date().toISOString(),
+      },
+    });
+    gatewayTestHelpers.publishWorkerEvent(session, {
+      type: "task.complete",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      result: "网页关闭后任务仍已完成。",
+    });
+    await gatewayTestHelpers.persistWorkerTaskConversation(actor, task);
+    if (worker.persistTimer) {
+      clearTimeout(worker.persistTimer);
+      worker.persistTimer = null;
+    }
+    await worker.persistQueue;
+
+    const bootstrap = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${account.deviceToken}` },
+    });
+    const state = (await bootstrap.json()).state;
+    const conversation = state.conversations.find(
+      (item) => item.id === "conversation-background",
+    );
+    assert.equal(conversation.title, "后台 Work 任务");
+    assert.equal(conversation.work.serverId, "cluster-bg");
+    assert.equal(conversation.messages[0].trace.status, "done");
+    assert.deepEqual(
+      conversation.messages[0].trace.steps.map((step) => step.status),
+      ["done", "pending"],
+    );
+    assert.equal(
+      conversation.messages.find((message) => message.role === "assistant").content,
+      "网页关闭后任务仍已完成。",
+    );
+    assert.equal(worker.sockets.size, 0);
+    session.lastUserActivityAt = new Date(
+      Date.now() - 31 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    await gatewayTestHelpers.cleanupIdleSshWorkers(Date.now());
+    assert.equal(worker.sessions.has("cluster-bg"), false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    const resolved = path.resolve(temporaryRoot);
+    assert.ok(resolved.startsWith(path.resolve(os.tmpdir()) + path.sep));
+    await rm(resolved, { recursive: true, force: true });
+  }
+});
+
 test("account settings follow the user across devices and stay isolated from other users", async () => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-account-sync-test-"));
   process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
@@ -1121,6 +1375,66 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
     secondDeviceSocket = undefined;
 
     await new Promise((resolve) => {
+      socket.once("close", resolve);
+      socket.close();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    const authenticationCountAfterAllPagesClosed = authenticationCount;
+    const hostMaintainedSnapshot = await new Promise((resolve, reject) => {
+      socket = new WebSocket(
+        `${base.replace("http:", "ws:")}/ws?deviceToken=${encodeURIComponent(account.deviceToken)}`,
+      );
+      const timer = setTimeout(
+        () => reject(new Error("host worker did not retain SSH after all pages closed")),
+        4_000,
+      );
+      socket.on("message", (raw) => {
+        const event = JSON.parse(String(raw));
+        if (
+          event.type !== "connections.snapshot" ||
+          !event.connections?.some(
+            (connection) =>
+              connection.serverId === "cluster-a" &&
+              connection.status === "connected",
+          ) ||
+          !event.connections?.some(
+            (connection) =>
+              connection.serverId === "cluster-b" &&
+              connection.status === "connected",
+          )
+        ) {
+          return;
+        }
+        clearTimeout(timer);
+        resolve(event);
+      });
+      socket.once("error", reject);
+    });
+    assert.equal(hostMaintainedSnapshot.connections.length >= 2, true);
+    assert.equal(authenticationCount, authenticationCountAfterAllPagesClosed);
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    const workerRuntime = JSON.parse(
+      await readFile(
+        path.join(
+          temporaryRoot,
+          "data",
+          "users",
+          account.actor.id,
+          "ssh-worker.json",
+        ),
+        "utf8",
+      ),
+    );
+    assert.match(workerRuntime.workerId, /^ssh-worker-/);
+    assert.ok(
+      workerRuntime.sessions.some(
+        (session) =>
+          session.serverId === "cluster-a" && session.status === "connected",
+      ),
+    );
+    assert.equal(JSON.stringify(workerRuntime).includes("PRIVATE KEY"), false);
+
+    await new Promise((resolve) => {
       const onMessage = (raw) => {
         const event = JSON.parse(String(raw));
         if (event.type !== "connection.status" || event.status !== "disconnected") return;
@@ -1307,6 +1621,47 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
       return;
     }
     if (req.method === "POST" && req.url === "/v1/responses") {
+      const parsedBody = JSON.parse(requestBody || "{}");
+      if (parsedBody.stream) {
+        const completeText = "我是 **EasyWork Chat 助手**，很高兴见到你。";
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+        });
+        res.write(
+          `data: ${JSON.stringify({
+            type: "response.content_part.added",
+            part: { type: "output_text", text: "我是 **" },
+          })}\n\n`,
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            type: "response.output_text.delta",
+            delta: "EasyWork Chat 助手**，很高兴见到你。",
+          })}\n\n`,
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            type: "response.output_text.done",
+            text: completeText,
+          })}\n\n`,
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            type: "response.completed",
+            response: {
+              output: [
+                {
+                  type: "message",
+                  content: [{ type: "output_text", text: completeText }],
+                },
+              ],
+            },
+          })}\n\n`,
+        );
+        res.end("data: [DONE]\n\n");
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: { message: "responses unsupported" } }));
       return;
@@ -1369,7 +1724,7 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
   const providerAddress = providerServer.address();
   const providerBase = `http://127.0.0.1:${providerAddress.port}/v1`;
 
-  const { createEasyWorkServer, gatewayTestHelpers } = await import(
+  const { createEasyWorkServer } = await import(
     `../gateway/server.mjs?models=${Date.now()}`
   );
   const { server } = await createEasyWorkServer();
@@ -1516,21 +1871,48 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
       "先检查上下文。再核对资源。",
     );
 
-    const plannedSteps = await gatewayTestHelpers.planWorkSteps(
-      {
-        baseUrl: providerBase,
-        model: "chat-model",
-        protocol: "chat-completions",
+    const saveResponsesProvider = await fetch(`${base}/api/settings/provider`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authorization,
       },
-      "test-key",
-      "修改训练脚本并验证",
+      body: JSON.stringify({
+        baseUrl: providerBase,
+        apiKey: "test-key",
+        model: "chat-model",
+        protocol: "responses",
+      }),
+    });
+    assert.equal(saveResponsesProvider.status, 200);
+    const responsesStreamResponse = await fetch(`${base}/api/chat/stream`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authorization,
+      },
+      body: JSON.stringify({
+        conversationId: "responses-stream-test",
+        prompt: "测试 Responses 首分片",
+        firstTurn: false,
+      }),
+    });
+    assert.equal(responsesStreamResponse.status, 200);
+    const responsesStreamEvents = (await responsesStreamResponse.text())
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      responsesStreamEvents
+        .filter((event) => event.type === "content_delta")
+        .map((event) => event.delta),
+      ["我是 **", "EasyWork Chat 助手**，很高兴见到你。"],
     );
-    assert.deepEqual(plannedSteps, [
-      "确认目标",
-      "检查文件",
-      "执行修改",
-      "验证结果",
-    ]);
+    assert.equal(
+      responsesStreamEvents.find((event) => event.type === "done")?.content,
+      "我是 **EasyWork Chat 助手**，很高兴见到你。",
+    );
+
   } finally {
     await Promise.all([
       new Promise((resolve) => server.close(resolve)),
