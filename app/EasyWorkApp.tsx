@@ -61,9 +61,12 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
+  Children,
+  isValidElement,
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -71,10 +74,12 @@ import {
 
 type Mode = "chat" | "work";
 type ViewName = "chat" | "project" | "library" | "skills" | "memory";
-type StepStatus = "pending" | "running" | "done" | "error";
+type StepStatus = "pending" | "running" | "done" | "error" | "cancelled";
 type EventStatus = "pending" | "running" | "done" | "error";
 type WorkEventKind =
   | "message"
+  | "agent_message"
+  | "agent_reasoning"
   | "plan"
   | "tool_call"
   | "approval_request"
@@ -92,7 +97,6 @@ type WorkflowStep = {
   id: string;
   title: string;
   status: StepStatus;
-  detail?: string;
 };
 
 type WorkEvent = {
@@ -101,9 +105,11 @@ type WorkEvent = {
   title: string;
   detail?: string;
   output?: string;
+  diff?: string;
   command?: string;
   path?: string;
   language?: string;
+  retractFinal?: boolean;
   status: EventStatus;
   timestamp: string;
 };
@@ -121,6 +127,7 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   reasoning?: string;
+  reasoningStatus?: "running" | "done" | "error";
   createdAt: string;
   mode: Mode;
   selectedSkills?: string[];
@@ -142,6 +149,7 @@ type Conversation = {
     agentSessionId?: string;
     workspace?: string;
     serverId?: string;
+    connectionEnabled?: boolean;
   };
 };
 
@@ -263,6 +271,8 @@ type ConnectionState = {
   latency?: number;
   fingerprint?: string;
   demo?: boolean;
+  conversationCount?: number;
+  activeTaskCount?: number;
 };
 
 type AgentItem = {
@@ -375,6 +385,26 @@ function fallbackConversationTitle(prompt: string) {
   return [...(compact || "新对话")].slice(0, 14).join("");
 }
 
+function conversationTitleNeedsRepair(title: string) {
+  const value = String(title || "").trim();
+  return (
+    !value ||
+    value === "新对话" ||
+    /(?:生成|拟定|概括|总结).{0,8}(?:标题|题目)|(?:标题|题目).{0,6}(?:是|为)|根据.{0,16}(?:对话|请求|回答)|[。！？!?；;]/.test(
+      value,
+    )
+  );
+}
+
+function repairConversationTitle(conversation: Conversation) {
+  const firstPrompt = conversation.messages?.find(
+    (message) => message.role === "user",
+  )?.content;
+  return firstPrompt && conversationTitleNeedsRepair(conversation.title)
+    ? { ...conversation, title: fallbackConversationTitle(firstPrompt) }
+    : conversation;
+}
+
 const DEFAULT_STATE: EasyWorkState = {
   projects: [],
   conversations: [],
@@ -472,9 +502,9 @@ function mergeStoredState(
           ]
         : current.settings.servers;
   const conversations = Array.isArray(incoming.conversations)
-    ? incoming.conversations.filter(
-        (conversation) => (conversation.messages?.length ?? 0) > 0,
-      )
+    ? incoming.conversations
+        .filter((conversation) => (conversation.messages?.length ?? 0) > 0)
+        .map(repairConversationTitle)
     : current.conversations;
   const referencedProjects = new Set(
     conversations.map((conversation) => conversation.projectId).filter(Boolean),
@@ -581,6 +611,11 @@ const formatProjectDate = (value: string) =>
     day: "numeric",
   }).format(new Date(value));
 
+const stripEasyWorkProtocolText = (value: string) =>
+  String(value || "")
+    .replace(/\[\[\s*EASYWORK_(?:FINAL|PROGRESS)\s*\]\]/gi, "")
+    .trimStart();
+
 const conversationPreview = (conversation: Conversation) =>
   conversation.messages.find((message) => message.role === "user")?.content ||
   "还没有内容";
@@ -603,12 +638,23 @@ function MarkdownContent({
   content: string;
   compact?: boolean;
 }) {
+  const normalizedContent = String(content || "").replace(
+    /^(\s*(?:#{1,6}\s+.+|\*\*[^*\n]+\*\*|__[^_\n]+__))\r?\n(?=\s*\d+[.)]\s+)/gm,
+    "$1\n\n",
+  );
   const inlineTone = (value: string) => {
     let hash = 0;
     for (const character of value) {
       hash = (hash * 31 + character.codePointAt(0)!) >>> 0;
     }
     return hash % 5;
+  };
+  const fencedCodeLanguage = (children: React.ReactNode) => {
+    const child = Children.toArray(children)[0];
+    if (!isValidElement<{ className?: string }>(child)) return "";
+    return String(child.props.className || "")
+      .match(/(?:^|\s)language-([^\s]+)/i)?.[1]
+      ?.toLowerCase() || "";
   };
   return (
     <div className={`markdown-content${compact ? " compact" : ""}`}>
@@ -621,9 +667,41 @@ function MarkdownContent({
               {children}
             </a>
           ),
-          pre: ({ children }) => (
-            <pre className="markdown-code-block">{children}</pre>
-          ),
+          pre: ({ children }) => {
+            const language = fencedCodeLanguage(children);
+            const terminal = /^(?:bash|sh|shell|console|terminal|zsh|fish|powershell|pwsh|cmd)$/.test(
+              language,
+            );
+            const languageLabel: Record<string, string> = {
+              javascript: "JavaScript",
+              js: "JavaScript",
+              typescript: "TypeScript",
+              ts: "TypeScript",
+              python: "Python",
+              py: "Python",
+              json: "JSON",
+              yaml: "YAML",
+              yml: "YAML",
+              toml: "TOML",
+              css: "CSS",
+              html: "HTML",
+              jsx: "JSX",
+              tsx: "TSX",
+            };
+            return (
+              <pre
+                className={`remote-terminal markdown-terminal${
+                  terminal ? " terminal-fence" : " code-fence"
+                }`}
+              >
+                <span className="terminal-caption">
+                  <i />
+                  {terminal ? "终端" : languageLabel[language] || language || "代码"}
+                </span>
+                {children}
+              </pre>
+            );
+          },
           code: ({ children, className }) => {
             const value = String(children).replace(/\n$/, "");
             const block = Boolean(className) || value.includes("\n");
@@ -646,7 +724,7 @@ function MarkdownContent({
           ),
         }}
       >
-        {content}
+        {normalizedContent}
       </ReactMarkdown>
     </div>
   );
@@ -717,6 +795,13 @@ function StatusGlyph({ status }: { status: StepStatus }) {
       </span>
     );
   }
+  if (status === "cancelled") {
+    return (
+      <span className="step-glyph cancelled">
+        <Square size={8} />
+      </span>
+    );
+  }
   return (
     <span className="step-glyph pending">
       <Circle size={8} />
@@ -726,14 +811,15 @@ function StatusGlyph({ status }: { status: StepStatus }) {
 
 function normalizedEventKind(kind: WorkEventKind): WorkEventKind {
   if (kind === "tool" || kind === "terminal") return "tool_call";
-  if (kind === "result") return "message";
+  if (kind === "result") return "agent_message";
   return kind;
 }
 
-function eventStatusLabel(status: EventStatus) {
+function eventStatusLabel(status: EventStatus | StepStatus) {
   if (status === "running") return "正在进行";
   if (status === "done") return "已完成";
   if (status === "error") return "失败";
+  if (status === "cancelled") return "已取消";
   return "等待";
 }
 
@@ -747,8 +833,11 @@ function EventGlyph({ event }: { event: WorkEvent }) {
   if (kind === "job_status") return <Gauge size={14} />;
   if (kind === "artifact") return <FileArchive size={14} />;
   if (kind === "reasoning") return <Brain size={14} />;
+  if (kind === "agent_reasoning") return <Brain size={14} />;
   if (kind === "connection") return <Network size={14} />;
-  if (kind === "message") return <MessageCircle size={14} />;
+  if (kind === "message" || kind === "agent_message") {
+    return <MessageCircle size={14} />;
+  }
   return <Check size={13} />;
 }
 
@@ -779,7 +868,7 @@ function ReasoningDisclosure({
           {running ? <LoaderCircle size={14} /> : <Brain size={14} />}
         </span>
         <strong>{running ? "思考中" : "思考完成"}</strong>
-        <ChevronDown size={13} />
+        <ChevronRight className="reasoning-chevron" size={13} />
       </button>
       <div className="reasoning-motion">
         <div>
@@ -808,7 +897,7 @@ function useAutoDisclosure(autoOpen: boolean) {
 }
 
 function CommandEventItem({ event }: { event: WorkEvent }) {
-  const [expanded, setExpanded] = useAutoDisclosure(event.status === "running");
+  const [expanded, setExpanded] = useState(false);
   const command = event.command || event.title;
   const panelId = `command-output-${event.id}`;
   return (
@@ -860,7 +949,7 @@ function CommandEventItem({ event }: { event: WorkEvent }) {
 function CommandEventGroup({ events }: { events: WorkEvent[] }) {
   const running = events.some((event) => event.status === "running");
   const failed = events.some((event) => event.status === "error");
-  const [groupExpanded, setGroupExpanded] = useAutoDisclosure(running);
+  const [groupExpanded, setGroupExpanded] = useState(false);
   const groupLabel = running
     ? `正在运行 ${events.length} 个命令`
     : `运行了 ${events.length} 个命令`;
@@ -895,21 +984,157 @@ function CommandEventGroup({ events }: { events: WorkEvent[] }) {
   );
 }
 
+function diffLineTone(line: string) {
+  if (/^(diff --git|index |--- |\+\+\+ )/.test(line)) return "meta";
+  if (line.startsWith("@@")) return "hunk";
+  if (line.startsWith("+")) return "added";
+  if (line.startsWith("-")) return "removed";
+  return "context";
+}
+
+function DiffView({ content }: { content: string }) {
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  return (
+    <div className="file-diff" aria-label="文件修改差异">
+      <div className="file-diff-caption">
+        <Code2 size={13} />
+        <span>Diff</span>
+      </div>
+      <div className="file-diff-lines">
+        {lines.map((line, index) => (
+          <div className={`file-diff-line ${diffLineTone(line)}`} key={`${index}-${line}`}>
+            <span className="file-diff-number">{index + 1}</span>
+            <code>{line || " "}</code>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function mergeAdjacentFileEvents(events: WorkEvent[]) {
+  const merged = new Map<string, WorkEvent>();
+  for (const event of events) {
+    const key = event.path || event.title || event.id;
+    const previous = merged.get(key);
+    if (!previous) {
+      merged.set(key, event);
+      continue;
+    }
+    merged.set(key, {
+      ...previous,
+      ...event,
+      id: previous.id,
+      diff:
+        previous.diff && event.diff && previous.diff !== event.diff
+          ? `${previous.diff}\n\n${event.diff}`
+          : event.diff || previous.diff,
+      output: event.output || previous.output,
+      status:
+        previous.status === "error" || event.status === "error"
+          ? "error"
+          : previous.status === "running" || event.status === "running"
+            ? "running"
+            : "done",
+    });
+  }
+  return [...merged.values()];
+}
+
+function FileChangeItem({ event }: { event: WorkEvent }) {
+  const [expanded, setExpanded] = useState(false);
+  const fileName = event.path?.split(/[\\/]/).filter(Boolean).at(-1) || event.title;
+  const panelId = `file-change-${event.id}`;
+  return (
+    <article className={`file-change-item ${event.status}${expanded ? " expanded" : ""}`}>
+      <button
+        className="file-change-summary"
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={panelId}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="file-change-status">
+          {event.status === "running" ? (
+            <LoaderCircle size={13} />
+          ) : event.status === "error" ? (
+            <X size={12} />
+          ) : (
+            <FileText size={13} />
+          )}
+        </span>
+        <span className="file-change-copy">
+          <strong title={fileName}>{fileName}</strong>
+          {event.path && <small title={event.path}>{event.path}</small>}
+        </span>
+        <ChevronRight className="file-change-chevron" size={13} />
+      </button>
+      <div className="file-change-detail-motion" id={panelId}>
+        <div>
+          <div className="file-change-detail">
+            {event.diff ? (
+              <DiffView content={event.diff} />
+            ) : event.output ? (
+              <pre className="file-change-raw">{event.output}</pre>
+            ) : (
+              <p className="file-change-empty">Agent 未返回可显示的差异内容。</p>
+            )}
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function FileChangeGroup({ events }: { events: WorkEvent[] }) {
+  const files = mergeAdjacentFileEvents(events);
+  const running = files.some((event) => event.status === "running");
+  const failed = files.some((event) => event.status === "error");
+  const [expanded, setExpanded] = useState(false);
+  const label = running
+    ? `正在编辑 ${files.length} 个文件`
+    : `已编辑 ${files.length} 个文件`;
+  return (
+    <section
+      className={`file-change-group${running ? " running" : ""}${
+        failed ? " error" : ""
+      }${expanded ? " expanded" : ""}`}
+    >
+      <button
+        className="file-change-group-heading"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="file-change-group-glyph">
+          {running ? <LoaderCircle size={14} /> : failed ? <X size={13} /> : <FileText size={14} />}
+        </span>
+        <strong>{label}</strong>
+        <span>{failed ? "部分编辑失败" : "远程文件"}</span>
+        <ChevronRight className="file-change-group-chevron" size={13} />
+      </button>
+      <div className="file-change-list-motion">
+        <div className="file-change-list">
+          {files.map((event) => (
+            <FileChangeItem event={event} key={event.id} />
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function AgentEventRow({
   event,
   onApproval,
-  runStatus,
   workflowSteps,
 }: {
   event: WorkEvent;
   onApproval?: (event: WorkEvent, approved: boolean) => void;
-  runStatus?: RunTrace["status"];
   workflowSteps?: WorkflowStep[];
 }) {
   const kind = normalizedEventKind(event.kind);
-  const autoOpen =
-    event.status === "running" ||
-    (kind === "plan" && runStatus === "running");
+  const autoOpen = kind === "approval_request" && event.status === "pending";
   const [expanded, setExpanded] = useAutoDisclosure(autoOpen);
   const disclosable = Boolean(
     event.detail ||
@@ -918,6 +1143,20 @@ function AgentEventRow({
       (kind === "plan" && workflowSteps?.length) ||
       (kind === "approval_request" && event.status === "pending"),
   );
+  const completedPlanSteps =
+    kind === "plan"
+      ? (workflowSteps ?? []).filter((step) =>
+          ["done", "cancelled"].includes(step.status),
+        ).length
+      : 0;
+  const planStatusLabel =
+    event.status === "error"
+      ? "执行失败"
+      : workflowSteps?.length && completedPlanSteps === workflowSteps.length
+        ? "已完成"
+        : workflowSteps?.length
+          ? `${completedPlanSteps} / ${workflowSteps.length}`
+          : "";
   return (
     <article
       className={`agent-event ${kind} ${event.status}${expanded ? " expanded" : ""}`}
@@ -935,7 +1174,11 @@ function AgentEventRow({
           <strong>{event.title}</strong>
           {event.detail && <small>{event.detail}</small>}
         </span>
-        <span className="agent-event-status">{eventStatusLabel(event.status)}</span>
+        <span className="agent-event-status">
+          {kind === "plan"
+            ? planStatusLabel
+            : eventStatusLabel(event.status)}
+        </span>
         {disclosable && <ChevronRight className="agent-event-chevron" size={13} />}
       </button>
       {disclosable && (
@@ -954,7 +1197,6 @@ function AgentEventRow({
                       <StatusGlyph status={step.status} />
                       <span className="trace-step-copy">
                         <strong>{step.title}</strong>
-                        {step.detail && <small>{step.detail}</small>}
                       </span>
                     </div>
                   ))}
@@ -984,16 +1226,33 @@ function AgentEventRow({
   );
 }
 
+function AgentThoughtEvent({ event }: { event: WorkEvent }) {
+  const content = String(event.output || event.detail || "").trim();
+  if (!content) return null;
+  return (
+    <section
+      className={`agent-thought-event ${event.status}`}
+      aria-label="Agent 中间输出"
+    >
+      <div className="agent-thought-content">
+        <MarkdownContent content={content} compact />
+      </div>
+    </section>
+  );
+}
+
 function WorkEventFeed({
   events,
   onApproval,
   runStatus,
   workflowSteps,
+  finalAnswerStarted = false,
 }: {
   events: WorkEvent[];
   onApproval?: (event: WorkEvent, approved: boolean) => void;
   runStatus?: RunTrace["status"];
   workflowSteps?: WorkflowStep[];
+  finalAnswerStarted?: boolean;
 }) {
   const visibleEvents = events
     .filter(
@@ -1007,6 +1266,12 @@ function WorkEventFeed({
           /开始新步骤|开始推进下一步/.test(event.title)
         ),
     )
+    .filter((event) => {
+      const kind = normalizedEventKind(event.kind);
+      if (kind === "plan") return Boolean(workflowSteps?.length);
+      if (!["agent_message", "agent_reasoning"].includes(kind)) return true;
+      return Boolean(String(event.output || event.detail || "").trim());
+    })
     .map((event) =>
       event.status === "running" && (runStatus === "done" || runStatus === "error")
         ? {
@@ -1017,11 +1282,19 @@ function WorkEventFeed({
     );
   const segments: Array<
     | { type: "commands"; id: string; events: WorkEvent[] }
+    | { type: "files"; id: string; events: WorkEvent[] }
     | { type: "event"; id: string; event: WorkEvent }
   > = [];
 
   for (const event of visibleEvents) {
-    if (normalizedEventKind(event.kind) === "tool_call" || event.command) {
+    if (normalizedEventKind(event.kind) === "file_change") {
+      const previous = segments.at(-1);
+      if (previous?.type === "files") {
+        previous.events.push(event);
+      } else {
+        segments.push({ type: "files", id: event.id, events: [event] });
+      }
+    } else if (normalizedEventKind(event.kind) === "tool_call" || event.command) {
       const previous = segments.at(-1);
       if (previous?.type === "commands") {
         previous.events.push(event);
@@ -1033,23 +1306,74 @@ function WorkEventFeed({
     }
   }
 
-  if (!segments.length) return null;
+  const callRunning =
+    runStatus === "running" ||
+    visibleEvents.some((event) => event.status === "running");
+  const callFailed =
+    runStatus === "error" ||
+    visibleEvents.some((event) => event.status === "error");
+  const [expanded, setExpanded] = useAutoDisclosure(
+    Boolean(segments.length) && callRunning && !finalAnswerStarted,
+  );
+  const hasDetails = segments.length > 0;
+
   return (
-    <div className="agent-activity" aria-label="Agent 调用过程">
-      {segments.map((segment) =>
-        segment.type === "commands" ? (
-          <CommandEventGroup events={segment.events} key={segment.id} />
-        ) : (
-          <AgentEventRow
-            event={segment.event}
-            key={segment.id}
-            onApproval={onApproval}
-            runStatus={runStatus}
-            workflowSteps={workflowSteps}
-          />
-        ),
+    <section
+      className={`agent-call ${expanded ? "expanded" : ""}${
+        callRunning ? " running" : ""
+      }${callFailed ? " error" : ""}${hasDetails ? " has-details" : " no-details"}`}
+    >
+      <button
+        className="agent-call-heading"
+        type="button"
+        aria-expanded={hasDetails ? expanded : undefined}
+        onClick={() => hasDetails && setExpanded((current) => !current)}
+      >
+        <span className="agent-call-glyph">
+          {callRunning ? (
+            <LoaderCircle size={14} />
+          ) : callFailed ? (
+            <X size={13} />
+          ) : (
+            <Bot size={14} />
+          )}
+        </span>
+        <strong>
+          {callRunning
+            ? "Agent调用中"
+            : callFailed
+              ? "Agent调用失败"
+              : "Agent调用完成"}
+        </strong>
+        {hasDetails && <ChevronRight className="agent-call-chevron" size={13} />}
+      </button>
+      {hasDetails && (
+        <div className="agent-call-motion">
+          <div>
+            <div className="agent-activity" aria-label="Agent 调用过程">
+              {segments.map((segment) =>
+                segment.type === "commands" ? (
+                  <CommandEventGroup events={segment.events} key={segment.id} />
+                ) : segment.type === "files" ? (
+                  <FileChangeGroup events={segment.events} key={segment.id} />
+                ) : ["agent_message", "agent_reasoning"].includes(
+                    normalizedEventKind(segment.event.kind),
+                  ) ? (
+                  <AgentThoughtEvent event={segment.event} key={segment.id} />
+                ) : (
+                  <AgentEventRow
+                    event={segment.event}
+                    key={segment.id}
+                    onApproval={onApproval}
+                    workflowSteps={workflowSteps}
+                  />
+                ),
+              )}
+            </div>
+          </div>
+        </div>
       )}
-    </div>
+    </section>
   );
 }
 
@@ -1091,6 +1415,51 @@ function ScrollingTitle({ title }: { title: string }) {
   );
 }
 
+function useAnchoredMenuPosition(
+  open: boolean,
+  estimatedWidth = 214,
+  estimatedHeight = 220,
+) {
+  const anchorRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [position, setPosition] = useState({
+    left: 0,
+    top: 0,
+    ready: false,
+  });
+
+  useEffect(() => {
+    if (!open) return;
+    const updatePosition = () => {
+      const anchor = anchorRef.current;
+      if (!anchor) return;
+      const rect = anchor.getBoundingClientRect();
+      const menuWidth = menuRef.current?.offsetWidth || estimatedWidth;
+      const menuHeight = menuRef.current?.offsetHeight || estimatedHeight;
+      const below = rect.bottom + 4;
+      const top =
+        below + menuHeight <= window.innerHeight - 8
+          ? below
+          : Math.max(8, rect.top - menuHeight - 4);
+      const left = Math.max(
+        8,
+        Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 8),
+      );
+      setPosition({ left, top, ready: true });
+    };
+    const frame = window.requestAnimationFrame(updatePosition);
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [estimatedHeight, estimatedWidth, open]);
+
+  return { anchorRef, menuRef, position };
+}
+
 function ConversationRow({
   conversation,
   active,
@@ -1119,56 +1488,11 @@ function ConversationRow({
   onDelete: () => void;
 }) {
   const destinations = projects.filter((project) => project.id !== conversation.projectId);
-  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const [menuPosition, setMenuPosition] = useState({
-    left: 0,
-    top: 0,
-    ready: false,
-  });
-
-  useEffect(() => {
-    if (!menuOpen) return;
-
-    const updatePosition = () => {
-      const anchor = menuButtonRef.current;
-      if (!anchor) return;
-      const rect = anchor.getBoundingClientRect();
-      const menuWidth = menuRef.current?.offsetWidth || 214;
-      const menuHeight = menuRef.current?.offsetHeight || 220;
-      const below = rect.bottom + 4;
-      const top =
-        below + menuHeight <= window.innerHeight - 8
-          ? below
-          : Math.max(8, rect.top - menuHeight - 4);
-      const left = Math.max(
-        8,
-        Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 8),
-      );
-      setMenuPosition({ left, top, ready: true });
-    };
-    const frame = window.requestAnimationFrame(updatePosition);
-    const closeOnOutsidePointer = (event: PointerEvent) => {
-      const target = event.target;
-      if (!(target instanceof Node)) return;
-      if (
-        menuRef.current?.contains(target) ||
-        menuButtonRef.current?.contains(target)
-      ) {
-        return;
-      }
-      onToggleMenu();
-    };
-    window.addEventListener("resize", updatePosition);
-    window.addEventListener("scroll", updatePosition, true);
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
-    return () => {
-      window.cancelAnimationFrame(frame);
-      window.removeEventListener("resize", updatePosition);
-      window.removeEventListener("scroll", updatePosition, true);
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-    };
-  }, [menuOpen, onToggleMenu]);
+  const {
+    anchorRef: menuButtonRef,
+    menuRef,
+    position: menuPosition,
+  } = useAnchoredMenuPosition(menuOpen);
 
   return (
     <div
@@ -1267,6 +1591,91 @@ function ConversationRow({
   );
 }
 
+function ProjectOptionsMenu({
+  project,
+  menuOpen,
+  onToggleMenu,
+  onRename,
+  onSettings,
+  onOpenHome,
+  onTogglePin,
+  onDelete,
+}: {
+  project: Project;
+  menuOpen: boolean;
+  onToggleMenu: () => void;
+  onRename: () => void;
+  onSettings: () => void;
+  onOpenHome: () => void;
+  onTogglePin: () => void;
+  onDelete: () => void;
+}) {
+  const {
+    anchorRef: menuButtonRef,
+    menuRef,
+    position: menuPosition,
+  } = useAnchoredMenuPosition(menuOpen, 204, 214);
+
+  return (
+    <>
+      <button
+        ref={menuButtonRef}
+        className="project-more-button"
+        type="button"
+        aria-label={`打开“${project.name}”的项目选项`}
+        aria-expanded={menuOpen}
+        onClick={(event) => {
+          event.stopPropagation();
+          onToggleMenu();
+        }}
+      >
+        <Ellipsis size={16} />
+      </button>
+      {menuOpen &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="conversation-menu conversation-menu-portal project-menu project-menu-portal"
+            role="menu"
+            ref={menuRef}
+            style={{
+              left: menuPosition.left,
+              top: menuPosition.top,
+              visibility: menuPosition.ready ? "visible" : "hidden",
+            }}
+          >
+            <button type="button" role="menuitem" onClick={onRename}>
+              <Pencil size={15} />
+              重命名项目
+            </button>
+            <button type="button" role="menuitem" onClick={onSettings}>
+              <Settings2 size={15} />
+              项目设置
+            </button>
+            <button type="button" role="menuitem" onClick={onOpenHome}>
+              <Home size={15} />
+              项目主页
+            </button>
+            <button type="button" role="menuitem" onClick={onTogglePin}>
+              {project.pinned ? <PinOff size={15} /> : <Pin size={15} />}
+              {project.pinned ? "取消置顶" : "置顶项目"}
+            </button>
+            <button
+              className="danger"
+              type="button"
+              role="menuitem"
+              onClick={onDelete}
+            >
+              <Trash2 size={15} />
+              删除项目
+            </button>
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+
 function UnifiedComposer({
   value,
   placeholder,
@@ -1308,6 +1717,9 @@ function UnifiedComposer({
   onDetectModels: () => void;
   onSelectModel: (model: string) => void;
 }) {
+  const localTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const activeTextareaRef = textareaRef ?? localTextareaRef;
+  const [multiline, setMultiline] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPage, setMenuPage] = useState<"root" | "skills">("root");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -1316,6 +1728,25 @@ function UnifiedComposer({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const enabledSkills = skills.filter((skill) => skill.enabled);
   const skillMenuHeight = Math.min(54 + Math.max(enabledSkills.length, 1) * 52, 314);
+
+  useLayoutEffect(() => {
+    const textarea = activeTextareaRef.current;
+    if (!textarea) return;
+    const minimumHeight = 30;
+    const maximumHeight = 140;
+    textarea.style.height = "0px";
+    const nextHeight = Math.min(
+      maximumHeight,
+      Math.max(minimumHeight, textarea.scrollHeight),
+    );
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY =
+      textarea.scrollHeight > maximumHeight ? "auto" : "hidden";
+    setMultiline((current) => {
+      const next = nextHeight > minimumHeight;
+      return current === next ? current : next;
+    });
+  }, [activeTextareaRef, value]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -1346,7 +1777,11 @@ function UnifiedComposer({
   };
 
   return (
-    <div className={`unified-composer${sending ? " busy" : ""}`}>
+    <div
+      className={`unified-composer${sending ? " busy" : ""}${
+        multiline ? " multiline" : ""
+      }`}
+    >
       <div className="composer-add-wrap" ref={menuWrapRef}>
         <button
           className={`composer-add-button${menuOpen ? " active" : ""}`}
@@ -1445,7 +1880,7 @@ function UnifiedComposer({
         )}
       </div>
       <textarea
-        ref={textareaRef}
+        ref={activeTextareaRef}
         value={value}
         disabled={disabled}
         rows={1}
@@ -1623,9 +2058,13 @@ export default function EasyWorkApp() {
   const [gatewayStatus, setGatewayStatus] = useState<
     "checking" | "connected" | "unavailable"
   >("checking");
+  const [appLoading, setAppLoading] = useState(true);
   const [gatewayProbe, setGatewayProbe] = useState(0);
   const [deviceToken, setDeviceToken] = useState("");
   const [agentsByServer, setAgentsByServer] = useState<Record<string, AgentItem[]>>({});
+  const [agentScanningByServer, setAgentScanningByServer] = useState<
+    Record<string, boolean>
+  >({});
   const [activeAgentByServer, setActiveAgentByServer] = useState<
     Record<string, string>
   >({});
@@ -1661,7 +2100,8 @@ export default function EasyWorkApp() {
     deviceToken: string;
   } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const messagesScrollRef = useRef<HTMLDivElement | null>(null);
+  const messagesPinnedToBottomRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const projectFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillInputRef = useRef<HTMLInputElement | null>(null);
@@ -1708,7 +2148,7 @@ export default function EasyWorkApp() {
     mode === "work"
       ? activeConversation?.work?.serverId || draftServerId || ""
       : "";
-  const connection: ConnectionState = connections[effectiveServerId] ?? {
+  const pooledConnection: ConnectionState = connections[effectiveServerId] ?? {
     serverId: effectiveServerId,
     status: "disconnected",
     label: "尚未连接远程服务器",
@@ -1717,6 +2157,18 @@ export default function EasyWorkApp() {
       (profile) => profile.id === effectiveServerId,
     )?.username,
   };
+  const conversationConnectionEnabled =
+    activeConversation?.work?.connectionEnabled !== false;
+  const connection: ConnectionState =
+    mode === "work" &&
+    activeConversation?.work?.serverId &&
+    !conversationConnectionEnabled
+      ? {
+          ...pooledConnection,
+          status: "disconnected",
+          label: "此对话已断开远程服务器",
+        }
+      : pooledConnection;
   const agents = dedupeAgents(
     effectiveServerId
       ? agentsByServer[effectiveServerId] ?? DEFAULT_AGENTS
@@ -1731,6 +2183,9 @@ export default function EasyWorkApp() {
     agents.find((item) => item.id === activeAgentId) ??
     agents.find((item) => item.status === "ready") ??
     agents[0];
+  const activeAgentScanning = Boolean(
+    effectiveServerId && agentScanningByServer[effectiveServerId],
+  );
   const activeAgentUpdate = agentUpdatesByServer[effectiveServerId] ?? {
     status: "idle",
   };
@@ -1872,6 +2327,7 @@ export default function EasyWorkApp() {
       }));
       const isMemoryQuestion = /内存|显存|资源|memory|gpu/i.test(prompt);
       const isFileTask = /文件|代码|修改|编辑|脚本|报告/i.test(prompt);
+      const exposesAgentPlan = isMemoryQuestion || isFileTask;
       const steps = isMemoryQuestion
         ? ["查看服务器内存", "查看可用资源", "判断任务所需资源是否满足"]
         : isFileTask
@@ -1883,14 +2339,15 @@ export default function EasyWorkApp() {
         (message) => ({
           ...message,
           trace: {
-            runId,
+            ...(message.trace ?? { runId, startedAt: now() }),
             status: "running",
-            startedAt: now(),
-            steps: steps.map((title, index) => ({
-              id: `${runId}_step_${index}`,
-              title,
-              status: index === 0 ? "running" : "pending",
-            })),
+            steps: exposesAgentPlan
+              ? steps.map((title, index) => ({
+                  id: `${runId}_step_${index}`,
+                  title,
+                  status: index === 0 ? "running" : "pending",
+                }))
+              : [],
           },
         }),
       );
@@ -1898,16 +2355,18 @@ export default function EasyWorkApp() {
       const eventPlan: WorkEvent = {
         id: `${runId}_plan`,
         kind: "plan",
-        title: `已编排 ${steps.length} 个步骤`,
-        detail: "流程已发送给 Agent",
-        output: steps.map((step, index) => `${index + 1}. ${step}`).join("\n"),
-        status: "done",
+        title: "执行计划",
+        status: "running",
         timestamp: now(),
       };
       updateMessage(
         conversationId,
         (message) => message.runId === runId && message.role === "assistant",
-        (message) => ({ ...message, events: [eventPlan] }),
+        (message) => ({
+          ...message,
+          reasoningStatus: "done",
+          events: exposesAgentPlan ? [eventPlan] : [],
+        }),
       );
 
       const outputs = isMemoryQuestion
@@ -1965,8 +2424,21 @@ export default function EasyWorkApp() {
                 ...message,
                 events: [
                   ...(message.events ?? []).filter(
-                    (event) => event.id !== `${runId}_tool_${index}`,
+                    (event) =>
+                      event.id !== `${runId}_thought_${index}` &&
+                      event.id !== `${runId}_tool_${index}`,
                   ),
+                  {
+                    id: `${runId}_thought_${index}`,
+                    kind: "agent_message",
+                    title: "Agent思考中",
+                    output:
+                      index === 0
+                        ? "先核对当前环境，再开始执行。"
+                        : `已取得上一项结果，继续处理“${title}”。`,
+                    status: "running",
+                    timestamp: now(),
+                  },
                   {
                     id: `${runId}_tool_${index}`,
                     kind:
@@ -1994,6 +2466,10 @@ export default function EasyWorkApp() {
                             /报告|结果文件|导出/i.test(prompt)
                           ? "~/report.md"
                           : undefined,
+                    diff:
+                      isFileTask && index === 2
+                        ? "--- a/train.py\n+++ b/train.py\n@@ -1,2 +1,4 @@\n def run(config):\n+    if not config:\n+        raise ValueError(\"config is required\")\n     return train(config)"
+                        : undefined,
                     status: "running",
                     timestamp: now(),
                   },
@@ -2037,20 +2513,23 @@ export default function EasyWorkApp() {
             updateMessage(
               conversationId,
               (message) => message.runId === runId && message.role === "assistant",
-              (message) => ({
-                ...message,
-                content:
-                  index === steps.length - 1
-                    ? isMemoryQuestion
-                      ? "检查完成。登录节点共有 251 GiB 内存，目前约 164 GiB 可用；GPU 队列中有 2 张 A100 处于空闲状态。按当前资源，轻量推理可以直接进行；如果是训练任务，我建议先提交一个小规模试跑并限制峰值内存。"
-                      : "任务已经完成。你可以在右侧展开执行流程，也可以继续在同一个 Agent 任务中追加要求。"
-                    : message.content,
-                events: (message.events ?? []).map((event) =>
-                  event.id === `${runId}_tool_${index}`
-                    ? { ...event, status: "done" }
+              (message) => {
+                const finalContent = isMemoryQuestion
+                  ? "检查完成。登录节点共有 251 GiB 内存，目前约 164 GiB 可用；GPU 队列中有 2 张 A100 处于空闲状态。按当前资源，轻量推理可以直接进行。"
+                  : "任务已经完成。你可以继续在同一个 Agent 任务中追加要求。";
+                const completedEvents = (message.events ?? []).map((event) =>
+                  event.id === `${runId}_tool_${index}` ||
+                  event.id === `${runId}_thought_${index}`
+                    ? { ...event, status: "done" as const }
                     : event,
-                ),
-              }),
+                );
+                return {
+                  ...message,
+                  content:
+                    index === steps.length - 1 ? finalContent : message.content,
+                  events: completedEvents,
+                };
+              },
             );
             if (index === steps.length - 1) {
               setExpandedTraces((current) => {
@@ -2096,6 +2575,14 @@ export default function EasyWorkApp() {
                       ? String(item.fingerprint)
                       : undefined,
                   demo: Boolean(item.demo),
+                  conversationCount:
+                    typeof item.conversationCount === "number"
+                      ? item.conversationCount
+                      : undefined,
+                  activeTaskCount:
+                    typeof item.activeTaskCount === "number"
+                      ? item.activeTaskCount
+                      : undefined,
                 } satisfies ConnectionState,
               ];
             }),
@@ -2117,6 +2604,14 @@ export default function EasyWorkApp() {
           latency: typeof payload.latency === "number" ? payload.latency : undefined,
           fingerprint: payload.fingerprint ? String(payload.fingerprint) : undefined,
           demo: Boolean(payload.demo),
+          conversationCount:
+            typeof payload.conversationCount === "number"
+              ? payload.conversationCount
+              : undefined,
+          activeTaskCount:
+            typeof payload.activeTaskCount === "number"
+              ? payload.activeTaskCount
+              : undefined,
         };
         setConnections((current) => ({
           ...current,
@@ -2126,6 +2621,12 @@ export default function EasyWorkApp() {
               : nextConnection,
         }));
         if (status === "connected") {
+          if (!payload.reused && !payload.demo) {
+            setAgentScanningByServer((current) => ({
+              ...current,
+              [serverId]: true,
+            }));
+          }
           setSelectedServerId(serverId);
           setSshModalOpen(false);
           const pendingBinding = pendingServerBindingRef.current;
@@ -2135,6 +2636,7 @@ export default function EasyWorkApp() {
               work: {
                 ...(conversation.work ?? { workspace: "~" }),
                 serverId,
+                connectionEnabled: true,
               },
             }));
             pendingServerBindingRef.current = null;
@@ -2158,6 +2660,17 @@ export default function EasyWorkApp() {
         }));
         return;
       }
+      if (type === "agent.scan.status") {
+        const serverId = String(payload.serverId || "");
+        if (!serverId) return;
+        const scanning = String(payload.status || "") === "scanning";
+        setAgentScanningByServer((current) => ({
+          ...current,
+          [serverId]: scanning,
+        }));
+        if (scanning) setAgentMenuOpen(false);
+        return;
+      }
       if (type === "agent.list") {
         const serverId = String(payload.serverId || "");
         if (!serverId) return;
@@ -2165,6 +2678,10 @@ export default function EasyWorkApp() {
           Array.isArray(payload.agents) ? (payload.agents as AgentItem[]) : [],
         );
         setAgentsByServer((current) => ({ ...current, [serverId]: incoming }));
+        setAgentScanningByServer((current) => ({
+          ...current,
+          [serverId]: false,
+        }));
         const firstReady = incoming.find((agent) => agent.status === "ready");
         if (firstReady) {
           setActiveAgentByServer((current) => ({
@@ -2317,9 +2834,7 @@ export default function EasyWorkApp() {
               return {
                 id: String(incomingStep?.id ?? `${runId}_step_${index}`),
                 title: String(incomingStep?.title ?? step),
-                status: String(
-                  incomingStep?.status ?? (index === 0 ? "running" : "pending"),
-                ) as StepStatus,
+                status: String(incomingStep?.status ?? "pending") as StepStatus,
                 detail: incomingStep?.detail ? String(incomingStep.detail) : undefined,
               };
             })
@@ -2330,47 +2845,15 @@ export default function EasyWorkApp() {
           (message) => ({
             ...message,
             trace: {
+              ...(message.trace ?? {}),
               runId,
               status: "running",
               steps,
-              startedAt: now(),
+              startedAt: message.trace?.startedAt ?? now(),
             },
           }),
         );
-        setExpandedTraces(new Set([runId]));
-        return;
-      }
-
-      if (type === "workflow.step") {
-        const stepIndex = Number(payload.stepIndex);
-        const status = String(payload.status ?? "running") as StepStatus;
-        if (!Number.isInteger(stepIndex) || stepIndex < 0) return;
-        updateMessage(
-          conversationId,
-          (message) => message.runId === runId && message.role === "user",
-          (message) => ({
-            ...message,
-            trace: message.trace
-              ? {
-                  ...message.trace,
-                  status: status === "error" ? "error" : "running",
-                  steps: message.trace.steps.map((step, index) => ({
-                    ...step,
-                    status:
-                      index < stepIndex
-                        ? "done"
-                        : index === stepIndex
-                          ? status
-                          : step.status,
-                    detail:
-                      index === stepIndex && payload.detail
-                        ? String(payload.detail)
-                        : step.detail,
-                  })),
-                }
-              : message.trace,
-          }),
-        );
+        if (steps.length) setExpandedTraces(new Set([runId]));
         return;
       }
 
@@ -2383,10 +2866,14 @@ export default function EasyWorkApp() {
           kind: normalizedEventKind(rawKind),
           title: String(event.title ?? "Agent 事件"),
           detail: event.detail ? String(event.detail) : undefined,
-          output: event.output ? String(event.output) : undefined,
+          output: event.output
+            ? stripEasyWorkProtocolText(String(event.output))
+            : undefined,
+          diff: event.diff ? String(event.diff) : undefined,
           command: event.command ? String(event.command) : undefined,
           path: event.path ? String(event.path) : undefined,
           language: event.language ? String(event.language) : undefined,
+          retractFinal: Boolean(event.retractFinal),
           status: String(event.status ?? "done") as EventStatus,
           timestamp: String(event.timestamp ?? now()),
         };
@@ -2399,19 +2886,31 @@ export default function EasyWorkApp() {
             const eventKind = normalizedEventKind(workEvent.kind);
             const isMessage = eventKind === "message";
             const isReasoning = eventKind === "reasoning";
+            const eventsWithoutCurrent = previous.filter(
+              (item) => item.id !== eventId,
+            );
             return {
               ...message,
               content:
-                isMessage && workEvent.output
+                workEvent.retractFinal
+                  ? ""
+                  : isMessage && workEvent.output
                   ? workEvent.output
                   : message.content,
               reasoning:
                 isReasoning && (workEvent.output || workEvent.detail)
                   ? workEvent.output || workEvent.detail
                   : message.reasoning,
+              reasoningStatus: isReasoning
+                ? workEvent.status === "error"
+                  ? "error"
+                  : workEvent.status === "running"
+                    ? "running"
+                    : "done"
+                : message.reasoningStatus,
               events:
                 isMessage || isReasoning
-                  ? previous.filter((item) => item.id !== eventId)
+                  ? eventsWithoutCurrent
                   : exists
                     ? previous.map((item) =>
                         item.id === eventId ? workEvent : item,
@@ -2420,43 +2919,14 @@ export default function EasyWorkApp() {
             };
           },
         );
-        const stepIndex =
-          typeof payload.stepIndex === "number" ? Number(payload.stepIndex) : undefined;
-        if (stepIndex !== undefined) {
-          updateMessage(
-            conversationId,
-            (message) => message.runId === runId && message.role === "user",
-            (message) => ({
-              ...message,
-              trace: message.trace
-                ? {
-                    ...message.trace,
-                    steps: message.trace.steps.map((step, index) => ({
-                      ...step,
-                      status:
-                        index < stepIndex
-                          ? "done"
-                          : index === stepIndex
-                            ? workEvent.status === "error"
-                              ? "error"
-                              : workEvent.status === "done"
-                                ? "done"
-                                : "running"
-                            : index === stepIndex + 1 && workEvent.status === "done"
-                              ? "running"
-                              : step.status,
-                    })),
-                  }
-                : message.trace,
-            }),
-          );
-        }
         return;
       }
 
       if (type === "task.complete" || type === "task.error") {
         const failed = type === "task.error";
-        const result = String(payload.result ?? (failed ? "任务执行失败" : "任务已完成"));
+        const result = stripEasyWorkProtocolText(
+          String(payload.result ?? (failed ? "任务执行失败" : "任务已完成")),
+        );
         updateMessage(
           conversationId,
           (message) => message.runId === runId && message.role === "user",
@@ -2467,14 +2937,14 @@ export default function EasyWorkApp() {
                   ...message.trace,
                   status: failed ? "error" : "done",
                   result,
-                  steps: message.trace.steps.map((step) => ({
-                    ...step,
-                    status: failed
-                      ? step.status === "running"
-                        ? "error"
-                        : step.status
-                      : "done",
-                  })),
+                   steps: message.trace.steps.map((step) => ({
+                     ...step,
+                     status: failed
+                       ? step.status === "running"
+                         ? "error"
+                         : step.status
+                       : step.status,
+                   })),
                 }
               : message.trace,
           }),
@@ -2485,6 +2955,12 @@ export default function EasyWorkApp() {
           (message) => ({
             ...message,
             content: failed ? result : message.content,
+            reasoningStatus:
+              message.reasoningStatus === "running"
+                ? failed
+                  ? "error"
+                  : "done"
+                : message.reasoningStatus,
             events: (message.events ?? []).map((event) =>
               event.status === "running"
                 ? {
@@ -2565,7 +3041,18 @@ export default function EasyWorkApp() {
           storeDeviceToken(payload.deviceToken);
           if (payload.state && shouldHydrate) {
             setState(mergeStoredState(DEFAULT_STATE, payload.state ?? {}));
+          } else if (!shouldHydrate) {
+            setState((current) => {
+              let changed = false;
+              const conversations = current.conversations.map((conversation) => {
+                const repaired = repairConversationTitle(conversation);
+                if (repaired !== conversation) changed = true;
+                return repaired;
+              });
+              return changed ? { ...current, conversations } : current;
+            });
           }
+          setAppLoading(false);
           return;
         } catch {
           // Continue with the next reachable EasyWork service candidate.
@@ -2573,6 +3060,7 @@ export default function EasyWorkApp() {
       }
       if (!disposed) {
         setGatewayStatus("unavailable");
+        setAppLoading(false);
       }
     };
     void bootstrap();
@@ -2676,16 +3164,22 @@ export default function EasyWorkApp() {
     [],
   );
 
+  const trackMessageScrollPosition = useCallback(() => {
+    const scroller = messagesScrollRef.current;
+    if (!scroller) return;
+    const distanceToBottom =
+      scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    messagesPinnedToBottomRef.current = distanceToBottom <= 72;
+  }, []);
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({
-      behavior: sending ? "auto" : "smooth",
-      block: "end",
+    const scroller = messagesScrollRef.current;
+    if (!scroller || !messagesPinnedToBottomRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      scroller.scrollTo({ top: scroller.scrollHeight, behavior: "auto" });
     });
-  }, [
-    activeMessageCount,
-    activeStreamProgress,
-    sending,
-  ]);
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeMessageCount, activeStreamProgress, sending]);
 
   const selectConversation = (conversation: Conversation) => {
     setActiveConversationId(conversation.id);
@@ -2902,6 +3396,7 @@ export default function EasyWorkApp() {
         work: {
           ...(conversation.work ?? { workspace: "~" }),
           serverId,
+          connectionEnabled: true,
         },
       }));
       setDraftServerId("");
@@ -2954,6 +3449,20 @@ export default function EasyWorkApp() {
         caught instanceof Error ? caught.message : "服务器配置保存失败",
       );
     }
+  };
+
+  const setConversationConnection = (
+    conversationId: string,
+    enabled: boolean,
+  ) => {
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      updatedAt: now(),
+      work: {
+        ...(conversation.work ?? { workspace: "~" }),
+        connectionEnabled: enabled,
+      },
+    }));
   };
 
   const moveConversation = (conversationId: string, projectId?: string) => {
@@ -3063,6 +3572,7 @@ export default function EasyWorkApp() {
             ...(conversation?.work ?? {}),
             agentId: conversation?.work?.agentId || activeAgentId,
             serverId: conversation?.work?.serverId || effectiveServerId,
+            connectionEnabled: true,
             workspace: conversation?.work?.workspace || "~",
           }
         : conversation?.work;
@@ -3076,6 +3586,15 @@ export default function EasyWorkApp() {
       mode: submissionMode,
       selectedSkills,
       runId: submissionMode === "work" ? runId : undefined,
+      trace:
+        submissionMode === "work"
+          ? {
+              runId,
+              status: "running",
+              steps: [],
+              startedAt: now(),
+            }
+          : undefined,
     };
     const assistantMessage: Message = {
       id: uid("message"),
@@ -3084,6 +3603,7 @@ export default function EasyWorkApp() {
       createdAt: now(),
       mode: submissionMode,
       events: submissionMode === "work" ? [] : undefined,
+      reasoningStatus: submissionMode === "work" ? "running" : undefined,
       runId: submissionMode === "work" ? runId : undefined,
     };
 
@@ -3149,6 +3669,8 @@ export default function EasyWorkApp() {
             serverId: work?.serverId,
             conversationId,
             runId,
+            userMessageId: userMessage.id,
+            assistantMessageId: assistantMessage.id,
             firstTurn,
             prompt: content,
             skills: selectedSkills,
@@ -3220,6 +3742,7 @@ export default function EasyWorkApp() {
               (message) => ({
                 ...message,
                 reasoning: `${message.reasoning || ""}${event.delta}`,
+                reasoningStatus: "running",
               }),
             );
           } else if (event.type === "title" && event.title) {
@@ -3238,6 +3761,7 @@ export default function EasyWorkApp() {
                   message.content ||
                   "请求已完成，但模型没有返回可显示的文本。",
                 reasoning: event.reasoning || message.reasoning,
+                reasoningStatus: "done",
               }),
             );
           } else if (event.type === "error") {
@@ -3269,6 +3793,10 @@ export default function EasyWorkApp() {
           content:
             message.content ||
             "暂时无法连接模型服务，请检查 EasyWork 服务与模型 API 设置。",
+          reasoningStatus:
+            message.reasoningStatus === "running"
+              ? "error"
+              : message.reasoningStatus,
         }),
       );
     } finally {
@@ -3423,6 +3951,7 @@ export default function EasyWorkApp() {
             work: {
               ...(conversation.work ?? { workspace: "~" }),
               serverId,
+              connectionEnabled: true,
             },
           }));
           pendingServerBindingRef.current = null;
@@ -3523,6 +4052,10 @@ export default function EasyWorkApp() {
 
   const scanAgents = () => {
     if (connection.demo) {
+      setAgentScanningByServer((current) => ({
+        ...current,
+        [effectiveServerId]: true,
+      }));
       setAgentsByServer((current) => ({
         ...current,
         [effectiveServerId]: [
@@ -3547,10 +4080,18 @@ export default function EasyWorkApp() {
         },
         ],
       }));
+      setAgentScanningByServer((current) => ({
+        ...current,
+        [effectiveServerId]: false,
+      }));
       showToast("已扫描用户目录，发现 2 个 agent");
       return;
     }
     if (socketRef.current?.readyState === WebSocket.OPEN) {
+      setAgentScanningByServer((current) => ({
+        ...current,
+        [effectiveServerId]: true,
+      }));
       socketRef.current.send(
         JSON.stringify({ type: "agent.scan", serverId: effectiveServerId }),
       );
@@ -4325,82 +4866,36 @@ export default function EasyWorkApp() {
                             >
                               <Home size={14} />
                             </button>
-                            <button
-                              className="project-more-button"
-                              type="button"
-                              aria-label={`打开“${project.name}”的项目选项`}
-                              aria-expanded={projectMenuId === project.id}
-                              onClick={(event) => {
-                                event.stopPropagation();
+                            <ProjectOptionsMenu
+                              project={project}
+                              menuOpen={projectMenuId === project.id}
+                              onToggleMenu={() =>
                                 setProjectMenuId((current) =>
                                   current === project.id ? "" : project.id,
-                                );
+                                )
+                              }
+                              onRename={() => {
+                                setProjectEditor({ project, mode: "rename" });
+                                setProjectMenuId("");
                               }}
-                            >
-                              <Ellipsis size={16} />
-                            </button>
+                              onSettings={() => {
+                                setProjectEditor({ project, mode: "settings" });
+                                setProjectMenuId("");
+                              }}
+                              onOpenHome={() => {
+                                openProject(project.id);
+                                setProjectMenuId("");
+                              }}
+                              onTogglePin={() => {
+                                toggleProjectPin(project.id);
+                                setProjectMenuId("");
+                              }}
+                              onDelete={() => {
+                                setProjectPendingDelete(project);
+                                setProjectMenuId("");
+                              }}
+                            />
                           </div>
-                          {projectMenuId === project.id && (
-                            <div className="conversation-menu project-menu" role="menu">
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setProjectEditor({ project, mode: "rename" });
-                                  setProjectMenuId("");
-                                }}
-                              >
-                                <Pencil size={15} />
-                                重命名项目
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setProjectEditor({ project, mode: "settings" });
-                                  setProjectMenuId("");
-                                }}
-                              >
-                                <Settings2 size={15} />
-                                项目设置
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  openProject(project.id);
-                                  setProjectMenuId("");
-                                }}
-                              >
-                                <Home size={15} />
-                                项目主页
-                              </button>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => toggleProjectPin(project.id)}
-                              >
-                                {project.pinned ? (
-                                  <PinOff size={15} />
-                                ) : (
-                                  <Pin size={15} />
-                                )}
-                                {project.pinned ? "取消置顶" : "置顶项目"}
-                              </button>
-                              <button
-                                className="danger"
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setProjectPendingDelete(project);
-                                  setProjectMenuId("");
-                                }}
-                              >
-                                <Trash2 size={15} />
-                                删除项目
-                              </button>
-                            </div>
-                          )}
                         </div>
                         {conversations.length > 0 && (
                           <div
@@ -4684,8 +5179,9 @@ export default function EasyWorkApp() {
                 )}
                 {connection.status === "connected" && (
                     <button
-                      className="agent-picker"
+                      className={`agent-picker${activeAgentScanning ? " scanning" : ""}`}
                       type="button"
+                      disabled={activeAgentScanning}
                       onClick={() =>
                         setAgentMenuOpen((current) => {
                           if (!current) setAgentMenuPage("root");
@@ -4693,9 +5189,17 @@ export default function EasyWorkApp() {
                         })
                       }
                   >
-                    <Bot size={15} />
-                    <span>{activeAgent?.name ?? "选择 Agent"}</span>
-                    <ChevronDown size={13} />
+                    {activeAgentScanning ? (
+                      <LoaderCircle className="spin" size={15} />
+                    ) : (
+                      <Bot size={15} />
+                    )}
+                    <span>
+                      {activeAgentScanning
+                        ? "扫描中"
+                        : activeAgent?.name ?? "选择 Agent"}
+                    </span>
+                    {!activeAgentScanning && <ChevronDown size={13} />}
                   </button>
                 )}
               </>
@@ -4802,9 +5306,10 @@ export default function EasyWorkApp() {
                 {mode === "work" && connection.status === "connected" && (
                   <div className="agent-selector">
                     <button
-                      className="agent-picker"
+                      className={`agent-picker${activeAgentScanning ? " scanning" : ""}`}
                       type="button"
                       aria-expanded={agentMenuOpen}
+                      disabled={activeAgentScanning}
                       onClick={() =>
                         setAgentMenuOpen((current) => {
                           if (!current) setAgentMenuPage("root");
@@ -4812,13 +5317,19 @@ export default function EasyWorkApp() {
                         })
                       }
                     >
-                      <Bot size={15} />
+                      {activeAgentScanning ? (
+                        <LoaderCircle className="spin" size={15} />
+                      ) : (
+                        <Bot size={15} />
+                      )}
                       <span>
-                        {activeAgent?.status === "ready"
+                        {activeAgentScanning
+                          ? "扫描中"
+                          : activeAgent?.status === "ready"
                           ? activeAgent.name
                           : "选择 Agent"}
                       </span>
-                      <ChevronDown size={13} />
+                      {!activeAgentScanning && <ChevronDown size={13} />}
                     </button>
                     {agentMenuOpen && (
                       <div
@@ -5096,49 +5607,71 @@ export default function EasyWorkApp() {
                 )}
               </div>
             </div>
-            <div className="messages-scroll">
+            <div
+              className="messages-scroll"
+              ref={messagesScrollRef}
+              onScroll={trackMessageScrollPosition}
+            >
               {!activeConversation?.messages.length ? (
-                <div className="empty-chat">
-                  <div>
-                    <h1>{mode === "chat" ? "有什么可以帮你？" : "在算力平台上开始工作"}</h1>
-                  </div>
-                  {mode === "work" && connection.status !== "connected" && (
-                    <button
-                      className="inline-connect"
-                      type="button"
-                      onClick={openConversationServerManager}
-                    >
-                      <KeyRound size={16} />
-                      连接远程服务器
-                    </button>
+                <div
+                  className={`empty-chat${appLoading ? " loading" : ""}`}
+                  aria-busy={appLoading}
+                  aria-live="polite"
+                >
+                  {appLoading ? (
+                    <div className="workspace-loading-indicator">
+                      <LoaderCircle className="spin" size={23} />
+                      <span>正在加载</span>
+                    </div>
+                  ) : (
+                    <>
+                      <div>
+                        <h1>
+                          {mode === "chat"
+                            ? "有什么可以帮你？"
+                            : "在算力平台上开始工作"}
+                        </h1>
+                      </div>
+                      {mode === "work" && connection.status !== "connected" && (
+                        <button
+                          className="inline-connect"
+                          type="button"
+                          onClick={openConversationServerManager}
+                        >
+                          <KeyRound size={16} />
+                          连接远程服务器
+                        </button>
+                      )}
+                      {mode === "work" &&
+                        connection.status === "connected" &&
+                        !activeAgentScanning &&
+                        (!activeAgent || !activeAgent.configured) && (
+                          <button
+                            className="inline-connect"
+                            type="button"
+                            onClick={() =>
+                              activeAgent?.status === "missing"
+                                ? (() => {
+                                    setAgentMenuPage("root");
+                                    setAgentMenuOpen(true);
+                                  })()
+                                : (() => {
+                                    if (activeAgent) {
+                                      setAgentConfigAgentId(activeAgent.id);
+                                    }
+                                    setAgentMenuPage("config");
+                                    setAgentMenuOpen(true);
+                                  })()
+                            }
+                          >
+                            <Settings2 size={16} />
+                            {activeAgent?.status === "missing"
+                              ? "安装或选择 Agent"
+                              : "配置 Agent"}
+                          </button>
+                        )}
+                    </>
                   )}
-                  {mode === "work" &&
-                    connection.status === "connected" &&
-                    (!activeAgent || !activeAgent.configured) && (
-                      <button
-                        className="inline-connect"
-                        type="button"
-                        onClick={() =>
-                          activeAgent?.status === "missing"
-                            ? (() => {
-                                setAgentMenuPage("root");
-                                setAgentMenuOpen(true);
-                              })()
-                            : (() => {
-                                if (activeAgent) {
-                                  setAgentConfigAgentId(activeAgent.id);
-                                }
-                                setAgentMenuPage("config");
-                                setAgentMenuOpen(true);
-                              })()
-                        }
-                      >
-                        <Settings2 size={16} />
-                        {activeAgent?.status === "missing"
-                          ? "安装或选择 Agent"
-                          : "配置 Agent"}
-                      </button>
-                    )}
                 </div>
               ) : (
                 <div className="message-list">
@@ -5173,18 +5706,21 @@ export default function EasyWorkApp() {
                           <ReasoningDisclosure
                             content={message.reasoning}
                             running={
-                              sending &&
-                              message.id ===
-                                activeConversation.messages.at(-1)?.id &&
-                              !message.content
+                              message.mode === "work"
+                                ? message.reasoningStatus === "running"
+                                : sending &&
+                                  message.id ===
+                                    activeConversation.messages.at(-1)?.id &&
+                                  !message.content
                             }
                           />
                         )}
                         {message.role === "assistant" &&
                           message.mode === "work" &&
-                          !!message.events?.length && (
+                          message.reasoningStatus !== "running" && (
                             <WorkEventFeed
-                              events={message.events}
+                              events={message.events ?? []}
+                              finalAnswerStarted={Boolean(message.content)}
                               runStatus={
                                 activeConversation.messages.find(
                                   (item) =>
@@ -5218,7 +5754,9 @@ export default function EasyWorkApp() {
                           <div className="message-text">
                             {message.role === "assistant" ? (
                               <>
-                                <MarkdownContent content={message.content} />
+                                <MarkdownContent
+                                  content={stripEasyWorkProtocolText(message.content)}
+                                />
                                 {sending &&
                                   message.id ===
                                     activeConversation.messages.at(-1)?.id && (
@@ -5249,7 +5787,6 @@ export default function EasyWorkApp() {
                       </div>
                     </article>
                   ))}
-                  <div ref={messagesEndRef} />
                 </div>
               )}
             </div>
@@ -5258,7 +5795,7 @@ export default function EasyWorkApp() {
               <UnifiedComposer
                 value={draft}
                 textareaRef={textareaRef}
-                disabled={mode === "work" && !workReady}
+                disabled={appLoading || (mode === "work" && !workReady)}
                 sending={sending}
                 skills={state.skills}
                 selectedSkills={selectedSkills}
@@ -5277,7 +5814,9 @@ export default function EasyWorkApp() {
                 onDetectModels={() => void detectProviderModels()}
                 onSelectModel={(modelId) => void selectProviderModel(modelId)}
                 placeholder={
-                  mode === "chat"
+                  appLoading
+                    ? "正在加载 EasyWork"
+                    : mode === "chat"
                     ? "给 EasyWork 发消息"
                     : connection.status !== "connected"
                       ? "请先连接远程服务器"
@@ -6111,7 +6650,6 @@ export default function EasyWorkApp() {
                                   <StatusGlyph status={step.status} />
                                   <span className="trace-step-copy">
                                     <strong>{step.title}</strong>
-                                    {step.detail && <small>{step.detail}</small>}
                                   </span>
                                 </div>
                               ))}
@@ -6248,6 +6786,11 @@ export default function EasyWorkApp() {
               : state.settings.servers
           }
           connections={connections}
+          conversations={state.conversations.filter(
+            (conversation) => conversation.mode === "work",
+          )}
+          context={sshModalContext}
+          conversationEnabled={conversationConnectionEnabled}
           selectedServerId={
             sshModalContext === "bound"
               ? effectiveServerId
@@ -6270,6 +6813,12 @@ export default function EasyWorkApp() {
           onSave={saveServerProfile}
           onConnect={connectSsh}
           onDisconnect={disconnectSsh}
+          onSetConversationConnection={setConversationConnection}
+          onSetCurrentConversationConnection={(enabled) => {
+            if (activeConversation) {
+              setConversationConnection(activeConversation.id, enabled);
+            }
+          }}
           onRetry={() => setGatewayProbe((current) => current + 1)}
         />
       )}
@@ -7033,6 +7582,9 @@ function ProfileModal({
 function ServerManagerModal({
   profiles,
   connections,
+  conversations,
+  context,
+  conversationEnabled,
   selectedServerId,
   conversationScoped,
   showFormConnect,
@@ -7046,10 +7598,15 @@ function ServerManagerModal({
   onSave,
   onConnect,
   onDisconnect,
+  onSetConversationConnection,
+  onSetCurrentConversationConnection,
   onRetry,
 }: {
   profiles: ServerProfile[];
   connections: Record<string, ConnectionState>;
+  conversations: Conversation[];
+  context: "manage" | "new-work" | "bound";
+  conversationEnabled: boolean;
   selectedServerId: string;
   conversationScoped: boolean;
   showFormConnect: boolean;
@@ -7078,6 +7635,11 @@ function ServerManagerModal({
     trustHost?: boolean;
   }) => void;
   onDisconnect: (serverId: string) => void;
+  onSetConversationConnection: (
+    conversationId: string,
+    enabled: boolean,
+  ) => void;
+  onSetCurrentConversationConnection: (enabled: boolean) => void;
   onRetry: () => void;
 }) {
   const createId = () =>
@@ -7107,12 +7669,25 @@ function ServerManagerModal({
   const [otp, setOtp] = useState("");
   const [trustHost, setTrustHost] = useState(false);
   const [configurationOpen, setConfigurationOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<"configuration" | "conversations">(
+    "configuration",
+  );
   const connection = connections[serverId] ?? {
     serverId,
     status: "disconnected",
     label: "尚未连接",
   };
   const selectedProfile = profiles.find((profile) => profile.id === serverId);
+  const serverConversations = conversations.filter(
+    (conversation) => conversation.work?.serverId === serverId,
+  );
+  const boundConversations = serverConversations.filter(
+    (conversation) => conversation.work?.connectionEnabled !== false,
+  );
+  const displayedConnectionStatus =
+    context === "bound" && !conversationEnabled
+      ? "disconnected"
+      : connection.status;
   const normalizedPort = Number(port) || 22;
   const keepsSavedCredential = Boolean(
     selectedProfile?.configured &&
@@ -7160,6 +7735,7 @@ function ServerManagerModal({
     setPassphrase("");
     setOtp("");
     setConfigurationOpen(false);
+    setActiveTab("configuration");
     setTrustHost(false);
     onSelect(profile.id);
   };
@@ -7180,6 +7756,7 @@ function ServerManagerModal({
     setPassphrase("");
     setOtp("");
     setConfigurationOpen(true);
+    setActiveTab("configuration");
     setTrustHost(false);
     onSelect(nextId);
   };
@@ -7189,6 +7766,7 @@ function ServerManagerModal({
       setConfigurationOpen(true);
       return;
     }
+    if (context === "bound") onSetCurrentConversationConnection(true);
     onConnect({
       serverId: selectedProfile.id,
       name: selectedProfile.name,
@@ -7243,7 +7821,127 @@ function ServerManagerModal({
         )}
 
         <div className="server-connection-body">
-          {gatewayStatus !== "connected" ? (
+          {context === "manage" && selectedProfile && (
+            <div className="server-detail-tabs" role="tablist" aria-label="服务器管理">
+              <button
+                className={activeTab === "configuration" ? "active" : ""}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "configuration"}
+                onClick={() => {
+                  setActiveTab("configuration");
+                  if (connection.status === "connected") {
+                    setConfigurationOpen(false);
+                  }
+                }}
+              >
+                服务器配置
+              </button>
+              <button
+                className={activeTab === "conversations" ? "active" : ""}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "conversations"}
+                onClick={() => setActiveTab("conversations")}
+              >
+                管理连接对话
+                <span>{boundConversations.length}</span>
+              </button>
+            </div>
+          )}
+          {context === "manage" &&
+          activeTab === "conversations" &&
+          selectedProfile ? (
+            <div className="server-conversation-panel">
+              <div className="server-conversation-summary">
+                <div>
+                  <strong>{selectedProfile.name || selectedProfile.host}</strong>
+                  <span>
+                    {connection.status === "connected"
+                      ? `已连接 ${boundConversations.length} 个对话`
+                      : `${boundConversations.length} 个对话`}
+                  </span>
+                </div>
+                <span className={`server-conversation-live ${connection.status}`}>
+                  {connection.status === "connected" ? "SSH 在线" : "SSH 未连接"}
+                </span>
+              </div>
+              <div className="server-conversation-table" role="table">
+                <div className="server-conversation-table-head" role="row">
+                  <span role="columnheader">对话</span>
+                  <span role="columnheader">状态</span>
+                  <span role="columnheader">操作</span>
+                </div>
+                {serverConversations.map((conversation) => {
+                  const enabled = conversation.work?.connectionEnabled !== false;
+                  const running = conversation.messages.some(
+                    (message) => message.trace?.status === "running",
+                  );
+                  const status = running
+                    ? "执行中"
+                    : enabled
+                      ? connection.status === "connected"
+                        ? "已连接"
+                        : "服务器离线"
+                      : "已断开";
+                  return (
+                    <div
+                      className={`server-conversation-row${enabled ? " bound" : ""}`}
+                      role="row"
+                      key={conversation.id}
+                    >
+                      <span className="server-conversation-title" role="cell">
+                        <strong>{conversation.title || "未命名对话"}</strong>
+                        <small>工作</small>
+                      </span>
+                      <span
+                        className={`server-conversation-status ${
+                          running
+                            ? "running"
+                            : enabled
+                              ? connection.status
+                              : "idle"
+                        }`}
+                        role="cell"
+                      >
+                        <i />
+                        {status}
+                      </span>
+                      <button
+                        className={`server-conversation-action ${
+                          enabled ? "disconnect" : "connect"
+                        }`}
+                        type="button"
+                        disabled={running || connection.status !== "connected"}
+                        title={
+                          connection.status !== "connected"
+                            ? "SSH 未连接"
+                            : running
+                              ? "对话正在执行任务"
+                              : enabled
+                                ? "断开这个对话"
+                                : "连接这个对话"
+                        }
+                        onClick={() =>
+                          onSetConversationConnection(
+                            conversation.id,
+                            !enabled,
+                          )
+                        }
+                      >
+                        {enabled ? "断开" : "连接"}
+                      </button>
+                    </div>
+                  );
+                })}
+                {!serverConversations.length && (
+                  <div className="server-conversation-empty">
+                    还没有对话绑定到这台服务器
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : gatewayStatus !== "connected" ? (
             <div className="gateway-unavailable-panel">
               <span className="gateway-state-icon">
                 {gatewayStatus === "checking" ? (
@@ -7268,17 +7966,17 @@ function ServerManagerModal({
                 </button>
               )}
             </div>
-          ) : (conversationScoped ||
-              (showFormConnect && connection.status === "connected")) &&
+          ) : ((context !== "manage" && selectedProfile) ||
+              (context === "manage" && connection.status === "connected")) &&
             !configurationOpen &&
             selectedProfile ? (
             <div
-              className={`connected-panel server-connected-panel quick-connection-panel ${connection.status}`}
+              className={`connected-panel server-connected-panel quick-connection-panel ${displayedConnectionStatus}`}
             >
               <span className="connected-hero">
-                {connection.status === "connecting" ? (
+                {displayedConnectionStatus === "connecting" ? (
                   <LoaderCircle className="spin" size={24} />
-                ) : connection.status === "connected" ? (
+                ) : displayedConnectionStatus === "connected" ? (
                   <Wifi size={24} />
                 ) : (
                   <WifiOff size={24} />
@@ -7291,9 +7989,9 @@ function ServerManagerModal({
               <div className="connection-facts">
                 <span>
                   <strong>
-                    {connection.status === "connected"
-                      ? `${connection.latency ?? "—"} ms`
-                      : connection.status === "connecting"
+                    {displayedConnectionStatus === "connected"
+                      ? `已连接 ${boundConversations.length} 个对话`
+                      : displayedConnectionStatus === "connecting"
                         ? "连接中"
                         : "未连接"}
                   </strong>
@@ -7304,7 +8002,7 @@ function ServerManagerModal({
                   <small>SSH 端口</small>
                 </span>
               </div>
-              {connection.status === "error" && (
+              {displayedConnectionStatus === "error" && (
                 <div className="form-error" role="alert">
                   {connection.label}
                 </div>
@@ -7318,15 +8016,35 @@ function ServerManagerModal({
                   <Settings2 size={15} />
                   配置
                 </button>
-                {connection.status === "connected" ? (
-                  <button
-                    className="secondary-button quick-disconnect-button"
-                    type="button"
-                    onClick={() => onDisconnect(serverId)}
-                  >
-                    <WifiOff size={15} />
-                    断开连接
-                  </button>
+                {displayedConnectionStatus === "connected" ? (
+                  context === "new-work" ? (
+                    <button
+                      className="primary-button quick-use-button"
+                      type="button"
+                      onClick={() => {
+                        onSelect(serverId);
+                        onClose();
+                      }}
+                    >
+                      <Check size={15} />
+                      使用此连接
+                    </button>
+                  ) : (
+                    <button
+                      className="secondary-button quick-disconnect-button"
+                      type="button"
+                      onClick={() => {
+                        if (context === "bound") {
+                          onSetCurrentConversationConnection(false);
+                        } else {
+                          onDisconnect(serverId);
+                        }
+                      }}
+                    >
+                      <WifiOff size={15} />
+                      断开连接
+                    </button>
+                  )
                 ) : (
                   <>
                     <input
@@ -7344,14 +8062,14 @@ function ServerManagerModal({
                       className="primary-button quick-connect-button"
                       type="button"
                       onClick={connectSavedProfile}
-                      disabled={connection.status === "connecting"}
+                      disabled={displayedConnectionStatus === "connecting"}
                     >
-                      {connection.status === "connecting" ? (
+                      {displayedConnectionStatus === "connecting" ? (
                         <LoaderCircle className="spin" size={15} />
                       ) : (
                         <KeyRound size={15} />
                       )}
-                      {connection.status === "connecting" ? "连接中" : "连接"}
+                      {displayedConnectionStatus === "connecting" ? "连接中" : "连接"}
                     </button>
                   </>
                 )}
@@ -7363,6 +8081,9 @@ function ServerManagerModal({
               onSubmit={(event) => {
                 event.preventDefault();
                 if (!showFormConnect && !conversationScoped) return;
+                if (context === "bound") {
+                  onSetCurrentConversationConnection(true);
+                }
                 onConnect({
                   serverId,
                   name: name.trim() || host,
@@ -7406,32 +8127,20 @@ function ServerManagerModal({
                   </select>
                 </label>
               )}
-              {(conversationScoped || showFormConnect) &&
-                selectedProfile && (
-                <button
-                  className="server-config-back"
-                  type="button"
-                  onClick={() => setConfigurationOpen(false)}
-                >
-                  <ChevronLeft size={14} />
-                  返回连接
-                </button>
-                )}
               <label className="field">
                 <span>服务器名称</span>
                 <input
                   value={name}
                   onChange={(event) => setName(event.target.value)}
-                  placeholder={host || "如：学校集群"}
+                  placeholder="您可以自定义对该服务器的称呼"
                 />
               </label>
               <div className="ssh-target-grid">
                 <label className="field host-field">
-                  <span>登录节点</span>
+                  <span>服务器地址</span>
                   <input
                     value={host}
                     onChange={(event) => setHost(event.target.value)}
-                    placeholder="例如 login.example.edu"
                     required
                   />
                 </label>
@@ -7450,7 +8159,7 @@ function ServerManagerModal({
                 <input
                   value={username}
                   onChange={(event) => setUsername(event.target.value)}
-                  placeholder="远程账号"
+                  placeholder="请输入您在服务器上的用户名"
                   required
                 />
               </label>
@@ -7659,7 +8368,9 @@ function ServerManagerModal({
                   onClick={() => {
                     onSave(profileDraft());
                     if (
-                      conversationScoped || showFormConnect
+                      conversationScoped ||
+                      showFormConnect ||
+                      connection.status === "connected"
                     ) {
                       setConfigurationOpen(false);
                     }
@@ -7669,7 +8380,16 @@ function ServerManagerModal({
                   <Save size={15} />
                   保存
                 </button>
-                {(showFormConnect || conversationScoped) && (
+                {connection.status === "connected" ? (
+                  <button
+                    className="secondary-button form-disconnect-button"
+                    type="button"
+                    onClick={() => onDisconnect(serverId)}
+                  >
+                    <WifiOff size={16} />
+                    断开 SSH
+                  </button>
+                ) : (showFormConnect || conversationScoped) ? (
                   <button
                     className="primary-button form-connect-button"
                     type="submit"
@@ -7695,7 +8415,7 @@ function ServerManagerModal({
                     )}
                     {connection.status === "connecting" ? "连接中" : "连接 SSH"}
                   </button>
-                )}
+                ) : null}
               </div>
             </form>
           )}

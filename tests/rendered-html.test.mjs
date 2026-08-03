@@ -20,7 +20,7 @@ async function render() {
   );
 }
 
-test("server-renders the finished EasyWork shell", async () => {
+test("server-renders the EasyWork shell with an in-workspace loading state", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -29,10 +29,11 @@ test("server-renders the finished EasyWork shell", async () => {
   assert.match(html, /<html lang="zh-CN">/);
   assert.match(html, /<title>EasyWork — 对话连接算力<\/title>/);
   assert.match(html, /EasyWork/);
-  assert.match(html, /\u6709\u4ec0\u4e48\u53ef\u4ee5\u5e2e\u4f60/);
+  assert.match(html, /class="workspace-loading-indicator"/);
+  assert.match(html, /正在加载/);
+  assert.match(html, /\u65b0\u804a\u5929/);
   assert.doesNotMatch(html, /CHAT · COMPUTE · CREATE|CONVERSATION MAP/);
   assert.doesNotMatch(html, /class="right-rail"/);
-  assert.match(html, /\u65b0\u804a\u5929/);
   assert.doesNotMatch(html, /Your site is taking shape|react-loading-skeleton|codex-preview/i);
 });
 
@@ -45,7 +46,15 @@ test("includes the two-mode product architecture and removes starter artifacts",
     readdir(new URL("../skill/built-in/", import.meta.url)),
   ]);
 
-  assert.deepEqual(prompts.sort(), ["chat-system.md", "work-system.md"]);
+  assert.deepEqual(prompts.sort(), [
+    "README.md",
+    "agents",
+    "chat-system.md",
+    "context",
+    "model",
+    "tasks",
+    "work-system.md",
+  ]);
   assert.deepEqual(builtIns.sort(), ["cluster-ops", "paper-reading", "training-debug"]);
   assert.match(app, /type Mode = "chat" \| "work"/);
   assert.match(app, /type: "work\.run"/);
@@ -53,6 +62,9 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /DEVICE_TOKEN_STORAGE_KEY/);
   assert.match(app, /beginConversation/);
   assert.match(app, /function UnifiedComposer/);
+  assert.match(app, /useLayoutEffect/);
+  assert.match(app, /maximumHeight = 140/);
+  assert.match(app, /multiline \? " multiline"/);
   assert.match(app, /project-composer-area/);
   assert.match(app, /project-launch-mode/);
   assert.match(app, /composer-menu-track/);
@@ -61,7 +73,14 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /hydratedActorIdRef/);
   assert.match(app, /queueStateSave/);
   assert.match(app, /ConversationRow/);
+  assert.match(app, /function ProjectOptionsMenu/);
+  assert.match(app, /useAnchoredMenuPosition/);
+  assert.match(app, /project-menu-portal/);
   assert.match(app, /function MarkdownContent/);
+  assert.match(app, /remote-terminal markdown-terminal/);
+  assert.match(app, /terminal \? " terminal-fence" : " code-fence"/);
+  assert.match(app, /terminal \? "终端" : languageLabel\[language\] \|\| language \|\| "代码"/);
+  assert.doesNotMatch(app, /markdown-code-block/);
   assert.match(app, /inline-function-field/);
   assert.match(app, /思考完成/);
   assert.match(app, /\(conversation\.messages\?\.length \?\? 0\) > 0/);
@@ -69,6 +88,7 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /type WorkEventKind/);
   assert.match(app, /\| "approval_request"/);
   assert.match(app, /\| "file_change"/);
+  assert.match(app, /\| "agent_message"/);
   assert.match(app, /\| "job_status"/);
   assert.match(app, /function fallbackConversationTitle/);
   assert.match(app, /function ScrollingTitle/);
@@ -81,14 +101,51 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /type: "agent\.config\.read"/);
   assert.match(app, /type === "conversation\.title"/);
   assert.match(app, /function WorkEventFeed/);
+  assert.match(app, /title: "执行计划"/);
+  assert.match(app, /if \(kind === "plan"\) return Boolean\(workflowSteps\?\.length\)/);
+  assert.doesNotMatch(app, /已编排/);
+  assert.match(app, /callRunning && !finalAnswerStarted/);
+  assert.match(app, /finalAnswerStarted=\{Boolean\(message\.content\)\}/);
+  assert.match(app, /function AgentThoughtEvent/);
+  assert.match(app, /Agent调用中/);
+  assert.match(app, /Agent调用完成/);
+  assert.match(app, /const hasDetails = segments\.length > 0/);
+  assert.match(app, /hasDetails && <ChevronRight className="agent-call-chevron"/);
+  assert.doesNotMatch(app, /if \(!segments\.length\) return null/);
+  assert.match(app, /Agent思考中/);
+  assert.doesNotMatch(app, /agent-thought-label/);
+  assert.match(app, /stripEasyWorkProtocolText/);
+  assert.match(app, /message\.reasoningStatus !== "running"/);
+  assert.match(app, /messagesPinnedToBottomRef/);
+  assert.match(app, /distanceToBottom <= 72/);
+  assert.doesNotMatch(app, /messagesEndRef/);
+  assert.doesNotMatch(app, /Agent 回复/);
+  assert.doesNotMatch(app, /step\.detail/);
+  assert.match(app, /function FileChangeGroup/);
+  assert.match(app, /function DiffView/);
+  assert.match(app, /previous\?\.type === "files"/);
+  assert.match(app, /`已编辑 \$\{files\.length\} 个文件`/);
   assert.match(app, /function useAutoDisclosure/);
   assert.match(app, /function AgentUpdateModal/);
+  assert.match(app, /function conversationTitleNeedsRepair/);
+  assert.match(app, /function repairConversationTitle/);
   assert.match(app, /className="trace-jump"/);
   assert.match(app, /className="trace-toggle"/);
   assert.match(app, /normalizedEventKind\(event\.kind\) === "tool_call" \|\| event\.command/);
   assert.match(app, /type: "agent\.update\.check"/);
   assert.match(app, /conversationScoped/);
   assert.match(app, /showFormConnect/);
+  assert.match(app, /管理连接对话/);
+  assert.match(app, /server-conversation-table/);
+  assert.match(app, /已连接 \$\{boundConversations\.length\} 个对话/);
+  assert.match(app, /agent\.scan\.status/);
+  assert.match(app, /扫描中/);
+  assert.match(app, /服务器地址/);
+  assert.match(app, /您可以自定义对该服务器的称呼/);
+  assert.match(app, /请输入您在服务器上的用户名/);
+  assert.match(app, /断开 SSH/);
+  assert.match(app, /running \|\| connection\.status !== "connected"/);
+  assert.doesNotMatch(app, /返回连接/);
   assert.match(app, /请输入2FA验证码（可选）/);
   assert.match(app, /转换为\{mode === "chat" \? "工作" : "聊天"\}模式/);
   assert.doesNotMatch(app, /const EMPTY_CONVERSATION_ID/);
@@ -99,6 +156,11 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /prefers-reduced-motion/);
   assert.match(css, /\.trace-detail-motion/);
   assert.match(css, /\.remote-terminal/);
+  assert.match(css, /Earthsong terminal palette/);
+  assert.match(css, /--terminal-green:\s*#85c54c/);
+  assert.match(css, /background-color:\s*rgb\(69 64 56 \/ 92%\)/);
+  assert.match(css, /backdrop-filter:\s*blur\(16px\) saturate\(118%\)/);
+  assert.doesNotMatch(css, /\.markdown-code-block/);
   assert.match(css, /\.remote-connection-panel/);
   assert.match(css, /\.remote-connection-state/);
   assert.match(css, /\.rail-edge-toggle/);
@@ -107,14 +169,41 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /height:\s*48px/);
   assert.match(css, /backdrop-filter:\s*blur\(9px\)/);
   assert.match(css, /\.agent-event-detail-motion/);
+  assert.match(css, /\.file-change-list-motion/);
+  assert.match(css, /\.file-diff-line\.added/);
+  assert.match(css, /\.file-diff-lines[\s\S]*overscroll-behavior:\s*contain/);
+  assert.match(css, /\.file-diff-line[\s\S]*width:\s*max-content;[\s\S]*min-width:\s*100%/);
+  assert.match(css, /\.agent-call-motion/);
+  assert.match(css, /\.reasoning-disclosure > button strong\s*\{[\s\S]*font-size:\s*16px !important/);
+  assert.match(css, /\.agent-call-heading strong\s*\{[\s\S]*font-size:\s*16px !important/);
+  assert.match(css, /\.agent-call-heading:hover\s*\{[\s\S]*background:\s*transparent/);
+  assert.doesNotMatch(css, /\.agent-thought-label/);
+  assert.match(css, /\.agent-thought-content\s*\{[\s\S]*font-size:\s*var\(--activity-title-size\) !important/);
+  assert.match(css, /\.agent-thought-event\s*\{[\s\S]*border-left:/);
+  assert.match(css, /\.server-conversation-action\.connect/);
+  assert.match(css, /\.server-conversation-action\.disconnect/);
+  assert.match(css, /--activity-title-size:\s*14\.5px/);
+  assert.match(css, /--activity-meta-size:\s*12px/);
+  assert.match(css, /--activity-text-inset/);
+  assert.match(css, /\.agent-call \+ \.message-text[\s\S]*border-top:\s*0/);
+  assert.match(css, /\.messages-scroll[\s\S]*scroll-behavior:\s*auto/);
+  assert.doesNotMatch(css, /\.command-event\.expanded \.command-summary > svg/);
+  assert.match(css, /\.workspace-loading-indicator/);
   assert.match(css, /\.agent-update-dialog/);
   assert.match(css, /\.unified-composer/);
+  assert.match(css, /\.unified-composer\.multiline/);
+  assert.match(css, /max-height:\s*140px/);
   assert.match(css, /\.composer-menu-popover\.show-skills/);
   assert.match(css, /\.message\.user \.message-text\s*\{[\s\S]*font-size:\s*17px !important/);
   assert.match(css, /\.markdown-content:not\(\.compact\)[\s\S]*table\s*\{[\s\S]*font-size:\s*16px !important/);
+  assert.match(css, /\.markdown-content\s*\{[\s\S]*white-space:\s*normal/);
+  assert.match(css, /\.markdown-content li > p \+ :is\(ul, ol\)/);
   assert.match(css, /code\.inline-function-field\s*\{[\s\S]*font-size:\s*0\.9em !important/);
   assert.match(css, /code\.inline-function-field\.tone-4/);
   assert.match(css, /\.quick-connection-actions/);
+  assert.match(css, /\.server-detail-tabs/);
+  assert.match(css, /\.server-conversation-panel/);
+  assert.match(css, /\.modal-card\.modal-wide:has\(\.server-manager\)/);
   assert.match(css, /\.project-sidebar-chats-motion/);
   assert.match(css, /grid-template-rows:\s*0fr/);
   assert.match(css, /\.project-sidebar-chats-motion\.expanded/);
@@ -122,7 +211,8 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /\.remote-file-manager/);
   assert.match(css, /@keyframes chat-title-scroll/);
   assert.match(css, /LLMGame-inspired conversation/);
-  assert.match(gateway, /keepaliveInterval:\s*15_000/);
+  assert.match(gateway, /SSH_KEEPALIVE_INTERVAL_MS\s*=\s*60 \* 1000/);
+  assert.match(gateway, /keepaliveInterval:\s*SSH_KEEPALIVE_INTERVAL_MS/);
   assert.match(gateway, /hostVerifier/);
   assert.match(gateway, /Access-Control-Allow-Private-Network/);
   assert.match(gateway, /\/api\/settings\/provider\/models/);
@@ -132,7 +222,12 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /remote\.fs\.upload/);
   assert.match(gateway, /connections\.snapshot/);
   assert.match(gateway, /conversation\.title/);
-  assert.match(gateway, /SSH_RECONNECT_GRACE_MS/);
+  assert.match(gateway, /const sshWorkerPool = new Map/);
+  assert.match(gateway, /SSH_IDLE_TTL_MS\s*=\s*30 \* 24 \* 60 \* 60 \* 1000/);
+  assert.match(gateway, /function cleanupIdleSshWorkers/);
+  assert.match(gateway, /function publishWorkerEvent/);
+  assert.match(gateway, /worker\.sockets\.delete\(socket\)/);
+  assert.doesNotMatch(gateway, /SSH_RECONNECT_GRACE_MS/);
   assert.match(gateway, /deviceToken/);
   assert.match(gateway, /--no-modify-path/);
   assert.match(gateway, /agentSessions:\s*new Map/);
@@ -143,9 +238,15 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /readOpenCodeFailureLog/);
   assert.match(gateway, /persistServerProfile/);
   assert.match(gateway, /\["provider", "embedding", "servers", "lastServerId"\]/);
-  assert.match(gateway, /planWorkSteps/);
-  assert.match(gateway, /agentPromptWithWorkflow\(context\.text, steps\)/);
-  assert.match(gateway, /type: "workflow\.step"/);
+  assert.match(gateway, /function normalizeAgentPlanSteps/);
+  assert.match(gateway, /sourceId: "agent-native-plan"/);
+  assert.match(gateway, /title: "执行计划"/);
+  assert.match(gateway, /await agentPromptWithNativePlanning\(/);
+  assert.match(gateway, /runWorkHandoffModel/);
+  assert.match(gateway, /kind: "reasoning"/);
+  assert.match(gateway, /renderPromptTemplate\("tasks\/work-handoff\.md"/);
+  assert.doesNotMatch(gateway, /planWorkSteps|agentPromptWithWorkflow/);
+  assert.doesNotMatch(gateway, /type: "workflow\.step"/);
 
   await assert.rejects(access(new URL("../app/_sites-preview/", import.meta.url)));
   for (const starterAsset of ["file.svg", "globe.svg", "window.svg"]) {
