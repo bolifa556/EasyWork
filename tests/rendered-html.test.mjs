@@ -288,7 +288,7 @@ test("keeps machine caches local while persistent EasyWork data remains shareabl
   assert.match(viteConfig, /"\/easywork-ws"/);
   assert.match(viteConfig, /easywork-websocket-tunnel/);
   assert.doesNotMatch(viteConfig, /hosting\.json|sites\(\)/);
-  assert.match(gitignore, /\/frp\/frpc\.local\.toml/);
+  assert.match(gitignore, /^\/frp\/$/m);
   assert.match(example, /REPLACE_WITH_FRP_TOKEN/);
   assert.doesNotMatch(example, /auth\.token\s*=\s*"[a-f0-9]{32,}"/i);
 

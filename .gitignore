@@ -42,14 +42,15 @@ next-env.d.ts
 /outputs/
 /work/
 /.cache/
+/build/
+/.openai/
 
 # EasyWork local gateway state and transient previews
 /data/
 /skill/users/
 /skill/guests/
-/.dev-server.*.log
-/.gateway.*.log
-/.reference-chat.png
-/frp/frpc.local.toml
-/frp/*.log
-requirments.md
+
+# Local product notes and device-specific FRP runtime
+/requirments.md
+/doc/
+/frp/

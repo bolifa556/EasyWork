@@ -9,6 +9,8 @@
 (?d)/EasyWork/outputs
 (?d)/EasyWork/work
 (?d)/EasyWork/coverage
+(?d)/EasyWork/build
+(?d)/EasyWork/.openai
 (?d)/EasyWork/*.tsbuildinfo
 
 // Device-local runtime logs and previews
@@ -22,4 +24,3 @@
 
 // Persistent data is intentionally NOT ignored:
 // EasyWork/data, EasyWork/skill, prompts and source files continue to sync.
-
