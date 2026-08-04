@@ -1,4 +1,6 @@
 import http from "node:http";
+import https from "node:https";
+import net from "node:net";
 import crypto from "node:crypto";
 import path from "node:path";
 import {
@@ -6,9 +8,12 @@ import {
   chmod,
   cp,
   mkdir,
+  open,
   readFile,
   readdir,
+  rename,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
@@ -23,6 +28,29 @@ import {
 } from "jsonc-parser";
 import mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
+import {
+  loadRemoteRuntimeBundle,
+  parseRuntimeFields,
+  remoteRuntimePaths,
+  safeRemoteRunId,
+} from "./remote-runtime.mjs";
+import {
+  activeMemoryRecords,
+  agentConversationDelta,
+  appendExplicitMemory,
+  appendMemoryTombstone,
+  cloneConversationMemoryScope,
+  cloneConversationSummary,
+  currentConversationHistory,
+  estimateContextTokens,
+  findConversationSummary,
+  invalidateMemoryVersions,
+  memorySequenceAt,
+  normalizeMemoryDocument,
+  selectMemoryRecords,
+  selectMemorySyncRecords,
+  upsertConversationSummary,
+} from "./memory.mjs";
 
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 const DATA_ROOT = path.resolve(process.env.EASYWORK_DATA_DIR || path.join(ROOT, "data"));
@@ -44,10 +72,22 @@ const BUILTIN_SKILLS = {
 
 const activeSockets = new Set();
 const sshWorkerPool = new Map();
-const stateMutationQueues = new Map();
-const secretMutationQueues = new Map();
+// Every persisted document belonging to one actor uses the same queue. This
+// prevents state, memory, binding and checkpoint writes for that user from
+// overtaking one another while different users still proceed independently.
+const actorMutationQueues = new Map();
+const stateMutationQueues = actorMutationQueues;
+const secretMutationQueues = actorMutationQueues;
+const agentBindingMutationQueues = actorMutationQueues;
+const memoryMutationQueues = actorMutationQueues;
+const conversationTreeMutationQueues = actorMutationQueues;
+const checkpointMutationQueues = actorMutationQueues;
+let accountMutationQueue = Promise.resolve();
 let sessionSecret;
 let encryptionKey;
+let remoteRuntimeBundlePromise;
+let openCodeReleaseCache;
+const openCodeArtifactPromises = new Map();
 
 function isoNow() {
   return new Date().toISOString();
@@ -70,6 +110,10 @@ function safeSegment(value, fallback = "item") {
   return normalized || fallback;
 }
 
+function uniqueStrings(...groups) {
+  return [...new Set(groups.flat(Infinity).filter(Boolean).map(String))];
+}
+
 async function renderPromptTemplate(relativePath, variables = {}) {
   const promptPath = path.resolve(PROMPT_ROOT, relativePath);
   const promptPrefix = `${path.resolve(PROMPT_ROOT)}${path.sep}`;
@@ -87,12 +131,45 @@ async function renderPromptTemplate(relativePath, variables = {}) {
 async function enqueueActorMutation(queues, actor, mutation) {
   const actorKey = `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
   const previous = queues.get(actorKey) || Promise.resolve();
-  const operation = previous.catch(() => undefined).then(mutation);
+  const operation = previous
+    .catch(() => undefined)
+    .then(() => withActorMutationLock(actor, mutation));
   queues.set(actorKey, operation);
   try {
     return await operation;
   } finally {
     if (queues.get(actorKey) === operation) queues.delete(actorKey);
+  }
+}
+
+async function withActorMutationLock(actor, mutation) {
+  const lockPath = path.join(actorDirectory(actor), "runtime", "mutation.lock");
+  await mkdir(path.dirname(lockPath), { recursive: true });
+  let handle;
+  for (let attempt = 0; attempt < 250; attempt += 1) {
+    try {
+      handle = await open(lockPath, "wx", 0o600);
+      await handle.writeFile(
+        `${JSON.stringify({ pid: process.pid, createdAt: isoNow() })}\n`,
+        "utf8",
+      );
+      break;
+    } catch (caught) {
+      if (String(caught?.code || "") !== "EEXIST") throw caught;
+      const lockStat = await stat(lockPath).catch(() => null);
+      if (lockStat && Date.now() - lockStat.mtimeMs > 120_000) {
+        await rm(lockPath, { force: true }).catch(() => undefined);
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  if (!handle) throw new Error("用户数据正在被另一网关进程修改，请稍后重试");
+  try {
+    return await mutation();
+  } finally {
+    await handle.close().catch(() => undefined);
+    await rm(lockPath, { force: true }).catch(() => undefined);
   }
 }
 
@@ -108,6 +185,153 @@ function safeRelativePath(value) {
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+function remoteOpenCodePortCommand() {
+  return [
+    "set -eu",
+    'EW_PORT=$((49152 + (($(date +%s) + $$) % 16000)))',
+    "EW_ATTEMPT=0",
+    'while [ "$EW_ATTEMPT" -lt 128 ]; do',
+    '  if command -v ss >/dev/null 2>&1; then',
+    '    EW_BUSY=$(ss -ltn 2>/dev/null | grep -Ec "[:.]${EW_PORT}([[:space:]]|$)" || true)',
+    '  elif command -v netstat >/dev/null 2>&1; then',
+    '    EW_BUSY=$(netstat -ltn 2>/dev/null | grep -Ec "[:.]${EW_PORT}[[:space:]]" || true)',
+    "  else",
+    "    EW_BUSY=0",
+    "  fi",
+    '  if [ "$EW_BUSY" -eq 0 ]; then printf "%s\\n" "$EW_PORT"; exit 0; fi',
+    '  EW_PORT=$((49152 + ((EW_PORT - 49152 + 1) % 16000)))',
+    '  EW_ATTEMPT=$((EW_ATTEMPT + 1))',
+    "done",
+    'printf "%s\\n" "没有找到可用的 OpenCode 本地端口" >&2',
+    "exit 1",
+  ].join("\n");
+}
+
+const PROVIDER_RELAY_ERROR_STATUS = 599;
+const PROVIDER_ROUTE_CACHE_MS = 5 * 60 * 1000;
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+function providerRelayTarget(baseUrl, requestUrl = "/") {
+  const upstream = new URL(baseUrl);
+  const incoming = new URL(String(requestUrl || "/"), "http://easywork-relay.local");
+  const basePath = upstream.pathname.replace(/\/+$/, "");
+  let targetPath = incoming.pathname || "/";
+  if (
+    basePath &&
+    basePath !== "/" &&
+    targetPath !== basePath &&
+    !targetPath.startsWith(`${basePath}/`)
+  ) {
+    targetPath = `${basePath}/${targetPath.replace(/^\/+/, "")}`;
+  }
+  upstream.pathname = targetPath;
+  upstream.search = incoming.search;
+  upstream.hash = "";
+  return upstream;
+}
+
+function proxyHeaders(headers, host = "") {
+  const next = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (value === undefined || HOP_BY_HOP_HEADERS.has(name.toLowerCase())) continue;
+    next[name] = value;
+  }
+  if (host) next.host = host;
+  return next;
+}
+
+async function createLocalProviderRelay(baseUrl) {
+  const sockets = new Set();
+  const server = http.createServer((request, response) => {
+    let target;
+    try {
+      target = providerRelayTarget(baseUrl, request.url);
+    } catch {
+      response.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ error: { message: "模型 API 请求地址无效" } }));
+      return;
+    }
+    const transport = target.protocol === "https:" ? https : http;
+    const upstream = transport.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || undefined,
+        method: request.method,
+        path: `${target.pathname}${target.search}`,
+        headers: proxyHeaders(request.headers, target.host),
+      },
+      (upstreamResponse) => {
+        response.writeHead(
+          upstreamResponse.statusCode || 502,
+          proxyHeaders(upstreamResponse.headers),
+        );
+        upstreamResponse.pipe(response);
+      },
+    );
+    upstream.setTimeout(10 * 60 * 1000, () => {
+      upstream.destroy(new Error("模型 API 响应超时"));
+    });
+    upstream.on("error", (error) => {
+      if (response.headersSent) {
+        response.destroy(error);
+        return;
+      }
+      response.writeHead(PROVIDER_RELAY_ERROR_STATUS, {
+        "content-type": "application/json; charset=utf-8",
+        "x-easywork-relay-error": "upstream-unreachable",
+      });
+      response.end(
+        JSON.stringify({
+          error: {
+            message: `EasyWork 主机无法访问模型 API：${String(error.code || "连接失败")}`,
+          },
+        }),
+      );
+    });
+    request.on("aborted", () => upstream.destroy());
+    request.pipe(upstream);
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    server.once("error", onError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  server.on("error", () => undefined);
+  server.unref?.();
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("主机模型 API 中继端口分配失败");
+  }
+  return {
+    server,
+    sockets,
+    localPort: address.port,
+    close() {
+      server.close();
+      for (const socket of sockets) socket.destroy();
+      sockets.clear();
+    },
+  };
 }
 
 function cookieMap(header = "") {
@@ -200,9 +424,19 @@ async function writeJson(filePath, value) {
   await mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rm(filePath, { force: true }).catch(() => undefined);
-  await cp(tempPath, filePath);
-  await rm(tempPath, { force: true });
+  await chmod(tempPath, 0o600).catch(() => undefined);
+  try {
+    await rename(tempPath, filePath);
+  } catch (caught) {
+    // Some Windows filesystems do not replace an existing destination through
+    // rename. The fallback keeps the old file in place until the copy succeeds.
+    if (!["EEXIST", "EPERM", "EACCES"].includes(String(caught?.code || ""))) {
+      await rm(tempPath, { force: true }).catch(() => undefined);
+      throw caught;
+    }
+    await cp(tempPath, filePath, { force: true });
+    await rm(tempPath, { force: true });
+  }
 }
 
 function encryptString(value) {
@@ -254,12 +488,390 @@ function actorSkillDirectory(actor) {
   return path.join(SKILL_ROOT, family, safeSegment(actor.id));
 }
 
+async function readUserRecord(userId) {
+  const record = await readJson(actorProfilePath(userId), null);
+  return record?.id === userId && record?.email ? record : null;
+}
+
+async function listUserRecords() {
+  const root = path.join(DATA_ROOT, "users");
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const records = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => readUserRecord(entry.name)),
+  );
+  return records.filter(Boolean);
+}
+
+async function writeUserRecord(record) {
+  await writeJson(actorProfilePath(record.id), record);
+  return record;
+}
+
+async function mutateAccounts(mutation) {
+  const operation = accountMutationQueue.catch(() => undefined).then(mutation);
+  accountMutationQueue = operation.catch(() => undefined);
+  return operation;
+}
+
 function sshWorkerKey(actor) {
   return `${actor.authenticated ? "user" : "guest"}:${actor.id}`;
 }
 
 function sshWorkerRuntimePath(actor) {
-  return path.join(actorDirectory(actor), "ssh-worker.json");
+  return path.join(actorDirectory(actor), "runtime", "ssh-worker.json");
+}
+
+function agentBindingsPath(actor) {
+  return path.join(actorDirectory(actor), "runtime", "agent-bindings.json");
+}
+
+function memoryDocumentPath(actor) {
+  return path.join(actorDirectory(actor), "memory", "memory.json");
+}
+
+function conversationTreePath(actor) {
+  return path.join(actorDirectory(actor), "conversations", "tree.json");
+}
+
+function conversationTombstonePath(actor) {
+  return path.join(
+    actorDirectory(actor),
+    "conversations",
+    "deleted.json",
+  );
+}
+
+function checkpointDocumentPath(actor) {
+  return path.join(actorDirectory(actor), "memory", "checkpoints", "index.json");
+}
+
+function actorProfilePath(actorOrId) {
+  const id = typeof actorOrId === "string" ? actorOrId : actorOrId.id;
+  return path.join(DATA_ROOT, "users", safeSegment(id), "state", "profile.json");
+}
+
+function actorStatePath(actor, name) {
+  return path.join(actorDirectory(actor), "state", `${safeSegment(name)}.json`);
+}
+
+function actorTaskDirectory(actor) {
+  return path.join(actorDirectory(actor), "tasks");
+}
+
+function actorTaskPath(actor, runId) {
+  return path.join(actorTaskDirectory(actor), `${safeRemoteRunId(runId)}.json`);
+}
+
+function actorCredentialPath(actor, name) {
+  return path.join(
+    actorDirectory(actor),
+    "credentials",
+    `${safeSegment(name)}.json`,
+  );
+}
+
+function actorAttachmentPath(actor, ...segments) {
+  return path.join(actorDirectory(actor), "attachments", ...segments);
+}
+
+async function readCheckpointDocument(actor) {
+  const stored = await readJson(checkpointDocumentPath(actor), {});
+  return {
+    updatedAt: String(stored.updatedAt || ""),
+    checkpoints:
+      stored.checkpoints && typeof stored.checkpoints === "object"
+        ? stored.checkpoints
+        : {},
+  };
+}
+
+async function updateCheckpointDocument(actor, updater) {
+  return enqueueActorMutation(checkpointMutationQueues, actor, async () => {
+    const document = await readCheckpointDocument(actor);
+    const next = (await updater(document)) || document;
+    next.updatedAt = isoNow();
+    await writeJson(checkpointDocumentPath(actor), next);
+    return next;
+  });
+}
+
+async function appendConversationTreeNode(actor, node) {
+  return enqueueActorMutation(
+    conversationTreeMutationQueues,
+    actor,
+    async () => {
+      const stored = await readJson(conversationTreePath(actor), {});
+      const document = {
+        updatedAt: isoNow(),
+        nodes:
+          stored.nodes && typeof stored.nodes === "object"
+            ? stored.nodes
+            : {},
+      };
+      document.nodes[node.conversationId] = node;
+      await writeJson(conversationTreePath(actor), document);
+      return node;
+    },
+  );
+}
+
+async function pruneConversationTreeDescendants(
+  actor,
+  parentConversationId,
+  parentMessageIds = [],
+) {
+  return enqueueActorMutation(
+    conversationTreeMutationQueues,
+    actor,
+    async () => {
+      const stored = await readJson(conversationTreePath(actor), {});
+      const nodes =
+        stored.nodes && typeof stored.nodes === "object" ? stored.nodes : {};
+      const messageIds = new Set(parentMessageIds.filter(Boolean).map(String));
+      const removed = new Set(
+        Object.values(nodes)
+          .filter(
+            (node) =>
+              String(node?.parentConversationId || "") ===
+                String(parentConversationId || "") &&
+              (!messageIds.size ||
+                messageIds.has(String(node?.parentMessageId || ""))),
+          )
+          .map((node) => String(node.conversationId || ""))
+          .filter(Boolean),
+      );
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const node of Object.values(nodes)) {
+          const id = String(node?.conversationId || "");
+          if (
+            id &&
+            !removed.has(id) &&
+            removed.has(String(node?.parentConversationId || ""))
+          ) {
+            removed.add(id);
+            changed = true;
+          }
+        }
+      }
+      for (const id of removed) delete nodes[id];
+      await writeJson(conversationTreePath(actor), {
+        updatedAt: isoNow(),
+        nodes,
+      });
+      return [...removed];
+    },
+  );
+}
+
+async function readMemoryDocument(actor) {
+  const stored = await readJson(memoryDocumentPath(actor), {});
+  return normalizeMemoryDocument(stored);
+}
+
+async function updateMemoryDocument(actor, updater) {
+  return enqueueActorMutation(memoryMutationQueues, actor, async () => {
+    const current = await readMemoryDocument(actor);
+    const next = normalizeMemoryDocument((await updater(current)) || current);
+    await writeJson(memoryDocumentPath(actor), next);
+    return next;
+  });
+}
+
+function agentBindingKey({ serverId, workspace, agentId, conversationId }) {
+  return [serverId, workspace, agentId, conversationId]
+    .map((value) => String(value || ""))
+    .join("::");
+}
+
+function createAgentSyncCursor({
+  state,
+  memoryDocument,
+  conversationId,
+  lastMessageId,
+  taskId,
+  checkpointId,
+  deliveredContent,
+  deliveredMemoryRecords = [],
+  memoryEnabled = true,
+  previous,
+}) {
+  const conversation = (state?.conversations || []).find(
+    (item) => String(item.id) === String(conversationId),
+  );
+  const messageIndex = (conversation?.messages || []).findIndex(
+    (message) => String(message.id) === String(lastMessageId),
+  );
+  const contentHash = deliveredContent
+    ? crypto.createHash("sha256").update(String(deliveredContent)).digest("hex")
+    : "";
+  return {
+    projectRevision: Number(memoryDocument?.revision || 0),
+    conversationEventSeq: messageIndex >= 0 ? messageIndex + 1 : 0,
+    conversationCheckpointVersion:
+      findConversationSummary(memoryDocument, conversationId)?.updatedAt || "",
+    workspaceRevision: String(checkpointId || ""),
+    contextEpoch: Number(previous?.contextEpoch || 0),
+    memoryEnabled: Boolean(memoryEnabled),
+    memoryVersions: memoryEnabled
+      ? Object.fromEntries([
+          ...Object.entries(previous?.memoryVersions || {}).filter(
+            ([key]) => key !== "document",
+          ),
+          ...deliveredMemoryRecords.map((record) => [
+            String(record.id),
+            Number(record.revision || 0),
+          ]),
+        ])
+      : {},
+    lastMessageId: String(lastMessageId || ""),
+    deliveredTaskIds: [
+      ...new Set([...(previous?.deliveredTaskIds || []), taskId].filter(Boolean)),
+    ].slice(-200),
+    deliveredContentHashes: [
+      ...new Set(
+        [
+          ...(previous?.deliveredContentHashes || []),
+          contentHash,
+          ...(Array.isArray(deliveredContent) ? deliveredContent : [])
+            .filter(Boolean)
+            .map((content) =>
+              crypto.createHash("sha256").update(String(content)).digest("hex"),
+            ),
+        ].filter(Boolean),
+      ),
+    ].slice(-400),
+  };
+}
+
+async function readAgentBindings(actor) {
+  const stored = await readJson(agentBindingsPath(actor), {});
+  return {
+    updatedAt: String(stored.updatedAt || ""),
+    bindings:
+      stored.bindings && typeof stored.bindings === "object"
+        ? stored.bindings
+        : {},
+  };
+}
+
+async function updateAgentBinding(actor, bindingKey, updater) {
+  return enqueueActorMutation(agentBindingMutationQueues, actor, async () => {
+    const document = await readAgentBindings(actor);
+    const current = document.bindings[bindingKey] || null;
+    const next = updater(current);
+    if (next) document.bindings[bindingKey] = next;
+    else delete document.bindings[bindingKey];
+    document.updatedAt = isoNow();
+    await writeJson(agentBindingsPath(actor), document);
+    return next;
+  });
+}
+
+async function removeAgentBindingsForConversations(actor, conversationIds) {
+  const ids = new Set(conversationIds.filter(Boolean).map(String));
+  if (!ids.size) return [];
+  const removed = await enqueueActorMutation(
+    agentBindingMutationQueues,
+    actor,
+    async () => {
+      const document = await readAgentBindings(actor);
+      const matches = [];
+      for (const [key, binding] of Object.entries(document.bindings)) {
+        if (!ids.has(String(binding?.conversationId || ""))) continue;
+        matches.push(binding);
+        delete document.bindings[key];
+      }
+      document.updatedAt = isoNow();
+      await writeJson(agentBindingsPath(actor), document);
+      return matches;
+    },
+  );
+  const worker = await getSshWorker(actor);
+  const nativeSessions = [];
+  for (const session of worker.sessions.values()) {
+    for (const [key, binding] of session.agentSessions || []) {
+      if (ids.has(String(binding?.conversationId || ""))) {
+        session.agentSessions.delete(key);
+      }
+    }
+  }
+  for (const binding of removed) {
+    const session = worker.sessions.get(safeSegment(binding.serverId || ""));
+    if (
+      binding.agentId !== "opencode" ||
+      !binding.agentSessionId ||
+      !session?.client ||
+      session.status !== "connected"
+    ) {
+      nativeSessions.push({
+        agentSessionId: binding.agentSessionId,
+        status: "detached",
+      });
+      continue;
+    }
+    try {
+      const agent = (await scanRemoteAgents(session, actor)).find(
+        (item) => item.id === binding.agentId && item.status === "ready",
+      );
+      if (!agent) throw new Error("Agent 当前不可用");
+      const service = await ensureOpenCodeService(session, agent);
+      await openCodeServiceRequest(session, service, {
+        method: "DELETE",
+        endpoint: `/session/${encodeURIComponent(binding.agentSessionId)}`,
+        directory: binding.workspace,
+      });
+      nativeSessions.push({
+        agentSessionId: binding.agentSessionId,
+        status: "deleted",
+      });
+    } catch (caught) {
+      nativeSessions.push({
+        agentSessionId: binding.agentSessionId,
+        status: "detached",
+        diagnostic: caught instanceof Error ? caught.message : "原生会话删除失败",
+      });
+    }
+  }
+  scheduleSshWorkerPersist(worker, 0);
+  return { bindings: removed, nativeSessions };
+}
+
+async function removeWorkerTasks(actor, runIds) {
+  const ids = new Set(runIds.filter(Boolean).map(String));
+  if (!ids.size) return;
+  const worker = await getSshWorker(actor);
+  for (const runId of ids) {
+    worker.tasks.delete(runId);
+    await rm(actorTaskPath(actor, runId), { force: true }).catch(() => undefined);
+  }
+  scheduleSshWorkerPersist(worker, 0);
+}
+
+async function removeManagedBranchWorkspaces(actor, conversations) {
+  const worker = await getSshWorker(actor);
+  for (const conversation of conversations) {
+    if (conversation?.work?.workspaceMode !== "managed") continue;
+    const session = worker.sessions.get(safeSegment(conversation.work.serverId || ""));
+    if (!session?.client || session.status !== "connected") continue;
+    const conversationSegment = safeSegment(conversation.id, "conversation");
+    const expectedRoot = `${session.home}/.easywork/worktrees/${conversationSegment}`;
+    const workspace = String(conversation.work.workspace || "");
+    if (workspace !== `${expectedRoot}/main`) continue;
+    await remoteExec(
+      session.client,
+      [
+        "set -eu",
+        `EW_TARGET=${shellQuote(expectedRoot)}`,
+        `EW_EXPECTED=${shellQuote(`${session.home}/.easywork/worktrees/${conversationSegment}`)}`,
+        'test "$EW_TARGET" = "$EW_EXPECTED"',
+        'case "$EW_TARGET" in "$HOME/.easywork/worktrees/"*) rm -rf -- "$EW_TARGET" ;; *) exit 91 ;; esac',
+      ].join("\n"),
+    ).catch(() => undefined);
+  }
 }
 
 function createSshSession(worker, serverId, stored = {}) {
@@ -281,6 +893,12 @@ function createSshSession(worker, serverId, stored = {}) {
     fingerprint: "",
     activeStream: null,
     activeRun: null,
+    activeRuns: new Map(),
+    runtime: null,
+    openCodeServices: new Map(),
+    openCodeServicePromises: new Map(),
+    apiRelays: new Map(),
+    providerRoute: null,
     agentSessions: new Map(Object.entries(stored.agentSessions || {})),
     agentUpdates: new Map(),
     lastConnectedAt: String(stored.lastConnectedAt || ""),
@@ -294,7 +912,6 @@ function createSshSession(worker, serverId, stored = {}) {
 
 function serializeSshWorker(worker) {
   return {
-    version: 1,
     workerId: worker.id,
     actorKey: worker.key,
     updatedAt: isoNow(),
@@ -311,10 +928,6 @@ function serializeSshWorker(worker) {
       disconnectReason: session.disconnectReason,
       agentSessions: Object.fromEntries(session.agentSessions || []),
     })),
-    tasks: [...worker.tasks.values()].map((task) => ({
-      ...task,
-      events: Array.isArray(task.events) ? task.events.slice(-600) : [],
-    })),
   };
 }
 
@@ -322,7 +935,17 @@ function persistSshWorker(worker) {
   const snapshot = serializeSshWorker(worker);
   worker.persistQueue = worker.persistQueue
     .catch(() => undefined)
-    .then(() => writeJson(sshWorkerRuntimePath(worker.actor), snapshot));
+    .then(async () => {
+      await writeJson(sshWorkerRuntimePath(worker.actor), snapshot);
+      await Promise.all(
+        [...worker.tasks.values()].map((task) =>
+          writeJson(actorTaskPath(worker.actor, task.runId), {
+            ...task,
+            events: Array.isArray(task.events) ? task.events.slice(-600) : [],
+          }),
+        ),
+      );
+    });
   return worker.persistQueue;
 }
 
@@ -361,21 +984,27 @@ async function getSshWorker(actor) {
       const session = createSshSession(worker, item.serverId, item);
       worker.sessions.set(session.serverId, session);
     }
-    for (const task of Array.isArray(stored.tasks) ? stored.tasks : []) {
+    const taskEntries = await readdir(actorTaskDirectory(actor), {
+      withFileTypes: true,
+    }).catch(() => []);
+    const storedTasks = await Promise.all(
+      taskEntries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) =>
+          readJson(path.join(actorTaskDirectory(actor), entry.name), null),
+        ),
+    );
+    for (const task of storedTasks.filter(Boolean)) {
       if (!task?.runId || !task?.conversationId) continue;
       worker.tasks.set(String(task.runId), {
         ...task,
         recoveredAfterRestart: task.status === "running",
-        status: task.status === "running" ? "error" : task.status,
-        error:
-          task.status === "running"
-            ? "主机服务已重启，远程任务状态无法继续跟踪"
-            : task.error,
-        result:
-          task.status === "running"
-            ? "主机服务已重启，远程任务状态无法继续跟踪"
-            : task.result,
+        status: task.status,
+        recoveryStatus: task.status === "running" ? "pending" : undefined,
         events: Array.isArray(task.events) ? task.events : [],
+        appendedInstructions: Array.isArray(task.appendedInstructions)
+          ? task.appendedInstructions
+          : [],
       });
     }
     worker.hydrated = true;
@@ -392,10 +1021,9 @@ function touchSshSession(session) {
 
 async function resolveActor(req, res, createGuest = true) {
   const cookies = cookieMap(req.headers.cookie);
-  const users = await readJson(path.join(DATA_ROOT, "users.json"), []);
   const signedActorId = verifySession(requestSessionToken(req) || cookies.ew_session);
   if (signedActorId) {
-    const record = users.find((item) => item.id === signedActorId);
+    const record = await readUserRecord(signedActorId);
     if (record) {
       return {
         id: record.id,
@@ -423,7 +1051,7 @@ async function resolveActor(req, res, createGuest = true) {
 }
 
 async function getSecrets(actor) {
-  const stored = await readJson(path.join(actorDirectory(actor), "secrets.json"), {});
+  const stored = await readJson(actorCredentialPath(actor, "secrets"), {});
   const sshCredentials = {};
   for (const [serverId, credential] of Object.entries(stored.sshCredentials || {})) {
     sshCredentials[serverId] = {
@@ -434,14 +1062,13 @@ async function getSecrets(actor) {
   return {
     providerApiKey: decryptString(stored.providerApiKey),
     embeddingApiKey: decryptString(stored.embeddingApiKey),
-    sshPrivateKey: decryptString(stored.sshPrivateKey),
     sshCredentials,
   };
 }
 
 async function updateSecrets(actor, patch) {
   return enqueueActorMutation(secretMutationQueues, actor, async () => {
-    const secretPath = path.join(actorDirectory(actor), "secrets.json");
+    const secretPath = actorCredentialPath(actor, "secrets");
     const stored = await readJson(secretPath, {});
     const next = { ...stored };
     if (typeof patch.providerApiKey === "string" && patch.providerApiKey) {
@@ -449,9 +1076,6 @@ async function updateSecrets(actor, patch) {
     }
     if (typeof patch.embeddingApiKey === "string" && patch.embeddingApiKey) {
       next.embeddingApiKey = encryptString(patch.embeddingApiKey);
-    }
-    if (typeof patch.sshPrivateKey === "string" && patch.sshPrivateKey) {
-      next.sshPrivateKey = encryptString(patch.sshPrivateKey);
     }
     if (
       patch.sshCredential?.serverId &&
@@ -477,14 +1101,91 @@ async function updateSecrets(actor, patch) {
 }
 
 async function getState(actor) {
-  return readJson(path.join(actorDirectory(actor), "state.json"), {});
+  const [settings, projects, conversations, skills, files] = await Promise.all([
+    readJson(actorStatePath(actor, "settings"), {}),
+    readJson(actorStatePath(actor, "projects"), []),
+    readJson(path.join(actorDirectory(actor), "conversations", "index.json"), []),
+    readJson(actorStatePath(actor, "skills"), []),
+    readJson(actorAttachmentPath(actor, "files.json"), []),
+  ]);
+  return { settings, projects, conversations, skills, files };
+}
+
+function conversationTimestamp(conversation) {
+  const value = Date.parse(
+    conversation?.updatedAt || conversation?.createdAt || "",
+  );
+  return Number.isFinite(value) ? value : 0;
+}
+
+function mergeConversationCollections(stored = [], incoming = [], tombstones = {}) {
+  const deletedIds = new Set(Object.keys(tombstones?.ids || {}));
+  const storedItems = Array.isArray(stored)
+    ? stored.filter((item) => item?.id && !deletedIds.has(String(item.id)))
+    : [];
+  const incomingItems = Array.isArray(incoming)
+    ? incoming.filter((item) => item?.id && !deletedIds.has(String(item.id)))
+    : [];
+  const storedById = new Map(storedItems.map((item) => [String(item.id), item]));
+  const incomingById = new Map(
+    incomingItems.map((item) => [String(item.id), item]),
+  );
+  const incomingOnly = incomingItems.filter(
+    (item) => !storedById.has(String(item.id)),
+  );
+  const mergedStored = storedItems.map((storedItem) => {
+    const incomingItem = incomingById.get(String(storedItem.id));
+    if (!incomingItem) return storedItem;
+    const storedTime = conversationTimestamp(storedItem);
+    const incomingTime = conversationTimestamp(incomingItem);
+    if (incomingTime < storedTime) return storedItem;
+    return {
+      ...storedItem,
+      ...incomingItem,
+      branch: incomingItem.branch || storedItem.branch,
+      work:
+        incomingItem.work || storedItem.work
+          ? { ...(storedItem.work || {}), ...(incomingItem.work || {}) }
+          : undefined,
+    };
+  });
+  return [...incomingOnly, ...mergedStored];
+}
+
+async function readConversationTombstones(actor) {
+  const stored = await readJson(conversationTombstonePath(actor), {});
+  return {
+    updatedAt: String(stored.updatedAt || ""),
+    ids: stored.ids && typeof stored.ids === "object" ? stored.ids : {},
+  };
+}
+
+async function tombstoneConversation(actor, conversationId) {
+  return enqueueActorMutation(stateMutationQueues, actor, async () => {
+    const document = await readConversationTombstones(actor);
+    document.updatedAt = isoNow();
+    document.ids[safeSegment(conversationId)] = document.updatedAt;
+    await writeJson(conversationTombstonePath(actor), document);
+    return document;
+  });
 }
 
 async function saveState(actor, state) {
   const safeState = JSON.parse(JSON.stringify(state || {}));
   if (safeState?.settings?.provider) delete safeState.settings.provider.apiKey;
   if (safeState?.settings?.embedding) delete safeState.settings.embedding.apiKey;
-  await writeJson(path.join(actorDirectory(actor), "state.json"), safeState);
+  await Promise.all([
+    writeJson(actorStatePath(actor, "settings"), safeState.settings || {}),
+    writeJson(actorStatePath(actor, "projects"), safeState.projects || []),
+    writeJson(
+      path.join(actorDirectory(actor), "conversations", "index.json"),
+      safeState.conversations || [],
+    ),
+    writeJson(actorStatePath(actor, "skills"), safeState.skills || []),
+    writeJson(actorAttachmentPath(actor, "files.json"), safeState.files || []),
+  ]);
+  delete safeState.memories;
+  delete safeState.memorySummary;
   return safeState;
 }
 
@@ -507,38 +1208,42 @@ async function persistServerProfile(actor, input, requestedId) {
     throw new Error("SSH 端口无效");
   }
 
+  const stateBefore = await getState(actor);
+  const profilesBefore = Array.isArray(stateBefore?.settings?.servers)
+    ? stateBefore.settings.servers
+    : [];
+  const current = profilesBefore.find((profile) => profile.id === serverId);
+  const credentialTargetChanged = Boolean(
+    current &&
+      (current.host !== host ||
+        Number(current.port || 22) !== port ||
+        current.username !== username ||
+        (current.authMethod || "key") !== authMethod),
+  );
+  if (credentialTargetChanged) {
+    await updateSecrets(actor, { removeSshCredentialId: serverId });
+  }
+  const incomingPrivateKey =
+    authMethod === "key" ? String(input.privateKey || "") : "";
+  const incomingPassword =
+    authMethod === "password" ? String(input.password || "") : "";
+  if (incomingPrivateKey || incomingPassword) {
+    await updateSecrets(actor, {
+      sshCredential: {
+        serverId,
+        privateKey: incomingPrivateKey || undefined,
+        password: incomingPassword || undefined,
+      },
+    });
+  }
+  const secrets = await getSecrets(actor);
+  const credential = secrets.sshCredentials?.[serverId];
   let savedProfile;
-  await updateState(actor, async (state) => {
+  await updateState(actor, (state) => {
     state.settings ||= {};
     const profiles = Array.isArray(state.settings.servers)
       ? state.settings.servers
       : [];
-    const current = profiles.find((profile) => profile.id === serverId);
-    const credentialTargetChanged = Boolean(
-      current &&
-        (current.host !== host ||
-          Number(current.port || 22) !== port ||
-          current.username !== username ||
-          (current.authMethod || "key") !== authMethod),
-    );
-    if (credentialTargetChanged) {
-      await updateSecrets(actor, { removeSshCredentialId: serverId });
-    }
-    const incomingPrivateKey =
-      authMethod === "key" ? String(input.privateKey || "") : "";
-    const incomingPassword =
-      authMethod === "password" ? String(input.password || "") : "";
-    if (incomingPrivateKey || incomingPassword) {
-      await updateSecrets(actor, {
-        sshCredential: {
-          serverId,
-          privateKey: incomingPrivateKey || undefined,
-          password: incomingPassword || undefined,
-        },
-      });
-    }
-    const secrets = await getSecrets(actor);
-    const credential = secrets.sshCredentials?.[serverId];
     savedProfile = {
       id: serverId,
       name: String(input.name || host).trim().slice(0, 80) || host,
@@ -559,7 +1264,6 @@ async function persistServerProfile(actor, input, requestedId) {
       ...profiles.filter((profile) => profile.id !== serverId),
     ];
     state.settings.lastServerId = serverId;
-    delete state.settings.ssh;
     return state;
   });
   return savedProfile;
@@ -567,77 +1271,49 @@ async function persistServerProfile(actor, input, requestedId) {
 
 async function stateForClient(actor) {
   const state = await getState(actor);
-  let secrets = await getSecrets(actor);
+  const secrets = await getSecrets(actor);
+  const memoryDocument = await readMemoryDocument(actor);
   if (state?.settings?.provider) {
     state.settings.provider.configured = Boolean(secrets.providerApiKey);
   }
   if (state?.settings?.embedding) {
     state.settings.embedding.configured = Boolean(secrets.embeddingApiKey);
   }
-  if (secrets.sshPrivateKey || state?.settings?.ssh || state?.settings?.servers) {
-    state.settings ||= {};
-    const legacySsh = state.settings.ssh;
-    state.settings.servers = Array.isArray(state.settings.servers)
-      ? state.settings.servers
-      : [];
-    if (
-      legacySsh?.host &&
-      !state.settings.servers.some(
-        (profile) =>
-          profile.host === legacySsh.host &&
-          Number(profile.port || 22) === Number(legacySsh.port || 22) &&
-          profile.username === legacySsh.username,
-      )
-    ) {
-      const legacyId = `server-${crypto
-        .createHash("sha256")
-        .update(`${legacySsh.host}:${legacySsh.port || 22}:${legacySsh.username || ""}`)
-        .digest("hex")
-        .slice(0, 12)}`;
-      state.settings.servers.unshift({
-        id: legacyId,
-        name: legacySsh.name || legacySsh.host,
-        host: legacySsh.host,
-        port: Number(legacySsh.port || 22),
-        username: legacySsh.username || "",
-        keyName: legacySsh.keyName || "",
-        authMethod: "key",
-        configured: Boolean(secrets.sshPrivateKey),
-      });
-      state.settings.lastServerId ||= legacyId;
-    }
-    if (legacySsh && secrets.sshPrivateKey) {
-      const matchingProfiles = state.settings.servers.filter(
-        (profile) =>
-          (profile.authMethod || "key") === "key" &&
-          profile.host === legacySsh.host &&
-          Number(profile.port || 22) === Number(legacySsh.port || 22) &&
-          profile.username === legacySsh.username &&
-          !secrets.sshCredentials?.[safeSegment(profile.id)]?.privateKey,
-      );
-      for (const profile of matchingProfiles) {
-        await updateSecrets(actor, {
-          sshCredential: {
-            serverId: profile.id,
-            privateKey: secrets.sshPrivateKey,
-          },
-        });
-      }
-      if (matchingProfiles.length) secrets = await getSecrets(actor);
-    }
+  if (Array.isArray(state?.settings?.servers)) {
     state.settings.servers = state.settings.servers.map((profile) => ({
       ...profile,
       configured: Boolean(
         secrets.sshCredentials?.[safeSegment(profile.id)]?.privateKey ||
-          secrets.sshCredentials?.[safeSegment(profile.id)]?.password ||
-          (legacySsh &&
-            secrets.sshPrivateKey &&
-            profile.host === legacySsh.host &&
-            Number(profile.port || 22) === Number(legacySsh.port || 22) &&
-            profile.username === legacySsh.username),
+          secrets.sshCredentials?.[safeSegment(profile.id)]?.password,
       ),
     }));
   }
+  const manageableMemoryRecords = memoryDocument.records.filter(
+    (record) => record.status !== "deleted",
+  );
+  const visibleMemoryRecords = activeMemoryRecords(memoryDocument);
+  state.memories = manageableMemoryRecords.map((record) => ({
+    id: record.id,
+    content: record.content,
+    scope: record.scope,
+    scopeId: record.scopeId,
+    projectId: record.scope === "project" ? record.scopeId : undefined,
+    kind: record.kind,
+    source: record.source,
+    confidence: Number(record.confidence || 0),
+    enabled: record.status !== "disabled",
+    portability: record.portability,
+    authority: record.authority,
+    sensitivity: record.sensitivity,
+    validUntil: record.validUntil,
+    updatedAt: record.updatedAt,
+  }));
+  state.memorySummary =
+    memoryDocument.overview ||
+    visibleMemoryRecords
+      .slice(0, 4)
+      .map((record) => record.summary || record.content)
+      .join("；");
   return state;
 }
 
@@ -832,7 +1508,7 @@ async function indexLibraryFile(actor, item, buffer, state) {
       vectors.push(...(await callEmbedding(embedding, secrets.embeddingApiKey, batch)));
     }
   }
-  const indexPath = path.join(actorDirectory(actor), "library", "index.json");
+  const indexPath = actorAttachmentPath(actor, "library-index.json");
   const index = await readJson(indexPath, { version: 1, files: {} });
   index.files[item.id] = {
     id: item.id,
@@ -879,7 +1555,7 @@ function cosine(left, right) {
 }
 
 async function retrieveKnowledge(actor, query, state, limit = 6) {
-  const index = await readJson(path.join(actorDirectory(actor), "library", "index.json"), {
+  const index = await readJson(actorAttachmentPath(actor, "library-index.json"), {
     files: {},
   });
   const terms = tokenize(query);
@@ -1017,40 +1693,407 @@ async function selectedSkillContext(actor, skillIds = []) {
   return pieces.join("\n\n");
 }
 
-function memoryContext(state, projectId, memoryMode) {
-  if (!state?.settings?.memoryEnabled) return "";
-  const memories = Array.isArray(state.memories) ? state.memories : [];
-  return memories
-    .filter((item) => item.enabled)
-    .filter((item) => {
-      if (memoryMode === "project-only") {
-        return item.scope === "project" && item.projectId === projectId;
+function memoryRecordsForContext(
+  document,
+  state,
+  prompt,
+  projectId,
+  memoryMode,
+  conversationId,
+  workspaceId = "",
+  taskId = "",
+) {
+  if (!state?.settings?.memoryEnabled) return [];
+  const conversation = (state?.conversations || []).find(
+    (item) => String(item.id) === String(conversationId),
+  );
+  return selectMemoryRecords(document, {
+    prompt,
+    projectId,
+    conversationId,
+    workspaceId,
+    taskId,
+    memoryMode,
+    limit: 16,
+    asOfSequence: Number(conversation?.branch?.memorySnapshotSequence || 0) || undefined,
+    lineageConversationId: conversationId,
+  });
+}
+
+function memorySyncRecordsForContext(
+  document,
+  state,
+  projectId,
+  memoryMode,
+  conversationId,
+  workspaceId = "",
+  taskId = "",
+) {
+  if (!state?.settings?.memoryEnabled) return [];
+  const conversation = (state?.conversations || []).find(
+    (item) => String(item.id) === String(conversationId),
+  );
+  return selectMemorySyncRecords(document, {
+    projectId,
+    conversationId,
+    workspaceId,
+    taskId,
+    memoryMode,
+    asOfSequence: Number(conversation?.branch?.memorySnapshotSequence || 0) || undefined,
+    lineageConversationId: conversationId,
+  });
+}
+
+function formatMemoryContext(records) {
+  return records
+    .map((item) => {
+      const scope =
+        item.scope === "conversation"
+          ? "本对话"
+          : item.scope === "project"
+            ? "本项目"
+            : item.scope === "workspace"
+              ? "工作区"
+              : item.scope === "task"
+                ? "本任务"
+                : "全局";
+      if (item.status !== "active") {
+        return `- [撤销][${scope}] 不再使用键为“${item.semanticKey || item.id}”的旧记忆。`;
       }
-      return item.scope === "global" || (item.scope === "project" && item.projectId === projectId);
+      return `- [${scope}] ${item.content}（来源：${item.source || "未知"}；可信度：${Number(item.confidence ?? 0.5).toFixed(2)}）`;
     })
-    .slice(0, 20)
-    .map((item) => `- ${item.content}（来源：${item.source || "未知"}）`)
     .join("\n");
 }
 
-function historyContext(state, conversationId, projectId, memoryMode) {
+function historyContext(state, memoryDocument, conversationId, beforeMessageId) {
   if (!state?.settings?.referenceHistory) return "";
-  const conversations = Array.isArray(state.conversations) ? state.conversations : [];
-  const allowed = conversations
-    .filter((conversation) => {
-      if (memoryMode === "project-only") return conversation.projectId === projectId;
-      return true;
-    })
-    .sort(
-      (left, right) =>
-        Number(left.id === conversationId) - Number(right.id === conversationId),
-    );
-  return allowed
-    .flatMap((conversation) => (conversation.messages || []).slice(-8))
-    .filter((message) => message.content)
-    .slice(-16)
+  const summary = findConversationSummary(memoryDocument, conversationId);
+  const recent = currentConversationHistory(state, conversationId, {
+    beforeMessageId,
+    afterMessageId: summary?.throughMessageId,
+    maxMessages: 32,
+  })
     .map((message) => `${message.role === "user" ? "用户" : "助手"}：${message.content}`)
     .join("\n");
+  return [
+    summary?.content ? `对话摘要：${summary.content}` : "",
+    recent,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function conversationContextUsage(
+  state,
+  memoryDocument,
+  conversationId,
+  {
+    systemText = "",
+    skillsText = "",
+    knowledgeText = "",
+    outputReserve = 8_192,
+  } = {},
+) {
+  const conversation = (state?.conversations || []).find(
+    (item) => String(item.id) === String(conversationId),
+  );
+  const messages = Array.isArray(conversation?.messages)
+    ? conversation.messages
+    : [];
+  const summary = findConversationSummary(memoryDocument, conversationId);
+  const activeMessages = currentConversationHistory(state, conversationId, {
+    afterMessageId: summary?.throughMessageId,
+    maxMessages: Math.max(1, messages.length + 1),
+  });
+  const records = state?.settings?.memoryEnabled
+    ? selectMemoryRecords(memoryDocument, {
+        prompt: messages.at(-1)?.content || "",
+        projectId: conversation?.projectId,
+        conversationId,
+        workspaceId: conversation?.work?.logicalWorkspaceId || "",
+        memoryMode:
+          state?.projects?.find((project) => project.id === conversation?.projectId)
+            ?.memoryMode || "project-and-global",
+        limit: 24,
+        asOfSequence:
+          Number(conversation?.branch?.memorySnapshotSequence || 0) || undefined,
+        lineageConversationId: conversationId,
+      })
+    : [];
+  const tokenText = [
+    summary?.content || "",
+    ...activeMessages.map((message) => message.content || ""),
+    ...records.map((record) => record.content || ""),
+  ].join("\n");
+  const messageTokens = estimateContextTokens(
+    activeMessages.map((message) => message.content || "").join("\n"),
+  );
+  const summaryTokens = estimateContextTokens(summary?.content || "");
+  const memoryTokens = estimateContextTokens(
+    records.map((record) => record.content || "").join("\n"),
+  );
+  const systemTokens = estimateContextTokens(systemText);
+  const skillTokens = estimateContextTokens(skillsText);
+  const knowledgeTokens = estimateContextTokens(knowledgeText);
+  const reserveTokens = Math.max(0, Number(outputReserve || 0));
+  const used =
+    estimateContextTokens(tokenText) +
+    systemTokens +
+    skillTokens +
+    knowledgeTokens +
+    reserveTokens;
+  const limit = Number(memoryDocument.contextSettings.conversationLimit || 200_000);
+  return {
+    used,
+    limit,
+    ratio: limit ? Math.min(1, used / limit) : 0,
+    automaticCompressionThreshold: Number(
+      memoryDocument.contextSettings.automaticCompressionThreshold || 0.95,
+    ),
+    summary,
+    messageCount: messages.length,
+    activeMessageCount: activeMessages.length,
+    memoryCount: records.length,
+    breakdown: {
+      messages: messageTokens,
+      summary: summaryTokens,
+      memory: memoryTokens,
+      system: systemTokens,
+      skills: skillTokens,
+      knowledge: knowledgeTokens,
+      outputReserve: reserveTokens,
+    },
+  };
+}
+
+const CONVERSATION_CHECKPOINT_ARRAY_FIELDS = [
+  "activeRequirements",
+  "activeConstraints",
+  "activeDecisions",
+  "executionOutcomes",
+  "importantFacts",
+  "artifactReferences",
+  "openQuestions",
+  "pendingApprovals",
+  "nextActions",
+  "exactAnchors",
+];
+
+function boundedCheckpointText(value, limit = 1_200) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function boundedCheckpointList(value, limit = 24) {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value
+        .map((item) => boundedCheckpointText(item, 1_000))
+        .filter(Boolean),
+    ),
+  ].slice(-limit);
+}
+
+function exactCheckpointAnchors(messages) {
+  const anchors = [];
+  const add = (value) => {
+    const normalized = boundedCheckpointText(value, 500);
+    if (normalized && !anchors.includes(normalized)) anchors.push(normalized);
+  };
+  for (const message of messages) {
+    const content = String(message?.content || "");
+    for (const match of content.matchAll(/`([^`\r\n]{2,300})`/g)) add(match[1]);
+    for (const match of content.matchAll(
+      /(?:~\/[\w.\-\/]+|\/[\w.\-]+(?:\/[\w.\-]+)+|[A-Za-z]:\\[^\r\n<>:"|?*]{2,240})/g,
+    )) add(match[0]);
+    for (const match of content.matchAll(
+      /\b(?:[A-Fa-f0-9]{12,64}|\d+(?:\.\d+)?\s*(?:ms|s|min|GB|MB|KB|GiB|MiB|%|端口)|(?:port|pid|job|task|run)[-_: ]?[A-Za-z0-9_.-]+)\b/gi,
+    )) add(match[0]);
+  }
+  return anchors.slice(-80);
+}
+
+function normalizeConversationCheckpoint(value, existing, messages) {
+  const source = value && typeof value === "object" ? value : {};
+  const previous = existing && typeof existing === "object" ? existing : {};
+  const userMessages = messages.filter((message) => message.role === "user");
+  const assistantMessages = messages.filter((message) => message.role !== "user");
+  const checkpoint = {
+    goal: boundedCheckpointText(
+      source.goal || previous.goal || userMessages[0]?.content,
+    ),
+    currentFocus: boundedCheckpointText(
+      source.currentFocus || userMessages.at(-1)?.content || previous.currentFocus,
+    ),
+  };
+  for (const field of CONVERSATION_CHECKPOINT_ARRAY_FIELDS) {
+    checkpoint[field] = boundedCheckpointList(
+      source[field]?.length ? source[field] : previous[field],
+    );
+  }
+  if (!checkpoint.executionOutcomes.length) {
+    checkpoint.executionOutcomes = boundedCheckpointList(
+      assistantMessages.slice(-4).map((message) => message.content),
+      8,
+    );
+  }
+  checkpoint.exactAnchors = boundedCheckpointList(
+    [
+      ...(previous.exactAnchors || []),
+      ...exactCheckpointAnchors(messages),
+    ],
+    80,
+  );
+  checkpoint.coveredMessageIds = uniqueStrings(
+    previous.coveredMessageIds || [],
+    messages.map((message) => String(message.id)),
+  );
+  return checkpoint;
+}
+
+function conversationCheckpointContent(checkpoint) {
+  const labels = {
+    activeRequirements: "当前要求",
+    activeConstraints: "约束",
+    activeDecisions: "已定事项",
+    executionOutcomes: "执行结果",
+    importantFacts: "重要事实",
+    artifactReferences: "产物",
+    openQuestions: "待澄清",
+    pendingApprovals: "待确认",
+    nextActions: "下一步",
+    exactAnchors: "精确锚点",
+  };
+  const sections = [
+    checkpoint.goal ? `目标：${checkpoint.goal}` : "",
+    checkpoint.currentFocus ? `当前焦点：${checkpoint.currentFocus}` : "",
+  ];
+  for (const field of CONVERSATION_CHECKPOINT_ARRAY_FIELDS) {
+    if (!checkpoint[field]?.length) continue;
+    sections.push(
+      `${labels[field]}：\n${checkpoint[field].map((item) => `- ${item}`).join("\n")}`,
+    );
+  }
+  let content = sections.filter(Boolean).join("\n\n");
+  while (estimateContextTokens(content) > 8_000) {
+    const reducible = CONVERSATION_CHECKPOINT_ARRAY_FIELDS
+      .map((field) => ({ field, length: checkpoint[field]?.length || 0 }))
+      .filter((item) => item.length > 2)
+      .sort((left, right) => right.length - left.length)[0];
+    if (!reducible) {
+      content = content.slice(0, Math.max(1, Math.floor(content.length * 0.9)));
+      break;
+    }
+    checkpoint[reducible.field].shift();
+    content = conversationCheckpointContent(checkpoint);
+  }
+  return content.slice(0, 24_000);
+}
+
+async function compressConversationContext(actor, conversationId) {
+  const state = await getState(actor);
+  const memoryDocument = await readMemoryDocument(actor);
+  const conversation = (state?.conversations || []).find(
+    (item) => String(item.id) === String(conversationId),
+  );
+  if (!conversation) {
+    const error = new Error("对话不存在");
+    error.statusCode = 404;
+    throw error;
+  }
+  const messages = (conversation.messages || []).filter(
+    (message) => message?.content,
+  );
+  const existing = findConversationSummary(memoryDocument, conversationId);
+  const throughIndex = existing?.throughMessageId
+    ? messages.findIndex((message) => message.id === existing.throughMessageId)
+    : -1;
+  const candidates = messages.slice(throughIndex + 1, Math.max(throughIndex + 1, messages.length - 8));
+  if (!candidates.length) {
+    return {
+      document: memoryDocument,
+      summary: existing || null,
+      usage: conversationContextUsage(state, memoryDocument, conversationId),
+      compressed: false,
+    };
+  }
+  const sourceText = candidates
+    .map(
+      (message) =>
+        `[${message.id}] ${message.role === "user" ? "用户" : "EasyWork"}：${String(message.content).slice(0, 8_000)}`,
+    )
+    .join("\n\n");
+  const provider = state?.settings?.provider || {};
+  const secrets = await getSecrets(actor);
+  let checkpointSource = null;
+  if (provider.configured && provider.model && secrets.providerApiKey) {
+    try {
+      const prompt = await renderPromptTemplate(
+        "memory/conversation-compact.md",
+        {
+          EXISTING_CHECKPOINT: existing?.checkpoint
+            ? JSON.stringify(existing.checkpoint, null, 2)
+            : "{}",
+          MESSAGES: sourceText,
+        },
+      );
+      const response = await callChatProvider(
+        provider,
+        secrets.providerApiKey,
+        prompt,
+      );
+      checkpointSource = parseModelJsonObject(extractModelText(response.payload));
+    } catch {
+      checkpointSource = null;
+    }
+  }
+  let checkpoint = normalizeConversationCheckpoint(
+    checkpointSource,
+    existing?.checkpoint,
+    candidates,
+  );
+  let summaryText = conversationCheckpointContent(checkpoint);
+  const sourceTokens = estimateContextTokens(
+    [existing?.content || "", sourceText].filter(Boolean).join("\n\n"),
+  );
+  let summaryTokens = estimateContextTokens(summaryText);
+  let validationMode = checkpointSource ? "model-validated" : "deterministic";
+  if (sourceTokens > 512 && summaryTokens >= sourceTokens * 0.95) {
+    checkpoint = normalizeConversationCheckpoint(
+      null,
+      existing?.checkpoint,
+      candidates,
+    );
+    summaryText = conversationCheckpointContent(checkpoint);
+    summaryTokens = estimateContextTokens(summaryText);
+    validationMode = "deterministic-fallback";
+  }
+  checkpoint.validation = {
+    mode: validationMode,
+    sourceTokens,
+    summaryTokens,
+    rawMessagesRetained: true,
+    validatedAt: isoNow(),
+  };
+  const throughMessage = candidates.at(-1);
+  const nextDocument = await updateMemoryDocument(actor, (document) =>
+    upsertConversationSummary(document, {
+      conversationId,
+      content: summaryText,
+      checkpoint,
+      throughMessageId: throughMessage.id,
+      sourceMessageIds: uniqueStrings(
+        existing?.sourceMessageIds || [],
+        candidates.map((message) => message.id),
+      ),
+    }),
+  );
+  return {
+    document: nextDocument,
+    summary: findConversationSummary(nextDocument, conversationId),
+    usage: conversationContextUsage(state, nextDocument, conversationId),
+    compressed: true,
+  };
 }
 
 async function buildContext({
@@ -1061,15 +2104,57 @@ async function buildContext({
   projectId,
   memoryMode,
   conversationId,
+  currentUserMessageId,
+  workspaceId = "",
+  taskId = "",
 }) {
   const state = await getState(actor);
+  let memoryDocument = await readMemoryDocument(actor);
   const system = await readFile(
     path.join(PROMPT_ROOT, mode === "work" ? "work-system.md" : "chat-system.md"),
     "utf8",
   );
   const skills = await selectedSkillContext(actor, skillIds);
-  const memories = memoryContext(state, projectId, memoryMode);
-  const history = historyContext(state, conversationId, projectId, memoryMode);
+  const usage = conversationContextUsage(state, memoryDocument, conversationId, {
+    systemText: system,
+    skillsText: skills,
+  });
+  if (
+    usage.messageCount > 12 &&
+    usage.ratio >= usage.automaticCompressionThreshold
+  ) {
+    const compressed = await compressConversationContext(
+      actor,
+      conversationId,
+    ).catch(() => null);
+    if (compressed?.document) memoryDocument = compressed.document;
+  }
+  const memoryRecords = memoryRecordsForContext(
+    memoryDocument,
+    state,
+    prompt,
+    projectId,
+    memoryMode,
+    conversationId,
+    workspaceId,
+    taskId,
+  );
+  const memorySyncRecords = memorySyncRecordsForContext(
+    memoryDocument,
+    state,
+    projectId,
+    memoryMode,
+    conversationId,
+    workspaceId,
+    taskId,
+  );
+  const memories = formatMemoryContext(memoryRecords);
+  const history = historyContext(
+    state,
+    memoryDocument,
+    conversationId,
+    currentUserMessageId,
+  );
   const knowledge = await retrieveKnowledge(actor, prompt, state).catch(() => []);
   const knowledgeText = (
     await Promise.all(
@@ -1098,9 +2183,33 @@ async function buildContext({
       CONTENT: prompt,
     }),
   });
+  const contextUsage = conversationContextUsage(
+    state,
+    memoryDocument,
+    conversationId,
+    {
+      systemText: system,
+      skillsText: skills,
+      knowledgeText,
+    },
+  );
   return {
     state,
+    memoryDocument,
     text,
+    sections: {
+      system,
+      memories,
+      history,
+      conversationSummary:
+        findConversationSummary(memoryDocument, conversationId)?.content || "",
+      skills,
+      knowledge: knowledgeText,
+      request: prompt,
+    },
+    memoryRecords,
+    memorySyncRecords,
+    contextUsage,
     sources: [...new Set(knowledge.map((item) => item.file))],
   };
 }
@@ -1124,6 +2233,33 @@ function extractModelText(payload) {
     .map((item) => item.text || item.output_text || "")
     .filter(Boolean)
     .join("\n");
+}
+
+function parseModelJsonObject(value) {
+  const source = String(value || "").trim();
+  const fenced = source.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  for (const candidate of [fenced, source]) {
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      const start = candidate.indexOf("{");
+      const end = candidate.lastIndexOf("}");
+      if (start < 0 || end <= start) continue;
+      try {
+        const parsed = JSON.parse(candidate.slice(start, end + 1));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed;
+        }
+      } catch {
+        // The caller treats malformed model output as an empty result.
+      }
+    }
+  }
+  return null;
 }
 
 async function modelRequest(protocol, model, context, test = false) {
@@ -1320,7 +2456,13 @@ function createThinkTagRouter(onDelta) {
   };
 }
 
-async function callChatProviderStream(provider, apiKey, context, onDelta) {
+async function callChatProviderStream(
+  provider,
+  apiKey,
+  context,
+  onDelta,
+  options = {},
+) {
   assertApiKeyShape(apiKey);
   const protocols =
     provider.protocol === "responses" || provider.protocol === "chat-completions"
@@ -1337,7 +2479,9 @@ async function callChatProviderStream(provider, apiKey, context, onDelta) {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({ ...request.body, stream: true }),
-      signal: AbortSignal.timeout(120_000),
+      signal: options.signal
+        ? AbortSignal.any([options.signal, AbortSignal.timeout(120_000)])
+        : AbortSignal.timeout(120_000),
     });
     if (!response.ok) {
       const diagnostic = (await response.text()).slice(0, 400);
@@ -1456,13 +2600,157 @@ async function runChatModelStream(actor, context, state, onDelta) {
   return { ...result, demo: false };
 }
 
-async function runWorkHandoffModel(actor, context, state, onReasoning) {
+async function persistChatTurnStart(actor, body, fallbackTitle) {
+  const conversationId = String(body.conversationId || "");
+  const userMessageId = String(body.userMessageId || "");
+  const assistantMessageId = String(body.assistantMessageId || "");
+  const createdAt = isoNow();
+  await updateState(actor, (state) => {
+    state.conversations = Array.isArray(state.conversations)
+      ? state.conversations
+      : [];
+    let conversation = state.conversations.find(
+      (item) => String(item.id) === conversationId,
+    );
+    if (!conversation) {
+      conversation = {
+        id: conversationId,
+        title: fallbackTitle || "新对话",
+        mode: "chat",
+        projectId: body.projectId ? String(body.projectId) : undefined,
+        messages: [],
+        updatedAt: createdAt,
+      };
+      state.conversations.unshift(conversation);
+    }
+    conversation.mode = "chat";
+    conversation.projectId ||= body.projectId
+      ? String(body.projectId)
+      : undefined;
+    conversation.updatedAt = createdAt;
+    conversation.messages = Array.isArray(conversation.messages)
+      ? conversation.messages
+      : [];
+    if (
+      userMessageId &&
+      !conversation.messages.some((message) => message.id === userMessageId)
+    ) {
+      conversation.messages.push({
+        id: userMessageId,
+        role: "user",
+        content: String(body.prompt || ""),
+        createdAt,
+        mode: "chat",
+        selectedSkills: Array.isArray(body.skillIds) ? body.skillIds : [],
+      });
+    }
+    if (
+      assistantMessageId &&
+      !conversation.messages.some(
+        (message) => message.id === assistantMessageId,
+      )
+    ) {
+      conversation.messages.push({
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        createdAt,
+        mode: "chat",
+        reasoningStatus: "running",
+      });
+    }
+    return state;
+  });
+}
+
+async function broadcastActorEvent(actor, payload) {
+  const worker = await getSshWorker(actor);
+  sessionSend({ worker }, payload);
+}
+
+async function persistChatTurnResult(actor, body, result) {
+  const conversationId = String(body.conversationId || "");
+  const assistantMessageId = String(body.assistantMessageId || "");
+  await updateState(actor, (state) => {
+    const conversation = (state.conversations || []).find(
+      (item) => String(item.id) === conversationId,
+    );
+    if (!conversation) return state;
+    conversation.updatedAt = isoNow();
+    const assistant = (conversation.messages || []).find(
+      (message) => message.id === assistantMessageId,
+    );
+    if (assistant) {
+      assistant.content = result.content;
+      assistant.reasoning = result.reasoning || undefined;
+      assistant.reasoningStatus = "done";
+    }
+    return state;
+  });
+}
+
+async function finalizeChatTurn(actor, body, result, fallbackTitle) {
+  const conversationId = String(body.conversationId || "");
+  const title = body.firstTurn
+    ? await generateConversationTitle(
+        actor,
+        String(body.prompt || ""),
+        result.content,
+      ).catch(() => fallbackTitle)
+    : "";
+  await updateState(actor, (state) => {
+    const conversation = (state.conversations || []).find(
+      (item) => String(item.id) === conversationId,
+    );
+    if (!conversation) return state;
+    if (title) conversation.title = title;
+    conversation.updatedAt = isoNow();
+    return state;
+  });
+  if (title) {
+    await broadcastActorEvent(actor, {
+      type: "conversation.title",
+      conversationId,
+      title,
+    });
+  }
+  await Promise.allSettled([
+    captureMemory(
+      actor,
+      String(body.prompt || ""),
+      body.projectId ? String(body.projectId) : undefined,
+      body.memoryMode === "project-only"
+        ? "project-only"
+        : "project-and-global",
+      conversationId,
+      String(body.userMessageId || ""),
+    ),
+    distillPortableMemory(actor, {
+      conversationId,
+      projectId: body.projectId ? String(body.projectId) : undefined,
+      userRequest: String(body.prompt || ""),
+      finalResult: result.content,
+      source: "chat-result-distillation",
+      sourceMessageIds: [body.userMessageId, body.assistantMessageId].filter(Boolean),
+    }),
+  ]);
+}
+
+async function runWorkHandoffModel(
+  actor,
+  currentRequest,
+  context,
+  state,
+  onReasoning,
+  signal,
+) {
   const provider = state?.settings?.provider || {};
   const secrets = await getSecrets(actor);
   if (!provider.configured || !provider.model || !secrets.providerApiKey) {
     return { content: "", reasoning: "", skipped: true };
   }
-  const handoffPrompt = await renderPromptTemplate("tasks/work-handoff.md", {
+  const handoffPrompt = await renderPromptTemplate("web/work-context-router.md", {
+    CURRENT_REQUEST: currentRequest,
     CONTEXT: context,
   });
   const result = await callChatProviderStream(
@@ -1472,32 +2760,166 @@ async function runWorkHandoffModel(actor, context, state, onReasoning) {
     (kind, delta) => {
       if (kind === "reasoning") onReasoning(delta);
     },
+    { signal },
   );
   return { ...result, skipped: false };
 }
 
-async function captureMemory(actor, prompt, projectId, memoryMode) {
+async function captureMemory(
+  actor,
+  prompt,
+  projectId,
+  memoryMode,
+  conversationId,
+  sourceMessageId = "",
+) {
   if (!/(请记住|记住这|以后请|我的偏好|我习惯)/i.test(prompt)) return;
   const content = String(prompt)
     .replace(/^.*?(请记住|记住这|以后请)[：:，,\s]*/i, "")
     .trim()
     .slice(0, 280);
   if (!content) return;
-  await updateState(actor, (state) => {
-    if (!state?.settings?.autoCapture || !Array.isArray(state.memories)) return state;
-    state.memories.unshift({
-      id: randomId("memory_"),
+  const state = await getState(actor);
+  if (!state?.settings?.memoryEnabled || !state?.settings?.autoCapture) return;
+  const scope = memoryMode === "project-only" ? "project" : "user";
+  await updateMemoryDocument(actor, (document) =>
+    appendExplicitMemory(document, {
       content,
-      scope: memoryMode === "project-only" ? "project" : "global",
-      ...(memoryMode === "project-only" ? { projectId } : {}),
+      scope,
+      scopeId: scope === "project" ? projectId : "",
       kind: "preference",
       source: "用户明确要求",
-      confidence: 1,
-      enabled: true,
-      updatedAt: isoNow(),
-    });
-    return state;
+      sourceConversationId: conversationId,
+      sourceMessageIds: [sourceMessageId].filter(Boolean),
+      portability: scope === "project" ? "project-shared" : "universal",
+      authority: "user-explicit",
+    }),
+  );
+}
+
+async function distillPortableMemory(actor, {
+  conversationId,
+  projectId,
+  userRequest,
+  finalResult,
+  location = "当前网页对话",
+  source = "result-distillation",
+  sourceTaskId,
+  sourceCheckpointId,
+  serverId,
+  workspaceId,
+  sourceAgentId,
+  sourceAgentSessionId,
+  sourceMessageIds = [],
+}) {
+  const request = String(userRequest || "").trim();
+  const result = String(finalResult || "").trim();
+  if (!request || !result) return [];
+
+  const state = await getState(actor);
+  if (!state?.settings?.memoryEnabled || !state?.settings?.autoCapture) return [];
+  const provider = state?.settings?.provider || {};
+  const secrets = await getSecrets(actor);
+  if (!provider.configured || !provider.model || !secrets.providerApiKey) {
+    return [];
+  }
+
+  const prompt = await renderPromptTemplate("memory/memory-candidate-extract.md", {
+    USER_REQUEST: request.slice(0, 8_000),
+    LOCATION: String(location || "当前网页对话").slice(0, 1_000),
+    FINAL_RESULT: result.slice(0, 16_000),
   });
+  const response = await callChatProvider(
+    provider,
+    secrets.providerApiKey,
+    prompt,
+  );
+  const parsed = parseModelJsonObject(extractModelText(response.payload));
+  const allowedKinds = new Set(["workflow", "fact", "decision", "constraint"]);
+  const allowedScopes = new Set(["project", "workspace", "conversation"]);
+  const allowedPortability = new Set([
+    "project-shared",
+    "reusable-after-validation",
+    "workspace-bound",
+    "agent-session-only",
+  ]);
+  const records = (Array.isArray(parsed?.records) ? parsed.records : [])
+    .map((record) => ({
+      content: String(record?.content || "").trim().slice(0, 2_000),
+      semanticKey: String(record?.semanticKey || "").trim().slice(0, 300),
+      kind: allowedKinds.has(String(record?.kind || ""))
+        ? String(record.kind)
+        : "fact",
+      scope: allowedScopes.has(String(record?.scope || ""))
+        ? String(record.scope)
+        : projectId
+          ? "project"
+          : "conversation",
+      portability: allowedPortability.has(String(record?.portability || ""))
+        ? String(record.portability)
+        : "workspace-bound",
+    }))
+    .filter((record) => record.content)
+    .slice(0, 8);
+  if (!records.length) return [];
+
+  const storedIds = [];
+  const updated = await updateMemoryDocument(actor, (document) => {
+    let next = document;
+    for (const record of records) {
+      const scope =
+        record.scope === "workspace" && workspaceId
+          ? "workspace"
+          : record.scope === "project" && projectId
+            ? "project"
+            : "conversation";
+      const scopeId =
+        scope === "workspace"
+          ? workspaceId
+          : scope === "project"
+            ? projectId
+            : conversationId;
+      next = appendExplicitMemory(next, {
+        content: record.content,
+        semanticKey: record.semanticKey,
+        scope,
+        scopeId,
+        kind: record.kind,
+        source: sourceTaskId ? `${source}:${sourceTaskId}` : source,
+        sourceConversationId: conversationId,
+        sourceMessageIds,
+        sourceTaskId,
+        sourceCheckpointId,
+        sourceWorkspaceId: workspaceId,
+        sourceAgentId,
+        sourceAgentSessionId,
+        evidenceRefs: serverId ? [`server:${serverId}`] : [],
+        portability:
+          scope === "workspace"
+            ? "workspace-bound"
+            : record.portability,
+        authority: sourceTaskId
+          ? "agent-reported-execution"
+          : "model-inferred",
+        confidence: sourceTaskId ? 0.86 : 0.58,
+      });
+      const stored = next.records.find(
+        (item) =>
+          item.scope === scope &&
+          String(item.scopeId || "") === String(scopeId || "") &&
+          item.semanticKey ===
+            String(record.semanticKey || record.content)
+              .normalize("NFKC")
+              .toLocaleLowerCase()
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 300),
+      );
+      if (stored) storedIds.push(stored.id);
+    }
+    return next;
+  });
+  return updated.records.filter((record) => storedIds.includes(record.id));
 }
 
 async function copyGuestDataToUser(guestActor, userActor) {
@@ -1518,7 +2940,7 @@ async function copyGuestDataToUser(guestActor, userActor) {
     await mkdir(userData, { recursive: true });
     await cp(guestData, userData, { recursive: true, force: false, errorOnExist: false });
   } catch {
-    // A new account can legitimately have no guest data to migrate.
+    // A new account can legitimately have no guest data to transfer.
   }
   try {
     await access(guestSkills, fsConstants.F_OK);
@@ -1564,6 +2986,7 @@ async function handleHttp(req, res) {
       const actor = await resolveActor(req, res);
       await mkdir(actorDirectory(actor), { recursive: true });
       await mkdir(actorSkillDirectory(actor), { recursive: true });
+      await updateMemoryDocument(actor, (document) => document);
       sendJson(res, 200, {
         actor,
         deviceToken: issueDeviceToken(actor),
@@ -1578,18 +3001,24 @@ async function handleHttp(req, res) {
     if (req.method === "PUT" && url.pathname === "/api/state") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
-      await updateState(actor, (storedState) => {
+      await updateState(actor, async (storedState) => {
         const nextState = JSON.parse(JSON.stringify(body.state || {}));
         nextState.settings ||= {};
         const storedSettings = storedState?.settings || {};
         // These account-level settings have dedicated endpoints. Keeping the
-        // server copy prevents an older browser tab from erasing a key or SSH
-        // profile that was just saved on another device.
+        // server copy prevents a concurrent browser tab from erasing a key or
+        // SSH profile that was just saved on another device.
         for (const key of ["provider", "embedding", "servers", "lastServerId"]) {
           if (Object.hasOwn(storedSettings, key)) {
             nextState.settings[key] = storedSettings[key];
           }
         }
+        const tombstones = await readConversationTombstones(actor);
+        nextState.conversations = mergeConversationCollections(
+          storedState?.conversations,
+          nextState.conversations,
+          tombstones,
+        );
         return nextState;
       });
       const worker = sshWorkerPool.get(sshWorkerKey(actor));
@@ -1599,6 +3028,794 @@ async function handleHttp(req, res) {
         }
       }
       sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (
+      req.method === "DELETE" &&
+      url.pathname.startsWith("/api/conversations/")
+    ) {
+      const actor = await resolveActor(req, res);
+      const conversationId = safeSegment(
+        decodeURIComponent(url.pathname.slice("/api/conversations/".length)),
+      );
+      if (!conversationId) {
+        sendJson(res, 400, { error: "对话标识不能为空" });
+        return;
+      }
+      const stateBeforeDelete = await getState(actor);
+      const deletedConversation = (stateBeforeDelete.conversations || []).find(
+        (conversation) => conversation.id === conversationId,
+      );
+      const deletedRunIds = [
+        ...new Set(
+          (deletedConversation?.messages || [])
+            .map((message) => String(message.runId || message.trace?.runId || ""))
+            .filter(Boolean),
+        ),
+      ];
+      await tombstoneConversation(actor, conversationId);
+      await updateState(actor, (state) => {
+        state.conversations = (state.conversations || []).filter(
+          (conversation) => conversation.id !== conversationId,
+        );
+        return state;
+      });
+      await updateMemoryDocument(actor, (current) => {
+        const next = invalidateMemoryVersions(current, {
+          sourceConversationIds: [conversationId],
+          reason: "conversation-deleted",
+          invalidatedBy: conversationId,
+        });
+        next.summaries = next.summaries.map((summary) =>
+          String(summary.conversationId || "") === conversationId
+            ? { ...summary, status: "invalidated", invalidatedAt: isoNow() }
+            : summary,
+        );
+        next.overview = "";
+        return next;
+      });
+      await removeAgentBindingsForConversations(actor, [conversationId]);
+      await removeWorkerTasks(actor, deletedRunIds);
+      sendJson(res, 200, { ok: true, conversationId });
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      url.pathname === "/api/conversations/action"
+    ) {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const action = String(body.action || "branch");
+      if (!["branch", "edit", "reset"].includes(action)) {
+        sendJson(res, 400, { error: "不支持的对话操作" });
+        return;
+      }
+      const sourceConversationId = String(body.conversationId || "");
+      const sourceMessageId = String(body.messageId || "");
+      const state = await getState(actor);
+      const source = (state.conversations || []).find(
+        (conversation) => conversation.id === sourceConversationId,
+      );
+      if (!source) {
+        sendJson(res, 404, { error: "原对话不存在" });
+        return;
+      }
+      const messages = Array.isArray(source.messages) ? source.messages : [];
+      const messageIndex = messages.findIndex(
+        (message) => message.id === sourceMessageId,
+      );
+      if (messageIndex < 0) {
+        sendJson(res, 404, { error: "目标消息不存在" });
+        return;
+      }
+      const sourceMessage = messages[messageIndex];
+
+      if (action === "branch") {
+        const newConversationId = safeSegment(
+          body.newConversationId || randomId("chat-"),
+        );
+        const retainedMessages = messages.slice(0, messageIndex + 1);
+        const memoryDocument = await readMemoryDocument(actor);
+        const createdAt = isoNow();
+        const memorySnapshotSequence = memorySequenceAt(
+          memoryDocument,
+          sourceMessage.createdAt || createdAt,
+          {
+            sourceMessageIds: [sourceMessage.id],
+            sourceTaskIds: [
+              String(sourceMessage.runId || sourceMessage.trace?.runId || ""),
+            ].filter(Boolean),
+          },
+        );
+        const branchConversation = {
+          ...JSON.parse(JSON.stringify(source)),
+          id: newConversationId,
+          messages: JSON.parse(JSON.stringify(retainedMessages)),
+          updatedAt: createdAt,
+          branch: {
+            parentConversationId: sourceConversationId,
+            parentMessageId: sourceMessageId,
+            action: "branch",
+            memorySnapshotSequence,
+            createdAt,
+          },
+          work: source.work
+            ? { ...source.work, agentSessionId: undefined }
+            : undefined,
+        };
+        const workspaceCapability = {
+          workspace:
+            branchConversation.mode === "work"
+              ? "unavailable"
+              : "not-applicable",
+          workspaceMessage: "",
+          sourceCheckpointId: "",
+        };
+        if (branchConversation.mode === "work") {
+          const sourceRunId = String(
+            sourceMessage.runId || sourceMessage.trace?.runId || "",
+          );
+          const checkpoint = checkpointForRun(
+            await readCheckpointDocument(actor),
+            sourceRunId,
+            sourceMessage.role === "assistant" ? "after" : "before",
+          );
+          const worker = await getSshWorker(actor);
+          const targetSession = worker.sessions.get(
+            safeSegment(branchConversation.work?.serverId || ""),
+          );
+          if (checkpoint?.status !== "available") {
+            sendJson(res, 409, {
+              error: "该位置没有可用的工作区检查点，无法安全创建工作分支",
+            });
+            return;
+          }
+          if (!targetSession?.client || targetSession.status !== "connected") {
+            sendJson(res, 409, {
+              error: "对应服务器当前未连接，无法创建工作分支",
+            });
+            return;
+          }
+          const restored = await restoreWorkspaceCheckpoint(
+            targetSession,
+            checkpoint,
+            newConversationId,
+          );
+          branchConversation.work = {
+            ...(branchConversation.work || {}),
+            workspace: restored.workspace,
+            workspaceMode: restored.mode,
+            logicalWorkspaceId:
+              checkpoint.logicalWorkspaceId ||
+              branchConversation.work?.logicalWorkspaceId,
+            sourceCheckpointId: checkpoint.id,
+            agentSessionId: undefined,
+          };
+          workspaceCapability.workspace = "restored-managed-branch";
+          workspaceCapability.workspaceMessage =
+            "已从该消息的检查点建立独立工作分支；原对话和原工作区未改动。";
+          workspaceCapability.sourceCheckpointId = checkpoint.id;
+        }
+        await updateState(actor, (current) => {
+          current.conversations = [
+            branchConversation,
+            ...(current.conversations || []).filter(
+              (conversation) => conversation.id !== newConversationId,
+            ),
+          ];
+          return current;
+        });
+        await updateMemoryDocument(actor, (current) => {
+          let next = cloneConversationMemoryScope(current, {
+            sourceConversationId,
+            targetConversationId: newConversationId,
+            asOfSequence: memorySnapshotSequence,
+          });
+          next = cloneConversationSummary(next, {
+            sourceConversationId,
+            targetConversationId: newConversationId,
+            retainedMessageIds: retainedMessages.map((message) => message.id),
+          });
+          if (!findConversationSummary(next, newConversationId) && retainedMessages.length > 8) {
+            const summarizedMessages = retainedMessages.slice(0, -8);
+            const checkpoint = normalizeConversationCheckpoint(
+              null,
+              null,
+              summarizedMessages,
+            );
+            next = upsertConversationSummary(next, {
+              conversationId: newConversationId,
+              content: conversationCheckpointContent(checkpoint),
+              checkpoint,
+              throughMessageId: summarizedMessages.at(-1)?.id,
+              sourceMessageIds: summarizedMessages.map((message) => message.id),
+            });
+          }
+          return next;
+        });
+        await appendConversationTreeNode(actor, {
+          conversationId: newConversationId,
+          parentConversationId: sourceConversationId,
+          parentMessageId: sourceMessageId,
+          action: "branch",
+          memorySnapshotSequence,
+          mode: branchConversation.mode,
+          projectId: branchConversation.projectId,
+          serverId: branchConversation.work?.serverId,
+          workspace: branchConversation.work?.workspace,
+          workspaceMode: branchConversation.work?.workspaceMode,
+          sourceCheckpointId:
+            workspaceCapability.sourceCheckpointId || undefined,
+          createdAt,
+        });
+        sendJson(res, 200, {
+          conversation: branchConversation,
+          seedPrompt: "",
+          capability: {
+            conversation: true,
+            agentMemory: "new-session-bootstrap",
+            ...workspaceCapability,
+          },
+        });
+        return;
+      }
+
+      const lastUserMessage = [...messages]
+        .reverse()
+        .find((message) => message.role === "user");
+      const lastAssistantMessage = [...messages]
+        .reverse()
+        .find((message) => message.role === "assistant");
+      let userIndex = messageIndex;
+      if (action === "edit") {
+        if (
+          sourceMessage.role !== "user" ||
+          lastUserMessage?.id !== sourceMessage.id
+        ) {
+          sendJson(res, 409, { error: "只能编辑当前对话最新一轮的用户提问" });
+          return;
+        }
+      } else {
+        if (
+          sourceMessage.role !== "assistant" ||
+          lastAssistantMessage?.id !== sourceMessage.id
+        ) {
+          sendJson(res, 409, { error: "只能重置当前对话的最新回复" });
+          return;
+        }
+        userIndex = messageIndex - 1;
+        while (userIndex >= 0 && messages[userIndex].role !== "user") {
+          userIndex -= 1;
+        }
+        if (userIndex < 0) {
+          sendJson(res, 409, { error: "没有找到该回复对应的用户提问" });
+          return;
+        }
+      }
+      const originalUserMessage = messages[userIndex];
+      const seedPrompt = String(
+        action === "edit"
+          ? body.content || originalUserMessage.content
+          : originalUserMessage.content,
+      ).trim();
+      if (!seedPrompt) {
+        sendJson(res, 400, { error: "重新生成的提问不能为空" });
+        return;
+      }
+      const affectedMessages = messages.slice(userIndex);
+      const affectedMessageIds = affectedMessages.map((message) => message.id);
+      const affectedRunIds = [
+        ...new Set(
+          affectedMessages
+            .map((message) => String(message.runId || message.trace?.runId || ""))
+            .filter(Boolean),
+        ),
+      ];
+      let resetCapability = {
+        workspace: source.mode === "work" ? "unchanged" : "not-applicable",
+        workspaceMessage: "",
+      };
+      if (source.mode === "work" && affectedRunIds.length) {
+        const checkpointDocument = await readCheckpointDocument(actor);
+        const checkpointPairs = affectedRunIds.map((runId) => ({
+          runId,
+          before: checkpointForRun(checkpointDocument, runId, "before"),
+          after: checkpointForRun(checkpointDocument, runId, "after"),
+        }));
+        const worker = await getSshWorker(actor);
+        const targetSession = worker.sessions.get(
+          safeSegment(source.work?.serverId || ""),
+        );
+        const reverted = await selectivelyRevertWorkspaceRuns(
+          targetSession,
+          actor,
+          {
+            conversationId: sourceConversationId,
+            serverId: source.work?.serverId,
+            workspace: source.work?.workspace,
+            logicalWorkspaceId: source.work?.logicalWorkspaceId,
+            checkpoints: checkpointPairs,
+          },
+        );
+        resetCapability = {
+          workspace: "selectively-reset",
+          workspaceMessage: reverted.files.length
+            ? `已仅撤销本轮对 ${reverted.files.length} 个可快照文件的修改；其他对话保持不变，工作区外副作用不在可重置范围内。`
+            : "本轮没有需要撤销的可快照文件修改；工作区外副作用不在可重置范围内。",
+        };
+      }
+      const descendantIds = await pruneConversationTreeDescendants(
+        actor,
+        sourceConversationId,
+        affectedMessageIds,
+      );
+      const descendantSet = new Set(descendantIds);
+      const descendantConversations = (state.conversations || []).filter(
+        (conversation) => descendantSet.has(String(conversation.id)),
+      );
+      let resetConversation;
+      await updateState(actor, (current) => {
+        const target = (current.conversations || []).find(
+          (conversation) => conversation.id === sourceConversationId,
+        );
+        if (!target) throw new Error("原对话不存在");
+        target.messages = (target.messages || []).slice(0, userIndex);
+        target.updatedAt = isoNow();
+        resetConversation = JSON.parse(JSON.stringify(target));
+        current.conversations = (current.conversations || []).filter(
+          (conversation) => !descendantSet.has(String(conversation.id)),
+        );
+        return current;
+      });
+      await updateMemoryDocument(actor, (current) => {
+        let next = current;
+        if (affectedRunIds.length) {
+          next = invalidateMemoryVersions(next, {
+            sourceConversationIds: [sourceConversationId],
+            sourceTaskIds: affectedRunIds,
+            reason: `${action}-run-reset`,
+            invalidatedBy: sourceConversationId,
+          });
+        }
+        next = invalidateMemoryVersions(next, {
+          sourceConversationIds: [sourceConversationId],
+          afterTimestamp: originalUserMessage.createdAt || "",
+          reason: `${action}-conversation-reset`,
+          invalidatedBy: sourceConversationId,
+        });
+        if (descendantIds.length) {
+          next = invalidateMemoryVersions(next, {
+            sourceConversationIds: descendantIds,
+            reason: `${action}-descendant-removed`,
+            invalidatedBy: sourceConversationId,
+          });
+        }
+        const invalidSummaryConversations = new Set([
+          sourceConversationId,
+          ...descendantIds,
+        ]);
+        next.summaries = next.summaries.map((summary) =>
+          invalidSummaryConversations.has(String(summary.conversationId || "")) &&
+          (summary.conversationId !== sourceConversationId ||
+            affectedMessageIds.includes(String(summary.throughMessageId || "")))
+            ? { ...summary, status: "invalidated", invalidatedAt: isoNow() }
+            : summary,
+        );
+        next.overview = "";
+        return next;
+      });
+      const removedAgentState = await removeAgentBindingsForConversations(actor, [
+        sourceConversationId,
+        ...descendantIds,
+      ]);
+      await removeWorkerTasks(actor, affectedRunIds);
+      await removeManagedBranchWorkspaces(actor, descendantConversations);
+      for (const descendantId of descendantIds) {
+        await tombstoneConversation(actor, descendantId);
+      }
+      sendJson(res, 200, {
+        conversation: resetConversation,
+        seedPrompt,
+        capability: {
+          conversation: true,
+          agentMemory: removedAgentState.nativeSessions.every(
+            (item) => item.status === "deleted",
+          )
+            ? "native-session-reset"
+            : "detached-new-session-bootstrap",
+          agentMemoryMessage: removedAgentState.nativeSessions.some(
+            (item) => item.status === "detached",
+          )
+            ? "旧 Agent 原生会话无法删除，EasyWork 已解除绑定；重新生成会使用全新 Agent 会话。"
+            : "",
+          ...resetCapability,
+          removedBranches: descendantIds.length,
+        },
+      });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/memories") {
+      const actor = await resolveActor(req, res);
+      const document = await readMemoryDocument(actor);
+      sendJson(res, 200, {
+        records: document.records.filter((record) => record.status !== "deleted"),
+        overview: document.overview,
+        revision: document.revision,
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/memories") {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const content = String(body.content || "").trim();
+      const allowedScopes = new Set([
+        "user",
+        "project",
+        "conversation",
+        "workspace",
+        "task",
+      ]);
+      const scope = allowedScopes.has(String(body.scope || ""))
+        ? String(body.scope)
+        : "user";
+      const scopeId = scope === "user" ? "" : String(body.scopeId || "").trim();
+      const sensitivity = ["normal", "personal", "restricted", "secret"].includes(
+        String(body.sensitivity || ""),
+      )
+        ? String(body.sensitivity)
+        : "normal";
+      const validUntil = String(body.validUntil || "").trim();
+      if (validUntil && !Number.isFinite(Date.parse(validUntil))) {
+        throw new Error("记忆有效期格式无效");
+      }
+      if (!content) throw new Error("记忆内容不能为空");
+      if (scope !== "user" && !scopeId) throw new Error("该记忆缺少作用域标识");
+      let record;
+      const document = await updateMemoryDocument(actor, (current) => {
+        const next = appendExplicitMemory(current, {
+          content,
+          scope,
+          scopeId,
+          kind: String(body.kind || "preference"),
+          semanticKey: String(body.semanticKey || ""),
+          source: "用户手动添加",
+          sourceConversationId: String(body.sourceConversationId || ""),
+          portability:
+            scope === "workspace"
+              ? "workspace-bound"
+              : scope === "project"
+                ? "project-shared"
+                : "universal",
+          authority: "user-explicit",
+          sensitivity,
+          validUntil,
+        });
+        record = next.records.find(
+          (item) =>
+            item.scope === scope &&
+            String(item.scopeId || "") === scopeId &&
+            item.content === content,
+        );
+        return next;
+      });
+      sendJson(res, 200, { record, revision: document.revision });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/memories/overview") {
+      const actor = await resolveActor(req, res);
+      const document = await updateMemoryDocument(actor, (current) => {
+        const active = activeMemoryRecords(current).slice(0, 8);
+        const timestamp = isoNow();
+        return {
+          ...current,
+          overview: active
+            .map((record) => record.summary || record.content)
+            .join("；")
+            .slice(0, 2_000),
+          revision: Number(current.revision || 0) + 1,
+          updatedAt: timestamp,
+          ledger: [
+            ...(current.ledger || []),
+            {
+              id: randomId("event-"),
+              type: "memory.overview-updated",
+              timestamp,
+            },
+          ],
+        };
+      });
+      sendJson(res, 200, { overview: document.overview });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/memories/instruction") {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const instruction = String(body.instruction || "").trim();
+      if (!instruction) throw new Error("请输入要更新的记忆");
+      const deletion = /^(?:忘记|删除)(?:关于|掉)?[：:，,\s]*/.exec(instruction);
+      const document = await updateMemoryDocument(actor, (current) => {
+        if (deletion) {
+          const target = instruction.slice(deletion[0].length).trim();
+          let next = current;
+          for (const record of activeMemoryRecords(current).filter(
+            (item) => !target || item.content.includes(target),
+          )) {
+            next = appendMemoryTombstone(next, {
+              memoryId: record.id,
+              reason: target ? `用户要求忘记：${target}` : "用户要求清空记忆",
+              source: "用户手动删除",
+            });
+          }
+          next.overview = "";
+          return next;
+        }
+        return appendExplicitMemory(current, {
+          content: instruction,
+          scope: "user",
+          kind: "preference",
+          source: "用户手动修正",
+          portability: "universal",
+          authority: "user-explicit",
+        });
+      });
+      sendJson(res, 200, {
+        records: activeMemoryRecords(document),
+        overview: document.overview,
+      });
+      return;
+    }
+
+    if (url.pathname.startsWith("/api/memories/") && ["PATCH", "DELETE"].includes(req.method)) {
+      const actor = await resolveActor(req, res);
+      const memoryId = safeSegment(
+        decodeURIComponent(url.pathname.slice("/api/memories/".length)),
+        "",
+      );
+      if (!memoryId) throw new Error("记忆标识无效");
+      const body = req.method === "PATCH" ? await parseJsonBody(req) : {};
+      let record = null;
+      const document = await updateMemoryDocument(actor, (current) => {
+        const index = current.records.findIndex((item) => item.id === memoryId);
+        if (index < 0) {
+          const error = new Error("记忆不存在");
+          error.statusCode = 404;
+          throw error;
+        }
+        if (req.method === "DELETE") {
+          return appendMemoryTombstone(current, {
+            memoryId,
+            reason: "用户删除",
+            source: "用户手动删除",
+          });
+        } else {
+          const existing = current.records[index];
+          const content = String(body.content ?? existing.content).trim();
+          if (!content) throw new Error("记忆内容不能为空");
+          const enabled =
+            typeof body.enabled === "boolean"
+              ? body.enabled
+              : existing.status === "active";
+          const sensitivity = [
+            "normal",
+            "personal",
+            "restricted",
+            "secret",
+          ].includes(String(body.sensitivity || ""))
+            ? String(body.sensitivity)
+            : existing.sensitivity;
+          const validUntil = String(body.validUntil ?? existing.validUntil ?? "");
+          if (validUntil && !Number.isFinite(Date.parse(validUntil))) {
+            throw new Error("记忆有效期格式无效");
+          }
+          const next = appendExplicitMemory(current, {
+            content,
+            summary: String(body.summary ?? existing.summary ?? content),
+            scope: existing.scope,
+            scopeId: existing.scopeId,
+            kind: existing.kind,
+            semanticKey: existing.semanticKey,
+            source: "用户手动修正",
+            authority: "user-explicit",
+            confidence: 1,
+            sensitivity,
+            portability: existing.portability,
+            validUntil,
+            status: enabled ? "active" : "disabled",
+          });
+          record = next.records.find((item) => item.id === memoryId) || null;
+          next.overview = "";
+          return next;
+        }
+      });
+      sendJson(res, 200, {
+        ok: true,
+        record,
+        revision: document.revision,
+      });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/context") {
+      const actor = await resolveActor(req, res);
+      const conversationId = String(url.searchParams.get("conversationId") || "");
+      const state = await getState(actor);
+      const memoryDocument = await readMemoryDocument(actor);
+      const contextConversation = (state.conversations || []).find(
+        (item) => String(item.id) === conversationId,
+      );
+      const lastUserContextMessage = [...(contextConversation?.messages || [])]
+        .reverse()
+        .find((message) => message.role === "user");
+      const [contextSystemText, contextSkillsText] = await Promise.all([
+        readFile(
+          path.join(
+            PROMPT_ROOT,
+            contextConversation?.mode === "work"
+              ? "work-system.md"
+              : "chat-system.md",
+          ),
+          "utf8",
+        ).catch(() => ""),
+        selectedSkillContext(
+          actor,
+          lastUserContextMessage?.selectedSkills || [],
+        ).catch(() => ""),
+      ]);
+      const usage = conversationContextUsage(
+        state,
+        memoryDocument,
+        conversationId,
+        {
+          systemText: contextSystemText,
+          skillsText: contextSkillsText,
+        },
+      );
+      const lastMeasuredWebUsage = [...(contextConversation?.messages || [])]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.webContextUsage)
+        ?.webContextUsage;
+      const measuredKnowledgeTokens = Number(
+        lastMeasuredWebUsage?.breakdown?.knowledge || 0,
+      );
+      if (measuredKnowledgeTokens > 0) {
+        usage.breakdown.knowledge = measuredKnowledgeTokens;
+        usage.used += measuredKnowledgeTokens;
+        usage.ratio = usage.limit
+          ? Math.min(1, usage.used / usage.limit)
+          : 0;
+      }
+      const conversation = contextConversation;
+      const bindings = await readAgentBindings(actor);
+      const requestedServerId = String(
+        url.searchParams.get("serverId") || conversation?.work?.serverId || "",
+      );
+      const requestedAgentId = String(
+        url.searchParams.get("agentId") || conversation?.work?.agentId || "",
+      );
+      const binding = Object.values(bindings.bindings).find(
+        (item) =>
+          String(item?.conversationId || "") === conversationId &&
+          (!requestedServerId || item?.serverId === requestedServerId) &&
+          (!requestedAgentId || item?.agentId === requestedAgentId),
+      );
+      const nativeAgentContext = await inspectNativeAgentContext(actor, binding);
+      const agentUsage = nativeAgentContext.usage || null;
+      sendJson(res, 200, {
+        web: {
+          used: usage.used,
+          limit: usage.limit,
+          ratio: usage.ratio,
+          automaticCompressionThreshold: usage.automaticCompressionThreshold,
+          modifiable: true,
+          compressible: usage.messageCount > 8,
+          breakdown: usage.breakdown,
+        },
+        agent: {
+          bound: Boolean(binding),
+          available: nativeAgentContext.available,
+          used: agentUsage
+            ? Number(
+                agentUsage.input ||
+                  agentUsage.total ||
+                  agentUsage.output ||
+                  0,
+              )
+            : null,
+          limit: null,
+          ratio: null,
+          modifiable: false,
+          compressible: Boolean(nativeAgentContext.compression?.supported),
+          status: nativeAgentContext.status,
+          diagnostic: nativeAgentContext.diagnostic || "",
+          binding: binding
+            ? {
+                serverId: binding.serverId,
+                agentId: binding.agentId,
+                agentSessionId: binding.agentSessionId,
+                workspace: binding.workspace,
+                updatedAt: binding.updatedAt,
+              }
+            : null,
+        },
+      });
+      return;
+    }
+
+    if (req.method === "PATCH" && url.pathname === "/api/context/settings") {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const limit = Number(body.conversationLimit);
+      const threshold = Number(body.automaticCompressionThreshold);
+      if (!Number.isFinite(limit) || limit < 8_000 || limit > 2_000_000) {
+        sendJson(res, 400, { error: "上下文上限应在 8k 到 2M 之间" });
+        return;
+      }
+      if (!Number.isFinite(threshold) || threshold < 0.5 || threshold > 1) {
+        sendJson(res, 400, { error: "自动压缩阈值应在 0.5 到 1 之间" });
+        return;
+      }
+      const document = await updateMemoryDocument(actor, (current) => ({
+        ...current,
+        revision: Number(current.revision || 0) + 1,
+        updatedAt: isoNow(),
+        contextSettings: {
+          conversationLimit: Math.floor(limit),
+          automaticCompressionThreshold: threshold,
+        },
+        ledger: [
+          ...(current.ledger || []),
+          {
+            id: randomId("event-"),
+            type: "context.settings-updated",
+            conversationLimit: Math.floor(limit),
+            automaticCompressionThreshold: threshold,
+            timestamp: isoNow(),
+          },
+        ],
+      }));
+      sendJson(res, 200, { settings: document.contextSettings });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/context/compress") {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const result = await compressConversationContext(
+        actor,
+        String(body.conversationId || ""),
+      );
+      sendJson(res, 200, {
+        compressed: result.compressed,
+        summary: result.summary,
+        usage: result.usage,
+      });
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      url.pathname === "/api/context/agent/compress"
+    ) {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const conversationId = String(body.conversationId || "");
+      const serverId = String(body.serverId || "");
+      const agentId = String(body.agentId || "");
+      const bindings = await readAgentBindings(actor);
+      const binding = Object.values(bindings.bindings).find(
+        (item) =>
+          String(item?.conversationId || "") === conversationId &&
+          (!serverId || String(item?.serverId || "") === serverId) &&
+          (!agentId || String(item?.agentId || "") === agentId),
+      );
+      const result = await compactNativeAgentContext(actor, binding);
+      sendJson(res, 202, result);
       return;
     }
 
@@ -1618,31 +3835,44 @@ async function handleHttp(req, res) {
         sendJson(res, 400, { error: "密码至少需要 8 位" });
         return;
       }
-      const userPath = path.join(DATA_ROOT, "users.json");
-      const users = await readJson(userPath, []);
-      let record = users.find((item) => item.email === email);
+      let record;
       if (url.pathname.endsWith("/register")) {
-        if (record) {
+        const result = await mutateAccounts(async () => {
+          const records = await listUserRecords();
+          if (records.some((item) => item.email === email)) {
+            return { conflict: true };
+          }
+          const created = {
+            id: crypto.randomUUID(),
+            email,
+            passwordHash: hashPassword(password),
+            displayName: String(body.displayName || email.split("@")[0])
+              .trim()
+              .slice(0, 48),
+            avatar: "",
+            createdAt: isoNow(),
+          };
+          if (!guestActor.authenticated) {
+            await copyGuestDataToUser(guestActor, {
+              ...created,
+              authenticated: true,
+            });
+          }
+          await writeUserRecord(created);
+          return { record: created };
+        });
+        if (result.conflict) {
           sendJson(res, 409, { error: "该邮箱已注册" });
           return;
         }
-        record = {
-          id: crypto.randomUUID(),
-          email,
-          passwordHash: hashPassword(password),
-          displayName: String(body.displayName || email.split("@")[0]).trim().slice(0, 48),
-          avatar: "",
-          createdAt: isoNow(),
-        };
-        users.push(record);
-        await writeJson(userPath, users);
-        await copyGuestDataToUser(guestActor, {
-          ...record,
-          authenticated: true,
-        });
-      } else if (!record || !verifyPassword(password, record.passwordHash)) {
-        sendJson(res, 401, { error: "邮箱或密码不正确" });
-        return;
+        record = result.record;
+      } else {
+        const records = await listUserRecords();
+        record = records.find((item) => item.email === email);
+        if (!record || !verifyPassword(password, record.passwordHash)) {
+          sendJson(res, 401, { error: "邮箱或密码不正确" });
+          return;
+        }
       }
       const expires = Date.now() + SESSION_MAX_AGE * 1000;
       const session = signSession(record.id, expires);
@@ -1685,9 +3915,7 @@ async function handleHttp(req, res) {
         return;
       }
       const body = await parseJsonBody(req);
-      const userPath = path.join(DATA_ROOT, "users.json");
-      const users = await readJson(userPath, []);
-      const record = users.find((item) => item.id === actor.id);
+      const record = await readUserRecord(actor.id);
       if (!record) {
         sendJson(res, 404, { error: "账号不存在" });
         return;
@@ -1696,7 +3924,7 @@ async function handleHttp(req, res) {
       if (typeof body.avatar === "string" && body.avatar.length < 3_000_000) {
         record.avatar = body.avatar;
       }
-      await writeJson(userPath, users);
+      await writeUserRecord(record);
       sendJson(res, 200, {
         actor: {
           id: record.id,
@@ -1898,7 +4126,7 @@ async function handleHttp(req, res) {
         sendJson(res, 400, { error: "文件为空" });
         return;
       }
-      const fileDir = path.join(actorDirectory(actor), "library", "files");
+      const fileDir = actorAttachmentPath(actor, "library");
       await mkdir(fileDir, { recursive: true });
       await writeFile(path.join(fileDir, `${id}-${name}`), buffer);
       const state = await getState(actor);
@@ -1915,7 +4143,7 @@ async function handleHttp(req, res) {
     if (req.method === "DELETE" && url.pathname.startsWith("/api/files/")) {
       const actor = await resolveActor(req, res);
       const id = safeSegment(decodeURIComponent(url.pathname.slice("/api/files/".length)));
-      const fileDir = path.join(actorDirectory(actor), "library", "files");
+      const fileDir = actorAttachmentPath(actor, "library");
       const entries = await readdir(fileDir).catch(() => []);
       for (const entry of entries) {
         if (entry === id || entry.startsWith(`${id}-`)) {
@@ -1925,7 +4153,7 @@ async function handleHttp(req, res) {
           }
         }
       }
-      const indexPath = path.join(actorDirectory(actor), "library", "index.json");
+      const indexPath = actorAttachmentPath(actor, "library-index.json");
       const index = await readJson(indexPath, { version: 1, files: {} });
       delete index.files?.[id];
       await writeJson(indexPath, index);
@@ -1989,6 +4217,10 @@ async function handleHttp(req, res) {
     if (req.method === "POST" && url.pathname === "/api/chat/stream") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
+      const fallbackTitle = body.firstTurn
+        ? fallbackConversationTitle(String(body.prompt || ""))
+        : "";
+      await persistChatTurnStart(actor, body, fallbackTitle);
       const context = await buildContext({
         actor,
         mode: "chat",
@@ -1996,8 +4228,19 @@ async function handleHttp(req, res) {
         skillIds: Array.isArray(body.skillIds) ? body.skillIds : [],
         projectId: body.projectId ? String(body.projectId) : undefined,
         memoryMode:
-          body.memoryMode === "project-only" ? "project-only" : "default",
+          body.memoryMode === "project-only" ? "project-only" : "project-and-global",
         conversationId: String(body.conversationId || ""),
+        currentUserMessageId: String(body.userMessageId || ""),
+      });
+      await updateState(actor, (state) => {
+        const conversation = (state.conversations || []).find(
+          (item) => item.id === String(body.conversationId || ""),
+        );
+        const assistant = (conversation?.messages || []).find(
+          (message) => message.id === String(body.assistantMessageId || ""),
+        );
+        if (assistant) assistant.webContextUsage = context.contextUsage;
+        return state;
       });
       res.writeHead(200, {
         "Content-Type": "application/x-ndjson; charset=utf-8",
@@ -2012,6 +4255,7 @@ async function handleHttp(req, res) {
         }
       };
       sendEvent({ type: "meta", sources: context.sources });
+      if (fallbackTitle) sendEvent({ type: "title", title: fallbackTitle });
       try {
         const result = await runChatModelStream(
           actor,
@@ -2019,26 +4263,25 @@ async function handleHttp(req, res) {
           context.state,
           (kind, delta) => sendEvent({ type: `${kind}_delta`, delta }),
         );
-        const title = body.firstTurn
-          ? await generateConversationTitle(
-              actor,
-              String(body.prompt || ""),
-              result.content,
-            )
-          : undefined;
-        await captureMemory(
-          actor,
-          String(body.prompt || ""),
-          body.projectId ? String(body.projectId) : undefined,
-          body.memoryMode === "project-only" ? "project-only" : "default",
-        );
-        if (title) sendEvent({ type: "title", title });
+        await persistChatTurnResult(actor, body, result);
         sendEvent({
           type: "done",
           content: result.content,
           reasoning: result.reasoning,
           demo: result.demo,
         });
+        if (!res.writableEnded) res.end();
+        if (actor.authenticated) {
+          void finalizeChatTurn(actor, body, result, fallbackTitle).catch(
+            (caught) =>
+              console.warn(
+                `[EasyWork Chat] background finalization failed: ${
+                  caught instanceof Error ? caught.message : "unknown"
+                }`,
+              ),
+          );
+        }
+        return;
       } catch (caught) {
         sendEvent({
           type: "error",
@@ -2075,7 +4318,10 @@ function createWorkerTask(session, payload) {
     serverId: session.serverId,
     agentId: String(payload.agentId || "opencode"),
     projectId: payload.projectId ? String(payload.projectId) : undefined,
-    memoryMode: payload.memoryMode === "project-only" ? "project-only" : "default",
+    memoryMode:
+      payload.memoryMode === "project-only"
+        ? "project-only"
+        : "project-and-global",
     workspace: String(payload.workspace || "~"),
     prompt: String(payload.prompt || ""),
     firstTurn: Boolean(payload.firstTurn),
@@ -2083,10 +4329,20 @@ function createWorkerTask(session, payload) {
     assistantMessageId: String(
       payload.assistantMessageId || `${payload.runId}_assistant`,
     ),
+    branchId: String(payload.branchId || payload.conversationId || ""),
+    logicalWorkspaceId: String(payload.logicalWorkspaceId || ""),
+    workspaceMode: ["managed", "attached", "unmanaged"].includes(
+      String(payload.workspaceMode || ""),
+    )
+      ? String(payload.workspaceMode)
+      : "unmanaged",
+    checkpointBeforeId: "",
+    checkpointAfterId: "",
     title: "",
     status: "running",
     steps: [],
     events: [],
+    appendedInstructions: [],
     result: "",
     error: "",
     startedAt: now,
@@ -2133,6 +4389,19 @@ function recordWorkerEvent(session, payload) {
     task.steps = task.steps.map((step) => ({
       ...step,
       status: step.status === "running" ? "error" : step.status,
+    }));
+  } else if (payload.type === "task.aborted") {
+    task.status = "aborted";
+    task.error = "";
+    task.result = String(payload.result || "任务已停止");
+    task.finishedAt = isoNow();
+    task.events = task.events.map((event) => ({
+      ...event,
+      status: event.status === "running" ? "cancelled" : event.status,
+    }));
+    task.steps = task.steps.map((step) => ({
+      ...step,
+      status: step.status === "running" ? "cancelled" : step.status,
     }));
   }
   scheduleSshWorkerPersist(session.worker);
@@ -2198,6 +4467,8 @@ async function ensureWorkerTaskConversation(actor, task) {
           serverId: task.serverId,
           connectionEnabled: true,
           workspace: task.workspace,
+          workspaceMode: task.workspaceMode,
+          logicalWorkspaceId: task.logicalWorkspaceId,
         },
       };
       state.conversations.unshift(conversation);
@@ -2211,6 +4482,8 @@ async function ensureWorkerTaskConversation(actor, task) {
       serverId: task.serverId,
       connectionEnabled: true,
       workspace: task.workspace,
+      workspaceMode: task.workspaceMode,
+      logicalWorkspaceId: task.logicalWorkspaceId,
     };
     conversation.messages = Array.isArray(conversation.messages)
       ? conversation.messages
@@ -2246,6 +4519,7 @@ async function ensureWorkerTaskConversation(actor, task) {
         createdAt: task.startedAt,
         mode: "work",
         runId: task.runId,
+        agentId: task.agentId,
         reasoningStatus: "running",
         events: [],
       };
@@ -2253,6 +4527,94 @@ async function ensureWorkerTaskConversation(actor, task) {
     }
     return state;
   });
+}
+
+async function persistAppendedInstruction(actor, task, instruction) {
+  task.appendedInstructions = Array.isArray(task.appendedInstructions)
+    ? task.appendedInstructions
+    : [];
+  const existing = task.appendedInstructions.find(
+    (item) => item.messageId === instruction.messageId,
+  );
+  if (existing) Object.assign(existing, instruction);
+  else task.appendedInstructions.push(instruction);
+  task.updatedAt = isoNow();
+  await ensureWorkerTaskConversation(actor, task);
+  await updateState(actor, (state) => {
+    const conversation = (state.conversations || []).find(
+      (item) => item.id === task.conversationId,
+    );
+    if (!conversation) return state;
+    conversation.updatedAt = task.updatedAt;
+    conversation.messages = Array.isArray(conversation.messages)
+      ? conversation.messages
+      : [];
+    if (
+      conversation.messages.some(
+        (message) => message.id === instruction.messageId,
+      )
+    ) {
+      return state;
+    }
+    const appendedMessage = {
+      id: instruction.messageId,
+      role: "user",
+      content: instruction.content,
+      createdAt: instruction.createdAt,
+      mode: "work",
+      appendedToRunId: task.runId,
+    };
+    const assistantIndex = conversation.messages.findIndex(
+      (message) => message.id === task.assistantMessageId,
+    );
+    if (assistantIndex >= 0) {
+      conversation.messages.splice(assistantIndex, 0, appendedMessage);
+    } else {
+      conversation.messages.push(appendedMessage);
+    }
+    return state;
+  });
+}
+
+async function deliverAppendedInstruction(session, task, activeRun, instruction) {
+  if (!activeRun?.agentControl) return false;
+  instruction.status = "sending";
+  instruction.updatedAt = isoNow();
+  scheduleSshWorkerPersist(session.worker);
+  try {
+    await appendOpenCodeInstruction(
+      session,
+      activeRun.agentControl,
+      instruction.content,
+    );
+    instruction.status = "sent";
+    instruction.sentAt = isoNow();
+    instruction.updatedAt = instruction.sentAt;
+    task.updatedAt = instruction.sentAt;
+    scheduleSshWorkerPersist(session.worker, 0);
+    sessionSend(session, {
+      type: "work.append.delivered",
+      serverId: session.serverId,
+      conversationId: task.conversationId,
+      runId: task.runId,
+      messageId: instruction.messageId,
+    });
+    return true;
+  } catch (caught) {
+    instruction.status = "error";
+    instruction.error =
+      caught instanceof Error ? caught.message : "追加指令发送失败";
+    instruction.updatedAt = isoNow();
+    scheduleSshWorkerPersist(session.worker, 0);
+    throw caught;
+  }
+}
+
+async function flushAppendedInstructions(session, task, activeRun) {
+  for (const instruction of task.appendedInstructions || []) {
+    if (["sent", "sending"].includes(instruction.status)) continue;
+    await deliverAppendedInstruction(session, task, activeRun, instruction);
+  }
 }
 
 async function persistWorkerTaskConversation(actor, task) {
@@ -2278,10 +4640,14 @@ async function persistWorkerTaskConversation(actor, task) {
             ? "done"
             : task.status === "error"
               ? "error"
-              : "running",
+              : task.status === "aborted"
+                ? "aborted"
+                : "running",
         steps: task.steps,
         result: task.result || undefined,
         startedAt: task.startedAt,
+        checkpointBeforeId: task.checkpointBeforeId || undefined,
+        checkpointAfterId: task.checkpointAfterId || undefined,
       };
     }
     if (assistantMessage) {
@@ -2295,7 +4661,9 @@ async function persistWorkerTaskConversation(actor, task) {
         .at(-1);
       assistantMessage.content =
         finalMessage?.output ||
-        (task.status === "error" ? task.error : task.result) ||
+        (["error", "aborted"].includes(task.status)
+          ? task.error || task.result
+          : task.result) ||
         assistantMessage.content ||
         "";
       assistantMessage.reasoning = reasoning || assistantMessage.reasoning;
@@ -2304,7 +4672,10 @@ async function persistWorkerTaskConversation(actor, task) {
           ? "running"
           : task.status === "error"
             ? "error"
-            : "done";
+             : "done";
+      assistantMessage.checkpointBeforeId = task.checkpointBeforeId || undefined;
+      assistantMessage.checkpointAfterId = task.checkpointAfterId || undefined;
+      assistantMessage.webContextUsage = task.webContextUsage || undefined;
       assistantMessage.events = task.events.filter(
         (event) => !["message", "reasoning"].includes(event.kind),
       );
@@ -2359,6 +4730,33 @@ function remoteSftpWrite(client, remotePath, content, mode = 0o600) {
       });
     });
   });
+}
+
+function remoteSftpFastPut(client, localPath, remotePath, onProgress = () => undefined) {
+  return withRemoteSftp(
+    client,
+    (sftp) =>
+      new Promise((resolve, reject) => {
+        let lastReported = -1;
+        sftp.fastPut(
+          localPath,
+          remotePath,
+          {
+            step(transferred, _chunk, total) {
+              const percent = total > 0 ? Math.floor((transferred / total) * 100) : 0;
+              if (percent === 100 || percent >= lastReported + 5) {
+                lastReported = percent;
+                onProgress(percent);
+              }
+            },
+          },
+          (error) => {
+            if (error) reject(error);
+            else resolve();
+          },
+        );
+      }),
+  );
 }
 
 async function remoteSftpReadOptional(client, remotePath) {
@@ -2449,6 +4847,1325 @@ function remoteSftpMkdir(client, remotePath) {
   );
 }
 
+function waitFor(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function forwardRemotePort(client, address, port) {
+  return new Promise((resolve, reject) => {
+    client.forwardIn(address, port, (error, assignedPort) => {
+      if (error) reject(error);
+      else resolve(Number(assignedPort || port));
+    });
+  });
+}
+
+function unforwardRemotePort(client, address, port) {
+  return new Promise((resolve) => {
+    client.unforwardIn(address, port, () => resolve());
+  });
+}
+
+function attachProviderRelayHandler(session, client) {
+  client.on("tcp connection", (details, accept, reject) => {
+    const relay = session.apiRelays?.get(Number(details.destPort));
+    if (!relay || relay.client !== client) {
+      reject();
+      return;
+    }
+    const channel = accept();
+    const localSocket = net.createConnection({
+      host: "127.0.0.1",
+      port: relay.localPort,
+    });
+    channel.pipe(localSocket).pipe(channel);
+    channel.on("error", () => localSocket.destroy());
+    channel.on("close", () => localSocket.destroy());
+    localSocket.on("error", () => channel.destroy());
+    localSocket.on("close", () => channel.destroy());
+  });
+}
+
+function clearProviderRelays(session) {
+  for (const relay of session.apiRelays?.values() || []) relay.close();
+  session.apiRelays?.clear();
+  session.providerRoute = null;
+}
+
+async function stopProviderRelay(session, relay) {
+  if (!relay) return;
+  session.apiRelays?.delete(relay.remotePort);
+  if (session.providerRoute === relay) session.providerRoute = null;
+  if (session.client === relay.client) {
+    await unforwardRemotePort(relay.client, relay.bindAddress, relay.remotePort).catch(
+      () => undefined,
+    );
+  }
+  relay.close();
+}
+
+function providerProbeCommand(baseUrl) {
+  return [
+    "set +e",
+    `EW_PROVIDER_URL=${shellQuote(baseUrl)}`,
+    'EW_HTTP=$(curl --silent --show-error --output /dev/null --head --connect-timeout 5 --max-time 8 --write-out "%{http_code}" "$EW_PROVIDER_URL" 2>"$HOME/.easywork/tmp/provider-probe.err")',
+    "EW_CODE=$?",
+    'printf "CODE=%s\\nHTTP=%s\\n" "$EW_CODE" "$EW_HTTP"',
+    'if [ -s "$HOME/.easywork/tmp/provider-probe.err" ]; then tail -n 2 "$HOME/.easywork/tmp/provider-probe.err"; fi',
+    'rm -f "$HOME/.easywork/tmp/provider-probe.err"',
+    'exit "$EW_CODE"',
+  ].join("\n");
+}
+
+async function probeRemoteProvider(session, baseUrl) {
+  await remoteExec(
+    session.client,
+    'mkdir -p "$HOME/.easywork/tmp" && chmod 700 "$HOME/.easywork/tmp"',
+  );
+  const result = await remoteExec(session.client, providerProbeCommand(baseUrl), {
+    allowFailure: true,
+  });
+  const fields = parseRuntimeFields(result.stdout);
+  const status = Number(fields.HTTP || 0);
+  return {
+    reachable:
+      status >= 100 &&
+      status <= 599 &&
+      status !== PROVIDER_RELAY_ERROR_STATUS,
+    status,
+    diagnostic: String(result.stderr || result.stdout || "连接失败")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 400),
+  };
+}
+
+function relayBaseUrl(remotePort, providerBaseUrl) {
+  const upstream = new URL(providerBaseUrl);
+  return `http://127.0.0.1:${remotePort}${upstream.pathname || "/"}${upstream.search || ""}`;
+}
+
+async function ensureRemoteProviderRoute(session, provider) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const providerBaseUrl = String(provider.baseUrl || "").trim();
+  const routeKey = crypto.createHash("sha256").update(providerBaseUrl).digest("hex");
+  const cached = session.providerRoute;
+  if (
+    cached?.key === routeKey &&
+    cached.client === session.client &&
+    (cached.mode === "relay" || Date.now() - cached.checkedAt < PROVIDER_ROUTE_CACHE_MS)
+  ) {
+    return cached;
+  }
+  if (cached?.mode === "relay") await stopProviderRelay(session, cached);
+
+  const direct = await probeRemoteProvider(session, providerBaseUrl);
+  if (direct.reachable) {
+    const route = {
+      key: routeKey,
+      mode: "direct",
+      baseUrl: providerBaseUrl,
+      checkedAt: Date.now(),
+      client: session.client,
+    };
+    session.providerRoute = route;
+    return route;
+  }
+
+  const localRelay = await createLocalProviderRelay(providerBaseUrl).catch(
+    (error) => {
+      throw new Error(
+        `远端无法直连模型 API（${direct.diagnostic || "连接失败"}），主机中继启动失败：${error instanceof Error ? error.message : "未知错误"}`,
+      );
+    },
+  );
+  let relay;
+  try {
+    const portResult = await remoteExec(session.client, remoteOpenCodePortCommand());
+    const requestedPort = Number(portResult.stdout.trim());
+    if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
+      throw new Error("无法分配远端回环端口");
+    }
+    const bindAddress = "127.0.0.1";
+    const remotePort = await forwardRemotePort(
+      session.client,
+      bindAddress,
+      requestedPort,
+    );
+    relay = {
+      key: routeKey,
+      mode: "relay",
+      baseUrl: relayBaseUrl(remotePort, providerBaseUrl),
+      upstreamBaseUrl: providerBaseUrl,
+      checkedAt: Date.now(),
+      client: session.client,
+      bindAddress,
+      remotePort,
+      localPort: localRelay.localPort,
+      close: localRelay.close,
+    };
+    session.apiRelays.set(remotePort, relay);
+    const relayed = await probeRemoteProvider(session, relay.baseUrl);
+    if (!relayed.reachable) {
+      throw new Error(
+        `SSH 模型 API 中继不可用：${relayed.diagnostic || `HTTP ${relayed.status || 0}`}`,
+      );
+    }
+    session.providerRoute = relay;
+    return relay;
+  } catch (error) {
+    if (relay) await stopProviderRelay(session, relay);
+    else localRelay.close();
+    throw new Error(
+      `远端无法直连模型 API（${direct.diagnostic || "连接失败"}），且 SSH 中继建立失败：${error instanceof Error ? error.message : "未知错误"}`,
+    );
+  }
+}
+
+function openCodeServicePaths(session, agent) {
+  const serviceId = crypto
+    .createHash("sha256")
+    .update(String(agent.path || agent.id || "opencode"))
+    .digest("hex")
+    .slice(0, 16);
+  const root = `${session.home}/.easywork/services/opencode/${serviceId}`;
+  return {
+    serviceId,
+    root,
+    portPath: `${root}/port`,
+    passwordPath: `${root}/password`,
+    curlConfigPath: `${root}/curl.conf`,
+    launcherPath: `${root}/launch.sh`,
+    pidPath: `${root}/pid`,
+    logPath: `${root}/server.log`,
+    requestsPath: `${root}/requests`,
+  };
+}
+
+async function stopOpenCodeService(session, agent) {
+  if (!session.client || !session.home || !agent?.path) return;
+  const paths = openCodeServicePaths(session, agent);
+  await remoteExec(
+    session.client,
+    [
+      "set +e",
+      `EW_PID_FILE=${shellQuote(paths.pidPath)}`,
+      `EW_AGENT=${shellQuote(agent.path)}`,
+      'EW_PID=$(cat "$EW_PID_FILE" 2>/dev/null)',
+      'case "$EW_PID" in ""|*[!0-9]*) exit 0 ;; esac',
+      'EW_COMMAND=$(ps -p "$EW_PID" -o args= 2>/dev/null)',
+      'case "$EW_COMMAND" in *"$EW_AGENT"*" serve"*) kill "$EW_PID" 2>/dev/null || true ;; esac',
+      'rm -f "$EW_PID_FILE"',
+    ].join("\n"),
+    { allowFailure: true },
+  );
+  session.openCodeServices?.delete(agent.id);
+  session.openCodeServicePromises?.delete(agent.id);
+}
+
+async function probeOpenCodeService(session, service) {
+  const result = await remoteExec(
+    session.client,
+    [
+      "set +e",
+      `EW_PID_FILE=${shellQuote(service.pidPath)}`,
+      `EW_CURL_CONFIG=${shellQuote(service.curlConfigPath)}`,
+      `EW_PORT_FILE=${shellQuote(service.portPath)}`,
+      '[ -r "$EW_PID_FILE" ] && [ -r "$EW_CURL_CONFIG" ] && [ -r "$EW_PORT_FILE" ] || exit 1',
+      'EW_PID=$(cat "$EW_PID_FILE" 2>/dev/null)',
+      'EW_PORT=$(cat "$EW_PORT_FILE" 2>/dev/null)',
+      'case "$EW_PID:$EW_PORT" in *[!0-9:]*|:|*:) exit 1 ;; esac',
+      'kill -0 "$EW_PID" 2>/dev/null || exit 1',
+      'curl --config "$EW_CURL_CONFIG" --silent --show-error --fail --max-time 4 -o /dev/null "http://127.0.0.1:$EW_PORT/global/health" || exit 1',
+      'printf "READY\\t%s\\t%s\\n" "$EW_PORT" "$EW_PID"',
+    ].join("\n"),
+    { allowFailure: true },
+  );
+  if (result.code !== 0) return null;
+  const [, portText, pid] = result.stdout.trim().split("\t");
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return {
+    ...service,
+    port,
+    pid: String(pid || ""),
+    baseUrl: `http://127.0.0.1:${port}`,
+  };
+}
+
+async function startOpenCodeService(session, agent) {
+  if (!session.client || !session.home) throw new Error("SSH 尚未连接");
+  const paths = openCodeServicePaths(session, agent);
+  const cached = session.openCodeServices?.get(agent.id);
+  const live = await probeOpenCodeService(session, cached || paths);
+  if (live) {
+    session.openCodeServices.set(agent.id, live);
+    return live;
+  }
+
+  await remoteExec(
+    session.client,
+    [
+      "set -eu",
+      `EW_ROOT=${shellQuote(paths.root)}`,
+      `EW_PID_FILE=${shellQuote(paths.pidPath)}`,
+      `EW_AGENT=${shellQuote(agent.path)}`,
+      'mkdir -p "$EW_ROOT" "$EW_ROOT/requests"',
+      'chmod 700 "$EW_ROOT" "$EW_ROOT/requests"',
+      'if [ -r "$EW_PID_FILE" ]; then',
+      '  EW_OLD_PID=$(cat "$EW_PID_FILE" 2>/dev/null || true)',
+      '  case "$EW_OLD_PID" in ""|*[!0-9]*) ;; *)',
+      '    if kill -0 "$EW_OLD_PID" 2>/dev/null; then',
+      '      EW_OLD_COMMAND=$(ps -p "$EW_OLD_PID" -o args= 2>/dev/null || true)',
+      '      case "$EW_OLD_COMMAND" in *"$EW_AGENT"*" serve"*) kill "$EW_OLD_PID" 2>/dev/null || true ;; esac',
+      '    fi',
+      '  ;; esac',
+      'fi',
+      'rm -f "$EW_PID_FILE"',
+    ].join("\n"),
+  );
+
+  const portResult = await remoteExec(
+    session.client,
+    remoteOpenCodePortCommand(),
+  );
+  const port = Number(portResult.stdout.trim());
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("无法为 OpenCode 会话服务分配本地端口");
+  }
+  const password = crypto.randomBytes(32).toString("hex");
+  const launcher = [
+    "#!/bin/sh",
+    "set -eu",
+    `EW_ROOT=${shellQuote(paths.root)}`,
+    `EW_PID_FILE=${shellQuote(paths.pidPath)}`,
+    `EW_PASSWORD_FILE=${shellQuote(paths.passwordPath)}`,
+    `EW_AGENT=${shellQuote(agent.path)}`,
+    `EW_PORT=${shellQuote(String(port))}`,
+    'umask 077',
+    'printf "%s\\n" "$$" > "$EW_PID_FILE.tmp"',
+    'mv -f "$EW_PID_FILE.tmp" "$EW_PID_FILE"',
+    'export OPENCODE_SERVER_USERNAME=opencode',
+    'export OPENCODE_SERVER_PASSWORD="$(cat "$EW_PASSWORD_FILE")"',
+    'exec "$EW_AGENT" serve --hostname 127.0.0.1 --port "$EW_PORT" --log-level WARN',
+  ].join("\n");
+  const curlConfig = [
+    "silent",
+    "show-error",
+    "connect-timeout = 4",
+    "max-time = 30",
+    `user = \"opencode:${password}\"`,
+    "",
+  ].join("\n");
+  for (const [targetPath, content, mode] of [
+    [paths.passwordPath, `${password}\n`, 0o600],
+    [paths.curlConfigPath, curlConfig, 0o600],
+    [paths.portPath, `${port}\n`, 0o600],
+    [paths.launcherPath, `${launcher}\n`, 0o700],
+  ]) {
+    await remoteSftpWriteAtomic(session.client, targetPath, content, mode);
+  }
+  await remoteExec(
+    session.client,
+    [
+      `: > ${shellQuote(paths.logPath)}`,
+      `setsid ${shellQuote(paths.launcherPath)} </dev/null >>${shellQuote(paths.logPath)} 2>&1 &`,
+    ].join("\n"),
+  );
+  const descriptor = {
+    ...paths,
+    port,
+    baseUrl: `http://127.0.0.1:${port}`,
+  };
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const ready = await probeOpenCodeService(session, descriptor);
+    if (ready) {
+      session.openCodeServices.set(agent.id, ready);
+      return ready;
+    }
+    await waitFor(250);
+  }
+  const diagnostic = await remoteExec(
+    session.client,
+    `tail -n 8 ${shellQuote(paths.logPath)}`,
+    { allowFailure: true },
+  );
+  throw new Error(
+    `OpenCode 会话服务启动失败${diagnostic.stdout.trim() ? `：${diagnostic.stdout.trim()}` : ""}`,
+  );
+}
+
+async function ensureOpenCodeService(session, agent) {
+  session.openCodeServicePromises ||= new Map();
+  const current = session.openCodeServicePromises.get(agent.id);
+  if (current) return current;
+  const operation = startOpenCodeService(session, agent);
+  session.openCodeServicePromises.set(agent.id, operation);
+  try {
+    return await operation;
+  } finally {
+    if (session.openCodeServicePromises.get(agent.id) === operation) {
+      session.openCodeServicePromises.delete(agent.id);
+    }
+  }
+}
+
+function openCodePathFromTemplate(template, sessionId) {
+  return String(template || "")
+    .replace(/\{(?:sessionID|sessionId|id)\}/g, encodeURIComponent(sessionId));
+}
+
+async function detectOpenCodeContextCapabilities(session, service) {
+  session.agentContextCapabilityCache ||= new Map();
+  const cacheKey = service.serviceId || service.root;
+  const cached = session.agentContextCapabilityCache.get(cacheKey);
+  if (
+    cached &&
+    Date.now() - Number(cached.checkedAt || 0) < 60_000
+  ) {
+    return cached;
+  }
+  let specification = null;
+  for (const endpoint of ["/doc", "/openapi.json"]) {
+    try {
+      const response = await openCodeServiceRequest(session, service, {
+        endpoint,
+      });
+      if (response.json?.paths && typeof response.json.paths === "object") {
+        specification = response.json;
+        break;
+      }
+    } catch {
+      // A missing OpenAPI document means that native context controls cannot
+      // be established reliably; no guessed endpoint is used.
+    }
+  }
+  const paths = Object.keys(specification?.paths || {});
+  const compactPath = paths.find((item) => /\/compact\/?$/i.test(item)) || "";
+  const summarizePath = paths.find((item) => /\/summarize\/?$/i.test(item)) || "";
+  const commandPath = paths.find((item) => /\/command\/?$/i.test(item)) || "";
+  const result = {
+    checkedAt: Date.now(),
+    readable: true,
+    compression:
+      compactPath || summarizePath || commandPath
+        ? {
+            supported: true,
+            pathTemplate: compactPath || summarizePath || commandPath,
+            mode: compactPath
+              ? "compact"
+              : summarizePath
+                ? "summarize"
+                : "command",
+          }
+        : {
+            supported: false,
+            pathTemplate: "",
+            mode: "",
+          },
+  };
+  session.agentContextCapabilityCache.set(cacheKey, result);
+  return result;
+}
+
+function openCodeUsageFromMessages(value) {
+  const messages = Array.isArray(value) ? value : [];
+  for (const message of messages.slice().reverse()) {
+    const tokens = message?.info?.tokens || message?.tokens || message?.usage;
+    if (!tokens || typeof tokens !== "object") continue;
+    const input = Number(
+      tokens.input || tokens.input_tokens || tokens.prompt_tokens || 0,
+    );
+    const output = Number(
+      tokens.output || tokens.output_tokens || tokens.completion_tokens || 0,
+    );
+    const reasoning = Number(tokens.reasoning || tokens.reasoning_tokens || 0);
+    const total = Number(
+      tokens.total || tokens.total_tokens || input + output + reasoning,
+    );
+    if (input || output || reasoning || total) {
+      return { input, output, reasoning, total, observedAt: isoNow() };
+    }
+  }
+  return null;
+}
+
+async function inspectNativeAgentContext(actor, binding) {
+  if (!binding) {
+    return {
+      bound: false,
+      available: false,
+      status: "not-bound",
+      usage: null,
+      compression: { supported: false },
+    };
+  }
+  if (binding.agentId !== "opencode") {
+    return {
+      bound: true,
+      available: false,
+      status: "unsupported-agent",
+      usage: null,
+      compression: { supported: false },
+    };
+  }
+  const worker = await getSshWorker(actor);
+  const session = worker.sessions.get(safeSegment(binding.serverId || ""));
+  if (!session?.client || session.status !== "connected") {
+    return {
+      bound: true,
+      available: false,
+      status: "connection-unavailable",
+      usage: null,
+      compression: { supported: false },
+    };
+  }
+  try {
+    const agents = await scanRemoteAgents(session, actor);
+    const agent = agents.find(
+      (item) => item.id === binding.agentId && item.status === "ready",
+    );
+    if (!agent) throw new Error("绑定的 Agent 当前不可用");
+    const service = await ensureOpenCodeService(session, agent);
+    await openCodeServiceRequest(session, service, {
+      endpoint: `/session/${encodeURIComponent(binding.agentSessionId)}`,
+      directory: binding.workspace,
+    });
+    const capabilities = await detectOpenCodeContextCapabilities(session, service);
+    let usage = null;
+    try {
+      const response = await openCodeServiceRequest(session, service, {
+        endpoint: `/session/${encodeURIComponent(binding.agentSessionId)}/message`,
+        directory: binding.workspace,
+      });
+      usage = openCodeUsageFromMessages(response.json);
+    } catch {
+      usage = binding.contextUsage || null;
+    }
+    return {
+      bound: true,
+      available: Boolean(usage),
+      status: usage ? "measured" : "usage-unavailable",
+      usage,
+      compression: capabilities.compression,
+      control: { session, service },
+    };
+  } catch (caught) {
+    return {
+      bound: true,
+      available: false,
+      status: "unreadable",
+      diagnostic:
+        caught instanceof Error ? caught.message : "无法读取 Agent 上下文",
+      usage: null,
+      compression: { supported: false },
+    };
+  }
+}
+
+async function compactNativeAgentContext(actor, binding) {
+  const inspected = await inspectNativeAgentContext(actor, binding);
+  if (!inspected.bound) {
+    const error = new Error("当前对话尚未绑定 Agent 会话");
+    error.statusCode = 409;
+    throw error;
+  }
+  if (!inspected.compression?.supported || !inspected.control) {
+    const error = new Error("当前 Agent 未提供可验证的原生压缩接口");
+    error.statusCode = 409;
+    throw error;
+  }
+  const endpoint = openCodePathFromTemplate(
+    inspected.compression.pathTemplate,
+    binding.agentSessionId,
+  );
+  const model = String(binding.model || "");
+  const body =
+    inspected.compression.mode === "summarize"
+      ? {
+          providerID: model.includes("/")
+            ? model.split("/")[0]
+            : EASYWORK_OPENCODE_PROVIDER_ID,
+          modelID: model.includes("/")
+            ? model.split("/").slice(1).join("/")
+            : model,
+        }
+      : inspected.compression.mode === "command"
+        ? { command: "compact", arguments: "" }
+        : {};
+  if (inspected.compression.mode === "summarize" && !body.modelID) {
+    const error = new Error("Agent 未暴露当前模型，无法调用其原生压缩接口");
+    error.statusCode = 409;
+    throw error;
+  }
+  await openCodeServiceRequest(
+    inspected.control.session,
+    inspected.control.service,
+    {
+      method: "POST",
+      endpoint,
+      directory: binding.workspace,
+      body,
+    },
+  );
+  await updateAgentBinding(actor, binding.bindingKey, (current) => ({
+    ...(current || binding),
+    contextUsage: undefined,
+    nativeCompactedAt: isoNow(),
+    updatedAt: isoNow(),
+  }));
+  const worker = await getSshWorker(actor);
+  const boundSession = worker.sessions.get(safeSegment(binding.serverId || ""));
+  if (boundSession?.agentSessions?.has(binding.bindingKey)) {
+    boundSession.agentSessions.set(binding.bindingKey, {
+      ...boundSession.agentSessions.get(binding.bindingKey),
+      contextUsage: undefined,
+      nativeCompactedAt: isoNow(),
+      updatedAt: isoNow(),
+    });
+    scheduleSshWorkerPersist(worker, 0);
+  }
+  return { accepted: true, mode: inspected.compression.mode };
+}
+
+async function openCodeServiceRequest(
+  session,
+  service,
+  { method = "GET", endpoint, directory = "", body },
+) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const requestId = crypto.randomBytes(10).toString("hex");
+  const requestPath = `${service.requestsPath}/${requestId}.json`;
+  const query = directory
+    ? `${endpoint.includes("?") ? "&" : "?"}directory=${encodeURIComponent(directory)}`
+    : "";
+  const url = `${service.baseUrl}${endpoint}${query}`;
+  if (body !== undefined) {
+    await remoteSftpWriteAtomic(
+      session.client,
+      requestPath,
+      `${JSON.stringify(body)}\n`,
+      0o600,
+    );
+  }
+  try {
+    const args = [
+      "curl",
+      `--config ${shellQuote(service.curlConfigPath)}`,
+      `--request ${shellQuote(method)}`,
+      "--header 'Content-Type: application/json'",
+      body !== undefined ? `--data-binary @${shellQuote(requestPath)}` : "",
+      "--write-out '\\n__EASYWORK_HTTP__:%{http_code}'",
+      shellQuote(url),
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const response = await remoteExec(session.client, args, {
+      allowFailure: true,
+    });
+    const marker = "\n__EASYWORK_HTTP__:";
+    const markerIndex = response.stdout.lastIndexOf(marker);
+    const responseBody =
+      markerIndex >= 0
+        ? response.stdout.slice(0, markerIndex)
+        : response.stdout;
+    const status = Number(
+      markerIndex >= 0
+        ? response.stdout.slice(markerIndex + marker.length).trim()
+        : 0,
+    );
+    const ok = status >= 200 && status < 300 && response.code === 0;
+    if (!ok) {
+      const detail = responseBody.trim() || response.stderr.trim();
+      const error = new Error(
+        detail || `OpenCode 会话接口返回 HTTP ${status || "错误"}`,
+      );
+      error.statusCode = status || 502;
+      throw error;
+    }
+    return {
+      status,
+      text: responseBody,
+      json: responseBody.trim() ? JSON.parse(responseBody) : null,
+    };
+  } finally {
+    if (body !== undefined) {
+      await remoteExec(session.client, `rm -f ${shellQuote(requestPath)}`, {
+        allowFailure: true,
+      }).catch(() => undefined);
+    }
+  }
+}
+
+async function ensureOpenCodeSession(
+  session,
+  service,
+  { sessionId = "", directory, title = "EasyWork" },
+) {
+  if (sessionId) {
+    try {
+      await openCodeServiceRequest(session, service, {
+        endpoint: `/session/${encodeURIComponent(sessionId)}`,
+        directory,
+      });
+      return { sessionId, created: false };
+    } catch (caught) {
+      if (Number(caught?.statusCode) !== 404) throw caught;
+    }
+  }
+  const created = await openCodeServiceRequest(session, service, {
+    method: "POST",
+    endpoint: "/session",
+    directory,
+    body: { title: String(title || "EasyWork").slice(0, 120) },
+  });
+  const createdId = String(created.json?.id || "");
+  if (!createdId.startsWith("ses")) {
+    throw new Error("OpenCode 未返回有效的原生会话标识");
+  }
+  return { sessionId: createdId, created: true };
+}
+
+async function appendOpenCodeInstruction(session, control, content) {
+  await openCodeServiceRequest(session, control.service, {
+    method: "POST",
+    endpoint: `/session/${encodeURIComponent(control.sessionId)}/prompt_async`,
+    directory: control.directory,
+    body: {
+      parts: [{ type: "text", text: String(content || "") }],
+    },
+  });
+}
+
+async function abortOpenCodeSession(session, control) {
+  if (!control?.sessionId || !control?.service) return false;
+  try {
+    await openCodeServiceRequest(session, control.service, {
+      method: "POST",
+      endpoint: `/session/${encodeURIComponent(control.sessionId)}/abort`,
+      directory: control.directory,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function openCodeSseToolPart(value, { sessionId, directory } = {}) {
+  let envelope;
+  try {
+    envelope = typeof value === "string" ? JSON.parse(value) : value;
+  } catch {
+    return null;
+  }
+  const event = envelope?.payload;
+  if (!event || event.type !== "message.part.updated") return null;
+  const properties = event.properties || {};
+  if (String(properties.sessionID || "") !== String(sessionId || "")) {
+    return null;
+  }
+  if (
+    envelope.directory &&
+    directory &&
+    String(envelope.directory) !== String(directory)
+  ) {
+    return null;
+  }
+  const part = properties.part;
+  if (!part || part.type !== "tool") return null;
+  return {
+    sessionID: properties.sessionID,
+    part,
+  };
+}
+
+async function waitForOpenCodeRunAdmission(session, control, remoteRun) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      const status = await openCodeServiceRequest(session, control.service, {
+        endpoint: "/session/status",
+        directory: control.directory,
+      });
+      if (status.json?.[control.sessionId]) return;
+      const snapshot = await readRemoteRuntimeRun(session, remoteRun);
+      if (
+        snapshot.stdout.length > 0 ||
+        ["done", "error", "aborted", "lost"].includes(snapshot.status)
+      ) {
+        return;
+      }
+    } catch {
+      // The attached CLI may still be negotiating with the local service.
+    }
+    await waitFor(100);
+  }
+}
+
+function getRemoteRuntimeBundle() {
+  remoteRuntimeBundlePromise ||= loadRemoteRuntimeBundle();
+  return remoteRuntimeBundlePromise;
+}
+
+async function ensureRemoteRuntime(session) {
+  if (!session.client || !session.home) throw new Error("SSH 尚未连接");
+  const bundle = await getRemoteRuntimeBundle();
+  const paths = remoteRuntimePaths(session.home, bundle.releaseId);
+  if (session.runtime?.releaseId === bundle.releaseId) return session.runtime;
+
+  const currentManifest = await remoteSftpReadOptional(
+    session.client,
+    `${paths.current}/manifest.json`,
+  );
+  if (currentManifest) {
+    try {
+      const parsed = JSON.parse(currentManifest.toString("utf8"));
+      if (parsed.digest === bundle.digest) {
+        const check = await remoteExec(
+          session.client,
+          `${shellQuote(paths.entrypoint)} self-test`,
+          { allowFailure: true },
+        );
+        const fields = parseRuntimeFields(check.stdout);
+        if (check.code === 0 && fields.status === "ready") {
+          session.runtime = {
+            ...paths,
+            digest: bundle.digest,
+            protocolVersion: Number(fields.protocol || 1),
+            releaseId: bundle.releaseId,
+          };
+          return session.runtime;
+        }
+      }
+    } catch {
+      // An invalid deployment is replaced atomically below.
+    }
+  }
+
+  const staging = `${paths.runtimeRoot}/.staging-${bundle.releaseId}-${crypto
+    .randomBytes(5)
+    .toString("hex")}`;
+  await remoteExec(
+    session.client,
+    [
+      `umask 077`,
+      `mkdir -p ${shellQuote(paths.root)} ${shellQuote(paths.runsRoot)} ${shellQuote(paths.releasesRoot)} ${shellQuote(`${staging}/bin`)}`,
+      `chmod 700 ${shellQuote(paths.root)} ${shellQuote(paths.runsRoot)} ${shellQuote(paths.runtimeRoot)} ${shellQuote(paths.releasesRoot)} ${shellQuote(staging)} ${shellQuote(`${staging}/bin`)}`,
+    ].join(" && "),
+  );
+  try {
+    for (const file of bundle.files) {
+      await remoteSftpWrite(
+        session.client,
+        `${staging}/${file.relativePath}`,
+        file.content,
+        file.mode,
+      );
+    }
+    const stagedEntrypoint = `${staging}/bin/easywork-runner`;
+    const selfTest = await remoteExec(
+      session.client,
+      `${shellQuote(stagedEntrypoint)} self-test`,
+      { allowFailure: true },
+    );
+    const selfTestFields = parseRuntimeFields(selfTest.stdout);
+    if (selfTest.code !== 0 || selfTestFields.status !== "ready") {
+      throw new Error(
+        selfTest.stderr.trim() ||
+          `远端 Runtime 自检失败${selfTestFields.missing ? `：缺少 ${selfTestFields.missing}` : ""}`,
+      );
+    }
+    await remoteExec(
+      session.client,
+      [
+        `if [ -d ${shellQuote(paths.releaseRoot)} ]; then rm -rf ${shellQuote(staging)}; else mv ${shellQuote(staging)} ${shellQuote(paths.releaseRoot)}; fi`,
+        `rm -f ${shellQuote(`${paths.runtimeRoot}/current.next`)}`,
+        `ln -s ${shellQuote(`releases/${bundle.releaseId}`)} ${shellQuote(`${paths.runtimeRoot}/current.next`)}`,
+        `mv -Tf ${shellQuote(`${paths.runtimeRoot}/current.next`)} ${shellQuote(paths.current)}`,
+      ].join(" && "),
+    );
+  } catch (caught) {
+    await remoteExec(session.client, `rm -rf ${shellQuote(staging)}`, {
+      allowFailure: true,
+    }).catch(() => undefined);
+    throw caught;
+  }
+
+  session.runtime = {
+    ...paths,
+    digest: bundle.digest,
+    protocolVersion: Number(bundle.manifest.protocolVersion || 1),
+    releaseId: bundle.releaseId,
+  };
+  return session.runtime;
+}
+
+async function createRemoteRuntimeRun(session, options) {
+  const runtime = await ensureRemoteRuntime(session);
+  const runId = safeRemoteRunId(options.runId);
+  const runDirectory = `${runtime.runsRoot}/${runId}`;
+  await remoteExec(
+    session.client,
+    `umask 077 && mkdir -p ${shellQuote(runDirectory)} && chmod 700 ${shellQuote(runDirectory)}`,
+  );
+  const metadata = {
+    schemaVersion: 1,
+    runId,
+    conversationId: String(options.conversationId || ""),
+    serverId: String(session.serverId || ""),
+    agentId: String(options.agentId || ""),
+    workspace: String(options.workspace || ""),
+    createdAt: isoNow(),
+  };
+  await remoteSftpWriteAtomic(
+    session.client,
+    `${runDirectory}/request.json`,
+    `${JSON.stringify(metadata, null, 2)}\n`,
+  );
+  await remoteSftpWriteAtomic(
+    session.client,
+    `${runDirectory}/prompt.txt`,
+    String(options.prompt || ""),
+  );
+  await remoteSftpWriteAtomic(
+    session.client,
+    `${runDirectory}/command.sh`,
+    String(
+      typeof options.command === "function"
+        ? options.command({ runDirectory, runtime })
+        : options.command || "",
+    ),
+    0o700,
+  );
+  const started = await remoteExec(
+    session.client,
+    `${shellQuote(runtime.entrypoint)} run-start ${shellQuote(runId)}`,
+  );
+  return {
+    ...parseRuntimeFields(started.stdout),
+    runId,
+    runDirectory,
+    runtime,
+  };
+}
+
+async function readRemoteRuntimeRun(session, remoteRun) {
+  const files = await withRemoteSftp(session.client, async (sftp) => {
+    const readText = (name) =>
+      new Promise((resolve, reject) => {
+        sftp.readFile(
+          `${remoteRun.runDirectory}/${name}`,
+          (error, content) => {
+            if (
+              error?.code === 2 ||
+              error?.code === "ENOENT" ||
+              /no such file/i.test(String(error?.message || ""))
+            ) {
+              resolve(Buffer.alloc(0));
+              return;
+            }
+            if (error) {
+              reject(error);
+              return;
+            }
+            resolve(content || Buffer.alloc(0));
+          },
+        );
+      });
+    const result = {};
+    for (const name of [
+      "status",
+      "pid",
+      "exit_code",
+      "stdout.log",
+      "stderr.log",
+      "agent-events.sse",
+    ]) {
+      result[name] = await readText(name);
+    }
+    return result;
+  });
+  const status = files.status;
+  const pid = files.pid;
+  const exitCode = files.exit_code;
+  const stdout = files["stdout.log"];
+  const stderr = files["stderr.log"];
+  const agentEvents = files["agent-events.sse"];
+  return {
+    status: status.toString("utf8").trim() || "starting",
+    pid: pid.toString("utf8").trim(),
+    exitCode: exitCode.toString("utf8").trim(),
+    stdout,
+    stderr,
+    agentEvents,
+  };
+}
+
+async function monitorRemoteRuntimeRun(session, remoteRun, handlers = {}) {
+  let stdoutOffset = 0;
+  let stderrOffset = 0;
+  let agentEventsOffset = 0;
+  let snapshot;
+  for (;;) {
+    if (!session.client) {
+      handlers.onUnavailable?.();
+      await waitFor(500);
+      continue;
+    }
+    try {
+      snapshot = await readRemoteRuntimeRun(session, remoteRun);
+    } catch (caught) {
+      if (
+        !session.client ||
+        /ECONNRESET|not connected|connection.*closed|No response from server/i.test(
+          String(caught?.message || ""),
+        )
+      ) {
+        handlers.onUnavailable?.();
+        await waitFor(500);
+        continue;
+      }
+      throw caught;
+    }
+    if (snapshot.stdout.length > stdoutOffset) {
+      handlers.onStdout?.(snapshot.stdout.subarray(stdoutOffset).toString("utf8"));
+      stdoutOffset = snapshot.stdout.length;
+    }
+    if (snapshot.stderr.length > stderrOffset) {
+      handlers.onStderr?.(snapshot.stderr.subarray(stderrOffset).toString("utf8"));
+      stderrOffset = snapshot.stderr.length;
+    }
+    if (snapshot.agentEvents.length > agentEventsOffset) {
+      handlers.onAgentEvents?.(
+        snapshot.agentEvents.subarray(agentEventsOffset).toString("utf8"),
+      );
+      agentEventsOffset = snapshot.agentEvents.length;
+    }
+    handlers.onStatus?.(snapshot);
+    if (["done", "error", "aborted", "lost"].includes(snapshot.status)) break;
+    await waitFor(240);
+  }
+  return {
+    code: Number(snapshot.exitCode || (snapshot.status === "done" ? 0 : 1)),
+    status: snapshot.status,
+    stdout: snapshot.stdout.toString("utf8"),
+    stderr: snapshot.stderr.toString("utf8"),
+  };
+}
+
+async function cancelRemoteRuntimeRun(session, activeRun) {
+  if (!session.client || !activeRun?.remoteRun?.runtime) return false;
+  activeRun.abortRequested = true;
+  await remoteExec(
+    session.client,
+    `${shellQuote(activeRun.remoteRun.runtime.entrypoint)} run-cancel ${shellQuote(activeRun.remoteRun.runId)}`,
+    { allowFailure: true },
+  );
+  if (activeRun.agentControl?.adapter === "opencode") {
+    await abortOpenCodeSession(session, activeRun.agentControl);
+  }
+  return true;
+}
+
+function reconstructOpenCodeTranscript(stdout, runId) {
+  const parserState = {
+    sessionId: "",
+    finalText: "",
+    latestText: "",
+    textParts: new Map(),
+    textOrder: [],
+    reasoningText: "",
+    reasoningParts: new Map(),
+    reasoningOrder: [],
+    lastError: "",
+    eventIndex: 0,
+    eventOrder: [],
+    forwardedEvents: new Map(),
+    activeThought: null,
+    activeFinal: null,
+    contextUsage: null,
+  };
+  const events = [];
+  let steps = [];
+  for (const line of String(stdout || "").split(/\r?\n/)) {
+    const parsed = parseOpenCodeLine(line, parserState);
+    if (!parsed) continue;
+    const { sourceId, planSteps, ...event } = parsed;
+    if (Array.isArray(planSteps)) steps = planSteps;
+    const id = sourceId
+      ? `${runId}_${safeSegment(event.kind)}_${safeSegment(sourceId)}`
+      : `${runId}_recovered_${events.length}`;
+    events.push({ id, ...event, timestamp: isoNow() });
+    parserState.eventOrder.push({ id, kind: event.kind });
+    parserState.forwardedEvents.set(id, event);
+  }
+  const finalCandidates = events.filter(
+    (event) => event.kind === "message" && event.output,
+  );
+  const finalText = stripEasyWorkProtocolMarkers(
+    String(
+      finalCandidates.at(-1)?.output ||
+        parserState.finalText ||
+        parserState.latestText ||
+        "",
+    ).trim(),
+    true,
+  );
+  return {
+    events,
+    steps,
+    finalText,
+    sessionId: parserState.sessionId,
+    error: parserState.lastError,
+    contextUsage: parserState.contextUsage,
+  };
+}
+
+async function finishRecoveredWorkerTask(session, actor, task, result) {
+  const reconstructed = reconstructOpenCodeTranscript(result.stdout, task.runId);
+  const recoveredWasAborted = Boolean(
+    task.abortRequested || result.status === "aborted",
+  );
+  let recoveredBinding = null;
+  let recoveredBindingKey = "";
+  for (const event of reconstructed.events) {
+    publishWorkerEvent(session, {
+      type: "agent.event",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      event,
+    });
+  }
+  if (reconstructed.steps.length) {
+    publishWorkerEvent(session, {
+      type: "workflow",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      steps: reconstructed.steps,
+    });
+  }
+  if (reconstructed.sessionId) {
+    const workspace = remotePathForSession(session, task.workspace || "~");
+    const bindingKey = agentBindingKey({
+      serverId: session.serverId,
+      workspace,
+      agentId: task.agentId,
+      conversationId: task.conversationId,
+    });
+    const [state, memoryDocument, bindings] = await Promise.all([
+      getState(actor),
+      readMemoryDocument(actor),
+      readAgentBindings(actor),
+    ]);
+    const previousBinding = bindings.bindings[bindingKey] || null;
+    const binding = {
+      bindingKey,
+      conversationId: task.conversationId,
+      serverId: session.serverId,
+      workspace,
+      agentId: task.agentId,
+      agentSessionId: reconstructed.sessionId,
+      lastRunId: task.runId,
+      syncMode: "recovered",
+      syncCursor:
+        result.status === "done" && !recoveredWasAborted
+          ? createAgentSyncCursor({
+              state,
+              memoryDocument,
+              conversationId: task.conversationId,
+              lastMessageId: task.assistantMessageId,
+              taskId: task.runId,
+              checkpointId: task.checkpointAfterId,
+              deliveredContent: [`user\u0000${task.prompt}`],
+              deliveredMemoryRecords: task.deliveredMemoryRecords || [],
+              memoryEnabled: state?.settings?.memoryEnabled !== false,
+              previous: previousBinding?.syncCursor,
+            })
+          : previousBinding?.syncCursor || {
+              memoryEnabled: state?.settings?.memoryEnabled !== false,
+              memoryVersions: {},
+              deliveredContentHashes: [],
+              lastMessageId: "",
+            },
+      deliveryState: {
+        runId: task.runId,
+        status:
+          result.status === "done" && !recoveredWasAborted
+            ? "acknowledged"
+            : "interrupted",
+      },
+      contextUsage: reconstructed.contextUsage || undefined,
+      updatedAt: isoNow(),
+    };
+    recoveredBinding = binding;
+    recoveredBindingKey = bindingKey;
+  }
+
+  if (!task.checkpointAfterId) {
+    const checkpoint = await createWorkspaceCheckpoint(
+      session,
+      actor,
+      task,
+      "after",
+    ).catch(() => null);
+    task.checkpointAfterId = checkpoint?.id || "";
+  }
+
+  if (recoveredBinding && recoveredBindingKey) {
+    recoveredBinding.syncCursor.workspaceRevision = task.checkpointAfterId || "";
+    recoveredBinding.updatedAt = isoNow();
+    session.agentSessions.set(recoveredBindingKey, recoveredBinding);
+    await updateAgentBinding(
+      actor,
+      recoveredBindingKey,
+      () => recoveredBinding,
+    );
+  }
+
+  if (result.status === "done" && !recoveredWasAborted) {
+    const finalText =
+      reconstructed.finalText || "Agent 已完成任务，未返回额外文本。";
+    publishWorkerEvent(session, {
+      type: "agent.event",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      event: {
+        id: `${task.runId}_recovered_final`,
+        kind: "message",
+        title: "Agent 最终回复",
+        output: finalText,
+        status: "done",
+        timestamp: isoNow(),
+      },
+    });
+    publishWorkerEvent(session, {
+      type: "task.complete",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      result: finalText,
+    });
+  } else if (recoveredWasAborted) {
+    publishWorkerEvent(session, {
+      type: "task.aborted",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      result: "任务已停止。",
+    });
+  } else {
+    publishWorkerEvent(session, {
+      type: "task.error",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      result:
+        reconstructed.error ||
+        result.stderr.trim() ||
+        "远端任务在主机恢复期间失败",
+    });
+  }
+  task.recoveryStatus = "complete";
+  session.activeRuns.delete(task.runId);
+  session.activeRun = session.activeRuns.values().next().value || null;
+  await persistWorkerTaskConversation(actor, task);
+  await persistSshWorker(session.worker);
+}
+
+async function reconcileRecoveredWorkerTasks(session, actor) {
+  const pending = [...session.worker.tasks.values()].filter(
+    (task) =>
+      task.serverId === session.serverId &&
+      task.status === "running" &&
+      task.remoteRun?.runId &&
+      task.recoveryStatus !== "watching",
+  );
+  if (!pending.length || !session.client) return;
+  const runtime = await ensureRemoteRuntime(session);
+  for (const task of pending) {
+    const remoteRun = {
+      runId: task.remoteRun.runId,
+      runDirectory: `${runtime.runsRoot}/${task.remoteRun.runId}`,
+      runtime,
+    };
+    const serviceRoot = String(
+      task.agentControl?.serviceRoot || task.remoteRun?.serviceRoot || "",
+    );
+    const servicePort = Number(
+      task.agentControl?.servicePort || task.remoteRun?.servicePort || 0,
+    );
+    const agentSessionId = String(
+      task.agentControl?.sessionId ||
+        task.remoteRun?.agentSessionId ||
+        task.agentSessionId ||
+        "",
+    );
+    const restoredService =
+      serviceRoot && servicePort
+        ? {
+            serviceId: String(
+              task.agentControl?.serviceId || task.remoteRun?.serviceId || "",
+            ),
+            root: serviceRoot,
+            port: servicePort,
+            baseUrl: `http://127.0.0.1:${servicePort}`,
+            portPath: `${serviceRoot}/port`,
+            passwordPath: `${serviceRoot}/password`,
+            curlConfigPath: `${serviceRoot}/curl.conf`,
+            launcherPath: `${serviceRoot}/launch.sh`,
+            pidPath: `${serviceRoot}/pid`,
+            logPath: `${serviceRoot}/server.log`,
+            requestsPath: `${serviceRoot}/requests`,
+          }
+        : null;
+    const activeRun = {
+      conversationId: task.conversationId,
+      runId: task.runId,
+      workspace: task.workspace,
+      remoteRun,
+      recovered: true,
+      supportsLiveInput: Boolean(restoredService && agentSessionId),
+      agentControl:
+        restoredService && agentSessionId
+          ? {
+              adapter: "opencode",
+              service: restoredService,
+              sessionId: agentSessionId,
+              directory: String(
+                task.agentControl?.directory ||
+                  task.remoteRun?.directory ||
+                  remotePathForSession(session, task.workspace || "~"),
+              ),
+            }
+          : null,
+    };
+    task.recoveryStatus = "watching";
+    session.activeRuns.set(task.runId, activeRun);
+    session.activeRun ||= activeRun;
+    if (task.abortRequested) {
+      void cancelRemoteRuntimeRun(session, activeRun).catch(() => undefined);
+    } else if (activeRun.agentControl) {
+      void flushAppendedInstructions(session, task, activeRun).catch(
+        () => undefined,
+      );
+    }
+    void monitorRemoteRuntimeRun(session, remoteRun, {
+      onStatus: (snapshot) => {
+        task.remoteRun.status = snapshot.status;
+        task.remoteRun.pid = snapshot.pid || undefined;
+        task.updatedAt = isoNow();
+        scheduleSshWorkerPersist(session.worker);
+      },
+    })
+      .then((result) => finishRecoveredWorkerTask(session, actor, task, result))
+      .catch(async (caught) => {
+        task.recoveryStatus = "pending";
+        session.activeRuns.delete(task.runId);
+        session.activeRun = session.activeRuns.values().next().value || null;
+        task.updatedAt = isoNow();
+        task.recoveryError =
+          caught instanceof Error ? caught.message : "远端任务恢复失败";
+        await persistSshWorker(session.worker).catch(() => undefined);
+      });
+  }
+}
+
 function remotePathForSession(session, value = "~") {
   const input = String(value || "~").trim();
   if (!session.home) throw new Error("尚未读取远端主目录");
@@ -2456,6 +6173,275 @@ function remotePathForSession(session, value = "~") {
   if (input.startsWith("~/")) return path.posix.join(session.home, input.slice(2));
   if (input.startsWith("/")) return path.posix.normalize(input);
   return path.posix.join(session.home, input);
+}
+
+async function ensureTaskWorkspace(session, task, workspace) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const managedPrefix = `${session.home}/.easywork/workspaces/`;
+  const requestedManaged =
+    task.workspaceMode === "managed" && workspace.startsWith(managedPrefix);
+  if (!requestedManaged) return;
+  await remoteExec(
+    session.client,
+    [
+      "set -eu",
+      `EW_DIR=${shellQuote(workspace)}`,
+      'mkdir -p "$EW_DIR"',
+      'chmod 700 "$HOME/.easywork" "$HOME/.easywork/workspaces" 2>/dev/null || true',
+      'if command -v git >/dev/null 2>&1 && ! (cd "$EW_DIR" && git rev-parse --git-dir >/dev/null 2>&1); then (cd "$EW_DIR" && git init -q); fi',
+    ].join("\n"),
+  );
+}
+
+function checkpointIdForTask(task, phase) {
+  return safeRemoteRunId(`checkpoint-${task.runId}-${phase}`);
+}
+
+async function createWorkspaceCheckpoint(session, actor, task, phase) {
+  const checkpointId = checkpointIdForTask(task, phase);
+  const workspace = remotePathForSession(session, task.workspace || "~");
+  const conversationSegment = safeSegment(task.conversationId, "conversation");
+  const checkpointRoot = `${session.home}/.easywork/checkpoints/${conversationSegment}`;
+  const bundlePath = `${checkpointRoot}/${checkpointId}.bundle`;
+  const metadataPath = `${checkpointRoot}/${checkpointId}.json`;
+  const temporaryIndex = `${session.home}/.easywork/tmp/${checkpointId}.index`;
+  const temporaryBundle = `${bundlePath}.tmp`;
+  const refName = `refs/easywork-snapshot/${crypto
+    .createHash("sha256")
+    .update(checkpointId)
+    .digest("hex")
+    .slice(0, 24)}`;
+  const result = await remoteExec(
+    session.client,
+    [
+      "set -eu",
+      `EW_DIR=${shellQuote(workspace)}`,
+      `EW_ROOT=${shellQuote(checkpointRoot)}`,
+      `EW_BUNDLE=${shellQuote(bundlePath)}`,
+      `EW_BUNDLE_TMP=${shellQuote(temporaryBundle)}`,
+      `EW_INDEX=${shellQuote(temporaryIndex)}`,
+      `EW_REF=${shellQuote(refName)}`,
+      'EW_EASYWORK="$HOME/.easywork"',
+      'mkdir -p "$EW_ROOT" "$HOME/.easywork/tmp"',
+      'if ! test -d "$EW_DIR"; then echo "MODE=missing"; exit 0; fi',
+      'if ! command -v git >/dev/null 2>&1; then echo "MODE=unmanaged"; exit 0; fi',
+      'EW_REPO="$(cd "$EW_DIR" && git rev-parse --show-toplevel 2>/dev/null)" || { echo "MODE=unmanaged"; exit 0; }',
+      'EW_GIT_DIR="$(cd "$EW_REPO" && git rev-parse --git-dir)"',
+      'case "$EW_GIT_DIR" in /*) ;; *) EW_GIT_DIR="$EW_REPO/$EW_GIT_DIR" ;; esac',
+      'EW_INDEX_SOURCE="$EW_GIT_DIR/index"',
+      'rm -f "$EW_INDEX" "$EW_BUNDLE_TMP"',
+      'if test -f "$EW_INDEX_SOURCE"; then cp "$EW_INDEX_SOURCE" "$EW_INDEX"; else (cd "$EW_REPO" && GIT_INDEX_FILE="$EW_INDEX" git read-tree --empty); fi',
+      'trap \'rm -f "$EW_INDEX" "$EW_BUNDLE_TMP"; (cd "$EW_REPO" && git update-ref -d "$EW_REF" >/dev/null 2>&1) || true\' EXIT HUP INT TERM',
+      '(cd "$EW_REPO" && GIT_INDEX_FILE="$EW_INDEX" git add -A -- .)',
+      'case "$EW_EASYWORK/" in "$EW_REPO"/*) EW_REL="${EW_EASYWORK#"$EW_REPO"/}"; (cd "$EW_REPO" && GIT_INDEX_FILE="$EW_INDEX" git rm -r -q --cached --ignore-unmatch -- "$EW_REL") ;; esac',
+      'EW_TREE="$(cd "$EW_REPO" && GIT_INDEX_FILE="$EW_INDEX" git write-tree)"',
+      'EW_COMMIT="$(cd "$EW_REPO" && printf "%s\\n" "EasyWork checkpoint" | env GIT_AUTHOR_NAME=EasyWork GIT_AUTHOR_EMAIL=runtime@easywork.local GIT_COMMITTER_NAME=EasyWork GIT_COMMITTER_EMAIL=runtime@easywork.local git commit-tree "$EW_TREE")"',
+      '(cd "$EW_REPO" && git update-ref "$EW_REF" "$EW_COMMIT")',
+      '(cd "$EW_REPO" && git bundle create "$EW_BUNDLE_TMP" "$EW_REF" >/dev/null)',
+      'mv -f "$EW_BUNDLE_TMP" "$EW_BUNDLE"',
+      'chmod 600 "$EW_BUNDLE"',
+      'echo "MODE=git"',
+      'echo "REPO_ROOT=$EW_REPO"',
+      'echo "COMMIT=$EW_COMMIT"',
+      'echo "REF=$EW_REF"',
+      'echo "BUNDLE=$EW_BUNDLE"',
+    ].join("\n"),
+    { allowFailure: true },
+  );
+  const fields = parseRuntimeFields(result.stdout);
+  const mode = String(fields.MODE || (result.code === 0 ? "unmanaged" : "error"));
+  const checkpoint = {
+    id: checkpointId,
+    conversationId: task.conversationId,
+    branchId: task.branchId || task.conversationId,
+    taskId: task.runId,
+    runId: task.runId,
+    phase,
+    serverId: task.serverId,
+    logicalWorkspaceId:
+      task.logicalWorkspaceId ||
+      crypto.createHash("sha256").update(`${task.serverId}:${workspace}`).digest("hex").slice(0, 24),
+    workspace,
+    workspaceMode:
+      mode === "git"
+        ? workspace.startsWith(`${session.home}/.easywork/worktrees/`) ||
+          workspace.startsWith(`${session.home}/.easywork/workspaces/`)
+          ? "managed"
+          : "attached"
+        : "unmanaged",
+    status: mode === "git" ? "available" : "unavailable",
+    repoRoot: fields.REPO_ROOT || undefined,
+    snapshotCommit: fields.COMMIT || undefined,
+    snapshotRef: fields.REF || undefined,
+    remoteBundlePath: fields.BUNDLE || undefined,
+    remoteMetadataPath: metadataPath,
+    exclusions:
+      mode === "git"
+        ? ["ignored files", "dirty submodule contents", "workspace-external effects"]
+        : ["non-Git workspace", "workspace-external effects"],
+    diagnostic:
+      mode === "git"
+        ? ""
+        : String(result.stderr || "未检测到可快照的 Git 工作区").trim().slice(0, 1_000),
+    createdAt: isoNow(),
+  };
+  await remoteSftpWriteAtomic(
+    session.client,
+    metadataPath,
+    `${JSON.stringify(checkpoint, null, 2)}\n`,
+    0o600,
+  ).catch(() => undefined);
+  await updateCheckpointDocument(actor, (document) => {
+    document.checkpoints[checkpointId] = checkpoint;
+    return document;
+  });
+  return checkpoint;
+}
+
+function checkpointForRun(document, runId, phase) {
+  return Object.values(document?.checkpoints || {})
+    .filter(
+      (checkpoint) =>
+        checkpoint?.runId === runId && checkpoint?.phase === phase,
+    )
+    .sort((left, right) =>
+      String(right.createdAt || "").localeCompare(String(left.createdAt || "")),
+    )[0];
+}
+
+async function restoreWorkspaceCheckpoint(session, checkpoint, conversationId) {
+  if (!checkpoint || checkpoint.status !== "available") {
+    throw new Error("该消息没有可恢复的 Git 工作区快照");
+  }
+  if (!session?.client || session.status !== "connected") {
+    throw new Error("对应服务器当前未连接，无法恢复工作区快照");
+  }
+  const conversationSegment = safeSegment(conversationId, "conversation");
+  const target = `${session.home}/.easywork/worktrees/${conversationSegment}/main`;
+  const result = await remoteExec(
+    session.client,
+    [
+      "set -eu",
+      `EW_BUNDLE=${shellQuote(checkpoint.remoteBundlePath)}`,
+      `EW_REF=${shellQuote(checkpoint.snapshotRef)}`,
+      `EW_TARGET=${shellQuote(target)}`,
+      'test -f "$EW_BUNDLE"',
+      'test ! -e "$EW_TARGET"',
+      'mkdir -p "$EW_TARGET"',
+      '(cd "$EW_TARGET" && git init -q)',
+      'if ! (cd "$EW_TARGET" && git fetch -q "$EW_BUNDLE" "$EW_REF"); then rm -rf "$EW_TARGET"; exit 1; fi',
+      'if ! (cd "$EW_TARGET" && git checkout -q --detach FETCH_HEAD); then rm -rf "$EW_TARGET"; exit 1; fi',
+      'echo "WORKSPACE=$EW_TARGET"',
+      'echo "COMMIT=$(cd "$EW_TARGET" && git rev-parse HEAD)"',
+    ].join("\n"),
+  );
+  const fields = parseRuntimeFields(result.stdout);
+  if (!fields.WORKSPACE || fields.WORKSPACE !== target) {
+    throw new Error("工作区快照恢复结果无法验证");
+  }
+  return {
+    workspace: target,
+    commit: fields.COMMIT,
+    mode: "managed",
+    sourceCheckpointId: checkpoint.id,
+  };
+}
+
+async function selectivelyRevertWorkspaceRuns(
+  session,
+  actor,
+  {
+    conversationId,
+    serverId,
+    workspace,
+    logicalWorkspaceId,
+    checkpoints,
+  },
+) {
+  if (!checkpoints.length) return { reverted: false, files: [] };
+  if (!session?.client || session.status !== "connected") {
+    throw new Error("对应服务器当前未连接，无法重置本轮工作区修改");
+  }
+  for (const pair of checkpoints) {
+    if (pair.before?.status !== "available" || pair.after?.status !== "available") {
+      throw new Error(`任务 ${pair.runId} 缺少可用的前后工作区检查点`);
+    }
+    if (
+      logicalWorkspaceId &&
+      [pair.before.logicalWorkspaceId, pair.after.logicalWorkspaceId].some(
+        (value) => value && String(value) !== String(logicalWorkspaceId),
+      )
+    ) {
+      throw new Error(`任务 ${pair.runId} 不属于当前工作区，已停止重置`);
+    }
+  }
+  const resetId = safeRemoteRunId(randomId("reset-"));
+  const currentCheckpoint = await createWorkspaceCheckpoint(
+    session,
+    actor,
+    {
+      conversationId,
+      branchId: conversationId,
+      runId: resetId,
+      serverId,
+      workspace,
+      logicalWorkspaceId,
+    },
+    "current",
+  );
+  if (currentCheckpoint.status !== "available") {
+    throw new Error(
+      currentCheckpoint.diagnostic || "当前工作区无法创建安全快照，已停止重置",
+    );
+  }
+  const previewId = `reset-preview-${resetId}`;
+  const preview = await restoreWorkspaceCheckpoint(
+    session,
+    currentCheckpoint,
+    previewId,
+  );
+  const tempRoot = `${session.home}/.easywork/tmp/${resetId}`;
+  const commands = [
+    "set -eu",
+    `EW_PREVIEW=${shellQuote(preview.workspace)}`,
+    `EW_ACTUAL=${shellQuote(currentCheckpoint.repoRoot || workspace)}`,
+    `EW_TMP=${shellQuote(tempRoot)}`,
+    'case "$EW_PREVIEW" in "$HOME/.easywork/worktrees/reset-preview-"*) ;; *) echo "预演工作区路径校验失败" >&2; exit 91 ;; esac',
+    'case "$EW_TMP" in "$HOME/.easywork/tmp/reset-"*) ;; *) echo "临时目录路径校验失败" >&2; exit 92 ;; esac',
+    'mkdir -p "$EW_TMP"',
+    'cleanup_reset() { rm -rf -- "$EW_PREVIEW" "$EW_TMP"; }',
+    "trap cleanup_reset EXIT HUP INT TERM",
+  ];
+  checkpoints
+    .slice()
+    .reverse()
+    .forEach((pair, index) => {
+      const beforeRef = `refs/easywork-reset/${resetId}/${index}/before`;
+      const afterRef = `refs/easywork-reset/${resetId}/${index}/after`;
+      const patchPath = `${tempRoot}/${index}.patch`;
+      commands.push(
+        `(cd "$EW_PREVIEW" && git fetch -q ${shellQuote(pair.before.remoteBundlePath)} ${shellQuote(`${pair.before.snapshotRef}:${beforeRef}`)})`,
+        `(cd "$EW_PREVIEW" && git fetch -q ${shellQuote(pair.after.remoteBundlePath)} ${shellQuote(`${pair.after.snapshotRef}:${afterRef}`)})`,
+        `(cd "$EW_PREVIEW" && git diff --binary --no-ext-diff ${shellQuote(afterRef)} ${shellQuote(beforeRef)} -- . > ${shellQuote(patchPath)})`,
+        `if test -s ${shellQuote(patchPath)}; then (cd "$EW_PREVIEW" && git apply --check ${shellQuote(patchPath)} && git apply ${shellQuote(patchPath)}); fi`,
+      );
+    });
+  const combinedPatch = `${tempRoot}/combined.patch`;
+  commands.push(
+    `(cd "$EW_PREVIEW" && git diff --binary --no-ext-diff HEAD -- . > ${shellQuote(combinedPatch)})`,
+    '(cd "$EW_PREVIEW" && git diff --name-only HEAD -- .)',
+    `if test -s ${shellQuote(combinedPatch)}; then (cd "$EW_ACTUAL" && git apply --check ${shellQuote(combinedPatch)}); fi`,
+    `if test -s ${shellQuote(combinedPatch)}; then (cd "$EW_ACTUAL" && git apply ${shellQuote(combinedPatch)}); fi`,
+  );
+  const result = await remoteExec(session.client, commands.join("\n"));
+  return {
+    reverted: true,
+    files: result.stdout
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean),
+    sourceCheckpointId: currentCheckpoint.id,
+  };
 }
 
 async function readOpenCodeFailureLog(session) {
@@ -2474,13 +6460,27 @@ async function readOpenCodeFailureLog(session) {
     { allowFailure: true },
   );
   const diagnosticText = `${result.stdout}\n${result.stderr}`;
-  const redacted = diagnosticText
+  return conciseOpenCodeDiagnostic(diagnosticText);
+}
+
+function conciseOpenCodeDiagnostic(value) {
+  const candidates = String(value || "")
     .split(/\r?\n/)
-    .filter((line) => /error|fail|exception|provider|api[_ -]?call/i.test(line))
-    .slice(-10)
-    .join("\n")
+    .filter((line) => /error|fail|exception|provider|api[_ -]?call/i.test(line));
+  if (!candidates.length) return "";
+  let message = candidates.at(-1).trim();
+  const embedded = message.match(/error(?:\.error)?=(?:"|')?(.+)$/i);
+  if (embedded?.[1]) message = embedded[1];
+  message = message
+    .replace(/\\n\s*at[\s\S]*$/i, "")
+    .replace(/\n\s*at[\s\S]*$/i, "")
+    .replace(/(?:"|')?\s+cause=(?:"|')[\s\S]*$/i, "")
+    .replace(/api_key:\s*[a-f0-9]{24,}/gi, "api_key: [已配置]")
+    .replace(/\\(["'\\])/g, "$1")
+    .replace(/^(?:"|')|(?:"|')$/g, "")
+    .replace(/\s+/g, " ")
     .trim();
-  return redacted.slice(-4_000);
+  return [...message].slice(0, 720).join("");
 }
 
 function fallbackConversationTitle(prompt) {
@@ -2552,15 +6552,123 @@ async function generateConversationTitle(actor, prompt, response = "") {
 }
 
 async function agentPromptWithNativePlanning(context, webHandoff = "") {
-  const handoffSection = webHandoff
-    ? await renderPromptTemplate("agents/web-handoff.md", {
+  const agentBrief = webHandoff
+    ? await renderPromptTemplate("web/agent-brief.md", {
         CONTENT: webHandoff,
       })
     : "";
-  return renderPromptTemplate("agents/opencode-bridge.md", {
-    CONTEXT: context,
-    WEB_HANDOFF: handoffSection,
+  const [agentSystem, eventProtocol] = await Promise.all([
+    renderPromptTemplate("agents/common.md"),
+    renderPromptTemplate("agents/protocol.md"),
+  ]);
+  return renderPromptTemplate("agents/opencode.md", {
+    AGENT_SYSTEM: agentSystem,
+    SYNC_CONTEXT:
+      typeof context === "string" ? context : String(context?.text || ""),
+    AGENT_BRIEF: agentBrief,
+    EVENT_PROTOCOL: eventProtocol,
   });
+}
+
+function formatAgentDelta(delta) {
+  if (!delta?.messages?.length) return "";
+  return delta.messages
+    .map((message) => {
+      const speaker = message.role === "user" ? "用户" : "EasyWork";
+      const agent = message.agentId ? ` / Agent ${message.agentId}` : "";
+      return `${speaker}${agent}：${message.content}`;
+    })
+    .join("\n\n");
+}
+
+async function buildAgentSyncContext(context, delta, memoryDelta) {
+  const optionalSection = async (template, content) =>
+    content
+      ? renderPromptTemplate(template, {
+          CONTENT: content,
+        })
+      : "";
+  return renderPromptTemplate("context/agent-sync.md", {
+    SUMMARY_SECTION: await optionalSection(
+      "context/conversation-summary.md",
+      delta.bootstrap || delta.truncated
+        ? context.sections.conversationSummary
+        : "",
+    ),
+    MEMORY_SECTION: await optionalSection(
+      "context/agent-memory-delta.md",
+      formatMemoryContext(memoryDelta),
+    ),
+    DELTA_SECTION: await optionalSection(
+      "context/agent-delta.md",
+      formatAgentDelta(delta),
+    ),
+  });
+}
+
+function agentMemoryDelta(context, binding) {
+  const versions = binding?.syncCursor?.memoryVersions || {};
+  if (!context?.state?.settings?.memoryEnabled) {
+    if (binding?.syncCursor?.memoryEnabled === false) return [];
+    return Object.entries(versions).map(([id, revision]) => ({
+      id,
+      revision: Number(revision || 0) + 1,
+      status: "deleted",
+      scope: "conversation",
+      semanticKey: id,
+      source: "memory-disabled",
+    }));
+  }
+  const candidates = binding?.agentSessionId
+    ? context?.memorySyncRecords || []
+    : context?.memoryRecords || [];
+  return candidates.filter(
+    (record) =>
+      !binding?.agentSessionId ||
+      Number(record.revision || 0) > Number(versions[record.id] || 0),
+  );
+}
+
+function workHandoffContext(context, delta, memoryDelta) {
+  const separatelySynchronized = [
+    delta.bootstrap || delta.truncated
+      ? context.sections.conversationSummary
+      : "",
+    formatAgentDelta(delta),
+    formatMemoryContext(memoryDelta),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  return [
+    context.sections.system,
+    context.sections.skills
+      ? `## 本轮技能\n\n${context.sections.skills}`
+      : "",
+    context.sections.knowledge
+      ? `## 相关文件片段\n\n${context.sections.knowledge}`
+      : "",
+    separatelySynchronized
+      ? `## 独立同步给 Agent 的上下文\n\n${separatelySynchronized}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function deterministicWorkHandoff(context, memoryDelta = context.memoryRecords) {
+  const sections = [
+    `## 本轮用户原文\n\n${context.sections.request}`,
+    memoryDelta.length
+      ? `## 与本轮相关的新记忆\n\n${formatMemoryContext(memoryDelta)}`
+      : "",
+    context.sections.skills
+      ? `## 本轮技能\n\n${context.sections.skills}`
+      : "",
+    context.sections.knowledge
+      ? `## 相关文件片段\n\n${context.sections.knowledge}`
+      : "",
+  ];
+  return sections.filter(Boolean).join("\n\n");
 }
 
 function providerConfigForOpenCode(provider) {
@@ -2584,6 +6692,13 @@ function providerConfigForOpenCode(provider) {
       },
     },
   };
+}
+
+function managedOpenCodeModel(agent, provider, hasApiKey) {
+  const model = String(agent?.model || provider?.model || "").trim();
+  return agent?.managed && model && hasApiKey
+    ? `${EASYWORK_OPENCODE_PROVIDER_ID}/${model}`
+    : "";
 }
 
 function isPlainObject(value) {
@@ -2630,16 +6745,6 @@ function mergeOpenCodeConfigContent(content, provider) {
     ["provider", EASYWORK_OPENCODE_PROVIDER_ID],
     managedProvider,
   );
-
-  const legacyProvider = current.provider?.custom;
-  const legacyModels = Object.keys(legacyProvider?.models || {});
-  const legacyLooksManaged =
-    legacyProvider?.name === "Custom API" &&
-    legacyProvider?.options?.baseURL === provider.baseUrl &&
-    legacyModels.includes(provider.model);
-  if (legacyLooksManaged) {
-    next = setJsoncValue(next, ["provider", "custom"], undefined);
-  }
   return `${next.trimEnd()}\n`;
 }
 
@@ -2755,8 +6860,24 @@ function agentConfigFor(adapter, home) {
   return {};
 }
 
+function agentRuntimeCapabilities(
+  adapter,
+  status = "ready",
+  { liveControl = true } = {},
+) {
+  const available = status === "ready";
+  const openCode = adapter === "opencode" && available;
+  return {
+    liveInput: openCode && liveControl,
+    nativeAbort: openCode && liveControl,
+    resumeSession: openCode,
+    nativePlanning: openCode,
+    workspaceCheckpoint: true,
+  };
+}
+
 function remoteAgentRegistryPath(actor) {
-  return path.join(actorDirectory(actor), "remote-agents.json");
+  return path.join(actorDirectory(actor), "runtime", "remote-agents.json");
 }
 
 function remoteServerKey(session) {
@@ -2782,11 +6903,9 @@ async function inspectOpenCodeNativeConfiguration(session, agent = {}) {
   const jsonPath = agent.configPath || defaults.configPath;
   const jsoncPath = agent.alternateConfigPath || defaults.alternateConfigPath;
   const authPath = `${session.home}/.local/share/opencode/auth.json`;
-  const [jsonBuffer, jsoncBuffer, authBuffer] = await Promise.all([
-    remoteSftpReadOptional(session.client, jsonPath),
-    remoteSftpReadOptional(session.client, jsoncPath),
-    remoteSftpReadOptional(session.client, authPath),
-  ]);
+  const jsonBuffer = await remoteSftpReadOptional(session.client, jsonPath);
+  const jsoncBuffer = await remoteSftpReadOptional(session.client, jsoncPath);
+  const authBuffer = await remoteSftpReadOptional(session.client, authPath);
   const useJsonc = Boolean(jsoncBuffer?.length);
   const configPath = useJsonc ? jsoncPath : jsonPath;
   const configContent = String(
@@ -2806,14 +6925,20 @@ async function inspectOpenCodeNativeConfiguration(session, agent = {}) {
 
 async function scanRemoteAgents(session, actor) {
   if (!session.client) throw new Error("SSH 尚未连接");
+  const liveControlCheck = await remoteExec(
+    session.client,
+    "command -v curl >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1",
+    { allowFailure: true },
+  );
+  const liveControlAvailable = liveControlCheck.code === 0;
   const command = [
     "set +e",
     'managed_opencode="$HOME/.easywork/agents/opencode/bin/opencode"',
     'user_opencode="$HOME/.opencode/bin/opencode"',
     'system_opencode="$(command -v opencode 2>/dev/null)"',
-    'if [ -x "$managed_opencode" ]; then printf "opencode\\t%s\\t%s\\t%s\\topencode\\n" "$HOME/.easywork/agents/opencode" "$managed_opencode" "$("$managed_opencode" --version 2>/dev/null | head -n 1)";',
-    'elif [ -x "$user_opencode" ]; then printf "opencode\\t%s\\t%s\\t%s\\topencode\\n" "$HOME/.opencode" "$user_opencode" "$("$user_opencode" --version 2>/dev/null | head -n 1)";',
-    'elif [ -n "$system_opencode" ] && [ -x "$system_opencode" ]; then printf "opencode\\t%s\\t%s\\t%s\\topencode\\n" "$(dirname "$system_opencode")" "$system_opencode" "$("$system_opencode" --version 2>/dev/null | head -n 1)"; fi',
+    'if [ -x "$managed_opencode" ]; then printf "opencode\\t%s\\t%s\\t%s\\topencode\\n" "$HOME/.easywork/agents/opencode" "$managed_opencode" "$("$managed_opencode" --version 2>/dev/null | head -n 1)"; fi',
+    'if [ -x "$user_opencode" ]; then printf "opencode-user\\t%s\\t%s\\t%s\\topencode\\n" "$HOME/.opencode" "$user_opencode" "$("$user_opencode" --version 2>/dev/null | head -n 1)"; fi',
+    'if [ -n "$system_opencode" ] && [ -x "$system_opencode" ]; then printf "opencode-system\\t%s\\t%s\\t%s\\topencode\\n" "$(dirname "$system_opencode")" "$system_opencode" "$("$system_opencode" --version 2>/dev/null | head -n 1)"; fi',
     'for spec in "qwen:$HOME:$(command -v qwen 2>/dev/null):qwen" "claude:$HOME:$(command -v claude 2>/dev/null):claude"; do',
     '  id="${spec%%:*}"; rest="${spec#*:}"; folder="${rest%%:*}"; rest="${rest#*:}"; bin="${rest%%:*}"; adapter="${rest##*:}";',
     '  if [ -n "$bin" ] && [ -x "$bin" ]; then ver="$("$bin" --version 2>/dev/null | head -n 1)"; printf "%s\\t%s\\t%s\\t%s\\t%s\\n" "$id" "$folder" "$bin" "$ver" "$adapter"; fi',
@@ -2836,9 +6961,18 @@ async function scanRemoteAgents(session, actor) {
         status: isOpenCode ? "ready" : "needs-adapter",
         adapter,
         managed: folder.includes("/.easywork/agents/opencode"),
+        capabilities: agentRuntimeCapabilities(
+          adapter,
+          isOpenCode ? "ready" : "needs-adapter",
+          { liveControl: liveControlAvailable },
+        ),
         ...config,
       };
-    });
+    })
+    .filter(
+      (agent, index, agents) =>
+        agents.findIndex((candidate) => candidate.path === agent.path) === index,
+    );
 
   const custom = await storedRemoteAgents(actor, session);
   for (const stored of custom) {
@@ -2846,7 +6980,7 @@ async function scanRemoteAgents(session, actor) {
       discovered.some(
         (agent) =>
           agent.id === stored.id ||
-          (agent.adapter === "opencode" && stored.adapter === "opencode"),
+          agent.path === stored.path,
       )
     ) {
       continue;
@@ -2861,6 +6995,11 @@ async function scanRemoteAgents(session, actor) {
       ...stored,
       version: binaryResult.stdout.trim() || stored.version,
       status: stored.adapter === "opencode" ? "ready" : "needs-adapter",
+      capabilities: agentRuntimeCapabilities(
+        stored.adapter,
+        stored.adapter === "opencode" ? "ready" : "needs-adapter",
+        { liveControl: liveControlAvailable },
+      ),
     });
   }
 
@@ -2887,7 +7026,7 @@ async function scanRemoteAgents(session, actor) {
     delete agent.alternateConfigPath;
   }
 
-  if (!discovered.some((agent) => agent.id === "opencode")) {
+  if (!discovered.some((agent) => agent.adapter === "opencode")) {
     discovered.unshift({
       id: "opencode",
       name: "OpenCode",
@@ -2897,6 +7036,9 @@ async function scanRemoteAgents(session, actor) {
       adapter: "opencode",
       managed: true,
       configured: false,
+      capabilities: agentRuntimeCapabilities("opencode", "missing", {
+        liveControl: liveControlAvailable,
+      }),
       ...agentConfigFor("opencode", session.home),
     });
   }
@@ -2919,6 +7061,8 @@ async function ensureOpenCodeNativeConfig(
       reason: "missing-provider",
     };
   }
+  onProgress("network", "检测远端模型 API 连接");
+  const providerRoute = await ensureRemoteProviderRoute(session, provider);
   const configuration = await inspectOpenCodeNativeConfiguration(session, {
     ...agentConfigFor("opencode", session.home),
     managed: true,
@@ -2934,7 +7078,11 @@ async function ensureOpenCodeNativeConfig(
       configPath: configuration.configPath,
     };
   }
-  const effectiveProvider = { ...provider, model: selectedModel };
+  const effectiveProvider = {
+    ...provider,
+    baseUrl: providerRoute.baseUrl,
+    model: selectedModel,
+  };
   const nextConfig = mergeOpenCodeConfigContent(
     configuration.configContent,
     effectiveProvider,
@@ -2951,6 +7099,7 @@ async function ensureOpenCodeNativeConfig(
       changed: false,
       configPath: configuration.configPath,
       model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${selectedModel}`,
+      route: providerRoute.mode,
     };
   }
   onProgress("configure", "同步 OpenCode 原生模型配置");
@@ -2977,11 +7126,18 @@ async function ensureOpenCodeNativeConfig(
       0o600,
     );
   }
+  if (configChanged) {
+    await stopOpenCodeService(session, {
+      id: "opencode",
+      path: `${session.home}/.easywork/agents/opencode/bin/opencode`,
+    });
+  }
   return {
     configured: true,
     changed: true,
     configPath: configuration.configPath,
     model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${selectedModel}`,
+    route: providerRoute.mode,
   };
 }
 
@@ -3026,62 +7182,18 @@ async function configureOpenCodeModel(
   };
 }
 
-async function remoteExecutableExists(session, remotePath) {
-  return (
-    (
-      await remoteExec(
-        session.client,
-        `test -x ${shellQuote(remotePath)}`,
-        { allowFailure: true },
-      )
-    ).code === 0
-  );
-}
-
-async function migrateLegacyOpenCode(
-  session,
-  onProgress = () => undefined,
-) {
-  const legacyPath = `${session.home}/.easywork/bin/opencode`;
-  const managedRoot = `${session.home}/.easywork/agents/opencode`;
-  const managedPath = `${managedRoot}/bin/opencode`;
-  if (!(await remoteExecutableExists(session, legacyPath))) return false;
-  if (await remoteExecutableExists(session, managedPath)) return true;
-  onProgress("migrate", "迁移旧版 OpenCode");
-  await remoteExec(
-    session.client,
-    [
-      "set -eu",
-      `mkdir -p ${shellQuote(`${managedRoot}/bin`)}`,
-      `cp ${shellQuote(legacyPath)} ${shellQuote(managedPath)}`,
-      `chmod 755 ${shellQuote(managedPath)}`,
-      `${shellQuote(managedPath)} --version`,
-    ].join("\n"),
-  );
-  return true;
-}
-
 async function prepareRemoteAgents(
   session,
   actor,
   onProgress = () => undefined,
 ) {
   let agents = await scanRemoteAgents(session, actor);
-  let managedOpenCode = agents.find(
+  const managedOpenCode = agents.find(
     (agent) =>
       agent.adapter === "opencode" &&
       agent.status === "ready" &&
       agent.managed,
   );
-  if (!managedOpenCode && (await migrateLegacyOpenCode(session, onProgress))) {
-    agents = await scanRemoteAgents(session, actor);
-    managedOpenCode = agents.find(
-      (agent) =>
-        agent.adapter === "opencode" &&
-        agent.status === "ready" &&
-        agent.managed,
-    );
-  }
   if (managedOpenCode) {
     await ensureOpenCodeNativeConfig(session, actor, onProgress);
     agents = await scanRemoteAgents(session, actor);
@@ -3130,7 +7242,8 @@ async function syncManagedOpenCodeForActor(actor) {
       session.status === "connected" &&
       session.client &&
       !session.demo &&
-      !session.activeStream,
+      !session.activeStream &&
+      !session.activeRuns?.size,
   );
   const results = await Promise.allSettled(
     sessions.map(async (session) => {
@@ -3147,6 +7260,191 @@ async function syncManagedOpenCodeForActor(actor) {
   if (failure?.status === "rejected") throw failure.reason;
 }
 
+async function readRemoteOpenCodeTarget(session) {
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const result = await remoteExec(
+    session.client,
+    [
+      'EW_OS="$(uname -s | tr "[:upper:]" "[:lower:]")"',
+      'EW_ARCH="$(uname -m)"',
+      'case "$EW_ARCH" in x86_64) EW_ARCH=x64 ;; aarch64|arm64) EW_ARCH=arm64 ;; esac',
+      'EW_MUSL=0; if test -f /etc/alpine-release || (command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl); then EW_MUSL=1; fi',
+      'EW_BASELINE=0; if test "$EW_ARCH" = x64 && ! grep -qwi avx2 /proc/cpuinfo 2>/dev/null; then EW_BASELINE=1; fi',
+      'printf "os=%s\\narch=%s\\nmusl=%s\\nbaseline=%s\\n" "$EW_OS" "$EW_ARCH" "$EW_MUSL" "$EW_BASELINE"',
+    ].join("\n"),
+  );
+  const fields = Object.fromEntries(
+    result.stdout
+      .split(/\r?\n/)
+      .map((line) => line.split("="))
+      .filter((parts) => parts.length === 2),
+  );
+  if (fields.os !== "linux" || !["x64", "arm64"].includes(fields.arch)) {
+    throw new Error(`OpenCode 暂不支持该服务器平台：${fields.os || "未知"}/${fields.arch || "未知"}`);
+  }
+  let target = `linux-${fields.arch}`;
+  if (fields.baseline === "1") target += "-baseline";
+  if (fields.musl === "1") target += "-musl";
+  return target;
+}
+
+async function fetchOpenCodeRelease() {
+  if (openCodeReleaseCache?.expiresAt > Date.now()) return openCodeReleaseCache.value;
+  let response;
+  try {
+    response = await fetch(
+      "https://api.github.com/repos/anomalyco/opencode/releases/latest",
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "EasyWork-Agent-Installer",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        signal: AbortSignal.timeout(20_000),
+      },
+    );
+  } catch (caught) {
+    throw new Error(`EasyWork 主机无法查询 OpenCode 版本：${caught instanceof Error ? caught.message : "网络错误"}`);
+  }
+  if (!response.ok) {
+    throw new Error(`EasyWork 主机查询 OpenCode 版本失败（HTTP ${response.status}）`);
+  }
+  const payload = await response.json();
+  const version = String(payload?.tag_name || "").replace(/^v/i, "");
+  const assets = Array.isArray(payload?.assets)
+    ? payload.assets.map((asset) => ({
+        name: String(asset?.name || ""),
+        url: String(asset?.browser_download_url || ""),
+        size: Number(asset?.size || 0),
+        digest: String(asset?.digest || ""),
+      }))
+    : [];
+  if (!/^\d+(?:\.\d+){1,3}(?:[-+][\w.-]+)?$/.test(version) || !assets.length) {
+    throw new Error("OpenCode 最新版本信息格式无效");
+  }
+  const value = { version, assets };
+  openCodeReleaseCache = { expiresAt: Date.now() + 5 * 60 * 1000, value };
+  return value;
+}
+
+async function hashLocalFile(filePath) {
+  const content = await readFile(filePath);
+  return crypto.createHash("sha256").update(content).digest("hex");
+}
+
+async function prepareOpenCodeArtifact(session, onProgress = () => undefined) {
+  const [target, release] = await Promise.all([
+    readRemoteOpenCodeTarget(session),
+    fetchOpenCodeRelease(),
+  ]);
+  const assetName = `opencode-${target}.tar.gz`;
+  const asset = release.assets.find((candidate) => candidate.name === assetName);
+  if (!asset?.url) throw new Error(`OpenCode ${release.version} 没有 ${assetName} 构建`);
+  const digest = asset.digest.match(/^sha256:([a-f0-9]{64})$/i)?.[1]?.toLowerCase();
+  if (!digest) throw new Error("OpenCode 发布包缺少可验证的 SHA-256 摘要");
+  const cacheDirectory = path.join(
+    DATA_ROOT,
+    "_cache",
+    "opencode",
+    safeSegment(release.version),
+  );
+  const localPath = path.join(cacheDirectory, assetName);
+  const promiseKey = `${release.version}:${assetName}:${digest}`;
+  let preparation = openCodeArtifactPromises.get(promiseKey);
+  if (!preparation) {
+    preparation = (async () => {
+      await mkdir(cacheDirectory, { recursive: true });
+      try {
+        if ((await hashLocalFile(localPath)) === digest) return localPath;
+      } catch {
+        // Missing or incomplete cache entries are downloaded again below.
+      }
+      onProgress("download", "EasyWork 主机正在下载 OpenCode");
+      let response;
+      try {
+        response = await fetch(asset.url, {
+          headers: { "User-Agent": "EasyWork-Agent-Installer" },
+          redirect: "follow",
+          signal: AbortSignal.timeout(5 * 60 * 1000),
+        });
+      } catch (caught) {
+        throw new Error(`EasyWork 主机下载 OpenCode 失败：${caught instanceof Error ? caught.message : "网络错误"}`);
+      }
+      if (!response.ok) {
+        throw new Error(`EasyWork 主机下载 OpenCode 失败（HTTP ${response.status}）`);
+      }
+      const content = Buffer.from(await response.arrayBuffer());
+      const actualDigest = crypto.createHash("sha256").update(content).digest("hex");
+      if (actualDigest !== digest) {
+        throw new Error("OpenCode 发布包校验失败，未向服务器上传");
+      }
+      await writeFile(localPath, content, { mode: 0o600 });
+      return localPath;
+    })().finally(() => openCodeArtifactPromises.delete(promiseKey));
+    openCodeArtifactPromises.set(promiseKey, preparation);
+  }
+  return {
+    target,
+    version: release.version,
+    asset,
+    digest,
+    localPath: await preparation,
+  };
+}
+
+async function uploadOpenCodeArtifact(
+  session,
+  artifact,
+  onProgress = () => undefined,
+  { candidateOnly = false } = {},
+) {
+  if (!session.client || !session.home) throw new Error("SSH 尚未连接");
+  const agentRoot = `${session.home}/.easywork/agents/opencode`;
+  const uploadRoot = `${agentRoot}/.incoming-${crypto.randomBytes(6).toString("hex")}`;
+  const remoteArchive = `${uploadRoot}/${artifact.asset.name}`;
+  await remoteExec(
+    session.client,
+    `mkdir -p ${shellQuote(uploadRoot)} ${shellQuote(`${agentRoot}/bin`)}`,
+  );
+  try {
+    onProgress("upload", "正在上传 OpenCode 到服务器");
+    await remoteSftpFastPut(
+      session.client,
+      artifact.localPath,
+      remoteArchive,
+      (percent) => onProgress("upload", `正在上传 OpenCode · ${percent}%`),
+    );
+    onProgress("verify", "正在校验 OpenCode");
+    const destination = candidateOnly
+      ? `${agentRoot}/.update-candidate/opencode`
+      : `${agentRoot}/bin/opencode`;
+    await remoteExec(
+      session.client,
+      [
+        "set -eu",
+        `EW_ROOT=${shellQuote(uploadRoot)}`,
+        `EW_ARCHIVE=${shellQuote(remoteArchive)}`,
+        `EW_EXPECTED=${shellQuote(artifact.digest)}`,
+        `EW_DESTINATION=${shellQuote(destination)}`,
+        'if command -v sha256sum >/dev/null 2>&1; then EW_ACTUAL="$(sha256sum "$EW_ARCHIVE" | awk \'{print $1}\')"; elif command -v openssl >/dev/null 2>&1; then EW_ACTUAL="$(openssl dgst -sha256 "$EW_ARCHIVE" | awk \'{print $NF}\')"; else echo "服务器缺少 SHA-256 校验工具" >&2; exit 1; fi',
+        'test "$EW_ACTUAL" = "$EW_EXPECTED"',
+        'mkdir -p "$EW_ROOT/unpacked" "$(dirname "$EW_DESTINATION")"',
+        'tar -xzf "$EW_ARCHIVE" -C "$EW_ROOT/unpacked"',
+        'test -x "$EW_ROOT/unpacked/opencode" || chmod 755 "$EW_ROOT/unpacked/opencode"',
+        '"$EW_ROOT/unpacked/opencode" --version >/dev/null',
+        'mv -f "$EW_ROOT/unpacked/opencode" "$EW_DESTINATION.new"',
+        'chmod 755 "$EW_DESTINATION.new"',
+        'mv -f "$EW_DESTINATION.new" "$EW_DESTINATION"',
+        '"$EW_DESTINATION" --version',
+      ].join("\n"),
+    );
+  } finally {
+    await remoteExec(session.client, `rm -rf ${shellQuote(uploadRoot)}`, {
+      allowFailure: true,
+    }).catch(() => undefined);
+  }
+}
+
 async function installOpenCode(session, actor, onProgress = () => undefined) {
   if (!session.client) throw new Error("SSH 尚未连接");
   let existingAgents = await scanRemoteAgents(session, actor);
@@ -3160,46 +7458,14 @@ async function installOpenCode(session, actor, onProgress = () => undefined) {
     await ensureOpenCodeNativeConfig(session, actor, onProgress);
     return scanRemoteAgents(session, actor);
   }
-  if (await migrateLegacyOpenCode(session, onProgress)) {
-    await ensureOpenCodeNativeConfig(session, actor, onProgress);
-    return scanRemoteAgents(session, actor);
-  }
   existingOpenCode = existingAgents.find(
     (agent) => agent.adapter === "opencode" && agent.status === "ready",
   );
   if (existingOpenCode) return existingAgents;
 
-  onProgress("prepare", "准备安装目录");
-  await remoteExec(
-    session.client,
-    'mkdir -p "$HOME/.easywork/agents/opencode/bin" "$HOME/.easywork/bindings"',
-  );
-  onProgress("download", "下载 OpenCode");
-  await remoteExec(
-    session.client,
-    [
-      "set -eu",
-      'EW_INSTALLER="$HOME/.easywork/install-opencode.sh"',
-      'EW_AGENT_ROOT="$HOME/.easywork/agents/opencode"',
-      'EW_INSTALL_HOME="$EW_AGENT_ROOT/.installer-home"',
-      'trap \'rm -f "$EW_INSTALLER"; rm -rf "$EW_INSTALL_HOME"\' EXIT',
-      'if [ ! -x "$EW_AGENT_ROOT/bin/opencode" ]; then',
-      '  if [ -x "$HOME/.easywork/bin/opencode" ]; then',
-      '    cp "$HOME/.easywork/bin/opencode" "$EW_AGENT_ROOT/bin/opencode"',
-      '  elif [ -x "$HOME/.opencode/bin/opencode" ]; then',
-      '    cp "$HOME/.opencode/bin/opencode" "$EW_AGENT_ROOT/bin/opencode"',
-      '  else',
-      '    curl --connect-timeout 15 --max-time 90 --retry 2 -fsSL https://opencode.ai/install -o "$EW_INSTALLER"',
-      '    mkdir -p "$EW_INSTALL_HOME"',
-      '    if command -v timeout >/dev/null 2>&1; then HOME="$EW_INSTALL_HOME" timeout 300 bash "$EW_INSTALLER" --no-modify-path; else HOME="$EW_INSTALL_HOME" bash "$EW_INSTALLER" --no-modify-path; fi',
-      '    mv "$EW_INSTALL_HOME/.opencode/bin/opencode" "$EW_AGENT_ROOT/bin/opencode"',
-      '  fi',
-      "fi",
-      'test -x "$EW_AGENT_ROOT/bin/opencode"',
-      'chmod 755 "$EW_AGENT_ROOT/bin/opencode"',
-      '"$EW_AGENT_ROOT/bin/opencode" --version',
-    ].join("\n"),
-  );
+  onProgress("prepare", "正在识别服务器环境");
+  const artifact = await prepareOpenCodeArtifact(session, onProgress);
+  await uploadOpenCodeArtifact(session, artifact, onProgress);
   await ensureOpenCodeNativeConfig(session, actor, onProgress);
   onProgress("verify", "验证 Agent");
   return scanRemoteAgents(session, actor);
@@ -3208,38 +7474,6 @@ async function installOpenCode(session, actor, onProgress = () => undefined) {
 function normalizeOpenCodeVersion(value) {
   const match = String(value || "").match(/\bv?(\d+(?:\.\d+){1,3}(?:[-+][\w.-]+)?)\b/i);
   return match?.[1] || String(value || "").trim().split(/\s+/)[0] || "";
-}
-
-function parseOpenCodeUpdateVersions(output) {
-  const source = String(output || "");
-  const current = source.match(/^EW_CURRENT_VERSION=(.+)$/m)?.[1]?.trim() || "";
-  const latest = source.match(/^EW_LATEST_VERSION=(.+)$/m)?.[1]?.trim() || "";
-  return {
-    currentVersion: normalizeOpenCodeVersion(current),
-    latestVersion: normalizeOpenCodeVersion(latest),
-  };
-}
-
-function openCodeUpdateProbeCommand() {
-  return [
-    "set -eu",
-    'EW_AGENT_ROOT="$HOME/.easywork/agents/opencode"',
-    'EW_CURRENT="$EW_AGENT_ROOT/bin/opencode"',
-    'EW_UPDATE_ROOT="$EW_AGENT_ROOT/.update-candidate"',
-    'EW_UPDATE_HOME="$EW_UPDATE_ROOT/home"',
-    'EW_INSTALLER="$EW_UPDATE_ROOT/install.sh"',
-    'test -x "$EW_CURRENT"',
-    'rm -rf "$EW_UPDATE_ROOT"',
-    'mkdir -p "$EW_UPDATE_HOME"',
-    'curl --connect-timeout 15 --max-time 90 --retry 2 -fsSL https://opencode.ai/install -o "$EW_INSTALLER"',
-    'if command -v timeout >/dev/null 2>&1; then HOME="$EW_UPDATE_HOME" timeout 300 bash "$EW_INSTALLER" --no-modify-path; else HOME="$EW_UPDATE_HOME" bash "$EW_INSTALLER" --no-modify-path; fi',
-    'test -x "$EW_UPDATE_HOME/.opencode/bin/opencode"',
-    'mv "$EW_UPDATE_HOME/.opencode/bin/opencode" "$EW_UPDATE_ROOT/opencode"',
-    'chmod 755 "$EW_UPDATE_ROOT/opencode"',
-    'printf "EW_CURRENT_VERSION=%s\\n" "$("$EW_CURRENT" --version 2>/dev/null | head -n 1)"',
-    'printf "EW_LATEST_VERSION=%s\\n" "$("$EW_UPDATE_ROOT/opencode" --version 2>/dev/null | head -n 1)"',
-    'rm -rf "$EW_UPDATE_HOME" "$EW_INSTALLER"',
-  ].join("\n");
 }
 
 function openCodeUpdateApplyCommand() {
@@ -3269,7 +7503,9 @@ async function checkOpenCodeUpdate(
   onProgress = () => undefined,
 ) {
   if (!session.client) throw new Error("SSH 尚未连接");
-  if (session.activeStream) throw new Error("请等待当前远程任务结束后再检测更新");
+  if (session.activeStream || session.activeRuns?.size) {
+    throw new Error("请等待当前远程任务结束后再检测更新");
+  }
   const agents = await scanRemoteAgents(session, actor);
   const openCode = agents.find(
     (agent) =>
@@ -3279,26 +7515,18 @@ async function checkOpenCodeUpdate(
   );
   if (!openCode) throw new Error("只能自动更新由 EasyWork 部署的 OpenCode");
   onProgress("checking", "读取当前版本");
-  onProgress("downloading", "下载并验证最新版本");
-  const result = await remoteExec(session.client, openCodeUpdateProbeCommand());
-  const versions = parseOpenCodeUpdateVersions(result.stdout);
-  if (!versions.currentVersion || !versions.latestVersion) {
-    throw new Error("未能识别 OpenCode 版本，候选文件已保留以便排查");
-  }
+  const release = await fetchOpenCodeRelease();
+  const currentVersion = normalizeOpenCodeVersion(openCode.version);
+  const latestVersion = normalizeOpenCodeVersion(release.version);
+  if (!currentVersion || !latestVersion) throw new Error("未能识别 OpenCode 版本");
   const update = {
-    ...versions,
-    updateAvailable: versions.currentVersion !== versions.latestVersion,
+    currentVersion,
+    latestVersion,
+    updateAvailable: currentVersion !== latestVersion,
     checkedAt: isoNow(),
   };
   session.agentUpdates ||= new Map();
   session.agentUpdates.set("opencode", update);
-  if (!update.updateAvailable) {
-    await remoteExec(
-      session.client,
-      'rm -rf "$HOME/.easywork/agents/opencode/.update-candidate"',
-      { allowFailure: true },
-    );
-  }
   return update;
 }
 
@@ -3308,7 +7536,9 @@ async function applyOpenCodeUpdate(
   onProgress = () => undefined,
 ) {
   if (!session.client) throw new Error("SSH 尚未连接");
-  if (session.activeStream) throw new Error("请等待当前远程任务结束后再更新");
+  if (session.activeStream || session.activeRuns?.size) {
+    throw new Error("请等待当前远程任务结束后再更新");
+  }
   let update = session.agentUpdates?.get("opencode");
   if (!update?.updateAvailable) {
     update = await checkOpenCodeUpdate(session, actor, onProgress);
@@ -3316,6 +7546,14 @@ async function applyOpenCodeUpdate(
   if (!update.updateAvailable) {
     return { ...update, agents: await scanRemoteAgents(session, actor) };
   }
+  onProgress("downloading", `正在准备 OpenCode ${update.latestVersion}`);
+  const artifact = await prepareOpenCodeArtifact(session, onProgress);
+  if (normalizeOpenCodeVersion(artifact.version) !== update.latestVersion) {
+    throw new Error("OpenCode 最新版本在检测后发生变化，请重新检测更新");
+  }
+  await uploadOpenCodeArtifact(session, artifact, onProgress, {
+    candidateOnly: true,
+  });
   onProgress("updating", `正在更新到 ${update.latestVersion}`);
   await remoteExec(session.client, openCodeUpdateApplyCommand());
   onProgress("configuring", "核对 OpenCode 原生配置");
@@ -3592,6 +7830,43 @@ function parseOpenCodeLine(line, state) {
   if (payload.sessionID) state.sessionId = payload.sessionID;
   const type = String(payload.type || payload.part?.type || "");
   const part = payload.part || payload;
+  const tokenSource = part.tokens || payload.tokens || part.usage || payload.usage;
+  if (tokenSource && typeof tokenSource === "object") {
+    const input = Number(
+      tokenSource.input ||
+        tokenSource.input_tokens ||
+        tokenSource.prompt_tokens ||
+        0,
+    );
+    const output = Number(
+      tokenSource.output ||
+        tokenSource.output_tokens ||
+        tokenSource.completion_tokens ||
+        0,
+    );
+    const reasoning = Number(
+      tokenSource.reasoning || tokenSource.reasoning_tokens || 0,
+    );
+    const cacheRead = Number(
+      tokenSource.cache?.read ||
+        tokenSource.cache_read ||
+        tokenSource.cached_tokens ||
+        0,
+    );
+    const total = Number(
+      tokenSource.total ||
+        tokenSource.total_tokens ||
+        input + output + reasoning,
+    );
+    state.contextUsage = {
+      input,
+      output,
+      reasoning,
+      cacheRead,
+      total,
+      observedAt: isoNow(),
+    };
+  }
   const sourceId = String(part.id || payload.id || "");
   if (type === "tool_use" || type === "tool") {
     const tool = String(part.tool || part.name || "tool");
@@ -3602,6 +7877,7 @@ function parseOpenCodeLine(line, state) {
     );
     const output =
       part.state?.output ||
+      part.state?.metadata?.output ||
       part.output ||
       part.state?.error ||
       "";
@@ -3772,15 +8048,32 @@ function parseOpenCodeLine(line, state) {
 
 async function runRemoteWork(socket, session, actor, payload) {
   if (!session.client) throw new Error("SSH 尚未连接");
-  if (session.activeRun || session.activeStream) {
-    throw new Error("该服务器上仍有任务在运行");
+  const requestedWorkspace = String(payload.workspace || "~");
+  const conflictingRun = [...(session.activeRuns?.values() || [])].find(
+    (run) =>
+      run.conversationId === String(payload.conversationId || "") ||
+      run.workspace === requestedWorkspace,
+  );
+  if (conflictingRun || session.activeStream) {
+    throw new Error(
+      conflictingRun?.workspace === requestedWorkspace
+        ? "这个工作区仍有任务在运行"
+        : "这个对话仍有任务在运行",
+    );
   }
   touchSshSession(session);
   const workerTask = createWorkerTask(session, payload);
-  session.activeRun = {
+  const webAbortController = new AbortController();
+  const activeRun = {
     conversationId: workerTask.conversationId,
     runId: workerTask.runId,
+    workspace: requestedWorkspace,
+    agentId: workerTask.agentId,
+    supportsLiveInput: workerTask.agentId === "opencode",
+    abortController: webAbortController,
   };
+  session.activeRun = activeRun;
+  session.activeRuns.set(workerTask.runId, activeRun);
   await ensureWorkerTaskConversation(actor, workerTask);
   const emit = (event) => publishWorkerEvent(session, event);
   const availableAgents = await prepareRemoteAgents(session, actor);
@@ -3793,16 +8086,46 @@ async function runRemoteWork(socket, session, actor, payload) {
   if (selectedAgent.adapter !== "opencode") {
     throw new Error("这个 Agent 尚未安装 EasyWork 运行适配器");
   }
+  activeRun.supportsLiveInput = Boolean(
+    selectedAgent.capabilities?.liveInput,
+  );
   if (!selectedAgent.configured) {
     throw new Error("请先打开 Agent 自带配置文件并完成模型配置");
   }
   const secrets = await getSecrets(actor);
   const state = await getState(actor);
   const provider = state?.settings?.provider || {};
-  const managedModel =
-    selectedAgent.managed && provider.model && secrets.providerApiKey
-      ? `${EASYWORK_OPENCODE_PROVIDER_ID}/${provider.model}`
-      : "";
+  const managedModel = managedOpenCodeModel(
+    selectedAgent,
+    provider,
+    Boolean(secrets.providerApiKey),
+  );
+  const workspace = remotePathForSession(
+    session,
+    String(payload.workspace || "~"),
+  );
+  await ensureTaskWorkspace(session, workerTask, workspace);
+  workerTask.logicalWorkspaceId =
+    workerTask.logicalWorkspaceId ||
+    crypto
+      .createHash("sha256")
+      .update(`${session.serverId}:${workspace}`)
+      .digest("hex")
+      .slice(0, 24);
+  const bindingKey = agentBindingKey({
+    serverId: session.serverId || session.host || "unknown-host",
+    workspace,
+    agentId: String(payload.agentId || "opencode"),
+    conversationId: String(payload.conversationId || ""),
+  });
+  const bindingDocument = await readAgentBindings(actor);
+  const memoryBinding = session.agentSessions.get(bindingKey);
+  const storedBinding = bindingDocument.bindings[bindingKey];
+  const effectiveBinding =
+    (typeof memoryBinding === "object" && memoryBinding) ||
+    storedBinding ||
+    null;
+  const boundSessionId = String(effectiveBinding?.agentSessionId || "");
   let titlePromise;
   if (payload.firstTurn) {
     const fallbackTitle = fallbackConversationTitle(payload.prompt);
@@ -3822,9 +8145,39 @@ async function runRemoteWork(socket, session, actor, payload) {
     prompt: String(payload.prompt || ""),
     skillIds: Array.isArray(payload.skills) ? payload.skills : [],
     projectId: payload.projectId ? String(payload.projectId) : undefined,
-    memoryMode: payload.memoryMode === "project-only" ? "project-only" : "default",
+    memoryMode:
+      payload.memoryMode === "project-only"
+        ? "project-only"
+        : "project-and-global",
     conversationId: String(payload.conversationId || ""),
+    currentUserMessageId: workerTask.userMessageId,
+    workspaceId: workerTask.logicalWorkspaceId,
+    taskId: workerTask.runId,
   });
+  workerTask.webContextUsage = context.contextUsage;
+  await captureMemory(
+    actor,
+    workerTask.prompt,
+    workerTask.projectId,
+    workerTask.memoryMode,
+    workerTask.conversationId,
+    workerTask.userMessageId,
+  );
+  const provisionalAgentDelta = agentConversationDelta(
+    context.state,
+    workerTask.conversationId,
+    effectiveBinding,
+    {
+      currentUserMessageId: workerTask.userMessageId,
+      maxMessages: 24,
+    },
+  );
+  const provisionalMemoryDelta = agentMemoryDelta(context, effectiveBinding);
+  const handoffModelContext = workHandoffContext(
+    context,
+    provisionalAgentDelta,
+    provisionalMemoryDelta,
+  );
   const webReasoningEventId = `${payload.runId}_web_reasoning`;
   let webReasoning = "";
   let reasoningStarted = false;
@@ -3832,7 +8185,8 @@ async function runRemoteWork(socket, session, actor, payload) {
   try {
     const handoffResult = await runWorkHandoffModel(
       actor,
-      context.text,
+      workerTask.prompt,
+      handoffModelContext,
       context.state,
       (delta) => {
         const nextDelta = String(delta || "");
@@ -3853,8 +8207,11 @@ async function runRemoteWork(socket, session, actor, payload) {
           },
         });
       },
+      webAbortController.signal,
     );
-    webHandoff = String(handoffResult.content || "").trim();
+    webHandoff =
+      String(handoffResult.content || "").trim() ||
+      deterministicWorkHandoff(context, provisionalMemoryDelta);
     const completedReasoning = String(
       handoffResult.reasoning || webReasoning,
     ).trim();
@@ -3876,6 +8233,7 @@ async function runRemoteWork(socket, session, actor, payload) {
       },
     });
   } catch {
+    webHandoff = deterministicWorkHandoff(context, provisionalMemoryDelta);
     emit({
       type: "agent.event",
       conversationId: payload.conversationId,
@@ -3890,41 +8248,87 @@ async function runRemoteWork(socket, session, actor, payload) {
       },
     });
   }
+  if (webAbortController.signal.aborted) {
+    emit({
+      type: "agent.event",
+      conversationId: workerTask.conversationId,
+      runId: workerTask.runId,
+      event: {
+        id: `${workerTask.runId}_aborted`,
+        kind: "job_status",
+        title: "任务已停止",
+        detail: "网页模型交接已停止，尚未启动远端 Agent。",
+        status: "cancelled",
+        timestamp: isoNow(),
+      },
+    });
+    emit({
+      type: "task.aborted",
+      conversationId: workerTask.conversationId,
+      runId: workerTask.runId,
+      result: "任务已停止；远端 Agent 尚未开始执行。",
+    });
+    session.activeRuns.delete(workerTask.runId);
+    session.activeRun = session.activeRuns.values().next().value || null;
+    await persistWorkerTaskConversation(actor, workerTask);
+    await persistSshWorker(session.worker);
+    return;
+  }
+  if (selectedAgent.managed && selectedAgent.adapter === "opencode") {
+    const nativeConfiguration = await ensureOpenCodeNativeConfig(
+      session,
+      actor,
+    );
+    if (!nativeConfiguration.configured) {
+      throw new Error("OpenCode 原生模型配置未完成");
+    }
+  }
+  const openCodeService = await ensureOpenCodeService(session, selectedAgent);
+  const nativeSession = await ensureOpenCodeSession(session, openCodeService, {
+    sessionId: boundSessionId,
+    directory: workspace,
+    title: workerTask.title || fallbackConversationTitle(workerTask.prompt),
+  });
+  const reusableBinding = nativeSession.created ? null : effectiveBinding;
+  activeRun.agentControl = {
+    adapter: "opencode",
+    service: openCodeService,
+    sessionId: nativeSession.sessionId,
+    directory: workspace,
+  };
+  workerTask.agentSessionId = nativeSession.sessionId;
+  workerTask.agentControl = {
+    adapter: "opencode",
+    serviceId: openCodeService.serviceId,
+    serviceRoot: openCodeService.root,
+    servicePort: openCodeService.port,
+    sessionId: nativeSession.sessionId,
+    directory: workspace,
+  };
+  scheduleSshWorkerPersist(session.worker, 0);
+  const agentDelta = agentConversationDelta(
+    context.state,
+    workerTask.conversationId,
+    reusableBinding,
+    {
+      currentUserMessageId: workerTask.userMessageId,
+      maxMessages: 24,
+    },
+  );
+  const deliveredMemoryRecords = agentMemoryDelta(context, reusableBinding);
+  workerTask.deliveredMemoryRecords = deliveredMemoryRecords.map((record) => ({
+    id: record.id,
+    revision: record.revision,
+  }));
+  const agentSyncContext = await buildAgentSyncContext(
+    context,
+    agentDelta,
+    deliveredMemoryRecords,
+  );
   const agentPrompt = await agentPromptWithNativePlanning(
-    context.text,
+    agentSyncContext,
     webHandoff,
   );
-  const workspaceEncoded = Buffer.from(
-    String(payload.workspace || "~"),
-    "utf8",
-  ).toString("base64");
-  const promptEncoded = Buffer.from(agentPrompt, "utf8").toString("base64");
-  const sessionId = session.agentSessions.get(String(payload.conversationId || ""));
-  const bindingsPath = path.join(actorDirectory(actor), "work-sessions.json");
-  const bindings = await readJson(bindingsPath, {});
-  const bindingKey = [
-    session.serverId || session.host || "unknown-host",
-    String(payload.agentId || "opencode"),
-    String(payload.conversationId || ""),
-  ].join("::");
-  const boundSessionId = sessionId || bindings[bindingKey];
-  const command = [
-    `EW_DIR="$(printf %s ${shellQuote(workspaceEncoded)} | base64 -d)"`,
-    'case "$EW_DIR" in "~/"*) EW_DIR="$HOME/${EW_DIR#~/}" ;; esac',
-    '[ "$EW_DIR" = "~" ] && EW_DIR="$HOME" || true',
-    'test -d "$EW_DIR" || mkdir -p "$EW_DIR"',
-    [
-      `printf %s ${shellQuote(promptEncoded)} | base64 -d |`,
-      shellQuote(selectedAgent.path),
-      "run --format json --auto",
-      `--dir "$EW_DIR"`,
-      managedModel ? `--model ${shellQuote(managedModel)}` : "",
-      boundSessionId ? `--session ${shellQuote(boundSessionId)}` : "",
-    ]
-      .filter(Boolean)
-      .join(" "),
-  ];
-  const commandText = command.join(" && ");
 
   const parserState = {
     sessionId: boundSessionId,
@@ -3941,138 +8345,314 @@ async function runRemoteWork(socket, session, actor, payload) {
     forwardedEvents: new Map(),
     activeThought: null,
     activeFinal: null,
+    contextUsage: null,
   };
-  let pending = "";
-  let stderrOutput = "";
-  const result = await remoteExec(session.client, commandText, {
-    allowFailure: true,
-    onStream: (stream) => {
-      session.activeStream = stream;
-      session.activeRun = {
+  const forwardOpenCodeEvent = (event) => {
+    if (!event) return;
+    if (
+      activeRun.abortRequested &&
+      event.kind === "error" &&
+      /\babort(?:ed)?\b/i.test(String(event.output || event.detail || ""))
+    ) {
+      return;
+    }
+    const { sourceId, planSteps, ...eventPayload } = event;
+    const eventId = sourceId
+      ? `${payload.runId}_${safeSegment(event.kind)}_${safeSegment(sourceId)}`
+      : `${payload.runId}_event_${parserState.eventIndex++}`;
+    if (parserState.activeFinal && parserState.activeFinal.id !== eventId) {
+      const retractedFinal = {
+        ...parserState.activeFinal.event,
+        kind: "agent_message",
+        title: "Agent思考中",
+        status: "done",
+        retractFinal: true,
+        timestamp: isoNow(),
+      };
+      emit({
+        type: "agent.event",
         conversationId: payload.conversationId,
         runId: payload.runId,
+        event: retractedFinal,
+      });
+      parserState.forwardedEvents.set(
+        parserState.activeFinal.id,
+        retractedFinal,
+      );
+      const orderedFinal = parserState.eventOrder.find(
+        (item) => item.id === parserState.activeFinal.id,
+      );
+      if (orderedFinal) orderedFinal.kind = "agent_message";
+      parserState.activeFinal = null;
+    }
+    if (parserState.activeThought && parserState.activeThought.id !== eventId) {
+      emit({
+        type: "agent.event",
+        conversationId: payload.conversationId,
+        runId: payload.runId,
+        event: {
+          ...parserState.activeThought.event,
+          status: "done",
+          timestamp: isoNow(),
+        },
+      });
+      parserState.forwardedEvents.set(parserState.activeThought.id, {
+        ...parserState.activeThought.event,
+        status: "done",
+      });
+      parserState.activeThought = null;
+    }
+    if (Array.isArray(planSteps)) {
+      emit({
+        type: "workflow",
+        conversationId: payload.conversationId,
+        runId: payload.runId,
+        steps: planSteps,
+      });
+    }
+    emit({
+      type: "agent.event",
+      conversationId: payload.conversationId,
+      runId: payload.runId,
+      event: {
+        id: eventId,
+        ...eventPayload,
+        timestamp: isoNow(),
+      },
+    });
+    if (!parserState.forwardedEvents.has(eventId)) {
+      parserState.eventOrder.push({ id: eventId, kind: event.kind });
+    } else {
+      const orderedEvent = parserState.eventOrder.find(
+        (item) => item.id === eventId,
+      );
+      if (orderedEvent) orderedEvent.kind = event.kind;
+    }
+    parserState.forwardedEvents.set(eventId, eventPayload);
+    if (["agent_message", "agent_reasoning"].includes(event.kind)) {
+      parserState.activeThought = {
+        id: eventId,
+        event: { id: eventId, ...eventPayload },
       };
+    }
+    if (event.kind === "message") {
+      parserState.activeFinal = {
+        id: eventId,
+        event: { id: eventId, ...eventPayload },
+      };
+    }
+  };
+  let pending = "";
+  let ssePending = "";
+  let stderrOutput = "";
+  const checkpointBefore = await createWorkspaceCheckpoint(
+    session,
+    actor,
+    workerTask,
+    "before",
+  ).catch((caught) => ({
+    status: "unavailable",
+    diagnostic:
+      caught instanceof Error ? caught.message : "任务前工作区快照失败",
+  }));
+  workerTask.checkpointBeforeId = checkpointBefore.id || "";
+  const remoteRun = await createRemoteRuntimeRun(session, {
+    runId: workerTask.runId,
+    conversationId: payload.conversationId,
+    agentId: selectedAgent.id,
+    workspace,
+    prompt: agentPrompt,
+    command: ({ runDirectory }) => {
+      const eventPath = `${runDirectory}/agent-events.sse`;
+      const eventErrorPath = `${runDirectory}/agent-events.err`;
+      const agentCommand = [
+        shellQuote(selectedAgent.path),
+        `run --attach ${shellQuote(openCodeService.baseUrl)} --format json --auto --thinking`,
+        `--dir "$EW_DIR"`,
+        managedModel ? `--model ${shellQuote(managedModel)}` : "",
+        `--session ${shellQuote(nativeSession.sessionId)}`,
+        `< ${shellQuote(`${runDirectory}/prompt.txt`)}`,
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return [
+        "#!/bin/sh",
+        "set -eu",
+        `EW_DIR=${shellQuote(workspace)}`,
+        'test -d "$EW_DIR" || mkdir -p "$EW_DIR"',
+        "export OPENCODE_SERVER_USERNAME=opencode",
+        `export OPENCODE_SERVER_PASSWORD="$(cat ${shellQuote(openCodeService.passwordPath)})"`,
+        `: > ${shellQuote(eventPath)}`,
+        [
+          "curl --no-buffer --silent --show-error",
+          `--config ${shellQuote(openCodeService.curlConfigPath)}`,
+          "--header 'Accept: text/event-stream'",
+          shellQuote(`${openCodeService.baseUrl}/global/event`),
+          `2>> ${shellQuote(eventErrorPath)}`,
+          `| grep --line-buffered '\"type\":\"tool\"' > ${shellQuote(eventPath)}`,
+          "&",
+        ].join(" "),
+        "EW_EVENT_PID=$!",
+        `cleanup_events() { kill "$EW_EVENT_PID" 2>/dev/null || true; wait "$EW_EVENT_PID" 2>/dev/null || true; }`,
+        "trap cleanup_events EXIT INT TERM",
+        "set +e",
+        agentCommand,
+        "EW_AGENT_STATUS=$?",
+        "set -e",
+        "cleanup_events",
+        "trap - EXIT INT TERM",
+        'exit "$EW_AGENT_STATUS"',
+      ].join("\n");
     },
+  });
+  workerTask.remoteRun = {
+    runId: remoteRun.runId,
+    runtimeVersion: remoteRun.runtime.releaseId,
+    status: remoteRun.status || "starting",
+    runDirectory: remoteRun.runDirectory,
+    agentSessionId: nativeSession.sessionId,
+    serviceId: openCodeService.serviceId,
+    serviceRoot: openCodeService.root,
+    servicePort: openCodeService.port,
+    directory: workspace,
+  };
+  Object.assign(activeRun, {
+    remoteRun,
+    abortRequested: false,
+    agentControl: {
+      adapter: "opencode",
+      service: openCodeService,
+      sessionId: nativeSession.sessionId,
+      directory: workspace,
+    },
+  });
+  session.activeRun = activeRun;
+  session.activeRuns.set(workerTask.runId, activeRun);
+  scheduleSshWorkerPersist(session.worker, 0);
+  const monitorPromise = monitorRemoteRuntimeRun(session, remoteRun, {
     onStdout: (text) => {
       pending += text;
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() || "";
       for (const line of lines) {
         const event = parseOpenCodeLine(line, parserState);
-        if (!event) continue;
-        const { sourceId, planSteps, ...eventPayload } = event;
-        const eventId =
-          sourceId
-            ? `${payload.runId}_${safeSegment(event.kind)}_${safeSegment(sourceId)}`
-            : `${payload.runId}_event_${parserState.eventIndex++}`;
-        if (
-          parserState.activeFinal &&
-          parserState.activeFinal.id !== eventId
-        ) {
-          const retractedFinal = {
-            ...parserState.activeFinal.event,
-            kind: "agent_message",
-            title: "Agent思考中",
-            status: "done",
-            retractFinal: true,
-            timestamp: isoNow(),
-          };
-          emit({
-            type: "agent.event",
-            conversationId: payload.conversationId,
-            runId: payload.runId,
-            event: retractedFinal,
-          });
-          parserState.forwardedEvents.set(
-            parserState.activeFinal.id,
-            retractedFinal,
-          );
-          const orderedFinal = parserState.eventOrder.find(
-            (item) => item.id === parserState.activeFinal.id,
-          );
-          if (orderedFinal) orderedFinal.kind = "agent_message";
-          parserState.activeFinal = null;
-        }
-        if (
-          parserState.activeThought &&
-          parserState.activeThought.id !== eventId
-        ) {
-          emit({
-            type: "agent.event",
-            conversationId: payload.conversationId,
-            runId: payload.runId,
-            event: {
-              ...parserState.activeThought.event,
-              status: "done",
-              timestamp: isoNow(),
-            },
-          });
-          parserState.forwardedEvents.set(parserState.activeThought.id, {
-            ...parserState.activeThought.event,
-            status: "done",
-          });
-          parserState.activeThought = null;
-        }
-        if (Array.isArray(planSteps)) {
-          emit({
-            type: "workflow",
-            conversationId: payload.conversationId,
-            runId: payload.runId,
-            steps: planSteps,
-          });
-        }
-        emit({
-          type: "agent.event",
-          conversationId: payload.conversationId,
-          runId: payload.runId,
-          event: {
-            id: eventId,
-            ...eventPayload,
-            timestamp: isoNow(),
-          },
-        });
-        if (!parserState.forwardedEvents.has(eventId)) {
-          parserState.eventOrder.push({
-            id: eventId,
-            kind: event.kind,
-          });
-        } else {
-          const orderedEvent = parserState.eventOrder.find(
-            (item) => item.id === eventId,
-          );
-          if (orderedEvent) orderedEvent.kind = event.kind;
-        }
-        parserState.forwardedEvents.set(eventId, eventPayload);
-        if (["agent_message", "agent_reasoning"].includes(event.kind)) {
-          parserState.activeThought = {
-            id: eventId,
-            event: {
-              id: eventId,
-              ...eventPayload,
-            },
-          };
-        }
-        if (event.kind === "message") {
-          parserState.activeFinal = {
-            id: eventId,
-            event: {
-              id: eventId,
-              ...eventPayload,
-            },
-          };
-        }
+        forwardOpenCodeEvent(event);
       }
     },
     onStderr: (text) => {
       stderrOutput = `${stderrOutput}${text}`.slice(-12_000);
     },
+    onAgentEvents: (text) => {
+      ssePending += text;
+      const lines = ssePending.split(/\r?\n/);
+      ssePending = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const livePart = openCodeSseToolPart(line.slice(5).trim(), {
+          sessionId: nativeSession.sessionId,
+          directory: workspace,
+        });
+        if (!livePart) continue;
+        forwardOpenCodeEvent(
+          parseOpenCodeLine(JSON.stringify(livePart), parserState),
+        );
+      }
+    },
+    onStatus: (snapshot) => {
+      workerTask.remoteRun.status = snapshot.status;
+      workerTask.remoteRun.pid = snapshot.pid || undefined;
+      workerTask.updatedAt = isoNow();
+      scheduleSshWorkerPersist(session.worker);
+    },
   });
+  await waitForOpenCodeRunAdmission(
+    session,
+    activeRun.agentControl,
+    remoteRun,
+  );
+  await flushAppendedInstructions(session, workerTask, activeRun).catch(
+    (caught) => {
+      emit({
+        type: "agent.event",
+        conversationId: payload.conversationId,
+        runId: payload.runId,
+        event: {
+          id: `${payload.runId}_append_error`,
+          kind: "error",
+          title: "追加指令发送失败",
+          detail:
+            caught instanceof Error ? caught.message : "追加指令发送失败",
+          status: "error",
+          timestamp: isoNow(),
+        },
+      });
+    },
+  );
+  const result = await monitorPromise;
+  const runWasAborted = Boolean(
+    activeRun.abortRequested ||
+      workerTask.abortRequested ||
+      result.status === "aborted",
+  );
   session.activeStream = null;
-  session.activeRun = null;
+  const checkpointAfter = await createWorkspaceCheckpoint(
+    session,
+    actor,
+    workerTask,
+    "after",
+  ).catch((caught) => ({
+    status: "unavailable",
+    diagnostic:
+      caught instanceof Error ? caught.message : "任务后工作区快照失败",
+  }));
+  workerTask.checkpointAfterId = checkpointAfter.id || "";
+  let persistedBinding = null;
   if (parserState.sessionId) {
-    session.agentSessions.set(String(payload.conversationId || ""), parserState.sessionId);
-    bindings[bindingKey] = parserState.sessionId;
-    await writeJson(bindingsPath, bindings);
+    const deliveryAcknowledged = result.status === "done" && !runWasAborted;
+    const binding = {
+      ...(reusableBinding || {}),
+      bindingKey,
+      conversationId: String(payload.conversationId || ""),
+      serverId: session.serverId,
+      workspace,
+      agentId: selectedAgent.id,
+      model: managedModel || selectedAgent.model || undefined,
+      agentSessionId: parserState.sessionId,
+      agentDataPath: selectedAgent.dataPath,
+      lastRunId: workerTask.runId,
+      syncMode: agentDelta.bootstrap ? "bootstrap" : "turn",
+      syncCursor: deliveryAcknowledged
+        ? createAgentSyncCursor({
+            state: context.state,
+            memoryDocument: context.memoryDocument,
+            conversationId: workerTask.conversationId,
+            lastMessageId: workerTask.assistantMessageId,
+            taskId: workerTask.runId,
+            checkpointId: workerTask.checkpointAfterId,
+            deliveredContent: agentDelta.messages.map(
+              (message) => `${message.role}\u0000${message.content}`,
+            ),
+            deliveredMemoryRecords,
+            memoryEnabled: context.state?.settings?.memoryEnabled !== false,
+            previous: reusableBinding?.syncCursor,
+          })
+        : reusableBinding?.syncCursor || {
+            memoryEnabled: context.state?.settings?.memoryEnabled !== false,
+            memoryVersions: {},
+            deliveredContentHashes: [],
+            lastMessageId: "",
+          },
+      deliveryState: {
+        runId: workerTask.runId,
+        status: deliveryAcknowledged ? "acknowledged" : "interrupted",
+        acknowledgedAt: deliveryAcknowledged ? isoNow() : undefined,
+      },
+      contextUsage: parserState.contextUsage || undefined,
+      updatedAt: isoNow(),
+    };
+    persistedBinding = binding;
+    session.agentSessions.set(bindingKey, binding);
+    await updateAgentBinding(actor, bindingKey, () => binding);
     const remoteBindingDirectory = `${session.home}/.easywork/bindings`;
     await remoteExec(
       session.client,
@@ -4081,21 +8661,44 @@ async function runRemoteWork(socket, session, actor, payload) {
     );
     await remoteSftpWrite(
       session.client,
-      `${remoteBindingDirectory}/${safeSegment(payload.conversationId)}.json`,
+      `${remoteBindingDirectory}/${crypto
+        .createHash("sha256")
+        .update(bindingKey)
+        .digest("hex")
+        .slice(0, 24)}.json`,
       `${JSON.stringify(
-        {
-          conversationId: String(payload.conversationId || ""),
-          serverId: session.serverId,
-          agentId: selectedAgent.id,
-          agentSessionId: parserState.sessionId,
-          agentDataPath: selectedAgent.dataPath,
-          workspace: String(payload.workspace || "~"),
-          updatedAt: isoNow(),
-        },
+        binding,
         null,
         2,
       )}\n`,
     ).catch(() => undefined);
+  }
+  session.activeRuns.delete(workerTask.runId);
+  session.activeRun = session.activeRuns.values().next().value || null;
+  if (runWasAborted) {
+    if (workerTask.remoteRun) workerTask.remoteRun.status = "aborted";
+    emit({
+      type: "agent.event",
+      conversationId: payload.conversationId,
+      runId: payload.runId,
+      event: {
+        id: `${payload.runId}_aborted`,
+        kind: "job_status",
+        title: "任务已停止",
+        detail: "远端进程组已停止。",
+        status: "cancelled",
+        timestamp: isoNow(),
+      },
+    });
+    emit({
+      type: "task.aborted",
+      conversationId: payload.conversationId,
+      runId: payload.runId,
+      result: "任务已停止。",
+    });
+    await persistWorkerTaskConversation(actor, workerTask);
+    await persistSshWorker(session.worker);
+    return;
   }
   if (result.code !== 0) {
     const primaryError =
@@ -4161,6 +8764,47 @@ async function runRemoteWork(socket, session, actor, payload) {
     result: finalText,
   });
   await persistWorkerTaskConversation(actor, workerTask);
+  const distilledRecords = await distillPortableMemory(actor, {
+    conversationId: workerTask.conversationId,
+    projectId: workerTask.projectId,
+    userRequest: workerTask.prompt,
+    finalResult: finalText,
+    location: `服务器 ${workerTask.serverId || "未知"}；工作区 ${workspace}`,
+    source: "work-result-distillation",
+    sourceTaskId: workerTask.runId,
+    sourceCheckpointId: workerTask.checkpointAfterId,
+    serverId: workerTask.serverId,
+    workspaceId: workerTask.logicalWorkspaceId,
+    sourceAgentId: selectedAgent.id,
+    sourceAgentSessionId: parserState.sessionId,
+    sourceMessageIds: [
+      workerTask.userMessageId,
+      workerTask.assistantMessageId,
+    ].filter(Boolean),
+  }).catch(() => []);
+  if (persistedBinding && distilledRecords.length) {
+    const synchronizedBinding = await updateAgentBinding(
+      actor,
+      bindingKey,
+      (current) => ({
+        ...(current || persistedBinding),
+        syncCursor: {
+          ...((current || persistedBinding).syncCursor || {}),
+          memoryVersions: Object.fromEntries([
+            ...Object.entries(
+              (current || persistedBinding).syncCursor?.memoryVersions || {},
+            ),
+            ...distilledRecords.map((record) => [
+              String(record.id),
+              Number(record.revision || 0),
+            ]),
+          ]),
+        },
+        updatedAt: isoNow(),
+      }),
+    );
+    session.agentSessions.set(bindingKey, synchronizedBinding);
+  }
   await persistSshWorker(session.worker);
 }
 
@@ -4168,11 +8812,23 @@ async function closeSshSession(session) {
   if (session.activeStream) session.activeStream.close();
   if (session.client) {
     const client = session.client;
+    clearProviderRelays(session);
     session.client = null;
     client.end();
+  } else {
+    clearProviderRelays(session);
   }
   session.activeStream = null;
-  session.activeRun = null;
+  if (session.activeRuns?.size) {
+    for (const activeRun of session.activeRuns.values()) {
+      activeRun.connectionLostAt = isoNow();
+    }
+    session.activeRun = session.activeRuns.values().next().value || null;
+  } else if (session.activeRun?.remoteRun) {
+    session.activeRun.connectionLostAt = isoNow();
+  } else {
+    session.activeRun = null;
+  }
   session.status = "disconnected";
   session.demo = false;
   session.lastDisconnectedAt = isoNow();
@@ -4234,6 +8890,9 @@ async function connectSsh(socket, session, actor, payload) {
           adapter: "opencode",
           managed: true,
           configured: true,
+          capabilities: agentRuntimeCapabilities("opencode", "ready", {
+            liveControl: false,
+          }),
         },
       ],
       serverId: session.serverId,
@@ -4246,9 +8905,7 @@ async function connectSsh(socket, session, actor, payload) {
   const username = String(payload.username || "").trim();
   const authMethod =
     payload.authMethod === "password" ? "password" : "key";
-  const useSavedCredential = Boolean(
-    payload.useSavedCredential || payload.useSavedKey,
-  );
+  const useSavedCredential = Boolean(payload.useSavedCredential);
   const storedSecrets = useSavedCredential ? await getSecrets(actor) : {};
   const savedCredential =
     storedSecrets.sshCredentials?.[session.serverId] || {};
@@ -4256,7 +8913,6 @@ async function connectSsh(socket, session, actor, payload) {
     authMethod === "key"
       ? payload.privateKey ||
           savedCredential.privateKey ||
-          storedSecrets.sshPrivateKey ||
           ""
       : "",
   );
@@ -4271,11 +8927,12 @@ async function connectSsh(socket, session, actor, payload) {
   if (authMethod === "password" && !password) throw new Error("请输入 SSH 登录密码");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("SSH 端口无效");
 
-  const knownHostsPath = path.join(actorDirectory(actor), "known-hosts.json");
+  const knownHostsPath = actorCredentialPath(actor, "known-hosts");
   const knownHosts = await readJson(knownHostsPath, {});
   let observedFingerprint = "";
   const startedAt = Date.now();
   const client = new SshClient();
+  attachProviderRelayHandler(session, client);
   session.demo = false;
   session.status = "connecting";
   session.client = client;
@@ -4353,6 +9010,7 @@ async function connectSsh(socket, session, actor, payload) {
         })
         .on("close", () => {
           if (session.client === client) {
+            clearProviderRelays(session);
             session.client = null;
             session.lastDisconnectedAt = isoNow();
             session.disconnectReason = "SSH 连接已关闭";
@@ -4414,9 +9072,7 @@ async function connectSsh(socket, session, actor, payload) {
   session.disconnectReason = "";
   if (
     actor.authenticated &&
-    (useSavedCredential ||
-      payload.rememberCredential ||
-      payload.rememberKey)
+    (useSavedCredential || payload.rememberCredential)
   ) {
     try {
       if (
@@ -4456,7 +9112,7 @@ async function connectSsh(socket, session, actor, payload) {
           authMethod,
           keyName: String(
             authMethod === "key"
-              ? payload.privateKeyName || currentProfile.keyName || "SSH 私钥"
+              ? payload.keyName || currentProfile.keyName || "SSH 私钥"
               : "",
           ).slice(0, 160),
           configured: true,
@@ -4467,7 +9123,6 @@ async function connectSsh(socket, session, actor, payload) {
           ...profiles.filter((item) => item.id !== session.serverId),
         ];
         state.settings.lastServerId = session.serverId;
-        delete state.settings.ssh;
         return state;
       });
       sessionSend(session, {
@@ -4481,6 +9136,15 @@ async function connectSsh(socket, session, actor, payload) {
       });
     }
   }
+  await reconcileRecoveredWorkerTasks(session, actor).catch((caught) => {
+    sessionSend(session, {
+      type: "error",
+      error:
+        caught instanceof Error
+          ? `远端任务恢复失败：${caught.message}`
+          : "远端任务恢复失败",
+    });
+  });
   await publishRemoteAgentScan(session, actor);
   await persistSshWorker(session.worker);
 }
@@ -4697,7 +9361,7 @@ function attachWebSocketServer(server) {
   const wss = new WebSocketServer({ noServer: true });
   server.on("upgrade", async (req, socket, head) => {
     const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
-    if (!["/ws", "/easywork-ws"].includes(url.pathname)) {
+    if (url.pathname !== "/easywork-ws") {
       socket.destroy();
       return;
     }
@@ -4773,7 +9437,7 @@ function attachWebSocketServer(server) {
       demo: session.demo,
       resumed,
       conversationCount: Number(conversationCounts.get(session.serverId) || 0),
-      activeTaskCount: session.activeRun ? 1 : 0,
+      activeTaskCount: Number(session.activeRuns?.size || 0),
     });
 
     activeSockets.add(socket);
@@ -4802,6 +9466,9 @@ function attachWebSocketServer(server) {
               adapter: "opencode",
               managed: true,
               configured: true,
+              capabilities: agentRuntimeCapabilities("opencode", "ready", {
+                liveControl: false,
+              }),
             },
           ],
         });
@@ -4844,7 +9511,9 @@ function attachWebSocketServer(server) {
           (payload.conversationId
             ? actorSessions().find(
                 (session) =>
-                  session.activeRun?.conversationId === payload.conversationId,
+                  [...(session.activeRuns?.values() || [])].some(
+                    (run) => run.conversationId === payload.conversationId,
+                  ),
               )
             : null);
         if (!targetSession) throw new Error("没有找到对应的远程连接");
@@ -4876,6 +9545,9 @@ function attachWebSocketServer(server) {
                   adapter: "opencode",
                   managed: true,
                   configured: true,
+                  capabilities: agentRuntimeCapabilities("opencode", "ready", {
+                    liveControl: false,
+                  }),
                 },
               ],
             });
@@ -4924,6 +9596,7 @@ function attachWebSocketServer(server) {
                 adapter: "opencode",
                 managed: true,
                 configured: false,
+                capabilities: agentRuntimeCapabilities("opencode", "installing"),
               },
             ],
           });
@@ -5141,6 +9814,70 @@ function attachWebSocketServer(server) {
           });
           return;
         }
+        if (payload.type === "work.append") {
+          const runId = String(payload.runId || "");
+          const conversationId = String(payload.conversationId || "");
+          const activeRun =
+            targetSession.activeRuns?.get(runId) || targetSession.activeRun;
+          if (
+            !activeRun ||
+            activeRun.runId !== runId ||
+            activeRun.conversationId !== conversationId
+          ) {
+            throw new Error("当前对话没有可追加指令的运行任务");
+          }
+          if (!activeRun.supportsLiveInput) {
+            throw new Error("当前 Agent 不支持在运行中追加指令");
+          }
+          const content = String(payload.content || "").trim();
+          if (!content) throw new Error("追加指令不能为空");
+          if (content.length > 64_000) throw new Error("追加指令过长");
+          const task = targetSession.worker.tasks.get(runId);
+          if (!task || task.status !== "running") {
+            throw new Error("当前任务已经结束，无法追加指令");
+          }
+          const instruction = {
+            messageId: String(payload.messageId || randomId("message_")),
+            content,
+            createdAt: String(payload.createdAt || isoNow()),
+            status: activeRun.agentControl ? "sending" : "queued",
+            updatedAt: isoNow(),
+          };
+          await persistAppendedInstruction(actor, task, instruction);
+          scheduleSshWorkerPersist(targetSession.worker, 0);
+          sessionSend(targetSession, {
+            type: "work.append.accepted",
+            serverId: targetSession.serverId,
+            conversationId,
+            runId,
+            requestId: payload.requestId,
+            message: {
+              id: instruction.messageId,
+              role: "user",
+              content,
+              createdAt: instruction.createdAt,
+              mode: "work",
+              appendedToRunId: runId,
+            },
+          });
+          if (activeRun.agentControl) {
+            const previousDelivery =
+              activeRun.appendDeliveryQueue || Promise.resolve();
+            const delivery = previousDelivery
+              .catch(() => undefined)
+              .then(() =>
+                deliverAppendedInstruction(
+                  targetSession,
+                  task,
+                  activeRun,
+                  instruction,
+                ),
+              );
+            activeRun.appendDeliveryQueue = delivery;
+            await delivery;
+          }
+          return;
+        }
         if (payload.type === "work.run") {
           await runRemoteWork(socket, targetSession, actor, payload);
           return;
@@ -5149,26 +9886,43 @@ function attachWebSocketServer(server) {
           return;
         }
         if (payload.type === "work.abort") {
-          if (targetSession.activeStream) targetSession.activeStream.close();
+          const activeRun =
+            targetSession.activeRuns?.get(String(payload.runId || "")) ||
+            targetSession.activeRun;
+          if (
+            !activeRun ||
+            String(activeRun.runId || "") !== String(payload.runId || "")
+          ) {
+            throw new Error("这个任务当前未在远端运行");
+          }
+          const abortingTask = worker.tasks.get(String(payload.runId || ""));
+          if (abortingTask) {
+            abortingTask.abortRequested = true;
+            abortingTask.updatedAt = isoNow();
+            scheduleSshWorkerPersist(worker, 0);
+          }
           publishWorkerEvent(targetSession, {
             type: "agent.event",
             conversationId: payload.conversationId,
             runId: payload.runId,
             event: {
-              id: `${payload.runId}_aborted`,
+              id: `${payload.runId}_cancelling`,
               kind: "job_status",
-              title: "任务已停止",
-              detail: "用户主动停止了远程执行",
-              status: "error",
+              title: "正在停止远端任务",
+              detail: "正在向远端进程组发送停止信号",
+              status: "running",
               timestamp: isoNow(),
             },
           });
-          publishWorkerEvent(targetSession, {
-            type: "task.error",
-            conversationId: payload.conversationId,
-            runId: payload.runId,
-            result: "任务已由用户停止",
-          });
+          if (activeRun.abortController && !activeRun.remoteRun) {
+            activeRun.abortController.abort();
+            return;
+          }
+          if (!(await cancelRemoteRuntimeRun(targetSession, activeRun))) {
+            if (targetSession.activeStream) targetSession.activeStream.close();
+            else throw new Error("SSH 已断开；重新连接后才能向远端任务发送停止信号");
+          }
+          return;
         }
       } catch (caught) {
         const message =
@@ -5202,7 +9956,9 @@ function attachWebSocketServer(server) {
         } else if (payload.type === "work.run") {
           if (targetSession) {
             targetSession.activeStream = null;
-            targetSession.activeRun = null;
+            targetSession.activeRuns?.delete(String(payload.runId || ""));
+            targetSession.activeRun =
+              targetSession.activeRuns?.values().next().value || null;
           }
           if (targetSession) publishWorkerEvent(targetSession, {
             type: "agent.event",
@@ -5244,6 +10000,7 @@ function attachWebSocketServer(server) {
                 adapter: "opencode",
                 managed: true,
                 configured: false,
+                capabilities: agentRuntimeCapabilities("opencode", "missing"),
               },
             ],
           });
@@ -5296,7 +10053,17 @@ async function cleanupIdleSshWorkers(now = Date.now()) {
     let changed = false;
     for (const [serverId, session] of worker.sessions) {
       const lastActivity = Date.parse(session.lastUserActivityAt || "") || 0;
-      if (session.activeRun || lastActivity >= cutoff) continue;
+      const hasRunningTask = [...worker.tasks.values()].some(
+        (task) => task.serverId === serverId && task.status === "running",
+      );
+      if (
+        hasRunningTask ||
+        session.activeRuns?.size ||
+        session.activeRun ||
+        lastActivity >= cutoff
+      ) {
+        continue;
+      }
       await closeSshSession(session).catch(() => undefined);
       worker.sessions.delete(serverId);
       changed = true;
@@ -5306,6 +10073,9 @@ async function cleanupIdleSshWorkers(now = Date.now()) {
       const finishedAt = Date.parse(task.finishedAt || task.updatedAt || "") || 0;
       if (finishedAt && finishedAt < cutoff) {
         worker.tasks.delete(runId);
+        await rm(actorTaskPath(worker.actor, runId), { force: true }).catch(
+          () => undefined,
+        );
         changed = true;
       }
     }
@@ -5342,6 +10112,7 @@ export async function createEasyWorkServer() {
 }
 
 export const gatewayTestHelpers = {
+  agentRuntimeCapabilities,
   agentPromptWithNativePlanning,
   agentPlanEventStatus,
   createThinkTagRouter,
@@ -5349,19 +10120,21 @@ export const gatewayTestHelpers = {
   ensureOpenCodeNativeConfig,
   normalizeOpenCodeVersion,
   openCodeUpdateApplyCommand,
-  openCodeUpdateProbeCommand,
-  parseOpenCodeUpdateVersions,
   fallbackConversationTitle,
   extractModelText,
   getSshWorker,
   mergeOpenCodeAuthContent,
   mergeOpenCodeConfigContent,
+  managedOpenCodeModel,
+  mergeConversationCollections,
   normalizeConversationTitle,
   normalizeAgentPlanStatus,
   normalizeAgentPlanSteps,
   openCodeConfigurationStatus,
+  openCodeSseToolPart,
   classifyOpenCodeText,
   cleanupIdleSshWorkers,
+  conciseOpenCodeDiagnostic,
   createSshSession,
   createWorkerTask,
   parseOpenCodeLine,
@@ -5369,6 +10142,9 @@ export const gatewayTestHelpers = {
   persistWorkerTaskConversation,
   publishWorkerEvent,
   providerConfigForOpenCode,
+  providerRelayTarget,
+  readRemoteRuntimeRun,
+  remoteOpenCodePortCommand,
   stripEasyWorkProtocolMarkers,
   trailingFinalMessages,
 };

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "runtimeVersion": "0.2.2",
+  "protocolVersion": 1,
+  "entrypoint": "bin/easywork-runner",
+  "requiredCommands": [
+    "sh",
+    "setsid",
+    "kill",
+    "date",
+    "mkdir",
+    "mv",
+    "sed",
+    "sleep",
+    "chmod",
+    "ps",
+    "awk",
+    "sort"
+  ]
+}

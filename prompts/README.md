@@ -7,12 +7,14 @@
 - `chat-system.md`：Chat 模式系统规则。
 - `work-system.md`：Work 模式系统规则与远程安全边界。
 - `context/`：记忆、历史、技能、知识库和用户请求的上下文装配模板。
+- `memory/`：对话压缩和可复用记忆候选提取。
 - `model/`：模型 API 的系统消息与连通性检测提示。
-- `tasks/`：标题生成、Work 模式网页模型交接等专项模型任务。
+- `tasks/`：标题生成等独立模型任务。
+- `web/`：网页模型向远程 Agent 交接当前任务的模板。
 - `agents/`：网页与远程 Agent 之间的协议提示。
 
 ## 前端协议
 
-`agents/opencode-bridge.md` 中的 `[[EASYWORK_PROGRESS]]` 和 `[[EASYWORK_FINAL]]` 只用于前端区分 Agent 中途文本与最终正文。它们不规定正文必须采用何种开头、章节或写作结构。
+`agents/protocol.md` 中的 `[[EASYWORK_PROGRESS]]` 和 `[[EASYWORK_FINAL]]` 只用于前端区分 Agent 中途文本与最终正文。它们不规定正文必须采用何种开头、章节或写作结构。
 
 网页模型的思考只显示模型 API 明确返回的 reasoning/thinking 内容；EasyWork 不根据正文虚构思考过程。
