@@ -27,28 +27,73 @@ function mergeCookies(current, response) {
   return [...next.values()].join("; ");
 }
 
+async function listenHttpServer(server) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const port = 20_000 + Math.floor(Math.random() * 30_000);
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = (error) => {
+          server.off("listening", onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          server.off("error", onError);
+          resolve();
+        };
+        server.once("error", onError);
+        server.once("listening", onListening);
+        server.listen(port, "127.0.0.1");
+      });
+      return;
+    } catch (error) {
+      if (error?.code !== "EADDRINUSE") throw error;
+    }
+  }
+  throw new Error("无法为 HTTP 测试服务分配安全端口");
+}
+
 test("Agent-native plans mirror todo snapshots and OpenCode events stay structured", async () => {
   const { gatewayTestHelpers } = await import(
     `../gateway/server.mjs?work-events=${Date.now()}`
   );
   const {
+    agentRuntimeCapabilities,
     agentPromptWithNativePlanning,
     classifyOpenCodeText,
+    conciseOpenCodeDiagnostic,
     extractModelText,
     mergeOpenCodeAuthContent,
     mergeOpenCodeConfigContent,
+    managedOpenCodeModel,
+    mergeConversationCollections,
     normalizeAgentPlanSteps,
     normalizeConversationTitle,
     normalizeOpenCodeVersion,
     openCodeUpdateApplyCommand,
-    openCodeUpdateProbeCommand,
     openCodeConfigurationStatus,
+    openCodeSseToolPart,
     parseOpenCodeLine,
-    parseOpenCodeUpdateVersions,
     providerConfigForOpenCode,
+    providerRelayTarget,
+    remoteOpenCodePortCommand,
     stripEasyWorkProtocolMarkers,
     trailingFinalMessages,
   } = gatewayTestHelpers;
+  assert.deepEqual(
+    agentRuntimeCapabilities("opencode", "ready", { liveControl: true }),
+    {
+      liveInput: true,
+      nativeAbort: true,
+      resumeSession: true,
+      nativePlanning: true,
+      workspaceCheckpoint: true,
+    },
+  );
+  assert.equal(
+    agentRuntimeCapabilities("opencode", "ready", { liveControl: false })
+      .liveInput,
+    false,
+  );
   assert.equal(
     normalizeConversationTitle("“查看登录节点资源是否充足”", "查看资源"),
     "查看登录节点资源是否充足",
@@ -101,12 +146,12 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
     "用户请求：检查资源",
     "保留用户的资源检查目标。",
   );
-  assert.match(prompt, /Agent 原生计划联动/);
-  assert.match(prompt, /不会在网页端预先生成或注入执行步骤/);
-  assert.match(prompt, /原生 todo\/plan 工具及时维护真实状态/);
-  assert.match(prompt, /简单任务无需为了界面展示而额外创建计划/);
+  assert.match(prompt, /EasyWork 远程执行 Agent/);
+  assert.match(prompt, /原生 todo\/plan 机制/);
+  assert.match(prompt, /计划的目标、顺序和状态反映真实执行过程/);
+  assert.match(prompt, /简单任务可以直接完成/);
   assert.match(prompt, /保留用户的资源检查目标/);
-  assert.match(prompt, /两个标记只用于前端路由/);
+  assert.match(prompt, /标记只承担文本路由/);
   assert.doesNotMatch(prompt, /先说明结论|必须以.*结论/);
   assert.match(prompt, /\[\[EASYWORK_PROGRESS\]\]/);
   assert.match(prompt, /\[\[EASYWORK_FINAL\]\]/);
@@ -121,16 +166,11 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
   );
 
   assert.equal(normalizeOpenCodeVersion("opencode v1.2.34"), "1.2.34");
-  assert.deepEqual(
-    parseOpenCodeUpdateVersions(
-      "installer output\nEW_CURRENT_VERSION=1.2.30\nEW_LATEST_VERSION=v1.2.34\n",
-    ),
-    { currentVersion: "1.2.30", latestVersion: "1.2.34" },
-  );
-  assert.match(openCodeUpdateProbeCommand(), /https:\/\/opencode\.ai\/install/);
-  assert.match(openCodeUpdateProbeCommand(), /\.update-candidate/);
   assert.match(openCodeUpdateApplyCommand(), /opencode\.easywork-backup/);
   assert.match(openCodeUpdateApplyCommand(), /cp -p "\$EW_BACKUP" "\$EW_CURRENT"/);
+  assert.match(remoteOpenCodePortCommand(), /command -v ss/);
+  assert.match(remoteOpenCodePortCommand(), /command -v netstat/);
+  assert.doesNotMatch(remoteOpenCodePortCommand(), /python/);
 
   const parserState = {
     sessionId: "",
@@ -200,6 +240,50 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
   assert.equal(commandEvent.kind, "tool_call");
   assert.equal(commandEvent.command, "free -h");
   assert.equal(commandEvent.sourceId, "tool_1");
+
+  const liveSsePart = openCodeSseToolPart(
+    {
+      directory: "/work/project",
+      payload: {
+        type: "message.part.updated",
+        properties: {
+          sessionID: "ses_live",
+          part: {
+            id: "tool_live",
+            type: "tool",
+            tool: "bash",
+            state: {
+              status: "running",
+              input: { command: "pwd && sleep 5" },
+              metadata: { output: "/work/project\n" },
+            },
+          },
+        },
+      },
+    },
+    { sessionId: "ses_live", directory: "/work/project" },
+  );
+  assert.equal(liveSsePart.part.id, "tool_live");
+  const liveSseEvent = parseOpenCodeLine(
+    JSON.stringify(liveSsePart),
+    parserState,
+  );
+  assert.equal(liveSseEvent.status, "running");
+  assert.equal(liveSseEvent.command, "pwd && sleep 5");
+  assert.equal(liveSseEvent.output, "/work/project\n");
+  assert.equal(
+    openCodeSseToolPart(
+      {
+        directory: "/other",
+        payload: {
+          type: "message.part.updated",
+          properties: { sessionID: "ses_live", part: liveSsePart.part },
+        },
+      },
+      { sessionId: "ses_live", directory: "/work/project" },
+    ),
+    null,
+  );
 
   const schedulerEvent = parseOpenCodeLine(
     JSON.stringify({
@@ -345,6 +429,82 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
     providerConfigForOpenCode(provider).provider.easywork.options,
     { baseURL: "https://api.example.com/v1" },
   );
+  assert.equal(
+    managedOpenCodeModel(
+      { managed: true, model: "agent-selected-model" },
+      provider,
+      true,
+    ),
+    "easywork/agent-selected-model",
+  );
+  assert.equal(
+    managedOpenCodeModel({ managed: true }, provider, true),
+    "easywork/test-model",
+  );
+  assert.equal(
+    providerRelayTarget(
+      "https://api.example.com/v1",
+      "/v1/chat/completions?stream=true",
+    ).href,
+    "https://api.example.com/v1/chat/completions?stream=true",
+  );
+  assert.equal(
+    providerRelayTarget(
+      "https://api.example.com/v1",
+      "/chat/completions",
+    ).href,
+    "https://api.example.com/v1/chat/completions",
+  );
+  const preservedBranch = {
+    id: "branch-1",
+    title: "分支",
+    updatedAt: "2026-08-04T01:00:00.000Z",
+    branch: { parentConversationId: "root-1", action: "edit" },
+    messages: [{ id: "m1" }],
+  };
+  assert.deepEqual(
+    mergeConversationCollections(
+      [preservedBranch],
+      [
+        {
+          id: "other-device-chat",
+          title: "另一设备的新对话",
+          updatedAt: "2026-08-04T02:00:00.000Z",
+          messages: [],
+        },
+      ],
+    ).map((item) => item.id),
+    ["other-device-chat", "branch-1"],
+  );
+  assert.equal(
+    mergeConversationCollections(
+      [preservedBranch],
+      [
+        {
+          id: "branch-1",
+          title: "较新的标题",
+          updatedAt: "2026-08-04T03:00:00.000Z",
+          messages: [{ id: "m1" }, { id: "m2" }],
+        },
+      ],
+    )[0].branch.parentConversationId,
+    "root-1",
+  );
+  assert.deepEqual(
+    mergeConversationCollections(
+      [preservedBranch],
+      [preservedBranch],
+      { ids: { "branch-1": "2026-08-04T04:00:00.000Z" } },
+    ),
+    [],
+  );
+  const conciseDiagnostic = conciseOpenCodeDiagnostic(
+    'timestamp=x level=ERROR error.error="AI_APICallError: Rate limit exceeded for api_key: 0123456789abcdef0123456789abcdef. Remaining: 0\\n    at SessionPrompt.run (/bunfs/root/chunk.js:1:2)" cause="stack"',
+  );
+  assert.match(conciseDiagnostic, /Rate limit exceeded/);
+  assert.match(conciseDiagnostic, /api_key: \[已配置\]/);
+  assert.equal(conciseDiagnostic.includes("SessionPrompt.run"), false);
+  assert.ok(conciseDiagnostic.length < 300);
 
   const mergedAuth = mergeOpenCodeAuthContent(
     '{"other":{"type":"api","key":"other-key"}}',
@@ -370,28 +530,69 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
   );
 });
 
-test("legacy EasyWork OpenCode is migrated and receives native configuration automatically", async () => {
+test("remote Runtime polling reuses one SFTP channel", async () => {
+  const { gatewayTestHelpers } = await import(
+    `../gateway/server.mjs?runtime-sftp=${Date.now()}`
+  );
+  let openedChannels = 0;
+  let activeReads = 0;
+  let maximumActiveReads = 0;
+  const content = new Map([
+    ["status", "running\n"],
+    ["pid", "4321\n"],
+    ["exit_code", ""],
+    ["stdout.log", "stdout"],
+    ["stderr.log", "stderr"],
+    ["agent-events.sse", "data: {}\n"],
+  ]);
+  const client = {
+    sftp(callback) {
+      openedChannels += 1;
+      callback(null, {
+        readFile(remotePath, done) {
+          activeReads += 1;
+          maximumActiveReads = Math.max(maximumActiveReads, activeReads);
+          setImmediate(() => {
+            activeReads -= 1;
+            const name = remotePath.split("/").at(-1);
+            done(null, Buffer.from(content.get(name) || ""));
+          });
+        },
+        end() {},
+      });
+    },
+  };
+  const snapshot = await gatewayTestHelpers.readRemoteRuntimeRun(
+    { client },
+    { runDirectory: "/home/user/.easywork/runtime/runs/run-1" },
+  );
+  assert.equal(openedChannels, 1);
+  assert.equal(maximumActiveReads, 1);
+  assert.equal(snapshot.status, "running");
+  assert.equal(snapshot.pid, "4321");
+  assert.equal(snapshot.stdout.toString("utf8"), "stdout");
+  assert.equal(snapshot.agentEvents.toString("utf8"), "data: {}\n");
+});
+
+test("managed OpenCode receives native configuration automatically", async () => {
   const temporaryRoot = await mkdtemp(
-    path.join(os.tmpdir(), "easywork-agent-migration-test-"),
+    path.join(os.tmpdir(), "easywork-agent-config-test-"),
   );
   process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
   process.env.EASYWORK_SKILL_DIR = path.join(temporaryRoot, "skill");
   const { createEasyWorkServer, gatewayTestHelpers } = await import(
-    `../gateway/server.mjs?agent-migration=${Date.now()}`
+    `../gateway/server.mjs?agent-config=${Date.now()}`
   );
   const { server } = await createEasyWorkServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await listenHttpServer(server);
   const address = server.address();
   const base = `http://127.0.0.1:${address.port}`;
   const home = "/home/easywork-test";
-  const legacyPath = `${home}/.easywork/bin/opencode`;
-  const userPath = `${home}/.opencode/bin/opencode`;
   const managedPath = `${home}/.easywork/agents/opencode/bin/opencode`;
   const configPath = `${home}/.config/opencode/opencode.json`;
   const authPath = `${home}/.local/share/opencode/auth.json`;
   const files = new Map([
-    [legacyPath, { content: Buffer.from("legacy-opencode"), mode: 0o755 }],
-    [userPath, { content: Buffer.from("user-opencode"), mode: 0o755 }],
+    [managedPath, { content: Buffer.from("managed-opencode"), mode: 0o755 }],
     [
       configPath,
       {
@@ -414,18 +615,9 @@ test("legacy EasyWork OpenCode is migrated and receives native configuration aut
         if (command.includes('managed_opencode="$HOME/.easywork/agents')) {
           if (files.get(managedPath)?.mode & 0o111) {
             stdout = `opencode\t${home}/.easywork/agents/opencode\t${managedPath}\t1.18.9\topencode\n`;
-          } else if (files.get(userPath)?.mode & 0o111) {
-            stdout = `opencode\t${home}/.opencode\t${userPath}\t1.18.9\topencode\n`;
           }
-        } else if (/^test -x /.test(command)) {
-          const target = command.match(/^test -x '([^']+)'/)?.[1] || "";
-          code = files.get(target)?.mode & 0o111 ? 0 : 1;
-        } else if (command.includes(`cp '${legacyPath}' '${managedPath}'`)) {
-          files.set(managedPath, {
-            content: Buffer.from(files.get(legacyPath).content),
-            mode: 0o755,
-          });
-          stdout = "1.18.9\n";
+        } else if (command.includes("provider-probe.err")) {
+          stdout = "CODE=0\nHTTP=401\n";
         } else if (command.includes("mv -f")) {
           const match = command.match(/mv -f '([^']+)' '([^']+)'/);
           if (match) {
@@ -471,9 +663,9 @@ test("legacy EasyWork OpenCode is migrated and receives native configuration aut
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: "agent-migration@example.com",
+        email: "agent-config@example.com",
         password: "correct-horse",
-        displayName: "Agent 迁移用户",
+        displayName: "Agent 配置用户",
       }),
     });
     assert.equal(registration.status, 200);
@@ -557,7 +749,7 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     `../gateway/server.mjs?test=${Date.now()}`
   );
   const { server } = await createEasyWorkServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await listenHttpServer(server);
   const address = server.address();
   const base = `http://127.0.0.1:${address.port}`;
   let cookies = "";
@@ -634,6 +826,134 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       "responses",
     );
 
+    const branchState = structuredClone(preservedState.state);
+    branchState.conversations = [
+      {
+        id: "conversation-source",
+        title: "分支测试",
+        mode: "chat",
+        updatedAt: new Date().toISOString(),
+        messages: [
+          { id: "user-1", role: "user", mode: "chat", content: "执行原任务", createdAt: new Date().toISOString() },
+          { id: "assistant-1", role: "assistant", mode: "chat", content: "原任务完成", createdAt: new Date().toISOString() },
+        ],
+      },
+    ];
+    const branchStateResponse = await fetch(`${base}/api/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({ state: branchState }),
+    });
+    assert.equal(branchStateResponse.status, 200);
+    const branchResponse = await fetch(`${base}/api/conversations/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({
+        action: "reset",
+        conversationId: "conversation-source",
+        messageId: "assistant-1",
+      }),
+    });
+    assert.equal(branchResponse.status, 200);
+    const branchPayload = await branchResponse.json();
+    assert.equal(branchPayload.seedPrompt, "执行原任务");
+    assert.equal(branchPayload.conversation.id, "conversation-source");
+    assert.equal(branchPayload.conversation.messages.length, 0);
+
+    const branchSourceState = structuredClone(branchState);
+    branchSourceState.conversations[0].updatedAt = new Date(
+      Date.now() + 1_000,
+    ).toISOString();
+    const branchSourceStateResponse = await fetch(`${base}/api/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({ state: branchSourceState }),
+    });
+    assert.equal(branchSourceStateResponse.status, 200);
+    const nonDestructiveBranchResponse = await fetch(
+      `${base}/api/conversations/action`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookies },
+        body: JSON.stringify({
+          action: "branch",
+          conversationId: "conversation-source",
+          messageId: "assistant-1",
+          newConversationId: "conversation-branch",
+        }),
+      },
+    );
+    assert.equal(nonDestructiveBranchResponse.status, 200);
+    const nonDestructiveBranch = await nonDestructiveBranchResponse.json();
+    assert.equal(nonDestructiveBranch.conversation.id, "conversation-branch");
+    assert.equal(nonDestructiveBranch.conversation.messages.length, 2);
+    assert.equal(
+      typeof nonDestructiveBranch.conversation.branch.memorySnapshotSequence,
+      "number",
+    );
+
+    const editResponse = await fetch(`${base}/api/conversations/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({
+        action: "edit",
+        conversationId: "conversation-source",
+        messageId: "user-1",
+        content: "执行修改后的任务",
+      }),
+    });
+    assert.equal(editResponse.status, 200);
+    const editPayload = await editResponse.json();
+    assert.equal(editPayload.conversation.id, "conversation-source");
+    assert.equal(editPayload.conversation.messages.length, 0);
+    assert.equal(editPayload.seedPrompt, "执行修改后的任务");
+    const stateAfterEditResponse = await fetch(`${base}/api/bootstrap`, {
+      headers: { Cookie: cookies },
+    });
+    const stateAfterEdit = await stateAfterEditResponse.json();
+    assert.deepEqual(
+      stateAfterEdit.state.conversations.map((conversation) => conversation.id),
+      ["conversation-source"],
+    );
+    const contextResponse = await fetch(
+      `${base}/api/context?conversationId=conversation-source&serverId=server-a&agentId=opencode`,
+      { headers: { Cookie: cookies } },
+    );
+    assert.equal(contextResponse.status, 200);
+    const contextPayload = await contextResponse.json();
+    assert.equal(contextPayload.web.limit, 200_000);
+    assert.equal(contextPayload.web.breakdown.messages, 0);
+    assert.equal(contextPayload.web.breakdown.system > 0, true);
+    assert.equal(contextPayload.web.breakdown.outputReserve, 8_192);
+    assert.equal(contextPayload.agent.status, "not-bound");
+    assert.equal(contextPayload.agent.bound, false);
+    assert.equal(contextPayload.agent.available, false);
+    const unavailableAgentCompact = await fetch(
+      `${base}/api/context/agent/compress`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookies },
+        body: JSON.stringify({ conversationId: "conversation-source" }),
+      },
+    );
+    assert.equal(unavailableAgentCompact.status, 409);
+    const contextSettingsResponse = await fetch(`${base}/api/context/settings`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({
+        conversationLimit: 80_000,
+        automaticCompressionThreshold: 0.82,
+      }),
+    });
+    assert.equal(contextSettingsResponse.status, 200);
+    const adjustedContextResponse = await fetch(
+      `${base}/api/context?conversationId=conversation-source`,
+      { headers: { Cookie: cookies } },
+    );
+    const adjustedContext = await adjustedContextResponse.json();
+    assert.equal(adjustedContext.web.limit, 80_000);
+    assert.equal(adjustedContext.web.automaticCompressionThreshold, 0.82);
+
     const fileResponse = await fetch(`${base}/api/files`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: cookies },
@@ -659,7 +979,7 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
         conversationId: "chat_test",
         prompt: "登录节点有多少内存？",
         skillIds: [],
-        memoryMode: "default",
+        memoryMode: "project-and-global",
       }),
     });
     assert.equal(chatResponse.status, 200);
@@ -678,7 +998,7 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     const events = [];
     await new Promise((resolve, reject) => {
       const socket = new WebSocket(
-        `${base.replace("http:", "ws:")}/ws?deviceToken=${encodeURIComponent(initial.deviceToken)}`,
+        `${base.replace("http:", "ws:")}/easywork-ws?deviceToken=${encodeURIComponent(initial.deviceToken)}`,
       );
       let updateRequested = false;
       const timer = setTimeout(() => {
@@ -743,7 +1063,7 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     const resumedEvents = [];
     await new Promise((resolve, reject) => {
       const socket = new WebSocket(
-        `${base.replace("http:", "ws:")}/ws?deviceToken=${encodeURIComponent(initial.deviceToken)}`,
+        `${base.replace("http:", "ws:")}/easywork-ws?deviceToken=${encodeURIComponent(initial.deviceToken)}`,
       );
       const timer = setTimeout(() => {
         socket.close();
@@ -813,7 +1133,7 @@ test("host worker persists a Work result without any browser subscriber", async 
     `../gateway/server.mjs?worker-task=${Date.now()}`
   );
   const { server } = await createEasyWorkServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await listenHttpServer(server);
   const address = server.address();
   const base = `http://127.0.0.1:${address.port}`;
   try {
@@ -900,6 +1220,28 @@ test("host worker persists a Work result without any browser subscriber", async 
       conversation.messages.find((message) => message.role === "assistant").content,
       "网页关闭后任务仍已完成。",
     );
+    const abortedTask = gatewayTestHelpers.createWorkerTask(session, {
+      conversationId: "conversation-aborted",
+      runId: "run-aborted",
+      prompt: "停止远端命令",
+    });
+    gatewayTestHelpers.publishWorkerEvent(session, {
+      type: "agent.event",
+      runId: abortedTask.runId,
+      event: {
+        id: "command-aborted",
+        kind: "tool_call",
+        command: "sleep 120",
+        status: "running",
+      },
+    });
+    gatewayTestHelpers.publishWorkerEvent(session, {
+      type: "task.aborted",
+      runId: abortedTask.runId,
+      result: "任务已停止。",
+    });
+    assert.equal(abortedTask.status, "aborted");
+    assert.equal(abortedTask.events[0].status, "cancelled");
     assert.equal(worker.sockets.size, 0);
     session.lastUserActivityAt = new Date(
       Date.now() - 31 * 24 * 60 * 60 * 1000,
@@ -922,7 +1264,7 @@ test("account settings follow the user across devices and stay isolated from oth
     `../gateway/server.mjs?account-sync-test=${Date.now()}`
   );
   const { server } = await createEasyWorkServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await listenHttpServer(server);
   const address = server.address();
   const base = `http://127.0.0.1:${address.port}`;
 
@@ -1079,7 +1421,7 @@ test("an SSH failure is not overwritten by a later close event", async () => {
     acceptedConnections += 1;
   });
   await new Promise((resolve) => interruptedSshServer.listen(0, "127.0.0.1", resolve));
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await listenHttpServer(server);
   const gatewayAddress = server.address();
   const sshAddress = interruptedSshServer.address();
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -1089,7 +1431,7 @@ test("an SSH failure is not overwritten by a later close event", async () => {
 
   try {
     await new Promise((resolve, reject) => {
-      socket = new WebSocket(`ws://127.0.0.1:${gatewayAddress.port}/ws`);
+      socket = new WebSocket(`ws://127.0.0.1:${gatewayAddress.port}/easywork-ws`);
       const timer = setTimeout(() => {
         socket.close();
         reject(new Error("SSH failure websocket timed out"));
@@ -1224,7 +1566,7 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
     `../gateway/server.mjs?ssh-profile-test=${Date.now()}`
   );
   const { server } = await createEasyWorkServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await listenHttpServer(server);
   const gatewayAddress = server.address();
   const sshAddress = sshServer.address();
   const base = `http://127.0.0.1:${gatewayAddress.port}`;
@@ -1290,7 +1632,7 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
     assert.equal(registration.status, 200);
     const account = await registration.json();
     socket = new WebSocket(
-      `${base.replace("http:", "ws:")}/ws?deviceToken=${encodeURIComponent(account.deviceToken)}`,
+      `${base.replace("http:", "ws:")}/easywork-ws?deviceToken=${encodeURIComponent(account.deviceToken)}`,
     );
     await new Promise((resolve, reject) => {
       socket.once("open", resolve);
@@ -1306,8 +1648,8 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
         port: sshAddress.port,
         username: "cluster-user",
         privateKey: userKeyPem,
-        privateKeyName: "cluster_ed25519",
-        rememberKey: true,
+        keyName: "cluster_ed25519",
+        rememberCredential: true,
         trustHost: true,
       },
       { expectProfile: true },
@@ -1323,8 +1665,8 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
         port: sshAddress.port,
         username: "cluster-user",
         privateKey: userKeyPem,
-        privateKeyName: "cluster_ed25519",
-        rememberKey: true,
+        keyName: "cluster_ed25519",
+        rememberCredential: true,
         trustHost: true,
       },
       { expectProfile: true },
@@ -1343,7 +1685,7 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
     const authenticationCountBeforeSecondDevice = authenticationCount;
     const secondDeviceSnapshot = await new Promise((resolve, reject) => {
       secondDeviceSocket = new WebSocket(
-        `${base.replace("http:", "ws:")}/ws?deviceToken=${encodeURIComponent(secondDeviceAccount.deviceToken)}`,
+        `${base.replace("http:", "ws:")}/easywork-ws?deviceToken=${encodeURIComponent(secondDeviceAccount.deviceToken)}`,
       );
       const timer = setTimeout(
         () => reject(new Error("second device did not resume account SSH sessions")),
@@ -1382,7 +1724,7 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
     const authenticationCountAfterAllPagesClosed = authenticationCount;
     const hostMaintainedSnapshot = await new Promise((resolve, reject) => {
       socket = new WebSocket(
-        `${base.replace("http:", "ws:")}/ws?deviceToken=${encodeURIComponent(account.deviceToken)}`,
+        `${base.replace("http:", "ws:")}/easywork-ws?deviceToken=${encodeURIComponent(account.deviceToken)}`,
       );
       const timer = setTimeout(
         () => reject(new Error("host worker did not retain SSH after all pages closed")),
@@ -1420,6 +1762,7 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
           "data",
           "users",
           account.actor.id,
+          "runtime",
           "ssh-worker.json",
         ),
         "utf8",
@@ -1469,7 +1812,7 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
       host: "127.0.0.1",
       port: sshAddress.port,
       username: "cluster-user",
-      useSavedKey: true,
+      useSavedCredential: true,
       trustHost: true,
     });
     assert.ok(authenticationCount >= 2);
@@ -1720,7 +2063,7 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
     res.writeHead(404);
     res.end();
   });
-  await new Promise((resolve) => providerServer.listen(0, "127.0.0.1", resolve));
+  await listenHttpServer(providerServer);
   const providerAddress = providerServer.address();
   const providerBase = `http://127.0.0.1:${providerAddress.port}/v1`;
 
@@ -1728,7 +2071,7 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
     `../gateway/server.mjs?models=${Date.now()}`
   );
   const { server } = await createEasyWorkServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await listenHttpServer(server);
   const address = server.address();
   const base = `http://127.0.0.1:${address.port}`;
 

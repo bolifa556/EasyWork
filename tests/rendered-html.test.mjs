@@ -51,8 +51,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
     "agents",
     "chat-system.md",
     "context",
+    "memory",
     "model",
     "tasks",
+    "web",
     "work-system.md",
   ]);
   assert.deepEqual(builtIns.sort(), ["cluster-ops", "paper-reading", "training-debug"]);
@@ -61,6 +63,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /\/api\/bootstrap/);
   assert.match(app, /DEVICE_TOKEN_STORAGE_KEY/);
   assert.match(app, /beginConversation/);
+  assert.match(app, /\/api\/conversations\/action/);
+  assert.match(app, /actOnConversationMessage\(\s*"edit"/);
+  assert.doesNotMatch(app, /\/api\/conversations\/branch/);
+  assert.doesNotMatch(app, /branchConversationFromMessage/);
   assert.match(app, /function UnifiedComposer/);
   assert.match(app, /useLayoutEffect/);
   assert.match(app, /maximumHeight = 140/);
@@ -226,10 +232,15 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /SSH_IDLE_TTL_MS\s*=\s*30 \* 24 \* 60 \* 60 \* 1000/);
   assert.match(gateway, /function cleanupIdleSshWorkers/);
   assert.match(gateway, /function publishWorkerEvent/);
+  assert.match(gateway, /url\.pathname === "\/api\/conversations\/action"/);
+  assert.doesNotMatch(gateway, /url\.pathname === "\/api\/conversations\/branch"/);
   assert.match(gateway, /worker\.sockets\.delete\(socket\)/);
   assert.doesNotMatch(gateway, /SSH_RECONNECT_GRACE_MS/);
   assert.match(gateway, /deviceToken/);
-  assert.match(gateway, /--no-modify-path/);
+  assert.match(gateway, /EasyWork-Agent-Installer/);
+  assert.match(gateway, /remoteSftpFastPut/);
+  assert.match(gateway, /OpenCode 发布包校验失败/);
+  assert.doesNotMatch(gateway, /opencode\.ai\/install/);
   assert.match(gateway, /agentSessions:\s*new Map/);
   assert.match(gateway, /agentUpdates:\s*new Map/);
   assert.match(gateway, /agent\.update\.check/);
@@ -244,9 +255,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /await agentPromptWithNativePlanning\(/);
   assert.match(gateway, /runWorkHandoffModel/);
   assert.match(gateway, /kind: "reasoning"/);
-  assert.match(gateway, /renderPromptTemplate\("tasks\/work-handoff\.md"/);
+  assert.match(gateway, /renderPromptTemplate\("web\/work-context-router\.md"/);
   assert.doesNotMatch(gateway, /planWorkSteps|agentPromptWithWorkflow/);
   assert.doesNotMatch(gateway, /type: "workflow\.step"/);
+  assert.doesNotMatch(gateway, /\["\/ws",\s*"\/easywork-ws"\]/);
 
   await assert.rejects(access(new URL("../app/_sites-preview/", import.meta.url)));
   for (const starterAsset of ["file.svg", "globe.svg", "window.svg"]) {
