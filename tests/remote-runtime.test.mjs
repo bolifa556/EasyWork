@@ -12,7 +12,9 @@ test("remote runtime bundle is deterministic and keeps all state under .easywork
   const first = await loadRemoteRuntimeBundle();
   const second = await loadRemoteRuntimeBundle();
   assert.equal(first.digest, second.digest);
-  assert.match(first.releaseId, /^0\.2\.2-[a-f0-9]{12}$/);
+  assert.match(first.releaseId, /^0\.3\.0-[a-f0-9]{12}$/);
+  assert.ok(first.manifest.requiredCommands.includes("mkfifo"));
+  assert.ok(first.manifest.requiredCommands.includes("grep"));
   assert.equal(first.manifest.protocolVersion, 1);
   assert.deepEqual(
     first.files.map((file) => file.relativePath),

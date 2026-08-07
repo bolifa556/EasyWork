@@ -53,32 +53,395 @@ async function listenHttpServer(server) {
 }
 
 test("Agent-native plans mirror todo snapshots and OpenCode events stay structured", async () => {
+  const {
+    compareAgentVersions,
+    normalizeAgentVersion,
+    remoteAgentPlatform,
+  } = await import(`../gateway/agent-artifacts.mjs?artifacts=${Date.now()}`);
   const { gatewayTestHelpers } = await import(
     `../gateway/server.mjs?work-events=${Date.now()}`
   );
   const {
+    agentBindingKey,
+    agentMemoryDelta,
     agentRuntimeCapabilities,
     agentPromptWithNativePlanning,
     classifyOpenCodeText,
     conciseOpenCodeDiagnostic,
+    createAgentSyncCursor,
     extractModelText,
     mergeOpenCodeAuthContent,
     mergeOpenCodeConfigContent,
+    managedAgentCapabilitySchema,
     managedOpenCodeModel,
     mergeConversationCollections,
     normalizeAgentPlanSteps,
     normalizeConversationTitle,
-    normalizeOpenCodeVersion,
-    openCodeUpdateApplyCommand,
+    normalizeWorkspaceRecord,
+    nativeAgentCommand,
     openCodeConfigurationStatus,
-    openCodeSseToolPart,
+    openCodeConfiguredModelDetails,
+    openCodeProviderContextLimit,
+    openCodeSseAgentEvent,
+    parseCodexLine,
+    parseClaudeCodeLine,
     parseOpenCodeLine,
     providerConfigForOpenCode,
+    providerModelDescriptor,
     providerRelayTarget,
     remoteOpenCodePortCommand,
     stripEasyWorkProtocolMarkers,
     trailingFinalMessages,
+    workspaceIdFor,
+    workspacePathContains,
+    workspaceRecordsOverlap,
+    workspaceRunConflict,
+    workspaceVersionDomainIdFor,
   } = gatewayTestHelpers;
+  const openCodeSchema = managedAgentCapabilitySchema(
+    { adapter: "opencode" },
+    {},
+  );
+  assert.deepEqual(Object.keys(openCodeSchema), ["permission"]);
+  assert.equal(openCodeSchema.permission.label, "全局工具权限");
+  assert.deepEqual(openCodeSchema.permission.options, ["ask", "allow", "deny"]);
+  const codexSchema = managedAgentCapabilitySchema(
+    { adapter: "codex" },
+    {},
+  );
+  assert.deepEqual(codexSchema.reasoning.options, [
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]);
+  assert.deepEqual(codexSchema.permission.options, [
+    "untrusted",
+    "on-request",
+    "never",
+  ]);
+  assert.equal(codexSchema.permission.label, "审批策略");
+  assert.equal(codexSchema.sandbox.label, "沙箱权限");
+  const claudeSchema = managedAgentCapabilitySchema(
+    { adapter: "claude", version: "2.1.203" },
+    {},
+  );
+  assert.deepEqual(claudeSchema.reasoning.options, [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultracode",
+  ]);
+  assert.deepEqual(claudeSchema.permission.options, [
+    "default",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+  ]);
+  assert.equal(claudeSchema.reasoning.value, "high");
+  assert.deepEqual(
+    managedAgentCapabilitySchema(
+      { adapter: "claude", version: "2.1.202" },
+      {},
+    ).reasoning.options,
+    ["low", "medium", "high", "xhigh", "max"],
+  );
+  assert.deepEqual(
+    managedAgentCapabilitySchema({ adapter: "plain" }, {}),
+    {},
+  );
+  const workspaceA = workspaceIdFor("server-a", "/srv/project-a");
+  const workspaceB = workspaceIdFor("server-a", "/srv/project-b");
+  assert.equal(workspaceA, workspaceIdFor("server-a", "/srv/project-a"));
+  assert.notEqual(workspaceA, workspaceB);
+  assert.notEqual(
+    workspaceA,
+    workspaceIdFor("server-b", "/srv/project-a"),
+  );
+  assert.notEqual(
+    agentBindingKey({
+      serverId: "server-a",
+      workspaceId: workspaceA,
+      agentId: "opencode",
+      conversationId: "conversation-a",
+    }),
+    agentBindingKey({
+      serverId: "server-a",
+      workspaceId: workspaceB,
+      agentId: "opencode",
+      conversationId: "conversation-a",
+    }),
+  );
+  assert.equal(
+    normalizeWorkspaceRecord({
+      serverId: "server-a",
+      path: "/srv/project-a",
+      name: "Project A",
+      mode: "attached",
+    }).id,
+    workspaceA,
+  );
+  assert.equal(workspacePathContains("/srv/project-a", "/srv/project-a/src"), true);
+  assert.equal(workspacePathContains("/srv/project-a", "/srv/project-ab"), false);
+  assert.equal(
+    workspaceRecordsOverlap(
+      { serverId: "server-a", path: "/srv/project-a" },
+      { serverId: "server-a", path: "/srv/project-a/src" },
+    ),
+    true,
+  );
+  assert.equal(
+    workspaceRecordsOverlap(
+      { serverId: "server-a", path: "/srv/project-a" },
+      { serverId: "server-b", path: "/srv/project-a" },
+    ),
+    false,
+  );
+  assert.equal(
+    workspaceRecordsOverlap(
+      {
+        serverId: "profile-a",
+        serverIdentity: "ssh-endpoint-shared",
+        path: "/srv/project-a",
+      },
+      {
+        serverId: "profile-b",
+        serverIdentity: "ssh-endpoint-shared",
+        path: "/srv/project-a/src",
+      },
+    ),
+    true,
+    "同一 SSH 端点的重复连接配置不能绕过目录冲突检测",
+  );
+  assert.equal(
+    workspaceVersionDomainIdFor("server-a", "/srv/project-a", "/srv/project-a"),
+    workspaceVersionDomainIdFor("server-a", "/srv/project-a", "/srv/project-a/src"),
+  );
+  const activeRuns = new Map([
+    [
+      "run-a",
+      {
+        runId: "run-a",
+        conversationId: "conversation-a",
+        serverId: "server-a",
+        workspace: "/srv/project-a/src",
+      },
+    ],
+  ]);
+  assert.equal(
+    workspaceRunConflict(activeRuns, "conversation-b", {
+      serverId: "server-a",
+      path: "/srv/project-a",
+    })?.runId,
+    "run-a",
+  );
+  assert.equal(
+    workspaceRunConflict(activeRuns, "conversation-b", {
+      serverId: "server-a",
+      path: "/srv/project-b",
+    }),
+    undefined,
+  );
+  assert.equal(
+    workspaceRunConflict(activeRuns, "conversation-a", {
+      serverId: "server-a",
+      path: "/srv/project-b",
+    })?.runId,
+    "run-a",
+  );
+  const duplicateProfileRuns = new Map([
+    [
+      "run-profile-a",
+      {
+        runId: "run-profile-a",
+        conversationId: "conversation-profile-a",
+        serverId: "profile-a",
+        serverIdentity: "ssh-endpoint-shared",
+        workspace: "/srv/shared/project",
+      },
+    ],
+  ]);
+  assert.equal(
+    workspaceRunConflict(duplicateProfileRuns, "conversation-profile-b", {
+      serverId: "profile-b",
+      serverIdentity: "ssh-endpoint-shared",
+      path: "/srv/shared/project/src",
+    })?.runId,
+    "run-profile-a",
+  );
+  const sharedVersionDomain = workspaceVersionDomainIdFor(
+    "server-a",
+    "/srv/monorepo",
+    "/srv/monorepo/packages/a",
+  );
+  const versionDomainRuns = new Map([
+    [
+      "run-monorepo-a",
+      {
+        runId: "run-monorepo-a",
+        conversationId: "conversation-monorepo-a",
+        serverId: "server-a",
+        workspace: "/srv/monorepo/packages/a",
+        versionDomainId: sharedVersionDomain,
+      },
+    ],
+  ]);
+  assert.equal(
+    workspaceRunConflict(versionDomainRuns, "conversation-monorepo-b", {
+      serverId: "server-a",
+      path: "/srv/monorepo/packages/b",
+      versionDomainId: sharedVersionDomain,
+    })?.runId,
+    "run-monorepo-a",
+  );
+  assert.equal(
+    workspaceRunConflict(versionDomainRuns, "conversation-other-server", {
+      serverId: "server-b",
+      path: "/srv/monorepo/packages/b",
+      versionDomainId: sharedVersionDomain,
+    }),
+    undefined,
+  );
+  const projectABinding = {
+    agentSessionId: "native-project-a",
+    syncCursor: {
+      memoryEnabled: true,
+      memoryVersions: { "memory-project-a": 2 },
+      memoryStatuses: { "memory-project-a": "active" },
+    },
+  };
+  const projectBDelta = agentMemoryDelta(
+    {
+      state: { settings: { memoryEnabled: true } },
+      memorySyncRecords: [],
+    },
+    projectABinding,
+  );
+  assert.deepEqual(projectBDelta, [
+    {
+      id: "memory-project-a",
+      revision: 2,
+      status: "deleted",
+      scope: "conversation",
+      semanticKey: "memory-project-a",
+      source: "memory-out-of-scope",
+    },
+  ]);
+  const revokedCursor = createAgentSyncCursor({
+    state: { conversations: [] },
+    memoryDocument: { revision: 2 },
+    conversationId: "conversation-a",
+    deliveredMemoryRecords: projectBDelta,
+    previous: projectABinding.syncCursor,
+  });
+  assert.equal(revokedCursor.memoryStatuses["memory-project-a"], "deleted");
+  const projectAReturnDelta = agentMemoryDelta(
+    {
+      state: { settings: { memoryEnabled: true } },
+      memorySyncRecords: [
+        {
+          id: "memory-project-a",
+          revision: 2,
+          status: "active",
+          scope: "project",
+        },
+      ],
+    },
+    {
+      agentSessionId: "native-project-a",
+      syncCursor: revokedCursor,
+    },
+  );
+  assert.equal(projectAReturnDelta.length, 1);
+  assert.equal(projectAReturnDelta[0].status, "active");
+  const interruptedState = {
+    conversations: [
+      {
+        id: "conversation-interrupted",
+        messages: [
+          { id: "user-1", role: "user", content: "开始任务" },
+          {
+            id: "assistant-1",
+            role: "assistant",
+            content: "任务已执行到中断位置",
+          },
+          { id: "user-2", role: "user", content: "继续处理" },
+        ],
+      },
+    ],
+  };
+  const interruptedCursor = createAgentSyncCursor({
+    state: interruptedState,
+    memoryDocument: { revision: 1 },
+    conversationId: "conversation-interrupted",
+    lastMessageId: "assistant-1",
+    taskId: "run-interrupted",
+    deliveredContent: [
+      "user\u0000开始任务",
+      "assistant\u0000任务已执行到中断位置",
+    ],
+  });
+  const { agentConversationDelta } = await import("../gateway/memory.mjs");
+  const resumeDelta = agentConversationDelta(
+    interruptedState,
+    "conversation-interrupted",
+    { agentSessionId: "native-interrupted", syncCursor: interruptedCursor },
+    { currentUserMessageId: "user-2" },
+  );
+  assert.deepEqual(
+    resumeDelta.messages,
+    [],
+    "中断前已投递到原生会话的内容不应在继续时重复注入",
+  );
+  const reusableDynamicBinding = agentBindingKey({
+    serverId: "server-a",
+    workspaceId: workspaceA,
+    agentId: "opencode",
+    conversationId: "virtual-conversation",
+  });
+  assert.equal(
+    reusableDynamicBinding,
+    agentBindingKey({
+      serverId: "server-a",
+      workspaceId: workspaceA,
+      agentId: "opencode",
+      conversationId: "virtual-conversation",
+    }),
+  );
+  assert.notEqual(
+    reusableDynamicBinding,
+    agentBindingKey({
+      serverId: "server-a",
+      workspaceId: workspaceA,
+      agentId: "opencode-user",
+      conversationId: "virtual-conversation",
+    }),
+  );
+  assert.notEqual(
+    reusableDynamicBinding,
+    agentBindingKey({
+      serverId: "server-a",
+      workspaceId: workspaceA,
+      agentId: "opencode",
+      conversationId: "another-conversation",
+    }),
+  );
+  assert.equal(
+    normalizeWorkspaceRecord({
+      serverId: "server-a",
+      path: "/home/user/.easywork/virtual/conversation-a",
+      name: "虚拟工作区",
+      mode: "managed",
+      kind: "virtual",
+      virtualConversationId: "conversation-a",
+    }).virtualConversationId,
+    "conversation-a",
+  );
   assert.deepEqual(
     agentRuntimeCapabilities("opencode", "ready", { liveControl: true }),
     {
@@ -87,6 +450,8 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
       resumeSession: true,
       nativePlanning: true,
       workspaceCheckpoint: true,
+      contextReadable: true,
+      permissions: true,
     },
   );
   assert.equal(
@@ -142,6 +507,14 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
     stripEasyWorkProtocolMarkers("[[EASYWORK_FINAL]]结论", true),
     "结论",
   );
+  assert.equal(
+    classifyOpenCodeText("正在整理。[[E").output,
+    "正在整理。",
+  );
+  assert.equal(
+    classifyOpenCodeText("正在整理。[[EASYWORK_F").output,
+    "正在整理。",
+  );
   const prompt = await agentPromptWithNativePlanning(
     "用户请求：检查资源",
     "保留用户的资源检查目标。",
@@ -165,9 +538,13 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
     [{ id: "actual-final", kind: "message" }],
   );
 
-  assert.equal(normalizeOpenCodeVersion("opencode v1.2.34"), "1.2.34");
-  assert.match(openCodeUpdateApplyCommand(), /opencode\.easywork-backup/);
-  assert.match(openCodeUpdateApplyCommand(), /cp -p "\$EW_BACKUP" "\$EW_CURRENT"/);
+  assert.equal(normalizeAgentVersion("opencode v1.2.34"), "1.2.34");
+  assert.equal(compareAgentVersions("1.2.33", "1.2.34"), -1);
+  assert.equal(compareAgentVersions("1.2.34", "1.2.34"), 0);
+  assert.equal(
+    remoteAgentPlatform({ os: "linux", arch: "x86_64", musl: "0" }),
+    "linux-x64",
+  );
   assert.match(remoteOpenCodePortCommand(), /command -v ss/);
   assert.match(remoteOpenCodePortCommand(), /command -v netstat/);
   assert.doesNotMatch(remoteOpenCodePortCommand(), /python/);
@@ -202,6 +579,21 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
   assert.equal(todoEvent.kind, "plan");
   assert.equal(todoEvent.title, "执行计划");
   assert.equal(todoEvent.sourceId, "agent-native-plan");
+  assert.equal(
+    parseOpenCodeLine(
+      JSON.stringify({
+        type: "tool_use",
+        part: {
+          id: "todo-empty",
+          type: "tool_use",
+          tool: "todowrite",
+          state: { input: {}, status: "pending" },
+        },
+      }),
+      parserState,
+    ),
+    null,
+  );
   assert.equal(todoEvent.status, "running");
   assert.deepEqual(todoEvent.planSteps, [
     { id: "inspect", title: "检查训练脚本", status: "done" },
@@ -241,7 +633,34 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
   assert.equal(commandEvent.command, "free -h");
   assert.equal(commandEvent.sourceId, "tool_1");
 
-  const liveSsePart = openCodeSseToolPart(
+  assert.equal(
+    parseOpenCodeLine(
+      JSON.stringify({
+        type: "message.updated",
+        sessionID: "ses_live",
+        info: { id: "msg-user", role: "user" },
+      }),
+      parserState,
+    ),
+    null,
+  );
+  assert.equal(
+    parseOpenCodeLine(
+      JSON.stringify({
+        sessionID: "ses_live",
+        part: {
+          id: "part-user",
+          messageID: "msg-user",
+          type: "text",
+          text: "不得作为 Agent 输出展示的完整用户交接提示",
+        },
+      }),
+      parserState,
+    ),
+    null,
+  );
+
+  const liveSsePart = openCodeSseAgentEvent(
     {
       directory: "/work/project",
       payload: {
@@ -272,7 +691,7 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
   assert.equal(liveSseEvent.command, "pwd && sleep 5");
   assert.equal(liveSseEvent.output, "/work/project\n");
   assert.equal(
-    openCodeSseToolPart(
+    openCodeSseAgentEvent(
       {
         directory: "/other",
         payload: {
@@ -283,6 +702,455 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
       { sessionId: "ses_live", directory: "/work/project" },
     ),
     null,
+  );
+
+  const permissionPart = openCodeSseAgentEvent(
+    {
+      directory: "/work/project",
+      payload: {
+        type: "permission.asked",
+        properties: {
+          sessionID: "ses_live",
+          id: "permission-1",
+          permission: "bash",
+          patterns: ["rm build.tmp"],
+        },
+      },
+    },
+    { sessionId: "ses_live", directory: "/work/project" },
+  );
+  const permissionEvent = parseOpenCodeLine(
+    JSON.stringify(permissionPart),
+    parserState,
+  );
+  assert.equal(permissionEvent.kind, "approval_request");
+  assert.equal(permissionEvent.approvalId, "permission-1");
+  assert.equal(permissionEvent.approvalType, "permission");
+  assert.equal(permissionEvent.status, "pending");
+
+  const questionPart = openCodeSseAgentEvent(
+    {
+      directory: "/work/project",
+      payload: {
+        type: "question.asked",
+        properties: {
+          sessionID: "ses_live",
+          id: "question-1",
+          questions: [
+            {
+              header: "目标环境",
+              question: "部署到哪个环境？",
+              options: [{ label: "测试", description: "测试环境" }],
+            },
+          ],
+        },
+      },
+    },
+    { sessionId: "ses_live", directory: "/work/project" },
+  );
+  const questionEvent = parseOpenCodeLine(
+    JSON.stringify(questionPart),
+    parserState,
+  );
+  assert.equal(questionEvent.approvalType, "question");
+  assert.equal(questionEvent.title, "目标环境");
+  assert.match(questionEvent.output, /部署到哪个环境/);
+
+  const codexState = { eventIndex: 0 };
+  assert.deepEqual(
+    parseCodexLine(
+      JSON.stringify({ type: "thread.started", thread_id: "codex-thread-1" }),
+      codexState,
+    ),
+    [],
+  );
+  assert.equal(codexState.sessionId, "codex-thread-1");
+  const codexController = nativeAgentCommand({
+    agent: { adapter: "codex", managed: true, path: "/agents/codex" },
+    runtimeConfiguration: {
+      model: "test-model",
+      profile: {
+        reasoningEffort: "medium",
+        permissionMode: "on-request",
+        sandboxMode: "workspace-write",
+      },
+      paths: {
+        codexHome: "/runtime/codex-home",
+        apiKeyPath: "/runtime/provider.key",
+        root: "/runtime/codex",
+      },
+    },
+    nativeSession: { created: false, sessionId: "thread-seed" },
+    workspace: "/work/project",
+    runDirectory: "/runs/codex-live",
+    prompt: "测试 Codex 实时控制",
+  });
+  assert.match(codexController, /app-server --listen stdio:\/\//);
+  assert.match(codexController, /on-request/);
+  assert.match(codexController, /excludeTurns/);
+  assert.match(codexController, /input\.fifo/);
+  assert.match(codexController, /grep -Eq .*turn\/completed/);
+  const claudeController = nativeAgentCommand({
+    agent: { adapter: "claude", managed: true, path: "/agents/claude" },
+    runtimeConfiguration: {
+      model: "test-model",
+      profile: { reasoningEffort: "medium", permissionMode: "acceptEdits" },
+      paths: {
+        claudeConfigDir: "/runtime/claude-home",
+        apiKeyPath: "/runtime/provider.key",
+        root: "/runtime/claude",
+      },
+    },
+    nativeSession: { created: true, sessionId: "claude-session" },
+    workspace: "/work/project",
+    runDirectory: "/runs/claude-live",
+    prompt: "测试 Claude 实时控制",
+  });
+  assert.match(claudeController, /--input-format stream-json/);
+  assert.match(claudeController, /input\.fifo/);
+  assert.match(claudeController, /grep -Eq .*result/);
+  assert.deepEqual(
+    parseCodexLine(
+      JSON.stringify({
+        method: "item/completed",
+        params: {
+          item: {
+            id: "codex-user-1",
+            type: "userMessage",
+            content: [{ type: "text", text: "运行中追加" }],
+            status: "completed",
+          },
+        },
+      }),
+      codexState,
+    ),
+    [],
+  );
+  const codexReasoning = parseCodexLine(
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "codex-reasoning-1",
+        type: "reasoning",
+        text: "准备给出 [[EASYWORK_FINAL]] 标记后的正文。",
+        status: "completed",
+      },
+    }),
+    codexState,
+  );
+  assert.equal(codexReasoning[0].output, "准备给出  标记后的正文。");
+  const codexFinal = parseCodexLine(
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "codex-final-1",
+        type: "agent_message",
+        text: "中间提示。[[EASYWORK_FINAL]]最终正文",
+        status: "completed",
+      },
+    }),
+    codexState,
+  );
+  assert.equal(codexFinal[0].output, "最终正文");
+  const codexPlan = parseCodexLine(
+    JSON.stringify({
+      type: "item.updated",
+      item: {
+        id: "codex-plan-1",
+        type: "todo_list",
+        items: [
+          { text: "检查环境", status: "completed" },
+          { text: "运行测试", status: "in_progress" },
+        ],
+      },
+    }),
+    codexState,
+  );
+  assert.equal(codexPlan[0].kind, "plan");
+  assert.deepEqual(
+    codexPlan[0].planSteps.map(({ title, status }) => ({ title, status })),
+    [
+      { title: "检查环境", status: "done" },
+      { title: "运行测试", status: "running" },
+    ],
+  );
+  const codexCommand = parseCodexLine(
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "codex-command-1",
+        type: "command_execution",
+        command: "uname -a",
+        aggregated_output: "Linux test",
+        status: "completed",
+      },
+    }),
+    codexState,
+  );
+  assert.equal(codexCommand[0].kind, "tool_call");
+  assert.equal(codexCommand[0].status, "done");
+  const codexPatch = parseCodexLine(
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "codex-patch-1",
+        type: "command_execution",
+        command:
+          "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: src/created.txt\n+created\n*** Update File: src/existing.txt\n@@\n-old\n+new\n*** End Patch\nPATCH",
+        aggregated_output:
+          "Success. Updated the following files:\nA src/created.txt\nM src/existing.txt\n",
+        status: "completed",
+      },
+    }),
+    codexState,
+  );
+  assert.equal(codexPatch.length, 2);
+  assert.deepEqual(
+    codexPatch.map(({ kind, path, status }) => ({ kind, path, status })),
+    [
+      { kind: "file_change", path: "src/created.txt", status: "done" },
+      { kind: "file_change", path: "src/existing.txt", status: "done" },
+    ],
+  );
+  assert.match(codexPatch[1].diff, /-old\n\+new/);
+  const failedCodexPatch = parseCodexLine(
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "codex-patch-failed",
+        type: "command_execution",
+        command:
+          "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: nope.txt\ninvalid\n*** End Patch\nPATCH",
+        aggregated_output: "Invalid patch hunk",
+        status: "failed",
+      },
+    }),
+    codexState,
+  );
+  assert.equal(failedCodexPatch[0].kind, "tool_call");
+  assert.equal(failedCodexPatch[0].status, "error");
+
+  const claudeState = { eventIndex: 0 };
+  const claudeToolStart = parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      session_id: "claude-session-1",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { id: "claude-tool-1", type: "tool_use", name: "Bash" },
+      },
+    }),
+    claudeState,
+  );
+  assert.equal(claudeToolStart[0].kind, "tool_call");
+  const claudeToolInput = parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      session_id: "claude-session-1",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"command":"pwd"}' },
+      },
+    }),
+    claudeState,
+  );
+  assert.equal(claudeToolInput[0].command, "pwd");
+  const claudeResult = parseClaudeCodeLine(
+    JSON.stringify({
+      type: "result",
+      session_id: "claude-session-1",
+      result: "任务完成",
+      usage: { input_tokens: 120, output_tokens: 30 },
+    }),
+    claudeState,
+  );
+  assert.equal(claudeResult[0].kind, "message");
+  assert.equal(claudeState.contextUsage.total, 150);
+  assert.deepEqual(
+    parseClaudeCodeLine(
+      JSON.stringify({ type: "tool_use_summary", summary: "" }),
+      claudeState,
+    ),
+    [],
+  );
+
+  const claudePlanState = { eventIndex: 0 };
+  const emptyClaudePlan = parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      session_id: "claude-session-plan",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          id: "claude-task-create",
+          type: "tool_use",
+          name: "TaskCreate",
+          input: {},
+        },
+      },
+    }),
+    claudePlanState,
+  );
+  assert.deepEqual(emptyClaudePlan, []);
+  const claudePlanCreated = parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      session_id: "claude-session-plan",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify({ subject: "检查远端环境" }),
+        },
+      },
+    }),
+    claudePlanState,
+  );
+  assert.equal(claudePlanCreated[0].kind, "plan");
+  assert.equal(claudePlanCreated[0].sourceId, "agent-native-plan");
+  assert.equal(claudePlanCreated[0].planSteps[0].title, "检查远端环境");
+  parseClaudeCodeLine(
+    JSON.stringify({
+      type: "user",
+      session_id: "claude-session-plan",
+      message: {
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "claude-task-create",
+            content: "Task #1 created successfully: 检查远端环境",
+          },
+        ],
+      },
+      tool_use_result: { task: { id: "1", subject: "检查远端环境" } },
+    }),
+    claudePlanState,
+  );
+  parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      session_id: "claude-session-plan",
+      event: {
+        type: "content_block_start",
+        index: 1,
+        content_block: {
+          id: "claude-task-update",
+          type: "tool_use",
+          name: "TaskUpdate",
+          input: {},
+        },
+      },
+    }),
+    claudePlanState,
+  );
+  const claudePlanCompleted = parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      session_id: "claude-session-plan",
+      event: {
+        type: "content_block_delta",
+        index: 1,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify({ taskId: "1", status: "completed" }),
+        },
+      },
+    }),
+    claudePlanState,
+  );
+  assert.equal(claudePlanCompleted[0].kind, "plan");
+  assert.equal(claudePlanCompleted[0].status, "done");
+  assert.equal(claudePlanCompleted[0].planSteps[0].status, "done");
+
+  const claudeThinkingState = { eventIndex: 0 };
+  parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "thinking", thinking: "", text: "" },
+      },
+    }),
+    claudeThinkingState,
+  );
+  parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "检查环境" },
+      },
+    }),
+    claudeThinkingState,
+  );
+  const duplicateClaudeThinking = parseClaudeCodeLine(
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "thinking", thinking: "检查环境" }] },
+    }),
+    claudeThinkingState,
+  );
+  assert.deepEqual(duplicateClaudeThinking, []);
+
+  const claudeFinalState = { eventIndex: 0 };
+  parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { id: "claude-final", type: "text", text: "" },
+      },
+    }),
+    claudeFinalState,
+  );
+  const claudeFinalText = parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "text_delta",
+          text: "[[EASYWORK_FINAL]]最终答案",
+        },
+      },
+    }),
+    claudeFinalState,
+  );
+  assert.equal(claudeFinalText[0].kind, "message");
+  assert.equal(claudeFinalText[0].output, "最终答案");
+  const claudeMarkerOnlyState = { eventIndex: 0 };
+  parseClaudeCodeLine(
+    JSON.stringify({
+      type: "stream_event",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { id: "claude-marker-only", type: "text", text: "" },
+      },
+    }),
+    claudeMarkerOnlyState,
+  );
+  assert.deepEqual(
+    parseClaudeCodeLine(
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "[[EASYWORK_FINAL]]" },
+        },
+      }),
+      claudeMarkerOnlyState,
+    ),
+    [],
   );
 
   const schedulerEvent = parseOpenCodeLine(
@@ -328,6 +1196,23 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
   assert.match(fileEvent.diff, /--- a\/work\/train\.py/);
   assert.match(fileEvent.diff, /-epochs = 10/);
   assert.match(fileEvent.diff, /\+epochs = 20/);
+
+  const commandWithEditInItsArgument = parseOpenCodeLine(
+    JSON.stringify({
+      type: "tool_use",
+      part: {
+        id: "tool_bash_edit_marker",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "echo OPEN_EDIT_RESEND_OK" },
+          output: "OPEN_EDIT_RESEND_OK",
+        },
+      },
+    }),
+    parserState,
+  );
+  assert.equal(commandWithEditInItsArgument.kind, "tool_call");
 
   const agentMessage = parseOpenCodeLine(
     JSON.stringify({
@@ -428,6 +1313,74 @@ test("Agent-native plans mirror todo snapshots and OpenCode events stay structur
   assert.deepEqual(
     providerConfigForOpenCode(provider).provider.easywork.options,
     { baseURL: "https://api.example.com/v1" },
+  );
+  assert.equal(
+    providerConfigForOpenCode(provider).provider.easywork.models["test-model"]
+      .limit.context,
+    200_000,
+  );
+  assert.equal(
+    providerConfigForOpenCode(provider).provider.easywork.models["test-model"]
+      .limit.output,
+    32_768,
+  );
+  assert.deepEqual(
+    providerConfigForOpenCode({
+      ...provider,
+      modelContextLimit: 200_000,
+      modelOutputLimit: 32_000,
+    }).provider.easywork.models["test-model"].limit,
+    { context: 200_000, output: 32_000 },
+  );
+  assert.deepEqual(
+    providerModelDescriptor({
+      id: "model-with-limits",
+      context_window: 262_144,
+      max_output_tokens: 32_768,
+    }),
+    {
+      id: "model-with-limits",
+      contextLimit: 262_144,
+      outputLimit: 32_768,
+    },
+  );
+  assert.equal(
+    openCodeProviderContextLimit(
+      {
+        all: [
+          {
+            id: "easywork",
+            models: {
+              "test-model": { id: "test-model", limit: { context: 200_000 } },
+            },
+          },
+        ],
+      },
+      "easywork",
+      "test-model",
+    ),
+    200_000,
+  );
+  assert.deepEqual(
+    openCodeConfiguredModelDetails(
+      {
+        model: "easywork/test-model",
+        provider: {
+          easywork: {
+            models: {
+              "test-model": { limit: { context: 200_000, output: 16_384 } },
+            },
+          },
+        },
+      },
+    ),
+    {
+      providerId: "easywork",
+      modelId: "test-model",
+      model: "easywork/test-model",
+      contextLimit: 200_000,
+      outputLimit: 16_384,
+    },
   );
   assert.equal(
     managedOpenCodeModel(
@@ -574,7 +1527,7 @@ test("remote Runtime polling reuses one SFTP channel", async () => {
   assert.equal(snapshot.agentEvents.toString("utf8"), "data: {}\n");
 });
 
-test("managed OpenCode receives native configuration automatically", async () => {
+test("managed OpenCode uses a conversation-scoped native configuration", async () => {
   const temporaryRoot = await mkdtemp(
     path.join(os.tmpdir(), "easywork-agent-config-test-"),
   );
@@ -589,19 +1542,8 @@ test("managed OpenCode receives native configuration automatically", async () =>
   const base = `http://127.0.0.1:${address.port}`;
   const home = "/home/easywork-test";
   const managedPath = `${home}/.easywork/agents/opencode/bin/opencode`;
-  const configPath = `${home}/.config/opencode/opencode.json`;
-  const authPath = `${home}/.local/share/opencode/auth.json`;
   const files = new Map([
     [managedPath, { content: Buffer.from("managed-opencode"), mode: 0o755 }],
-    [
-      configPath,
-      {
-        content: Buffer.from(
-          '{"$schema":"https://opencode.ai/config.json"}\n',
-        ),
-        mode: 0o600,
-      },
-    ],
   ]);
 
   const fakeClient = {
@@ -612,9 +1554,9 @@ test("managed OpenCode receives native configuration automatically", async () =>
       setImmediate(() => {
         let stdout = "";
         let code = 0;
-        if (command.includes('managed_opencode="$HOME/.easywork/agents')) {
+        if (command.includes('emit_agent opencode "$HOME/.easywork/agents')) {
           if (files.get(managedPath)?.mode & 0o111) {
-            stdout = `opencode\t${home}/.easywork/agents/opencode\t${managedPath}\t1.18.9\topencode\n`;
+            stdout = `opencode\t${home}/.easywork/agents/opencode\t${managedPath}\t1.18.9\topencode\teasywork\n`;
           }
         } else if (command.includes("provider-probe.err")) {
           stdout = "CODE=0\nHTTP=401\n";
@@ -685,22 +1627,40 @@ test("managed OpenCode receives native configuration automatically", async () =>
     });
     assert.equal(providerResponse.status, 200);
 
+    const fakeSession = {
+      client: fakeClient,
+      home,
+      host: "cluster.example.com",
+      port: 22,
+      username: "cluster-user",
+      serverId: "cluster-agent-test",
+    };
+    const scope = {
+      conversationId: "conversation-config-test",
+      workspaceId: "workspace-config-test",
+    };
     const agents = await gatewayTestHelpers.prepareRemoteAgents(
-      {
-        client: fakeClient,
-        home,
-        host: "cluster.example.com",
-        port: 22,
-        username: "cluster-user",
-        serverId: "cluster-agent-test",
-      },
+      fakeSession,
       account.actor,
+      scope,
     );
     const opencode = agents.find((agent) => agent.adapter === "opencode");
     assert.equal(opencode.path, managedPath);
     assert.equal(opencode.managed, true);
     assert.equal(opencode.configured, true);
+    assert.match(opencode.configPath, /\.easywork\/runtime\/agents\/opencode\//);
+    assert.match(opencode.authPath, /\.easywork\/runtime\/agents\/opencode\//);
+    assert.match(opencode.configRoot, /\.easywork\/runtime\/agents\/opencode\//);
     assert.equal(files.get(managedPath)?.mode, 0o755);
+    const configured = await gatewayTestHelpers.ensureManagedAgentRuntimeConfig(
+      fakeSession,
+      account.actor,
+      opencode,
+      scope,
+    );
+    const configPath = configured.paths.opencodeConfigPath;
+    const authPath = configured.paths.opencodeAuthPath;
+    assert.match(configPath, /\.easywork\/runtime\/agents\/opencode\//);
     assert.equal(files.get(configPath)?.mode, 0o600);
     assert.equal(files.get(authPath)?.mode, 0o600);
     const nativeConfig = JSON.parse(files.get(configPath).content.toString());
@@ -715,23 +1675,21 @@ test("managed OpenCode receives native configuration automatically", async () =>
       type: "api",
       key: "saved-provider-key",
     });
-    await gatewayTestHelpers.ensureOpenCodeNativeConfig(
-      {
-        client: fakeClient,
-        home,
-        host: "cluster.example.com",
-        port: 22,
-        username: "cluster-user",
-        serverId: "cluster-agent-test",
-      },
+    await gatewayTestHelpers.ensureManagedAgentRuntimeConfig(
+      fakeSession,
       account.actor,
-      () => undefined,
-      "alternate-model",
+      opencode,
+      scope,
     );
     const alternateConfig = JSON.parse(files.get(configPath).content.toString());
     assert.deepEqual(
       Object.keys(alternateConfig.provider.easywork.models),
-      ["alternate-model"],
+      ["test-model"],
+    );
+    assert.equal(
+      files.has(`${home}/.config/opencode/opencode.json`),
+      false,
+      "EasyWork must not write the user's native OpenCode config",
     );
   } finally {
     await new Promise((resolve) => server.close(resolve));
@@ -915,6 +1873,122 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       stateAfterEdit.state.conversations.map((conversation) => conversation.id),
       ["conversation-source"],
     );
+
+    const rewindState = structuredClone(stateAfterEdit.state);
+    const rewindStartedAt = Date.now() + 2_000;
+    rewindState.conversations.unshift({
+      id: "conversation-rewind",
+      title: "回溯测试",
+      mode: "chat",
+      updatedAt: new Date(rewindStartedAt + 4_000).toISOString(),
+      messages: [
+        {
+          id: "rewind-user-1",
+          role: "user",
+          mode: "chat",
+          content: "保留的问题",
+          createdAt: new Date(rewindStartedAt).toISOString(),
+        },
+        {
+          id: "rewind-assistant-1",
+          role: "assistant",
+          mode: "chat",
+          content: "保留的回复",
+          createdAt: new Date(rewindStartedAt + 1_000).toISOString(),
+        },
+        {
+          id: "rewind-user-2",
+          role: "user",
+          mode: "chat",
+          content: "需要清除的问题",
+          createdAt: new Date(rewindStartedAt + 2_000).toISOString(),
+        },
+        {
+          id: "rewind-assistant-2",
+          role: "assistant",
+          mode: "chat",
+          content: "需要清除的回复",
+          createdAt: new Date(rewindStartedAt + 3_000).toISOString(),
+        },
+      ],
+    });
+    const rewindStateResponse = await fetch(`${base}/api/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({ state: rewindState }),
+    });
+    assert.equal(rewindStateResponse.status, 200);
+
+    const rewindDescendantResponse = await fetch(
+      `${base}/api/conversations/action`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookies },
+        body: JSON.stringify({
+          action: "branch",
+          conversationId: "conversation-rewind",
+          messageId: "rewind-assistant-2",
+          newConversationId: "rewind-descendant",
+        }),
+      },
+    );
+    assert.equal(rewindDescendantResponse.status, 200);
+
+    const rewindResponse = await fetch(`${base}/api/conversations/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({
+        action: "rewind",
+        conversationId: "conversation-rewind",
+        messageId: "rewind-assistant-1",
+      }),
+    });
+    assert.equal(rewindResponse.status, 200);
+    const rewindPayload = await rewindResponse.json();
+    assert.equal(rewindPayload.seedPrompt, "");
+    assert.deepEqual(
+      rewindPayload.conversation.messages.map((message) => message.id),
+      ["rewind-user-1", "rewind-assistant-1"],
+    );
+    assert.deepEqual(rewindPayload.removedConversationIds, [
+      "rewind-descendant",
+    ]);
+    assert.equal(
+      rewindPayload.capability.rewoundToMessageId,
+      "rewind-assistant-1",
+    );
+
+    const stateAfterRewindResponse = await fetch(`${base}/api/bootstrap`, {
+      headers: { Cookie: cookies },
+    });
+    const stateAfterRewind = await stateAfterRewindResponse.json();
+    assert.equal(
+      stateAfterRewind.state.conversations.some(
+        (conversation) => conversation.id === "rewind-descendant",
+      ),
+      false,
+    );
+    assert.deepEqual(
+      stateAfterRewind.state.conversations
+        .find((conversation) => conversation.id === "conversation-rewind")
+        .messages.map((message) => message.id),
+      ["rewind-user-1", "rewind-assistant-1"],
+    );
+
+    const redundantRewindResponse = await fetch(
+      `${base}/api/conversations/action`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookies },
+        body: JSON.stringify({
+          action: "rewind",
+          conversationId: "conversation-rewind",
+          messageId: "rewind-assistant-1",
+        }),
+      },
+    );
+    assert.equal(redundantRewindResponse.status, 409);
+
     const contextResponse = await fetch(
       `${base}/api/context?conversationId=conversation-source&serverId=server-a&agentId=opencode`,
       { headers: { Cookie: cookies } },
@@ -925,8 +1999,9 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     assert.equal(contextPayload.web.breakdown.messages, 0);
     assert.equal(contextPayload.web.breakdown.system > 0, true);
     assert.equal(contextPayload.web.breakdown.outputReserve, 8_192);
-    assert.equal(contextPayload.agent.status, "not-bound");
+    assert.equal(contextPayload.agent.status, "connection-unavailable");
     assert.equal(contextPayload.agent.bound, false);
+    assert.equal(contextPayload.agent.readable, false);
     assert.equal(contextPayload.agent.available, false);
     const unavailableAgentCompact = await fetch(
       `${base}/api/context/agent/compress`,
@@ -1096,6 +2171,138 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       ),
     );
 
+    const workspaceListResponse = await fetch(
+      `${base}/api/workspaces?serverId=demo`,
+      { headers: { Cookie: cookies } },
+    );
+    assert.equal(workspaceListResponse.status, 200);
+    const workspaceList = await workspaceListResponse.json();
+    assert.equal(workspaceList.connected, true);
+    assert.equal(workspaceList.home, "/home/demo");
+    const homeWorkspace = workspaceList.workspaces.find(
+      (workspace) => workspace.path === "/home/demo",
+    );
+    assert.ok(homeWorkspace?.id);
+
+    const secondWorkspaceResponse = await fetch(`${base}/api/workspaces`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({
+        serverId: "demo",
+        path: "/home/demo/project-b",
+      }),
+    });
+    assert.equal(secondWorkspaceResponse.status, 200);
+    const secondWorkspace = (await secondWorkspaceResponse.json()).workspace;
+    assert.notEqual(secondWorkspace.id, homeWorkspace.id);
+
+    const virtualWorkspaceResponse = await fetch(
+      `${base}/api/workspaces/virtual`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookies },
+        body: JSON.stringify({
+          serverId: "demo",
+          conversationId: "virtual-conversation",
+        }),
+      },
+    );
+    assert.equal(virtualWorkspaceResponse.status, 200);
+    const virtualWorkspace = (await virtualWorkspaceResponse.json()).workspace;
+    assert.equal(virtualWorkspace.kind, "virtual");
+    assert.equal(virtualWorkspace.virtualConversationId, "virtual-conversation");
+    assert.match(virtualWorkspace.path, /\.easywork\/virtual\/virtual-conversation$/);
+    const scopedVirtualList = await fetch(
+      `${base}/api/workspaces?serverId=demo&conversationId=virtual-conversation`,
+      { headers: { Cookie: cookies } },
+    ).then((response) => response.json());
+    assert.ok(
+      scopedVirtualList.workspaces.some(
+        (workspace) => workspace.id === virtualWorkspace.id,
+      ),
+    );
+    const otherVirtualList = await fetch(
+      `${base}/api/workspaces?serverId=demo&conversationId=other-conversation`,
+      { headers: { Cookie: cookies } },
+    ).then((response) => response.json());
+    assert.ok(
+      !otherVirtualList.workspaces.some(
+        (workspace) => workspace.id === virtualWorkspace.id,
+      ),
+    );
+
+    const beforeWorkspaceBinding = await fetch(`${base}/api/bootstrap`, {
+      headers: { Cookie: cookies },
+    }).then((response) => response.json());
+    const workState = structuredClone(beforeWorkspaceBinding.state);
+    workState.conversations = [
+      {
+        id: "workspace-conversation",
+        title: "工作区切换",
+        mode: "work",
+        updatedAt: new Date().toISOString(),
+        messages: [
+          {
+            id: "workspace-user",
+            role: "user",
+            mode: "work",
+            content: "检查工作区",
+            createdAt: new Date().toISOString(),
+          },
+        ],
+        work: {
+          serverId: "demo",
+          agentId: "opencode",
+          connectionEnabled: true,
+        },
+      },
+      ...(workState.conversations || []),
+    ];
+    const workStateResponse = await fetch(`${base}/api/state`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Cookie: cookies },
+      body: JSON.stringify({ state: workState }),
+    });
+    assert.equal(workStateResponse.status, 200);
+
+    const crossConversationVirtualSwitch = await fetch(
+      `${base}/api/conversations/workspace-conversation/workspace`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Cookie: cookies },
+        body: JSON.stringify({ workspaceId: virtualWorkspace.id }),
+      },
+    );
+    assert.equal(crossConversationVirtualSwitch.status, 409);
+    assert.match(
+      (await crossConversationVirtualSwitch.json()).error,
+      /虚拟工作区只属于创建它的对话/,
+    );
+
+    for (const workspace of [homeWorkspace, secondWorkspace, homeWorkspace]) {
+      const switchResponse = await fetch(
+        `${base}/api/conversations/workspace-conversation/workspace`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", Cookie: cookies },
+          body: JSON.stringify({ workspaceId: workspace.id }),
+        },
+      );
+      assert.equal(switchResponse.status, 200);
+    }
+    const workspaceBoundState = await fetch(`${base}/api/bootstrap`, {
+      headers: { Cookie: cookies },
+    }).then((response) => response.json());
+    const workspaceConversation = workspaceBoundState.state.conversations.find(
+      (conversation) => conversation.id === "workspace-conversation",
+    );
+    assert.equal(workspaceConversation.work.workspaceId, homeWorkspace.id);
+    assert.equal(workspaceConversation.work.workspace, "/home/demo");
+    assert.deepEqual(
+      workspaceConversation.work.workspaceHistory.map((entry) => entry.workspaceId),
+      [homeWorkspace.id, secondWorkspace.id, homeWorkspace.id],
+    );
+
     const registration = await fetch(`${base}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: cookies },
@@ -1158,7 +2365,9 @@ test("host worker persists a Work result without any browser subscriber", async 
       assistantMessageId: "message-background-assistant",
       prompt: "检查后台任务是否继续执行",
       agentId: "opencode",
-      workspace: "~",
+      workspace: "/home/background/project",
+      workspaceId: "workspace-background-project",
+      workspaceName: "后台项目",
       firstTurn: true,
     });
     gatewayTestHelpers.publishWorkerEvent(session, {
@@ -1175,6 +2384,31 @@ test("host worker persists a Work result without any browser subscriber", async 
         { id: "step-bg", title: "执行远程检查", status: "done" },
         { id: "step-follow-up", title: "可选后续检查", status: "pending" },
       ],
+    });
+    gatewayTestHelpers.publishWorkerEvent(session, {
+      type: "agent.event",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      event: {
+        id: "reasoning-bg",
+        kind: "reasoning",
+        title: "思考中",
+        output: "先核对后台任务的持久化状态。",
+        status: "running",
+        timestamp: new Date().toISOString(),
+      },
+    });
+    gatewayTestHelpers.publishWorkerEvent(session, {
+      type: "agent.event",
+      conversationId: task.conversationId,
+      runId: task.runId,
+      event: {
+        id: "reasoning-bg",
+        kind: "reasoning",
+        title: "思考完成",
+        status: "done",
+        timestamp: new Date().toISOString(),
+      },
     });
     gatewayTestHelpers.publishWorkerEvent(session, {
       type: "agent.event",
@@ -1219,6 +2453,10 @@ test("host worker persists a Work result without any browser subscriber", async 
     assert.equal(
       conversation.messages.find((message) => message.role === "assistant").content,
       "网页关闭后任务仍已完成。",
+    );
+    assert.equal(
+      conversation.messages.find((message) => message.role === "assistant").reasoning,
+      "先核对后台任务的持久化状态。",
     );
     const abortedTask = gatewayTestHelpers.createWorkerTask(session, {
       conversationId: "conversation-aborted",
@@ -1796,14 +3034,24 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
       );
       const onMessage = (raw) => {
         const event = JSON.parse(String(raw));
-        if (event.type !== "agent.list" || event.serverId !== "cluster-b") return;
+        if (
+          event.type !== "connection.status" ||
+          event.serverId !== "cluster-b" ||
+          event.status !== "connected"
+        ) {
+          return;
+        }
         clearTimeout(timer);
         socket.off("message", onMessage);
         resolve();
       };
       socket.on("message", onMessage);
       socket.send(
-        JSON.stringify({ type: "agent.scan", serverId: "cluster-b" }),
+        JSON.stringify({
+          type: "ssh.connect",
+          serverId: "cluster-b",
+          useSavedCredential: true,
+        }),
       );
     });
     await waitForConnection({

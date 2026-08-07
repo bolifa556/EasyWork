@@ -13,7 +13,7 @@
     "frp": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File frp/start.ps1",
     "sync:setup": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File sync/install.ps1",
     "test:gateway": "node --test tests/gateway.test.mjs",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/gateway.test.mjs tests/remote-runtime.test.mjs tests/memory.test.mjs",
+    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/gateway.test.mjs tests/remote-runtime.test.mjs tests/memory.test.mjs tests/memory-version-conflicts.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .cache --ignore-pattern outputs --ignore-pattern work",
     "db:generate": "drizzle-kit generate"
   },
