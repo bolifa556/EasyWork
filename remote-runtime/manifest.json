@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "runtimeVersion": "0.2.2",
+  "runtimeVersion": "0.3.0",
   "protocolVersion": 1,
   "entrypoint": "bin/easywork-runner",
   "requiredCommands": [
@@ -15,6 +15,9 @@
     "chmod",
     "ps",
     "awk",
-    "sort"
+    "sort",
+    "cat",
+    "grep",
+    "mkfifo"
   ]
 }

@@ -78,21 +78,17 @@ function normalizeVersion(raw, fallback, sequence) {
   const sourceConversationIds = uniqueStrings(
     source.sourceConversationIds || [],
     source.sourceConversationId,
-    fallback.sourceConversationIds || [],
   );
   const sourceTaskIds = uniqueStrings(
     source.sourceTaskIds || [],
     source.sourceTaskId,
-    fallback.sourceTaskIds || [],
   );
   const sourceMessageIds = uniqueStrings(
     source.sourceMessageIds || [],
-    fallback.sourceMessageIds || [],
   );
   const sourceCheckpointIds = uniqueStrings(
     source.sourceCheckpointIds || [],
     source.sourceCheckpointId,
-    fallback.sourceCheckpointIds || [],
   );
   const versionSequence = Math.max(1, Number(source.sequence || sequence || 1));
   return {
@@ -130,40 +126,68 @@ function normalizeVersion(raw, fallback, sequence) {
       String(source.sourceTaskId || sourceTaskIds.at(-1) || "") || undefined,
     sourceTaskIds,
     sourceWorkspaceId:
-      String(source.sourceWorkspaceId || fallback.sourceWorkspaceId || "") ||
+      String(source.sourceWorkspaceId || "") ||
       undefined,
     sourceCheckpointId:
       String(source.sourceCheckpointId || sourceCheckpointIds.at(-1) || "") ||
       undefined,
     sourceCheckpointIds,
     sourceAgentId:
-      String(source.sourceAgentId || fallback.sourceAgentId || "") || undefined,
+      String(source.sourceAgentId || "") || undefined,
     sourceAgentSessionId:
-      String(
-        source.sourceAgentSessionId || fallback.sourceAgentSessionId || "",
-      ) || undefined,
-    evidenceRefs: uniqueStrings(source.evidenceRefs || [], fallback.evidenceRefs || []),
+      String(source.sourceAgentSessionId || "") || undefined,
+    evidenceRefs: uniqueStrings(source.evidenceRefs || []),
     createdAt,
     invalidatedAt: String(source.invalidatedAt || "") || undefined,
+    invalidatedSequence:
+      Number.isFinite(Number(source.invalidatedSequence)) &&
+      Number(source.invalidatedSequence) > 0
+        ? Number(source.invalidatedSequence)
+        : undefined,
     invalidatedReason: String(source.invalidatedReason || "") || undefined,
     invalidatedBy: String(source.invalidatedBy || "") || undefined,
   };
 }
 
-function versionAllowedBySnapshot(version, asOfSequence, lineageConversationId) {
-  if (!Number.isFinite(asOfSequence) || asOfSequence <= 0) return true;
+function versionAllowedBySnapshot(
+  version,
+  asOfSequence,
+  lineageConversationId,
+  snapshotVersionIds,
+) {
+  if (!Number.isFinite(asOfSequence)) return true;
   if (Number(version.sequence || 0) <= asOfSequence) return true;
+  if (snapshotVersionIds?.has(String(version.versionId || ""))) return true;
   return Boolean(
     lineageConversationId &&
       String(version.sourceConversationId || "") === String(lineageConversationId),
   );
 }
 
-function projectRecord(record, { asOfSequence, lineageConversationId } = {}) {
+function projectRecord(
+  record,
+  { asOfSequence, lineageConversationId, snapshotVersionIds = [] } = {},
+) {
+  const allowedVersionIds =
+    snapshotVersionIds instanceof Set
+      ? snapshotVersionIds
+      : new Set((snapshotVersionIds || []).map(String));
   const eligible = (record.versions || [])
-    .filter((version) => !version.invalidatedAt)
+    .filter((version) => {
+      if (!version.invalidatedAt) return true;
+      if (allowedVersionIds.has(String(version.versionId || ""))) return true;
+      return Boolean(
+        Number.isFinite(asOfSequence) &&
+          Number(version.invalidatedSequence || 0) > Number(asOfSequence),
+      );
+    })
     .filter((version) =>
-      versionAllowedBySnapshot(version, asOfSequence, lineageConversationId),
+      versionAllowedBySnapshot(
+        version,
+        asOfSequence,
+        lineageConversationId,
+        allowedVersionIds,
+      ),
     )
     .sort(
       (left, right) =>
@@ -442,6 +466,7 @@ export function cloneConversationMemoryScope(
     sourceConversationId,
     targetConversationId,
     asOfSequence,
+    snapshotVersionIds = [],
   },
 ) {
   let next = normalizeMemoryDocument(document);
@@ -451,7 +476,9 @@ export function cloneConversationMemoryScope(
         record.scope === "conversation" &&
         String(record.scopeId || "") === String(sourceConversationId || ""),
     )
-    .map((record) => projectRecord(record, { asOfSequence }))
+    .map((record) =>
+      projectRecord(record, { asOfSequence, snapshotVersionIds }),
+    )
     .filter((record) => record.status === "active");
   for (const record of sourceRecords) {
     next = appendExplicitMemory(next, {
@@ -491,6 +518,7 @@ export function selectMemoryRecords(
     limit = 16,
     relevanceThreshold = DEFAULT_RELEVANCE_THRESHOLD,
     asOfSequence,
+    snapshotVersionIds = [],
     lineageConversationId = conversationId,
     includeSensitive = false,
   } = {},
@@ -505,7 +533,13 @@ export function selectMemoryRecords(
     user: 2,
   };
   return normalized.records
-    .map((record) => projectRecord(record, { asOfSequence, lineageConversationId }))
+    .map((record) =>
+      projectRecord(record, {
+        asOfSequence,
+        lineageConversationId,
+        snapshotVersionIds,
+      }),
+    )
     .filter((record) => canEnterModelContext(record, { includeSensitive }))
     .filter((record) =>
       scopeMatches(record, {
@@ -556,11 +590,18 @@ export function selectMemorySyncRecords(
     taskId = "",
     memoryMode = "project-and-global",
     asOfSequence,
+    snapshotVersionIds = [],
     lineageConversationId = conversationId,
   } = {},
 ) {
   return normalizeMemoryDocument(document).records
-    .map((record) => projectRecord(record, { asOfSequence, lineageConversationId }))
+    .map((record) =>
+      projectRecord(record, {
+        asOfSequence,
+        lineageConversationId,
+        snapshotVersionIds,
+      }),
+    )
     .filter((record) =>
       scopeMatches(record, {
         projectId,
@@ -611,6 +652,12 @@ export function currentConversationHistory(
       createdAt: String(message.createdAt || ""),
       agentId: message.agentId ? String(message.agentId) : undefined,
       runId: message.runId ? String(message.runId) : undefined,
+      workspaceId: message.workspaceId
+        ? String(message.workspaceId)
+        : undefined,
+      workspaceName: message.workspaceName
+        ? String(message.workspaceName)
+        : undefined,
     }));
 }
 
@@ -645,6 +692,12 @@ export function agentConversationDelta(
       content: String(message.content || ""),
       agentId: message.agentId ? String(message.agentId) : undefined,
       runId: message.runId ? String(message.runId) : undefined,
+      workspaceId: message.workspaceId
+        ? String(message.workspaceId)
+        : undefined,
+      workspaceName: message.workspaceName
+        ? String(message.workspaceName)
+        : undefined,
       contentFingerprint: contentFingerprint(
         `${message.role === "user" ? "user" : "assistant"}\u0000${message.content}`,
       ),
@@ -837,6 +890,7 @@ export function invalidateMemoryVersions(
   for (let recordIndex = 0; recordIndex < next.records.length; recordIndex += 1) {
     const record = next.records[recordIndex];
     let touched = false;
+    const invalidatedSequence = next.sequence + 1;
     const versions = (record.versions || []).map((version) => {
       if (version.invalidatedAt) return version;
       const conversationMatches =
@@ -868,6 +922,7 @@ export function invalidateMemoryVersions(
         return {
           ...version,
           invalidatedAt: timestamp,
+          invalidatedSequence,
           invalidatedReason: reason,
           invalidatedBy,
         };
@@ -875,7 +930,7 @@ export function invalidateMemoryVersions(
       return version;
     });
     if (touched) {
-      next.sequence += 1;
+      next.sequence = invalidatedSequence;
       next.records[recordIndex] = projectRecord({
         ...record,
         revision: Number(record.revision || 0) + 1,
@@ -905,7 +960,7 @@ export function invalidateMemoryVersions(
   return next;
 }
 
-export function memorySequenceAt(
+export function memorySnapshotAt(
   document,
   timestamp,
   { sourceMessageIds = [], sourceTaskIds = [] } = {},
@@ -913,11 +968,13 @@ export function memorySequenceAt(
   const target = String(timestamp || "");
   const messageSet = new Set(sourceMessageIds.filter(Boolean).map(String));
   const taskSet = new Set(sourceTaskIds.filter(Boolean).map(String));
+  const normalized = normalizeMemoryDocument(document);
   if (!target && !messageSet.size && !taskSet.size) {
-    return normalizeMemoryDocument(document).sequence;
+    return { sequence: normalized.sequence, versionIds: [] };
   }
   let sequence = 0;
-  for (const record of normalizeMemoryDocument(document).records) {
+  const versionIds = [];
+  for (const record of normalized.records) {
     for (const version of record.versions || []) {
       const beforeTime =
         target && String(version.createdAt || "").localeCompare(target) <= 0;
@@ -927,12 +984,18 @@ export function memorySequenceAt(
       const sourcedByTask =
         taskSet.has(String(version.sourceTaskId || "")) ||
         (version.sourceTaskIds || []).some((id) => taskSet.has(String(id)));
-      if (beforeTime || sourcedByMessage || sourcedByTask) {
+      if (beforeTime) {
         sequence = Math.max(sequence, Number(version.sequence || 0));
+      }
+      if (sourcedByMessage || sourcedByTask) {
+        versionIds.push(String(version.versionId || ""));
       }
     }
   }
-  return sequence;
+  return {
+    sequence,
+    versionIds: [...new Set(versionIds.filter(Boolean))],
+  };
 }
 
 export function activeMemoryRecords(document) {

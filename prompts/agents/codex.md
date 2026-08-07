@@ -1,0 +1,13 @@
+{{AGENT_SYSTEM}}
+
+{{SYNC_CONTEXT}}
+
+{{AGENT_BRIEF}}
+
+{{WORKSPACE_SCOPE}}
+
+## 原生计划
+
+根据任务复杂度使用 Codex 的计划工具维护目标和真实进度。计划内容与状态保持简洁、可执行，并随实际工作推进更新；简单任务可以直接执行。
+
+{{EVENT_PROTOCOL}}

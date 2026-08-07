@@ -35,6 +35,16 @@ import {
   safeRemoteRunId,
 } from "./remote-runtime.mjs";
 import {
+  MANAGED_AGENT_CATALOG,
+  compareAgentVersions,
+  managedAgentPaths,
+  managedAgentRuntimePaths,
+  normalizeAgentVersion,
+  readAgentArtifactManifest,
+  remoteAgentPlatform,
+  resolveAgentArtifact,
+} from "./agent-artifacts.mjs";
+import {
   activeMemoryRecords,
   agentConversationDelta,
   appendExplicitMemory,
@@ -45,7 +55,7 @@ import {
   estimateContextTokens,
   findConversationSummary,
   invalidateMemoryVersions,
-  memorySequenceAt,
+  memorySnapshotAt,
   normalizeMemoryDocument,
   selectMemoryRecords,
   selectMemorySyncRecords,
@@ -64,6 +74,8 @@ const SSH_KEEPALIVE_INTERVAL_MS = 60 * 1000;
 const SSH_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SSH_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const EASYWORK_OPENCODE_PROVIDER_ID = "easywork";
+const DEFAULT_AGENT_CONTEXT_LIMIT = 200_000;
+const DEFAULT_AGENT_OUTPUT_LIMIT = 32_768;
 const BUILTIN_SKILLS = {
   skill_cluster: path.join(SKILL_ROOT, "built-in", "cluster-ops"),
   skill_paper: path.join(SKILL_ROOT, "built-in", "paper-reading"),
@@ -79,15 +91,15 @@ const actorMutationQueues = new Map();
 const stateMutationQueues = actorMutationQueues;
 const secretMutationQueues = actorMutationQueues;
 const agentBindingMutationQueues = actorMutationQueues;
+const agentProfileMutationQueues = actorMutationQueues;
 const memoryMutationQueues = actorMutationQueues;
 const conversationTreeMutationQueues = actorMutationQueues;
 const checkpointMutationQueues = actorMutationQueues;
+const workspaceMutationQueues = actorMutationQueues;
 let accountMutationQueue = Promise.resolve();
 let sessionSecret;
 let encryptionKey;
 let remoteRuntimeBundlePromise;
-let openCodeReleaseCache;
-const openCodeArtifactPromises = new Map();
 
 function isoNow() {
   return new Date().toISOString();
@@ -547,6 +559,173 @@ function checkpointDocumentPath(actor) {
   return path.join(actorDirectory(actor), "memory", "checkpoints", "index.json");
 }
 
+function workspaceDocumentPath(actor) {
+  return path.join(actorDirectory(actor), "workspaces", "index.json");
+}
+
+function workspaceIdFor(serverId, canonicalPath) {
+  return `workspace-${crypto
+    .createHash("sha256")
+    .update(`${String(serverId || "")}\u0000${String(canonicalPath || "")}`)
+    .digest("hex")
+    .slice(0, 24)}`;
+}
+
+function sshServerIdentity({ host = "", port = 22, serverId = "", demo = false } = {}) {
+  const normalizedHost = String(host || "")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/\.$/, "");
+  if (!normalizedHost || demo) return `profile:${safeSegment(serverId || "server")}`;
+  return `ssh-endpoint-${crypto
+    .createHash("sha256")
+    .update(`${normalizedHost}\u0000${Number(port || 22)}`)
+    .digest("hex")
+    .slice(0, 24)}`;
+}
+
+function workspaceVersionDomainIdFor(serverIdentity, versionRoot, canonicalPath) {
+  const root = String(versionRoot || canonicalPath || "").trim();
+  return `version-domain-${crypto
+    .createHash("sha256")
+    .update(`${String(serverIdentity || "")}\u0000${root}`)
+    .digest("hex")
+    .slice(0, 24)}`;
+}
+
+function normalizedWorkspacePath(value) {
+  const input = String(value || "").trim();
+  if (!input) return "";
+  const normalized = path.posix.normalize(input);
+  return normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
+}
+
+function workspacePathContains(parentPath, childPath) {
+  const parent = normalizedWorkspacePath(parentPath);
+  const child = normalizedWorkspacePath(childPath);
+  if (!parent || !child) return false;
+  return parent === "/" || child === parent || child.startsWith(`${parent}/`);
+}
+
+function workspaceRecordsOverlap(left, right) {
+  if (!left || !right) return false;
+  const leftServer = String(left.serverIdentity || left.serverId || "");
+  const rightServer = String(right.serverIdentity || right.serverId || "");
+  if (leftServer !== rightServer) return false;
+  return (
+    workspacePathContains(left.path, right.path) ||
+    workspacePathContains(right.path, left.path)
+  );
+}
+
+function workspaceRunConflict(activeRuns, conversationId, workspaceRecord) {
+  return [...(activeRuns?.values?.() || activeRuns || [])].find(
+    (run) => {
+      if (
+        String(run?.conversationId || "") === String(conversationId || "")
+      ) {
+        return true;
+      }
+      const sameServer =
+        String(
+          run?.serverIdentity ||
+            run?.serverId ||
+            workspaceRecord?.serverIdentity ||
+            workspaceRecord?.serverId ||
+            "",
+        ) ===
+        String(
+          workspaceRecord?.serverIdentity || workspaceRecord?.serverId || "",
+        );
+      const sameVersionDomain = Boolean(
+        sameServer &&
+          run?.versionDomainId &&
+          workspaceRecord?.versionDomainId &&
+          String(run.versionDomainId) ===
+            String(workspaceRecord.versionDomainId),
+      );
+      return (
+        sameVersionDomain ||
+        workspaceRecordsOverlap(
+          {
+            serverId: run?.serverId || workspaceRecord?.serverId,
+            serverIdentity:
+              run?.serverIdentity || workspaceRecord?.serverIdentity,
+            path: run?.workspace || run?.path,
+          },
+          workspaceRecord,
+        )
+      );
+    },
+  );
+}
+
+function normalizeWorkspaceRecord(record = {}) {
+  const serverId = safeSegment(record.serverId || "", "");
+  const canonicalPath = normalizedWorkspacePath(record.path);
+  if (!serverId || !canonicalPath) return null;
+  const id = workspaceIdFor(serverId, canonicalPath);
+  const serverIdentity = String(record.serverIdentity || serverId);
+  const versionRoot = normalizedWorkspacePath(record.versionRoot) || undefined;
+  const kind = record.kind === "virtual" ? "virtual" : "physical";
+  return {
+    id,
+    serverId,
+    serverIdentity,
+    name:
+      String(record.name || "").trim().slice(0, 120) ||
+      path.posix.basename(canonicalPath) ||
+      canonicalPath,
+    path: canonicalPath,
+    mode: ["managed", "attached", "unmanaged"].includes(
+      String(record.mode || ""),
+    )
+      ? String(record.mode)
+      : "unmanaged",
+    kind,
+    virtualConversationId:
+      kind === "virtual"
+        ? safeSegment(record.virtualConversationId || "", "") || undefined
+        : undefined,
+    versionRoot,
+    versionDomainId: workspaceVersionDomainIdFor(
+      serverIdentity,
+      versionRoot,
+      canonicalPath,
+    ),
+    writable: record.writable !== false,
+    createdAt: String(record.createdAt || isoNow()),
+    updatedAt: String(record.updatedAt || isoNow()),
+    lastUsedAt: String(record.lastUsedAt || record.updatedAt || isoNow()),
+  };
+}
+
+async function readWorkspaceDocument(actor) {
+  const stored = await readJson(workspaceDocumentPath(actor), {});
+  const records = Object.fromEntries(
+    Object.values(stored.records || {})
+      .map(normalizeWorkspaceRecord)
+      .filter(Boolean)
+      .map((record) => [record.id, record]),
+  );
+  return {
+    schemaVersion: 2,
+    updatedAt: String(stored.updatedAt || ""),
+    records,
+  };
+}
+
+async function updateWorkspaceDocument(actor, updater) {
+  return enqueueActorMutation(workspaceMutationQueues, actor, async () => {
+    const current = await readWorkspaceDocument(actor);
+    const next = (await updater(current)) || current;
+    next.schemaVersion = 2;
+    next.updatedAt = isoNow();
+    await writeJson(workspaceDocumentPath(actor), next);
+    return next;
+  });
+}
+
 function actorProfilePath(actorOrId) {
   const id = typeof actorOrId === "string" ? actorOrId : actorOrId.id;
   return path.join(DATA_ROOT, "users", safeSegment(id), "state", "profile.json");
@@ -681,8 +860,8 @@ async function updateMemoryDocument(actor, updater) {
   });
 }
 
-function agentBindingKey({ serverId, workspace, agentId, conversationId }) {
-  return [serverId, workspace, agentId, conversationId]
+function agentBindingKey({ serverId, workspaceId, agentId, conversationId }) {
+  return [serverId, workspaceId, agentId, conversationId]
     .map((value) => String(value || ""))
     .join("::");
 }
@@ -724,6 +903,15 @@ function createAgentSyncCursor({
           ...deliveredMemoryRecords.map((record) => [
             String(record.id),
             Number(record.revision || 0),
+          ]),
+        ])
+      : {},
+    memoryStatuses: memoryEnabled
+      ? Object.fromEntries([
+          ...Object.entries(previous?.memoryStatuses || {}),
+          ...deliveredMemoryRecords.map((record) => [
+            String(record.id),
+            String(record.status || "active"),
           ]),
         ])
       : {},
@@ -771,9 +959,13 @@ async function updateAgentBinding(actor, bindingKey, updater) {
   });
 }
 
-async function removeAgentBindingsForConversations(actor, conversationIds) {
+async function removeAgentBindingsForConversations(
+  actor,
+  conversationIds,
+  { shouldRemove } = {},
+) {
   const ids = new Set(conversationIds.filter(Boolean).map(String));
-  if (!ids.size) return [];
+  if (!ids.size) return { bindings: [], nativeSessions: [] };
   const removed = await enqueueActorMutation(
     agentBindingMutationQueues,
     actor,
@@ -782,7 +974,8 @@ async function removeAgentBindingsForConversations(actor, conversationIds) {
       const matches = [];
       for (const [key, binding] of Object.entries(document.bindings)) {
         if (!ids.has(String(binding?.conversationId || ""))) continue;
-        matches.push(binding);
+        if (shouldRemove && !shouldRemove(binding)) continue;
+        matches.push({ key, binding });
         delete document.bindings[key];
       }
       document.updatedAt = isoNow();
@@ -790,19 +983,21 @@ async function removeAgentBindingsForConversations(actor, conversationIds) {
       return matches;
     },
   );
+  const removedKeys = new Set(removed.map((item) => item.key));
   const worker = await getSshWorker(actor);
   const nativeSessions = [];
   for (const session of worker.sessions.values()) {
-    for (const [key, binding] of session.agentSessions || []) {
-      if (ids.has(String(binding?.conversationId || ""))) {
+    for (const [key] of session.agentSessions || []) {
+      if (removedKeys.has(key)) {
         session.agentSessions.delete(key);
       }
     }
   }
-  for (const binding of removed) {
+  for (const { binding } of removed) {
     const session = worker.sessions.get(safeSegment(binding.serverId || ""));
     if (
-      binding.agentId !== "opencode" ||
+      (binding.adapter !== "opencode" &&
+        !String(binding.agentId || "").startsWith("opencode")) ||
       !binding.agentSessionId ||
       !session?.client ||
       session.status !== "connected"
@@ -837,7 +1032,10 @@ async function removeAgentBindingsForConversations(actor, conversationIds) {
     }
   }
   scheduleSshWorkerPersist(worker, 0);
-  return { bindings: removed, nativeSessions };
+  return {
+    bindings: removed.map((item) => item.binding),
+    nativeSessions,
+  };
 }
 
 async function removeWorkerTasks(actor, runIds) {
@@ -853,29 +1051,53 @@ async function removeWorkerTasks(actor, runIds) {
 
 async function removeManagedBranchWorkspaces(actor, conversations) {
   const worker = await getSshWorker(actor);
+  const removedWorkspaceIds = new Set();
   for (const conversation of conversations) {
     if (conversation?.work?.workspaceMode !== "managed") continue;
     const session = worker.sessions.get(safeSegment(conversation.work.serverId || ""));
-    if (!session?.client || session.status !== "connected") continue;
     const conversationSegment = safeSegment(conversation.id, "conversation");
-    const expectedRoot = `${session.home}/.easywork/worktrees/${conversationSegment}`;
     const workspace = String(conversation.work.workspace || "");
-    if (workspace !== `${expectedRoot}/main`) continue;
-    await remoteExec(
-      session.client,
-      [
-        "set -eu",
-        `EW_TARGET=${shellQuote(expectedRoot)}`,
-        `EW_EXPECTED=${shellQuote(`${session.home}/.easywork/worktrees/${conversationSegment}`)}`,
-        'test "$EW_TARGET" = "$EW_EXPECTED"',
-        'case "$EW_TARGET" in "$HOME/.easywork/worktrees/"*) rm -rf -- "$EW_TARGET" ;; *) exit 91 ;; esac',
-      ].join("\n"),
-    ).catch(() => undefined);
+    const home = String(session?.home || "");
+    if (!home) continue;
+    const virtual = conversation.work.workspaceKind === "virtual";
+    const expectedRoot = virtual
+      ? `${home}/.easywork/virtual/${conversationSegment}`
+      : `${home}/.easywork/worktrees/${conversationSegment}`;
+    const expectedWorkspaceRoot = virtual ? expectedRoot : `${expectedRoot}/main`;
+    if (workspace !== expectedWorkspaceRoot && !workspace.startsWith(`${expectedWorkspaceRoot}/`)) continue;
+    if (session?.client && session.status === "connected") {
+      await remoteExec(
+        session.client,
+        [
+          "set -eu",
+          `EW_TARGET=${shellQuote(expectedRoot)}`,
+          `EW_EXPECTED=${shellQuote(expectedRoot)}`,
+          'test "$EW_TARGET" = "$EW_EXPECTED"',
+          virtual
+            ? 'case "$EW_TARGET" in "$HOME/.easywork/virtual/"*) rm -rf -- "$EW_TARGET" ;; *) exit 91 ;; esac'
+            : 'case "$EW_TARGET" in "$HOME/.easywork/worktrees/"*) rm -rf -- "$EW_TARGET" ;; *) exit 91 ;; esac',
+        ].join("\n"),
+      ).catch(() => undefined);
+    }
+    if (conversation.work.workspaceId) {
+      removedWorkspaceIds.add(String(conversation.work.workspaceId));
+    }
+  }
+  if (removedWorkspaceIds.size) {
+    await updateWorkspaceDocument(actor, (document) => {
+      for (const workspaceId of removedWorkspaceIds) {
+        delete document.records[workspaceId];
+      }
+      return document;
+    });
   }
 }
 
 function createSshSession(worker, serverId, stored = {}) {
   const safeServerId = safeSegment(serverId || "default-server");
+  const host = String(stored.host || "");
+  const port = Number(stored.port || 22);
+  const demo = Boolean(stored.demo);
   return {
     poolKey: `${worker.key}:${safeServerId}`,
     actorKey: worker.key,
@@ -883,15 +1105,18 @@ function createSshSession(worker, serverId, stored = {}) {
     serverId: safeServerId,
     socketId: crypto.randomUUID(),
     client: null,
-    demo: Boolean(stored.demo),
+    demo,
     status: "disconnected",
     home: "",
-    host: String(stored.host || ""),
-    port: Number(stored.port || 22),
+    host,
+    port,
+    serverIdentity: String(
+      stored.serverIdentity ||
+        sshServerIdentity({ host, port, serverId: safeServerId, demo }),
+    ),
     username: String(stored.username || ""),
     latency: undefined,
     fingerprint: "",
-    activeStream: null,
     activeRun: null,
     activeRuns: new Map(),
     runtime: null,
@@ -920,6 +1145,7 @@ function serializeSshWorker(worker) {
       status: session.status,
       host: session.host,
       port: session.port,
+      serverIdentity: session.serverIdentity,
       username: session.username,
       demo: session.demo,
       lastConnectedAt: session.lastConnectedAt,
@@ -1441,7 +1667,44 @@ function assertApiKeyShape(apiKey) {
   }
 }
 
-async function listProviderModels(baseUrl, apiKey) {
+function positiveInteger(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
+function providerModelDescriptor(item) {
+  const id =
+    typeof item === "string"
+      ? item
+      : String(item?.id || item?.model || item?.model_id || item?.name || "");
+  if (!id) return null;
+  const limit = item?.limit && typeof item.limit === "object" ? item.limit : {};
+  const contextLimit = positiveInteger(
+    limit.context ??
+      item?.context_window ??
+      item?.contextWindow ??
+      item?.context_length ??
+      item?.contextLength ??
+      item?.max_context_tokens ??
+      item?.maxContextTokens ??
+      item?.max_input_tokens ??
+      item?.maxInputTokens,
+  );
+  const outputLimit = positiveInteger(
+    limit.output ??
+      item?.max_output_tokens ??
+      item?.maxOutputTokens ??
+      item?.max_completion_tokens ??
+      item?.maxCompletionTokens,
+  );
+  return {
+    id,
+    contextLimit: contextLimit || undefined,
+    outputLimit: outputLimit || undefined,
+  };
+}
+
+async function listProviderModelDescriptors(baseUrl, apiKey) {
   assertApiKeyShape(apiKey);
   const response = await fetch(apiUrl(baseUrl, "models"), {
     headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
@@ -1461,15 +1724,16 @@ async function listProviderModels(baseUrl, apiKey) {
     : Array.isArray(payload?.models)
       ? payload.models
       : [];
-  return [
-    ...new Set(
-      source
-        .map((item) =>
-          typeof item === "string" ? item : String(item?.id || item?.name || ""),
-        )
-        .filter(Boolean),
-    ),
-  ].sort((left, right) => left.localeCompare(right));
+  const descriptors = new Map();
+  for (const item of source) {
+    const descriptor = providerModelDescriptor(item);
+    if (!descriptor) continue;
+    const previous = descriptors.get(descriptor.id) || {};
+    descriptors.set(descriptor.id, { ...previous, ...descriptor });
+  }
+  return [...descriptors.values()].sort((left, right) =>
+    left.id.localeCompare(right.id),
+  );
 }
 
 async function callEmbedding(config, apiKey, inputs) {
@@ -1715,7 +1979,10 @@ function memoryRecordsForContext(
     taskId,
     memoryMode,
     limit: 16,
-    asOfSequence: Number(conversation?.branch?.memorySnapshotSequence || 0) || undefined,
+    asOfSequence: conversation?.branch
+      ? Number(conversation.branch.memorySnapshotSequence || 0)
+      : undefined,
+    snapshotVersionIds: conversation?.branch?.memorySnapshotVersionIds || [],
     lineageConversationId: conversationId,
   });
 }
@@ -1739,7 +2006,10 @@ function memorySyncRecordsForContext(
     workspaceId,
     taskId,
     memoryMode,
-    asOfSequence: Number(conversation?.branch?.memorySnapshotSequence || 0) || undefined,
+    asOfSequence: conversation?.branch
+      ? Number(conversation.branch.memorySnapshotSequence || 0)
+      : undefined,
+    snapshotVersionIds: conversation?.branch?.memorySnapshotVersionIds || [],
     lineageConversationId: conversationId,
   });
 }
@@ -1810,13 +2080,16 @@ function conversationContextUsage(
         prompt: messages.at(-1)?.content || "",
         projectId: conversation?.projectId,
         conversationId,
-        workspaceId: conversation?.work?.logicalWorkspaceId || "",
+        workspaceId: conversation?.work?.workspaceId || "",
         memoryMode:
           state?.projects?.find((project) => project.id === conversation?.projectId)
             ?.memoryMode || "project-and-global",
         limit: 24,
-        asOfSequence:
-          Number(conversation?.branch?.memorySnapshotSequence || 0) || undefined,
+        asOfSequence: conversation?.branch
+          ? Number(conversation.branch.memorySnapshotSequence || 0)
+          : undefined,
+        snapshotVersionIds:
+          conversation?.branch?.memorySnapshotVersionIds || [],
         lineageConversationId: conversationId,
       })
     : [];
@@ -1864,6 +2137,49 @@ function conversationContextUsage(
       outputReserve: reserveTokens,
     },
   };
+}
+
+async function measuredConversationContextUsage(
+  actor,
+  state,
+  memoryDocument,
+  conversationId,
+) {
+  const conversation = (state?.conversations || []).find(
+    (item) => String(item.id) === String(conversationId),
+  );
+  const lastUserMessage = [...(conversation?.messages || [])]
+    .reverse()
+    .find((message) => message.role === "user");
+  const [systemText, skillsText] = await Promise.all([
+    readFile(
+      path.join(
+        PROMPT_ROOT,
+        conversation?.mode === "work" ? "work-system.md" : "chat-system.md",
+      ),
+      "utf8",
+    ).catch(() => ""),
+    selectedSkillContext(actor, lastUserMessage?.selectedSkills || []).catch(
+      () => "",
+    ),
+  ]);
+  const usage = conversationContextUsage(state, memoryDocument, conversationId, {
+    systemText,
+    skillsText,
+  });
+  const lastMeasuredWebUsage = [...(conversation?.messages || [])]
+    .reverse()
+    .find((message) => message.role === "assistant" && message.webContextUsage)
+    ?.webContextUsage;
+  const measuredKnowledgeTokens = Number(
+    lastMeasuredWebUsage?.breakdown?.knowledge || 0,
+  );
+  if (measuredKnowledgeTokens > 0) {
+    usage.breakdown.knowledge = measuredKnowledgeTokens;
+    usage.used += measuredKnowledgeTokens;
+    usage.ratio = usage.limit ? Math.min(1, usage.used / usage.limit) : 0;
+  }
+  return usage;
 }
 
 const CONVERSATION_CHECKPOINT_ARRAY_FIELDS = [
@@ -2998,6 +3314,226 @@ async function handleHttp(req, res) {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/api/workspaces/browse") {
+      const actor = await resolveActor(req, res);
+      const serverId = safeSegment(
+        url.searchParams.get("serverId") || "",
+        "",
+      );
+      if (!serverId) {
+        sendJson(res, 400, { error: "缺少服务器" });
+        return;
+      }
+      const worker = await getSshWorker(actor);
+      const session = worker.sessions.get(serverId);
+      if (!session || session.status !== "connected") {
+        sendJson(res, 409, { error: "SSH 尚未连接" });
+        return;
+      }
+      if (session.demo) {
+        const currentPath = remotePathForSession(
+          session,
+          url.searchParams.get("path") || "~",
+        );
+        sendJson(res, 200, {
+          path: currentPath,
+          home: session.home,
+          parent:
+            currentPath === session.home
+              ? null
+              : path.posix.dirname(currentPath),
+          entries: [],
+        });
+        return;
+      }
+      sendJson(
+        res,
+        200,
+        await listRemoteFiles(session, url.searchParams.get("path") || "~"),
+      );
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/workspaces") {
+      const actor = await resolveActor(req, res);
+      const serverId = safeSegment(
+        url.searchParams.get("serverId") || "",
+        "",
+      );
+      const worker = await getSshWorker(actor);
+      const session = worker.sessions.get(serverId);
+      const conversationId = safeSegment(
+        url.searchParams.get("conversationId") || "",
+        "",
+      );
+      if (session?.status === "connected" && session.home) {
+        await registerWorkspace(actor, session, "~").catch(() => undefined);
+      }
+      const document = await readWorkspaceDocument(actor);
+      const workspaces = Object.values(document.records)
+        .filter((record) => !serverId || record.serverId === serverId)
+        .filter(
+          (record) =>
+            record.kind !== "virtual" ||
+            (conversationId && record.virtualConversationId === conversationId),
+        )
+        .sort((left, right) =>
+          String(right.lastUsedAt || "").localeCompare(
+            String(left.lastUsedAt || ""),
+          ),
+        );
+      sendJson(res, 200, {
+        workspaces,
+        connected: session?.status === "connected",
+        home: session?.home || "",
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/workspaces/virtual") {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const serverId = safeSegment(body.serverId || "", "");
+      const conversationId = safeSegment(body.conversationId || "", "");
+      if (!serverId || !conversationId) {
+        sendJson(res, 400, { error: "虚拟工作区缺少服务器或对话标识" });
+        return;
+      }
+      const worker = await getSshWorker(actor);
+      const session = worker.sessions.get(serverId);
+      if (!session || session.status !== "connected") {
+        sendJson(res, 409, { error: "SSH 尚未连接" });
+        return;
+      }
+      const workspace = await ensureVirtualWorkspace(
+        actor,
+        session,
+        conversationId,
+      );
+      sendJson(res, 200, { workspace });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/workspaces") {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const serverId = safeSegment(body.serverId || "", "");
+      if (!serverId) {
+        sendJson(res, 400, { error: "缺少服务器" });
+        return;
+      }
+      const worker = await getSshWorker(actor);
+      const session = worker.sessions.get(serverId);
+      if (!session || session.status !== "connected") {
+        sendJson(res, 409, { error: "SSH 尚未连接" });
+        return;
+      }
+      const workspace = await registerWorkspace(
+        actor,
+        session,
+        body.path || "~",
+        { name: body.name },
+      );
+      sendJson(res, 200, { workspace });
+      return;
+    }
+
+    const conversationWorkspaceMatch = url.pathname.match(
+      /^\/api\/conversations\/([^/]+)\/workspace$/,
+    );
+    if (req.method === "PATCH" && conversationWorkspaceMatch) {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const conversationId = safeSegment(
+        decodeURIComponent(conversationWorkspaceMatch[1]),
+      );
+      const workspaceId = String(body.workspaceId || "");
+      const workspaceDocument = await readWorkspaceDocument(actor);
+      const storedWorkspace = workspaceDocument.records[workspaceId];
+      if (!storedWorkspace) {
+        sendJson(res, 404, { error: "所选工作区不存在，请重新选择" });
+        return;
+      }
+      const worker = await getSshWorker(actor);
+      const session = worker.sessions.get(storedWorkspace.serverId);
+      if (!session || session.status !== "connected") {
+        sendJson(res, 409, { error: "SSH 尚未连接" });
+        return;
+      }
+      const workspace = await registeredWorkspaceForRun(
+        actor,
+        session,
+        workspaceId,
+        conversationId,
+      );
+      const running = [...worker.tasks.values()].some(
+        (task) =>
+          task.conversationId === conversationId && task.status === "running",
+      );
+      if (running) {
+        sendJson(res, 409, { error: "任务运行期间不能切换工作区" });
+        return;
+      }
+      let updatedConversation = null;
+      await updateState(actor, (state) => {
+        const conversation = (state.conversations || []).find(
+          (item) => item.id === conversationId,
+        );
+        if (!conversation) throw new Error("对话不存在");
+        if (conversation.mode !== "work") throw new Error("只有工作对话可以选择工作区");
+        const boundServerId = String(conversation.work?.serverId || "");
+        if (boundServerId && boundServerId !== workspace.serverId) {
+          throw new Error("所选工作区不属于当前对话的服务器");
+        }
+        const previousWorkspaceId = String(conversation.work?.workspaceId || "");
+        const history = Array.isArray(conversation.work?.workspaceHistory)
+          ? conversation.work.workspaceHistory
+          : [];
+        conversation.work = {
+          ...(conversation.work || {}),
+          serverId: workspace.serverId,
+          connectionEnabled: true,
+          workspaceId: workspace.id,
+          workspaceName: workspace.name,
+          workspace: workspace.path,
+          workspaceMode: workspace.mode,
+          workspaceKind: workspace.kind,
+          versionDomainId: workspace.versionDomainId,
+          sourceCheckpointId: undefined,
+          workspaceHistory:
+            previousWorkspaceId === workspace.id
+              ? history
+              : [
+                  ...history,
+                  {
+                    workspaceId: workspace.id,
+                    serverId: workspace.serverId,
+                    name: workspace.name,
+                    path: workspace.path,
+                    kind: workspace.kind,
+                    versionDomainId: workspace.versionDomainId,
+                    activatedAt: isoNow(),
+                  },
+                ].slice(-100),
+        };
+        conversation.updatedAt = isoNow();
+        updatedConversation = JSON.parse(JSON.stringify(conversation));
+        return state;
+      });
+      await updateWorkspaceDocument(actor, (document) => {
+        if (document.records[workspace.id]) {
+          document.records[workspace.id].lastUsedAt = isoNow();
+          document.records[workspace.id].updatedAt = isoNow();
+        }
+        return document;
+      });
+      sendJson(res, 200, {
+        conversation: updatedConversation,
+        workspace,
+      });
+      return;
+    }
+
     if (req.method === "PUT" && url.pathname === "/api/state") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
@@ -3077,6 +3613,9 @@ async function handleHttp(req, res) {
       });
       await removeAgentBindingsForConversations(actor, [conversationId]);
       await removeWorkerTasks(actor, deletedRunIds);
+      if (deletedConversation) {
+        await removeManagedBranchWorkspaces(actor, [deletedConversation]);
+      }
       sendJson(res, 200, { ok: true, conversationId });
       return;
     }
@@ -3088,7 +3627,7 @@ async function handleHttp(req, res) {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
       const action = String(body.action || "branch");
-      if (!["branch", "edit", "reset"].includes(action)) {
+      if (!["branch", "edit", "reset", "rewind"].includes(action)) {
         sendJson(res, 400, { error: "不支持的对话操作" });
         return;
       }
@@ -3119,7 +3658,7 @@ async function handleHttp(req, res) {
         const retainedMessages = messages.slice(0, messageIndex + 1);
         const memoryDocument = await readMemoryDocument(actor);
         const createdAt = isoNow();
-        const memorySnapshotSequence = memorySequenceAt(
+        const memorySnapshot = memorySnapshotAt(
           memoryDocument,
           sourceMessage.createdAt || createdAt,
           {
@@ -3129,6 +3668,8 @@ async function handleHttp(req, res) {
             ].filter(Boolean),
           },
         );
+        const memorySnapshotSequence = memorySnapshot.sequence;
+        const memorySnapshotVersionIds = memorySnapshot.versionIds;
         const branchConversation = {
           ...JSON.parse(JSON.stringify(source)),
           id: newConversationId,
@@ -3139,11 +3680,10 @@ async function handleHttp(req, res) {
             parentMessageId: sourceMessageId,
             action: "branch",
             memorySnapshotSequence,
+            memorySnapshotVersionIds,
             createdAt,
           },
-          work: source.work
-            ? { ...source.work, agentSessionId: undefined }
-            : undefined,
+          work: source.work ? { ...source.work } : undefined,
         };
         const workspaceCapability = {
           workspace:
@@ -3183,15 +3723,28 @@ async function handleHttp(req, res) {
             checkpoint,
             newConversationId,
           );
+          const restoredWorkspace = await registerWorkspace(
+            actor,
+            targetSession,
+            restored.workspace,
+            { name: `${source.title || "工作分支"} · 分支` },
+          );
           branchConversation.work = {
             ...(branchConversation.work || {}),
-            workspace: restored.workspace,
-            workspaceMode: restored.mode,
-            logicalWorkspaceId:
-              checkpoint.logicalWorkspaceId ||
-              branchConversation.work?.logicalWorkspaceId,
+            workspaceId: restoredWorkspace.id,
+            workspaceName: restoredWorkspace.name,
+            workspace: restoredWorkspace.path,
+            workspaceMode: restoredWorkspace.mode,
             sourceCheckpointId: checkpoint.id,
-            agentSessionId: undefined,
+            workspaceHistory: [
+              {
+                workspaceId: restoredWorkspace.id,
+                serverId: restoredWorkspace.serverId,
+                name: restoredWorkspace.name,
+                path: restoredWorkspace.path,
+                activatedAt: createdAt,
+              },
+            ],
           };
           workspaceCapability.workspace = "restored-managed-branch";
           workspaceCapability.workspaceMessage =
@@ -3212,6 +3765,7 @@ async function handleHttp(req, res) {
             sourceConversationId,
             targetConversationId: newConversationId,
             asOfSequence: memorySnapshotSequence,
+            snapshotVersionIds: memorySnapshotVersionIds,
           });
           next = cloneConversationSummary(next, {
             sourceConversationId,
@@ -3241,9 +3795,12 @@ async function handleHttp(req, res) {
           parentMessageId: sourceMessageId,
           action: "branch",
           memorySnapshotSequence,
+          memorySnapshotVersionIds,
           mode: branchConversation.mode,
           projectId: branchConversation.projectId,
           serverId: branchConversation.work?.serverId,
+          workspaceId: branchConversation.work?.workspaceId,
+          workspaceName: branchConversation.work?.workspaceName,
           workspace: branchConversation.work?.workspace,
           workspaceMode: branchConversation.work?.workspaceMode,
           sourceCheckpointId:
@@ -3268,7 +3825,9 @@ async function handleHttp(req, res) {
       const lastAssistantMessage = [...messages]
         .reverse()
         .find((message) => message.role === "assistant");
-      let userIndex = messageIndex;
+      let truncateIndex = messageIndex;
+      let originalUserMessage = null;
+      let seedPrompt = "";
       if (action === "edit") {
         if (
           sourceMessage.role !== "user" ||
@@ -3277,7 +3836,9 @@ async function handleHttp(req, res) {
           sendJson(res, 409, { error: "只能编辑当前对话最新一轮的用户提问" });
           return;
         }
-      } else {
+        originalUserMessage = sourceMessage;
+        seedPrompt = String(body.content || sourceMessage.content).trim();
+      } else if (action === "reset") {
         if (
           sourceMessage.role !== "assistant" ||
           lastAssistantMessage?.id !== sourceMessage.id
@@ -3285,26 +3846,35 @@ async function handleHttp(req, res) {
           sendJson(res, 409, { error: "只能重置当前对话的最新回复" });
           return;
         }
-        userIndex = messageIndex - 1;
-        while (userIndex >= 0 && messages[userIndex].role !== "user") {
-          userIndex -= 1;
+        truncateIndex = messageIndex - 1;
+        while (
+          truncateIndex >= 0 &&
+          messages[truncateIndex].role !== "user"
+        ) {
+          truncateIndex -= 1;
         }
-        if (userIndex < 0) {
+        if (truncateIndex < 0) {
           sendJson(res, 409, { error: "没有找到该回复对应的用户提问" });
           return;
         }
+        originalUserMessage = messages[truncateIndex];
+        seedPrompt = String(originalUserMessage.content || "").trim();
+      } else {
+        if (sourceMessage.role !== "assistant") {
+          sendJson(res, 409, { error: "只能回溯到 EasyWork 的回复" });
+          return;
+        }
+        truncateIndex = messageIndex + 1;
+        if (truncateIndex >= messages.length) {
+          sendJson(res, 409, { error: "当前已经是该回复对应的状态" });
+          return;
+        }
       }
-      const originalUserMessage = messages[userIndex];
-      const seedPrompt = String(
-        action === "edit"
-          ? body.content || originalUserMessage.content
-          : originalUserMessage.content,
-      ).trim();
-      if (!seedPrompt) {
+      if (action !== "rewind" && !seedPrompt) {
         sendJson(res, 400, { error: "重新生成的提问不能为空" });
         return;
       }
-      const affectedMessages = messages.slice(userIndex);
+      const affectedMessages = messages.slice(truncateIndex);
       const affectedMessageIds = affectedMessages.map((message) => message.id);
       const affectedRunIds = [
         ...new Set(
@@ -3325,31 +3895,80 @@ async function handleHttp(req, res) {
           after: checkpointForRun(checkpointDocument, runId, "after"),
         }));
         const worker = await getSshWorker(actor);
-        const targetSession = worker.sessions.get(
-          safeSegment(source.work?.serverId || ""),
-        );
-        const reverted = await selectivelyRevertWorkspaceRuns(
-          targetSession,
-          actor,
-          {
-            conversationId: sourceConversationId,
-            serverId: source.work?.serverId,
-            workspace: source.work?.workspace,
-            logicalWorkspaceId: source.work?.logicalWorkspaceId,
-            checkpoints: checkpointPairs,
-          },
-        );
+        const groupedPairs = new Map();
+        for (const pair of checkpointPairs) {
+          const before = pair.before;
+          const after = pair.after;
+          if (!before || !after) {
+            throw new Error(`任务 ${pair.runId} 缺少工作区检查点`);
+          }
+          const serverId = String(before.serverId || after.serverId || "");
+          const workspaceId = String(
+            before.workspaceId || after.workspaceId || "",
+          );
+          const workspace = String(before.workspace || after.workspace || "");
+          if (!serverId || !workspaceId || !workspace) {
+            throw new Error(`任务 ${pair.runId} 的工作区身份不完整`);
+          }
+          if (
+            String(after.serverId || serverId) !== serverId ||
+            String(after.workspaceId || workspaceId) !== workspaceId
+          ) {
+            throw new Error(`任务 ${pair.runId} 的前后检查点不属于同一工作区`);
+          }
+          const key = `${serverId}\u0000${workspaceId}`;
+          const group = groupedPairs.get(key) || {
+            serverId,
+            workspaceId,
+            workspace,
+            workspaceName: String(before.workspaceName || after.workspaceName || ""),
+            workspaceKind: String(before.workspaceKind || after.workspaceKind || "physical"),
+            versionRoot: String(before.versionRoot || after.versionRoot || ""),
+            versionDomainId: String(
+              before.versionDomainId || after.versionDomainId || "",
+            ),
+            checkpoints: [],
+          };
+          group.checkpoints.push(pair);
+          groupedPairs.set(key, group);
+        }
+        const revertedFiles = [];
+        for (const group of groupedPairs.values()) {
+          const targetSession = worker.sessions.get(
+            safeSegment(group.serverId, ""),
+          );
+          const reverted = await selectivelyRevertWorkspaceRuns(
+            targetSession,
+            actor,
+            {
+              conversationId: sourceConversationId,
+              serverId: group.serverId,
+              workspaceId: group.workspaceId,
+              workspace: group.workspace,
+              workspaceName: group.workspaceName,
+              workspaceKind: group.workspaceKind,
+              versionRoot: group.versionRoot,
+              versionDomainId: group.versionDomainId,
+              checkpoints: group.checkpoints,
+            },
+          );
+          revertedFiles.push(...reverted.files);
+        }
         resetCapability = {
           workspace: "selectively-reset",
-          workspaceMessage: reverted.files.length
-            ? `已仅撤销本轮对 ${reverted.files.length} 个可快照文件的修改；其他对话保持不变，工作区外副作用不在可重置范围内。`
+          workspaceMessage: revertedFiles.length
+            ? `已仅撤销本轮对 ${new Set(revertedFiles).size} 个可快照文件的修改；其他对话保持不变，工作区外副作用不在可重置范围内。`
             : "本轮没有需要撤销的可快照文件修改；工作区外副作用不在可重置范围内。",
         };
       }
+      const descendantTriggerMessageIds =
+        action === "rewind"
+          ? [sourceMessage.id, ...affectedMessageIds]
+          : affectedMessageIds;
       const descendantIds = await pruneConversationTreeDescendants(
         actor,
         sourceConversationId,
-        affectedMessageIds,
+        descendantTriggerMessageIds,
       );
       const descendantSet = new Set(descendantIds);
       const descendantConversations = (state.conversations || []).filter(
@@ -3361,7 +3980,7 @@ async function handleHttp(req, res) {
           (conversation) => conversation.id === sourceConversationId,
         );
         if (!target) throw new Error("原对话不存在");
-        target.messages = (target.messages || []).slice(0, userIndex);
+        target.messages = (target.messages || []).slice(0, truncateIndex);
         target.updatedAt = isoNow();
         resetConversation = JSON.parse(JSON.stringify(target));
         current.conversations = (current.conversations || []).filter(
@@ -3381,7 +4000,11 @@ async function handleHttp(req, res) {
         }
         next = invalidateMemoryVersions(next, {
           sourceConversationIds: [sourceConversationId],
-          afterTimestamp: originalUserMessage.createdAt || "",
+          ...(action === "rewind"
+            ? { sourceMessageIds: affectedMessageIds }
+            : originalUserMessage?.createdAt
+              ? { afterTimestamp: originalUserMessage.createdAt }
+              : { sourceMessageIds: affectedMessageIds }),
           reason: `${action}-conversation-reset`,
           invalidatedBy: sourceConversationId,
         });
@@ -3406,10 +4029,29 @@ async function handleHttp(req, res) {
         next.overview = "";
         return next;
       });
-      const removedAgentState = await removeAgentBindingsForConversations(actor, [
-        sourceConversationId,
-        ...descendantIds,
-      ]);
+      const affectedTaskSet = new Set(affectedRunIds.map(String));
+      const affectedMessageSet = new Set(affectedMessageIds.map(String));
+      const removedAgentState = await removeAgentBindingsForConversations(
+        actor,
+        [sourceConversationId, ...descendantIds],
+        {
+          shouldRemove: (binding) => {
+            const bindingConversationId = String(
+              binding?.conversationId || "",
+            );
+            if (descendantSet.has(bindingConversationId)) return true;
+            const deliveredTaskIds = binding?.syncCursor?.deliveredTaskIds || [];
+            return (
+              affectedTaskSet.has(String(binding?.lastRunId || "")) ||
+              affectedTaskSet.has(String(binding?.deliveryState?.runId || "")) ||
+              deliveredTaskIds.some((id) => affectedTaskSet.has(String(id))) ||
+              affectedMessageSet.has(
+                String(binding?.syncCursor?.lastMessageId || ""),
+              )
+            );
+          },
+        },
+      );
       await removeWorkerTasks(actor, affectedRunIds);
       await removeManagedBranchWorkspaces(actor, descendantConversations);
       for (const descendantId of descendantIds) {
@@ -3418,6 +4060,7 @@ async function handleHttp(req, res) {
       sendJson(res, 200, {
         conversation: resetConversation,
         seedPrompt,
+        removedConversationIds: descendantIds,
         capability: {
           conversation: true,
           agentMemory: removedAgentState.nativeSessions.every(
@@ -3432,6 +4075,8 @@ async function handleHttp(req, res) {
             : "",
           ...resetCapability,
           removedBranches: descendantIds.length,
+          rewoundToMessageId:
+            action === "rewind" ? sourceMessage.id : undefined,
         },
       });
       return;
@@ -3649,47 +4294,12 @@ async function handleHttp(req, res) {
       const contextConversation = (state.conversations || []).find(
         (item) => String(item.id) === conversationId,
       );
-      const lastUserContextMessage = [...(contextConversation?.messages || [])]
-        .reverse()
-        .find((message) => message.role === "user");
-      const [contextSystemText, contextSkillsText] = await Promise.all([
-        readFile(
-          path.join(
-            PROMPT_ROOT,
-            contextConversation?.mode === "work"
-              ? "work-system.md"
-              : "chat-system.md",
-          ),
-          "utf8",
-        ).catch(() => ""),
-        selectedSkillContext(
-          actor,
-          lastUserContextMessage?.selectedSkills || [],
-        ).catch(() => ""),
-      ]);
-      const usage = conversationContextUsage(
+      const usage = await measuredConversationContextUsage(
+        actor,
         state,
         memoryDocument,
         conversationId,
-        {
-          systemText: contextSystemText,
-          skillsText: contextSkillsText,
-        },
       );
-      const lastMeasuredWebUsage = [...(contextConversation?.messages || [])]
-        .reverse()
-        .find((message) => message.role === "assistant" && message.webContextUsage)
-        ?.webContextUsage;
-      const measuredKnowledgeTokens = Number(
-        lastMeasuredWebUsage?.breakdown?.knowledge || 0,
-      );
-      if (measuredKnowledgeTokens > 0) {
-        usage.breakdown.knowledge = measuredKnowledgeTokens;
-        usage.used += measuredKnowledgeTokens;
-        usage.ratio = usage.limit
-          ? Math.min(1, usage.used / usage.limit)
-          : 0;
-      }
       const conversation = contextConversation;
       const bindings = await readAgentBindings(actor);
       const requestedServerId = String(
@@ -3698,14 +4308,52 @@ async function handleHttp(req, res) {
       const requestedAgentId = String(
         url.searchParams.get("agentId") || conversation?.work?.agentId || "",
       );
-      const binding = Object.values(bindings.bindings).find(
-        (item) =>
+      const requestedWorkspaceId = String(
+        url.searchParams.get("workspaceId") ||
+          conversation?.work?.workspaceId ||
+          "",
+      );
+      const bindingCandidates = Object.values(bindings.bindings)
+        .filter(
+          (item) =>
           String(item?.conversationId || "") === conversationId &&
           (!requestedServerId || item?.serverId === requestedServerId) &&
           (!requestedAgentId || item?.agentId === requestedAgentId),
-      );
-      const nativeAgentContext = await inspectNativeAgentContext(actor, binding);
+        )
+        .sort(
+          (left, right) =>
+            (Date.parse(String(right?.updatedAt || "")) || 0) -
+            (Date.parse(String(left?.updatedAt || "")) || 0),
+        );
+      const exactBinding = requestedWorkspaceId
+        ? bindingCandidates.find(
+            (item) => String(item?.workspaceId || "") === requestedWorkspaceId,
+          )
+        : bindingCandidates[0];
+      const binding =
+        exactBinding ||
+        (conversation?.work?.workspaceKind === "virtual"
+          ? bindingCandidates[0]
+          : null);
+      const nativeAgentContext = await inspectNativeAgentContext(actor, binding, {
+        serverId: requestedServerId,
+        agentId: requestedAgentId,
+        agentAdapter: String(url.searchParams.get("agentAdapter") || ""),
+        conversationId,
+        workspaceId: requestedWorkspaceId,
+      });
       const agentUsage = nativeAgentContext.usage || null;
+      const agentUsed = agentUsage
+        ? Number(
+            agentUsage.total ||
+              Number(agentUsage.input || 0) +
+                Number(agentUsage.output || 0) +
+                Number(agentUsage.reasoning || 0),
+          )
+        : nativeAgentContext.readable && !nativeAgentContext.bound
+          ? 0
+          : null;
+      const agentLimit = positiveInteger(nativeAgentContext.limit);
       sendJson(res, 200, {
         web: {
           used: usage.used,
@@ -3717,27 +4365,34 @@ async function handleHttp(req, res) {
           breakdown: usage.breakdown,
         },
         agent: {
-          bound: Boolean(binding),
+          bound: Boolean(nativeAgentContext.bound),
+          readable: Boolean(nativeAgentContext.readable),
           available: nativeAgentContext.available,
-          used: agentUsage
-            ? Number(
-                agentUsage.input ||
-                  agentUsage.total ||
-                  agentUsage.output ||
-                  0,
-              )
-            : null,
-          limit: null,
-          ratio: null,
-          modifiable: false,
-          compressible: Boolean(nativeAgentContext.compression?.supported),
+          used: agentUsed,
+          limit: agentLimit,
+          ratio:
+            agentUsed !== null && agentLimit
+              ? Math.min(1, agentUsed / agentLimit)
+              : null,
+          modifiable: Boolean(nativeAgentContext.modifiable),
+          compressible: Boolean(
+            nativeAgentContext.bound &&
+              nativeAgentContext.compression?.supported,
+          ),
+          compressionSupported: Boolean(
+            nativeAgentContext.compression?.supported,
+          ),
           status: nativeAgentContext.status,
           diagnostic: nativeAgentContext.diagnostic || "",
+          model: nativeAgentContext.model || "",
+          limitSource: nativeAgentContext.limitSource || "",
           binding: binding
             ? {
                 serverId: binding.serverId,
                 agentId: binding.agentId,
                 agentSessionId: binding.agentSessionId,
+                workspaceId: binding.workspaceId,
+                workspaceName: binding.workspaceName,
                 workspace: binding.workspace,
                 updatedAt: binding.updatedAt,
               }
@@ -3747,9 +4402,28 @@ async function handleHttp(req, res) {
       return;
     }
 
+    if (
+      req.method === "PATCH" &&
+      url.pathname === "/api/context/agent/settings"
+    ) {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const result = await updateNativeAgentContextLimit(actor, {
+        serverId: String(body.serverId || ""),
+        agentId: String(body.agentId || ""),
+        agentAdapter: String(body.agentAdapter || ""),
+        conversationId: String(body.conversationId || ""),
+        workspaceId: String(body.workspaceId || ""),
+        contextLimit: body.contextLimit,
+      });
+      sendJson(res, 200, { ok: true, ...result });
+      return;
+    }
+
     if (req.method === "PATCH" && url.pathname === "/api/context/settings") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
+      const conversationId = String(body.conversationId || "");
       const limit = Number(body.conversationLimit);
       const threshold = Number(body.automaticCompressionThreshold);
       if (!Number.isFinite(limit) || limit < 8_000 || limit > 2_000_000) {
@@ -3779,7 +4453,50 @@ async function handleHttp(req, res) {
           },
         ],
       }));
-      sendJson(res, 200, { settings: document.contextSettings });
+      let autoCompression = {
+        triggered: false,
+        compressed: false,
+        error: "",
+      };
+      let usage = null;
+      if (conversationId) {
+        const state = await getState(actor);
+        usage = await measuredConversationContextUsage(
+          actor,
+          state,
+          document,
+          conversationId,
+        );
+        if (
+          usage.messageCount > 8 &&
+          usage.ratio >= document.contextSettings.automaticCompressionThreshold
+        ) {
+          autoCompression.triggered = true;
+          try {
+            const compressed = await compressConversationContext(
+              actor,
+              conversationId,
+            );
+            autoCompression.compressed = Boolean(compressed.compressed);
+            const nextState = await getState(actor);
+            const nextDocument = compressed.document || (await readMemoryDocument(actor));
+            usage = await measuredConversationContextUsage(
+              actor,
+              nextState,
+              nextDocument,
+              conversationId,
+            );
+          } catch (caught) {
+            autoCompression.error =
+              caught instanceof Error ? caught.message : "自动压缩失败";
+          }
+        }
+      }
+      sendJson(res, 200, {
+        settings: document.contextSettings,
+        autoCompression,
+        usage,
+      });
       return;
     }
 
@@ -3807,13 +4524,33 @@ async function handleHttp(req, res) {
       const conversationId = String(body.conversationId || "");
       const serverId = String(body.serverId || "");
       const agentId = String(body.agentId || "");
+      const workspaceId = String(body.workspaceId || "");
       const bindings = await readAgentBindings(actor);
-      const binding = Object.values(bindings.bindings).find(
-        (item) =>
+      const state = await getState(actor);
+      const conversation = (state.conversations || []).find(
+        (item) => String(item.id || "") === conversationId,
+      );
+      const candidates = Object.values(bindings.bindings)
+        .filter(
+          (item) =>
           String(item?.conversationId || "") === conversationId &&
           (!serverId || String(item?.serverId || "") === serverId) &&
           (!agentId || String(item?.agentId || "") === agentId),
-      );
+        )
+        .sort(
+          (left, right) =>
+            (Date.parse(String(right?.updatedAt || "")) || 0) -
+            (Date.parse(String(left?.updatedAt || "")) || 0),
+        );
+      const binding =
+        (workspaceId
+          ? candidates.find(
+              (item) => String(item?.workspaceId || "") === workspaceId,
+            )
+          : candidates[0]) ||
+        (conversation?.work?.workspaceKind === "virtual"
+          ? candidates[0]
+          : null);
       const result = await compactNativeAgentContext(actor, binding);
       sendJson(res, 202, result);
       return;
@@ -3975,7 +4712,8 @@ async function handleHttp(req, res) {
         sendJson(res, 400, { error: "请输入 API Key" });
         return;
       }
-      const models = await listProviderModels(body.baseUrl, apiKey);
+      const descriptors = await listProviderModelDescriptors(body.baseUrl, apiKey);
+      const models = descriptors.map((descriptor) => descriptor.id);
       const embeddingModels = models.filter((model) =>
         /(embedding|embed|bge|e5|gte|nomic|jina|m3)/i.test(model),
       );
@@ -3996,7 +4734,14 @@ async function handleHttp(req, res) {
         sendJson(res, 404, { error: "接口没有返回可用模型" });
         return;
       }
-      sendJson(res, 200, { models: available });
+      sendJson(res, 200, {
+        models: available,
+        modelDetails: Object.fromEntries(
+          descriptors
+            .filter((descriptor) => available.includes(descriptor.id))
+            .map((descriptor) => [descriptor.id, descriptor]),
+        ),
+      });
       return;
     }
 
@@ -4018,14 +4763,42 @@ async function handleHttp(req, res) {
         body.baseUrl || currentProvider.baseUrl || "https://api.openai.com/v1",
       );
       const modelWasProvided = Object.prototype.hasOwnProperty.call(body, "model");
+      const selectedModel = modelWasProvided
+        ? String(body.model || "")
+        : String(currentProvider.model || "");
+      let modelContextLimit =
+        !modelWasProvided || selectedModel === String(currentProvider.model || "")
+          ? positiveInteger(currentProvider.modelContextLimit)
+          : null;
+      let modelOutputLimit =
+        !modelWasProvided || selectedModel === String(currentProvider.model || "")
+          ? positiveInteger(currentProvider.modelOutputLimit)
+          : null;
+      const providerSecrets = await getSecrets(actor);
+      if (selectedModel && providerSecrets.providerApiKey) {
+        try {
+          const descriptors = await listProviderModelDescriptors(
+            baseUrl,
+            providerSecrets.providerApiKey,
+          );
+          const descriptor = descriptors.find((item) => item.id === selectedModel);
+          modelContextLimit = positiveInteger(descriptor?.contextLimit);
+          modelOutputLimit = positiveInteger(descriptor?.outputLimit);
+        } catch {
+          // Saving a valid provider/model selection does not depend on optional
+          // limit metadata. OpenCode's own config remains the next authority.
+        }
+      }
       const provider = {
         name: String(body.name || currentProvider.name || "OpenAI Compatible"),
         baseUrl,
         model: modelWasProvided
-          ? String(body.model || "")
+          ? selectedModel
           : baseUrl !== currentProvider.baseUrl
             ? ""
             : String(currentProvider.model || ""),
+        modelContextLimit: modelContextLimit || undefined,
+        modelOutputLimit: modelOutputLimit || undefined,
         protocol:
           body.protocol === "chat-completions" || body.protocol === "responses"
             ? body.protocol
@@ -4033,7 +4806,7 @@ async function handleHttp(req, res) {
                 currentProvider.protocol === "responses"
               ? currentProvider.protocol
               : "auto",
-        configured: Boolean(body.apiKey || (await getSecrets(actor)).providerApiKey),
+        configured: Boolean(body.apiKey || providerSecrets.providerApiKey),
       };
       await updateState(actor, (state) => {
         state.settings ||= {};
@@ -4044,7 +4817,7 @@ async function handleHttp(req, res) {
         (Object.prototype.hasOwnProperty.call(body, "baseUrl") &&
           baseUrl !== currentProvider.baseUrl);
       if (shouldSyncManagedAgents) {
-        void syncManagedOpenCodeForActor(actor).catch((caught) => {
+        void syncManagedAgentsForActor(actor).catch((caught) => {
           console.warn(
             `[EasyWork Agent] provider sync skipped: ${
               caught instanceof Error ? caught.message : "unknown error"
@@ -4316,13 +5089,40 @@ function createWorkerTask(session, payload) {
     runId: String(payload.runId || randomId("run-")),
     conversationId: String(payload.conversationId || randomId("chat-")),
     serverId: session.serverId,
+    serverIdentity: session.serverIdentity,
     agentId: String(payload.agentId || "opencode"),
     projectId: payload.projectId ? String(payload.projectId) : undefined,
     memoryMode:
       payload.memoryMode === "project-only"
         ? "project-only"
         : "project-and-global",
-    workspace: String(payload.workspace || "~"),
+    workspace: String(payload.workspace || ""),
+    workspaceId: String(payload.workspaceId || ""),
+    workspaceName: String(payload.workspaceName || ""),
+    workspaceKind: payload.workspaceKind === "virtual" ? "virtual" : "physical",
+    versionRoot: String(payload.versionRoot || ""),
+    versionDomainId: String(payload.versionDomainId || ""),
+    conversationWorkspaceId: String(
+      payload.conversationWorkspaceId || payload.workspaceId || "",
+    ),
+    conversationWorkspaceName: String(
+      payload.conversationWorkspaceName || payload.workspaceName || "",
+    ),
+    conversationWorkspace: String(
+      payload.conversationWorkspace || payload.workspace || "",
+    ),
+    conversationWorkspaceMode: ["managed", "attached", "unmanaged"].includes(
+      String(payload.conversationWorkspaceMode || ""),
+    )
+      ? String(payload.conversationWorkspaceMode)
+      : ["managed", "attached", "unmanaged"].includes(
+            String(payload.workspaceMode || ""),
+          )
+        ? String(payload.workspaceMode)
+        : "unmanaged",
+    conversationWorkspaceKind:
+      payload.conversationWorkspaceKind === "virtual" ? "virtual" : "physical",
+    dynamicWorkspace: Boolean(payload.dynamicWorkspace),
     prompt: String(payload.prompt || ""),
     firstTurn: Boolean(payload.firstTurn),
     userMessageId: String(payload.userMessageId || `${payload.runId}_user`),
@@ -4330,7 +5130,6 @@ function createWorkerTask(session, payload) {
       payload.assistantMessageId || `${payload.runId}_assistant`,
     ),
     branchId: String(payload.branchId || payload.conversationId || ""),
-    logicalWorkspaceId: String(payload.logicalWorkspaceId || ""),
     workspaceMode: ["managed", "attached", "unmanaged"].includes(
       String(payload.workspaceMode || ""),
     )
@@ -4375,8 +5174,26 @@ function recordWorkerEvent(session, payload) {
     const existingIndex = task.events.findIndex(
       (event) => event.id === incoming.id,
     );
-    if (existingIndex >= 0) task.events[existingIndex] = incoming;
-    else task.events.push(incoming);
+    if (existingIndex >= 0) {
+      const existing = task.events[existingIndex];
+      task.events[existingIndex] = {
+        ...existing,
+        ...incoming,
+        // Several providers finish a streamed item with a status-only event.
+        // Keep the accumulated text so the completed conversation can be
+        // persisted and reloaded with the same visible reasoning content.
+        output:
+          typeof incoming.output === "string" && incoming.output.length
+            ? incoming.output
+            : existing.output,
+        detail:
+          typeof incoming.detail === "string" && incoming.detail.length
+            ? incoming.detail
+            : existing.detail,
+      };
+    } else {
+      task.events.push(incoming);
+    }
   } else if (payload.type === "task.complete") {
     task.status = "done";
     task.result = String(payload.result || "");
@@ -4408,8 +5225,18 @@ function recordWorkerEvent(session, payload) {
 }
 
 function publishWorkerEvent(session, payload) {
-  recordWorkerEvent(session, payload);
-  sessionSend(session, payload);
+  const published =
+    payload?.type === "agent.event" && typeof payload.event?.output === "string"
+      ? {
+          ...payload,
+          event: {
+            ...payload.event,
+            output: stripEasyWorkProtocolMarkers(payload.event.output),
+          },
+        }
+      : payload;
+  recordWorkerEvent(session, published);
+  sessionSend(session, published);
 }
 
 function replayWorkerTasks(socket, worker) {
@@ -4466,9 +5293,11 @@ async function ensureWorkerTaskConversation(actor, task) {
           agentId: task.agentId,
           serverId: task.serverId,
           connectionEnabled: true,
-          workspace: task.workspace,
-          workspaceMode: task.workspaceMode,
-          logicalWorkspaceId: task.logicalWorkspaceId,
+          workspace: task.conversationWorkspace,
+          workspaceMode: task.conversationWorkspaceMode,
+          workspaceId: task.conversationWorkspaceId,
+          workspaceName: task.conversationWorkspaceName,
+          workspaceKind: task.conversationWorkspaceKind,
         },
       };
       state.conversations.unshift(conversation);
@@ -4481,9 +5310,11 @@ async function ensureWorkerTaskConversation(actor, task) {
       agentId: task.agentId,
       serverId: task.serverId,
       connectionEnabled: true,
-      workspace: task.workspace,
-      workspaceMode: task.workspaceMode,
-      logicalWorkspaceId: task.logicalWorkspaceId,
+      workspace: task.conversationWorkspace,
+      workspaceMode: task.conversationWorkspaceMode,
+      workspaceId: task.conversationWorkspaceId,
+      workspaceName: task.conversationWorkspaceName,
+      workspaceKind: task.conversationWorkspaceKind,
     };
     conversation.messages = Array.isArray(conversation.messages)
       ? conversation.messages
@@ -4499,6 +5330,10 @@ async function ensureWorkerTaskConversation(actor, task) {
         createdAt: task.startedAt,
         mode: "work",
         runId: task.runId,
+        workspaceId: task.workspaceId,
+        workspaceName: task.workspaceName,
+        workspaceKind: task.workspaceKind,
+        dynamicWorkspace: task.dynamicWorkspace,
         trace: {
           runId: task.runId,
           status: "running",
@@ -4520,6 +5355,10 @@ async function ensureWorkerTaskConversation(actor, task) {
         mode: "work",
         runId: task.runId,
         agentId: task.agentId,
+        workspaceId: task.workspaceId,
+        workspaceName: task.workspaceName,
+        workspaceKind: task.workspaceKind,
+        dynamicWorkspace: task.dynamicWorkspace,
         reasoningStatus: "running",
         events: [],
       };
@@ -4563,6 +5402,8 @@ async function persistAppendedInstruction(actor, task, instruction) {
       createdAt: instruction.createdAt,
       mode: "work",
       appendedToRunId: task.runId,
+      workspaceId: task.workspaceId,
+      workspaceName: task.workspaceName,
     };
     const assistantIndex = conversation.messages.findIndex(
       (message) => message.id === task.assistantMessageId,
@@ -4582,11 +5423,45 @@ async function deliverAppendedInstruction(session, task, activeRun, instruction)
   instruction.updatedAt = isoNow();
   scheduleSshWorkerPersist(session.worker);
   try {
-    await appendOpenCodeInstruction(
-      session,
-      activeRun.agentControl,
-      instruction.content,
-    );
+    if (activeRun.agentControl.adapter === "opencode") {
+      await appendOpenCodeInstruction(
+        session,
+        activeRun.agentControl,
+        instruction.content,
+      );
+    } else if (activeRun.agentControl.adapter === "claude") {
+      await sendRemoteRuntimeInput(session, activeRun.remoteRun, {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: instruction.content }],
+        },
+      });
+    } else if (activeRun.agentControl.adapter === "codex") {
+      const deadline = Date.now() + 15_000;
+      while (
+        (!activeRun.agentControl.sessionId || !activeRun.agentControl.turnId) &&
+        Date.now() < deadline
+      ) {
+        await waitFor(80);
+      }
+      if (!activeRun.agentControl.sessionId || !activeRun.agentControl.turnId) {
+        throw new Error("Codex 当前轮次尚未进入可追加状态");
+      }
+      await sendRemoteRuntimeInput(session, activeRun.remoteRun, {
+        id: `easywork-steer-${safeSegment(instruction.messageId)}`,
+        method: "turn/steer",
+        params: {
+          threadId: activeRun.agentControl.sessionId,
+          expectedTurnId: activeRun.agentControl.turnId,
+          input: [
+            { type: "text", text: instruction.content, text_elements: [] },
+          ],
+        },
+      });
+    } else {
+      throw new Error("当前 Agent 不支持运行中追加输入");
+    }
     instruction.status = "sent";
     instruction.sentAt = isoNow();
     instruction.updatedAt = instruction.sentAt;
@@ -4648,6 +5523,11 @@ async function persistWorkerTaskConversation(actor, task) {
         startedAt: task.startedAt,
         checkpointBeforeId: task.checkpointBeforeId || undefined,
         checkpointAfterId: task.checkpointAfterId || undefined,
+        workspaceId: task.workspaceId || undefined,
+        workspaceName: task.workspaceName || undefined,
+        workspaceKind: task.workspaceKind || undefined,
+        dynamicWorkspace: Boolean(task.dynamicWorkspace),
+        versionDomainId: task.versionDomainId || undefined,
       };
     }
     if (assistantMessage) {
@@ -4675,6 +5555,10 @@ async function persistWorkerTaskConversation(actor, task) {
              : "done";
       assistantMessage.checkpointBeforeId = task.checkpointBeforeId || undefined;
       assistantMessage.checkpointAfterId = task.checkpointAfterId || undefined;
+      assistantMessage.workspaceId = task.workspaceId || undefined;
+      assistantMessage.workspaceName = task.workspaceName || undefined;
+      assistantMessage.workspaceKind = task.workspaceKind || undefined;
+      assistantMessage.dynamicWorkspace = Boolean(task.dynamicWorkspace);
       assistantMessage.webContextUsage = task.webContextUsage || undefined;
       assistantMessage.events = task.events.filter(
         (event) => !["message", "reasoning"].includes(event.kind),
@@ -4694,6 +5578,15 @@ function remoteExec(client, command, options = {}) {
       options.onStream?.(stream);
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      const timeout = options.timeoutMs
+        ? setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            stream.close();
+            reject(new Error("远端命令等待超时"));
+          }, options.timeoutMs)
+        : null;
       stream.on("data", (chunk) => {
         stdout += chunk.toString();
         options.onStdout?.(chunk.toString());
@@ -4703,6 +5596,9 @@ function remoteExec(client, command, options = {}) {
         options.onStderr?.(chunk.toString());
       });
       stream.on("close", (code, signal) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
         const result = { code: Number(code || 0), signal, stdout, stderr };
         if (code && !options.allowFailure) {
           const failure = new Error(stderr.trim() || `远端命令退出码 ${code}`);
@@ -4712,6 +5608,9 @@ function remoteExec(client, command, options = {}) {
           resolve(result);
         }
       });
+      if (options.input !== undefined) {
+        stream.end(options.input);
+      }
     });
   });
 }
@@ -5023,9 +5922,13 @@ async function ensureRemoteProviderRoute(session, provider) {
 }
 
 function openCodeServicePaths(session, agent) {
+  const serviceKey = String(
+    agent.serviceKey ||
+      `${agent.id || "opencode"}:${agent.runtimeId || agent.configPath || "default"}`,
+  );
   const serviceId = crypto
     .createHash("sha256")
-    .update(String(agent.path || agent.id || "opencode"))
+    .update(`${String(agent.path || agent.id || "opencode")}\u0000${serviceKey}`)
     .digest("hex")
     .slice(0, 16);
   const root = `${session.home}/.easywork/services/opencode/${serviceId}`;
@@ -5039,6 +5942,7 @@ function openCodeServicePaths(session, agent) {
     pidPath: `${root}/pid`,
     logPath: `${root}/server.log`,
     requestsPath: `${root}/requests`,
+    serviceKey,
   };
 }
 
@@ -5054,13 +5958,16 @@ async function stopOpenCodeService(session, agent) {
       'EW_PID=$(cat "$EW_PID_FILE" 2>/dev/null)',
       'case "$EW_PID" in ""|*[!0-9]*) exit 0 ;; esac',
       'EW_COMMAND=$(ps -p "$EW_PID" -o args= 2>/dev/null)',
-      'case "$EW_COMMAND" in *"$EW_AGENT"*" serve"*) kill "$EW_PID" 2>/dev/null || true ;; esac',
+      'case "$EW_COMMAND" in *"$EW_AGENT"*" serve"*) ;; *) rm -f "$EW_PID_FILE"; exit 0 ;; esac',
+      'kill -TERM "$EW_PID" 2>/dev/null || true',
+      'EW_WAIT=0; while kill -0 "$EW_PID" 2>/dev/null && test "$EW_WAIT" -lt 5; do sleep 1; EW_WAIT=$((EW_WAIT + 1)); done',
+      'if kill -0 "$EW_PID" 2>/dev/null; then EW_COMMAND=$(ps -p "$EW_PID" -o args= 2>/dev/null); case "$EW_COMMAND" in *"$EW_AGENT"*" serve"*) kill -KILL "$EW_PID" 2>/dev/null || true ;; esac; fi',
       'rm -f "$EW_PID_FILE"',
     ].join("\n"),
     { allowFailure: true },
   );
-  session.openCodeServices?.delete(agent.id);
-  session.openCodeServicePromises?.delete(agent.id);
+  session.openCodeServices?.delete(paths.serviceKey);
+  session.openCodeServicePromises?.delete(paths.serviceKey);
 }
 
 async function probeOpenCodeService(session, service) {
@@ -5096,10 +6003,10 @@ async function probeOpenCodeService(session, service) {
 async function startOpenCodeService(session, agent) {
   if (!session.client || !session.home) throw new Error("SSH 尚未连接");
   const paths = openCodeServicePaths(session, agent);
-  const cached = session.openCodeServices?.get(agent.id);
+  const cached = session.openCodeServices?.get(paths.serviceKey);
   const live = await probeOpenCodeService(session, cached || paths);
   if (live) {
-    session.openCodeServices.set(agent.id, live);
+    session.openCodeServices.set(paths.serviceKey, live);
     return live;
   }
 
@@ -5134,6 +6041,20 @@ async function startOpenCodeService(session, agent) {
     throw new Error("无法为 OpenCode 会话服务分配本地端口");
   }
   const password = crypto.randomBytes(32).toString("hex");
+  const baseManagedConfig = agent.managed
+    ? agentConfigFor("opencode", session.home, {
+        managed: true,
+        agentId: agent.id,
+      })
+    : null;
+  const managedConfig = baseManagedConfig
+    ? {
+        ...baseManagedConfig,
+        configPath: agent.configPath || baseManagedConfig.configPath,
+        dataPath: agent.dataPath || baseManagedConfig.dataPath,
+        configRoot: agent.configRoot || baseManagedConfig.configRoot,
+      }
+    : null;
   const launcher = [
     "#!/bin/sh",
     "set -eu",
@@ -5143,12 +6064,26 @@ async function startOpenCodeService(session, agent) {
     `EW_AGENT=${shellQuote(agent.path)}`,
     `EW_PORT=${shellQuote(String(port))}`,
     'umask 077',
+    'mkdir -p "$EW_ROOT/tmp"',
+    'chmod 700 "$EW_ROOT/tmp"',
+    'export TMPDIR="$EW_ROOT/tmp"',
+    'export TMP="$TMPDIR"',
+    'export TEMP="$TMPDIR"',
     'printf "%s\\n" "$$" > "$EW_PID_FILE.tmp"',
     'mv -f "$EW_PID_FILE.tmp" "$EW_PID_FILE"',
     'export OPENCODE_SERVER_USERNAME=opencode',
     'export OPENCODE_SERVER_PASSWORD="$(cat "$EW_PASSWORD_FILE")"',
+    managedConfig
+      ? `export OPENCODE_CONFIG=${shellQuote(managedConfig.configPath)}`
+      : "",
+    managedConfig
+      ? `export XDG_DATA_HOME=${shellQuote(managedConfig.dataPath)}`
+      : "",
+    managedConfig
+      ? `export OPENCODE_CONFIG_DIR=${shellQuote(managedConfig.configRoot)}`
+      : "",
     'exec "$EW_AGENT" serve --hostname 127.0.0.1 --port "$EW_PORT" --log-level WARN',
-  ].join("\n");
+  ].filter(Boolean).join("\n");
   const curlConfig = [
     "silent",
     "show-error",
@@ -5177,13 +6112,13 @@ async function startOpenCodeService(session, agent) {
     port,
     baseUrl: `http://127.0.0.1:${port}`,
   };
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     const ready = await probeOpenCodeService(session, descriptor);
     if (ready) {
-      session.openCodeServices.set(agent.id, ready);
+      session.openCodeServices.set(paths.serviceKey, ready);
       return ready;
     }
-    await waitFor(250);
+    await waitFor(500);
   }
   const diagnostic = await remoteExec(
     session.client,
@@ -5197,15 +6132,16 @@ async function startOpenCodeService(session, agent) {
 
 async function ensureOpenCodeService(session, agent) {
   session.openCodeServicePromises ||= new Map();
-  const current = session.openCodeServicePromises.get(agent.id);
+  const serviceKey = openCodeServicePaths(session, agent).serviceKey;
+  const current = session.openCodeServicePromises.get(serviceKey);
   if (current) return current;
   const operation = startOpenCodeService(session, agent);
-  session.openCodeServicePromises.set(agent.id, operation);
+  session.openCodeServicePromises.set(serviceKey, operation);
   try {
     return await operation;
   } finally {
-    if (session.openCodeServicePromises.get(agent.id) === operation) {
-      session.openCodeServicePromises.delete(agent.id);
+    if (session.openCodeServicePromises.get(serviceKey) === operation) {
+      session.openCodeServicePromises.delete(serviceKey);
     }
   }
 }
@@ -5290,74 +6226,298 @@ function openCodeUsageFromMessages(value) {
   return null;
 }
 
-async function inspectNativeAgentContext(actor, binding) {
-  if (!binding) {
+function contextLimitFromModelValue(value) {
+  if (!value || typeof value !== "object") return null;
+  return positiveInteger(
+    value.limit?.context ??
+      value.context_window ??
+      value.contextWindow ??
+      value.context_length ??
+      value.contextLength ??
+      value.max_context_tokens ??
+      value.maxContextTokens ??
+      value.max_input_tokens ??
+      value.maxInputTokens,
+  );
+}
+
+function openCodeProviderContextLimit(payload, providerId, modelId) {
+  const wantedProvider = String(providerId || "").toLowerCase();
+  const wantedModel = String(modelId || "").toLowerCase();
+  if (!wantedModel) return null;
+  const visited = new Set();
+  const walk = (value, key = "", providerHint = "", depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 9 || visited.has(value)) {
+      return null;
+    }
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = walk(item, "", providerHint, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    }
+    const objectProvider = String(
+      value.providerID || value.providerId || value.provider || providerHint || "",
+    ).toLowerCase();
+    const objectModel = String(
+      value.modelID || value.modelId || value.model || value.id || key || "",
+    ).toLowerCase();
+    const providerMatches = !wantedProvider || !objectProvider || objectProvider === wantedProvider;
+    const modelMatches =
+      objectModel === wantedModel ||
+      objectModel === `${wantedProvider}/${wantedModel}` ||
+      String(key || "").toLowerCase() === wantedModel;
+    if (providerMatches && modelMatches) {
+      const limit = contextLimitFromModelValue(value);
+      if (limit) return limit;
+    }
+    const nextProvider =
+      objectProvider ||
+      (String(key || "").toLowerCase() === wantedProvider ? wantedProvider : providerHint);
+    for (const [childKey, child] of Object.entries(value)) {
+      const found = walk(child, childKey, nextProvider, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(payload);
+}
+
+async function inspectOpenCodeProviderContextLimit(
+  session,
+  service,
+  providerId,
+  modelId,
+) {
+  session.agentModelLimitCache ||= new Map();
+  const cacheKey = `${service.serviceId || service.root}:${providerId}/${modelId}`;
+  const cached = session.agentModelLimitCache.get(cacheKey);
+  if (cached && Date.now() - Number(cached.checkedAt || 0) < 60_000) {
+    return cached;
+  }
+  let contextLimit = null;
+  try {
+    const response = await openCodeServiceRequest(session, service, {
+      endpoint: "/provider",
+    });
+    contextLimit = openCodeProviderContextLimit(
+      response.json,
+      providerId,
+      modelId,
+    );
+  } catch {
+    // The config file remains authoritative when the service does not expose
+    // provider metadata.
+  }
+  const result = {
+    checkedAt: Date.now(),
+    contextLimit: contextLimit || null,
+  };
+  session.agentModelLimitCache.set(cacheKey, result);
+  return result;
+}
+
+async function inspectNativeAgentContext(actor, binding, target = {}) {
+  const serverId = String(binding?.serverId || target.serverId || "");
+  const agentId = String(binding?.agentId || target.agentId || "");
+  const requestedAdapter = String(binding?.adapter || target.agentAdapter || "");
+  if (!serverId || !agentId) {
     return {
-      bound: false,
+      bound: Boolean(binding),
+      readable: false,
       available: false,
-      status: "not-bound",
+      status: "agent-not-selected",
       usage: null,
+      limit: null,
       compression: { supported: false },
     };
   }
-  if (binding.agentId !== "opencode") {
-    return {
-      bound: true,
-      available: false,
-      status: "unsupported-agent",
-      usage: null,
-      compression: { supported: false },
-    };
-  }
+  const adapterIsReadable = ["opencode", "codex", "claude"].includes(
+    requestedAdapter,
+  );
   const worker = await getSshWorker(actor);
-  const session = worker.sessions.get(safeSegment(binding.serverId || ""));
+  const session = worker.sessions.get(safeSegment(serverId));
   if (!session?.client || session.status !== "connected") {
     return {
-      bound: true,
-      available: false,
+      bound: Boolean(binding),
+      readable: adapterIsReadable || Boolean(binding?.contextUsage),
+      available: Boolean(binding?.contextUsage),
       status: "connection-unavailable",
-      usage: null,
+      usage: binding?.contextUsage || null,
+      limit: positiveInteger(binding?.contextLimit),
       compression: { supported: false },
     };
   }
   try {
-    const agents = await scanRemoteAgents(session, actor);
+    const scope = {
+      conversationId: String(binding?.conversationId || target.conversationId || ""),
+      workspaceId: String(binding?.workspaceId || target.workspaceId || ""),
+    };
+    const agents = await scanRemoteAgents(session, actor, scope);
     const agent = agents.find(
-      (item) => item.id === binding.agentId && item.status === "ready",
+      (item) => item.id === agentId && item.status === "ready",
     );
     if (!agent) throw new Error("绑定的 Agent 当前不可用");
-    const service = await ensureOpenCodeService(session, agent);
-    await openCodeServiceRequest(session, service, {
-      endpoint: `/session/${encodeURIComponent(binding.agentSessionId)}`,
-      directory: binding.workspace,
-    });
-    const capabilities = await detectOpenCodeContextCapabilities(session, service);
-    let usage = null;
+    if (agent.adapter !== "opencode") {
+      const profile =
+        (await getAgentRuntimeProfile(actor, session, agent.id, scope)) || {};
+      const usage = binding?.contextUsage || null;
+      const contextLimit =
+        positiveInteger(profile.contextLimit) ||
+        positiveInteger(binding?.contextLimit) ||
+        null;
+      return {
+        bound: Boolean(binding),
+        readable: true,
+        available: Boolean(usage),
+        status: usage
+          ? "measured"
+          : binding?.agentSessionId
+            ? "usage-empty"
+            : "ready-no-session",
+        usage,
+        limit: contextLimit,
+        limitSource: positiveInteger(profile.contextLimit) ? "config" : "",
+        model: profile.model || binding?.model || agent.model || "",
+        modifiable: Boolean(agent.managed),
+        compression: {
+          supported: Boolean(binding?.agentSessionId),
+          mode: "native-command",
+        },
+        control: { session, agent, profile, scope },
+      };
+    }
+    const runtimeConfiguration = agent.managed
+      ? await ensureManagedAgentRuntimeConfig(session, actor, agent, scope)
+      : null;
+    const runtimePaths = agent.managed
+      ? managedAgentRuntimePaths(
+          session.home,
+          agent.id,
+          binding?.runtimeId || runtimeConfiguration?.runtimeId || agent.runtimeId,
+        )
+      : null;
+    const contextAgent = runtimePaths
+      ? {
+          ...agent,
+          runtimeId: binding.runtimeId,
+          serviceKey: `${agent.id}:${binding.runtimeId}`,
+          configPath: runtimePaths.opencodeConfigPath,
+          authPath: runtimePaths.opencodeAuthPath,
+          dataPath: runtimePaths.opencodeDataHome,
+          configRoot: runtimePaths.configRoot,
+        }
+      : agent;
+    const configuration = await inspectOpenCodeNativeConfiguration(
+      session,
+      contextAgent,
+    );
+    const configuredModel = openCodeConfiguredModelDetails(
+      parseJsoncObject(configuration.configContent),
+      binding?.model ||
+        (configuration.providerId && configuration.model
+          ? `${configuration.providerId}/${configuration.model}`
+          : configuration.model || agent.model || ""),
+    );
+    let service = null;
+    let capabilities = {
+      readable: true,
+      compression: { supported: false, pathTemplate: "", mode: "" },
+    };
+    let serviceDiagnostic = "";
     try {
-      const response = await openCodeServiceRequest(session, service, {
-        endpoint: `/session/${encodeURIComponent(binding.agentSessionId)}/message`,
-        directory: binding.workspace,
-      });
-      usage = openCodeUsageFromMessages(response.json);
-    } catch {
-      usage = binding.contextUsage || null;
+      service = await ensureOpenCodeService(session, contextAgent);
+      capabilities = await detectOpenCodeContextCapabilities(session, service);
+    } catch (caught) {
+      serviceDiagnostic =
+        caught instanceof Error
+          ? caught.message
+          : "OpenCode 原生会话服务暂时不可用";
+    }
+    const providerLimit =
+      configuredModel.contextLimit || !service
+        ? { contextLimit: configuredModel.contextLimit || null }
+        : await inspectOpenCodeProviderContextLimit(
+            session,
+            service,
+            configuredModel.providerId,
+            configuredModel.modelId,
+          );
+    const contextLimit =
+      positiveInteger(configuredModel.contextLimit) ||
+      positiveInteger(providerLimit.contextLimit) ||
+      positiveInteger(binding?.contextLimit) ||
+      null;
+    let usage = null;
+    let sessionDiagnostic = serviceDiagnostic;
+    if (binding?.agentSessionId && service) {
+      try {
+        await openCodeServiceRequest(session, service, {
+          endpoint: `/session/${encodeURIComponent(binding.agentSessionId)}`,
+          directory: binding.workspace,
+        });
+        const response = await openCodeServiceRequest(session, service, {
+          endpoint: `/session/${encodeURIComponent(binding.agentSessionId)}/message`,
+          directory: binding.workspace,
+        });
+        usage = openCodeUsageFromMessages(response.json) || binding.contextUsage || null;
+      } catch (caught) {
+        usage = binding.contextUsage || null;
+        sessionDiagnostic =
+          caught instanceof Error ? caught.message : "原生 Agent 会话暂时不可读";
+      }
     }
     return {
-      bound: true,
+      bound: Boolean(binding?.agentSessionId),
+      readable: Boolean(capabilities.readable),
       available: Boolean(usage),
-      status: usage ? "measured" : "usage-unavailable",
+      status: usage
+        ? "measured"
+        : serviceDiagnostic
+          ? "service-unavailable"
+        : binding?.agentSessionId
+          ? "usage-empty"
+          : "ready-no-session",
       usage,
+      limit: contextLimit,
+      limitSource: configuredModel.contextLimit
+        ? "config"
+        : providerLimit.contextLimit
+          ? "provider"
+          : "",
+      model: configuredModel.model || binding?.model || agent.model || "",
+      modifiable: Boolean(
+        configuration.configPath &&
+          configuredModel.providerId &&
+          configuredModel.modelId,
+      ),
+      diagnostic: sessionDiagnostic,
       compression: capabilities.compression,
-      control: { session, service },
+      control: {
+        session,
+        service,
+        agent: contextAgent,
+        configuration,
+        configuredModel,
+      },
     };
   } catch (caught) {
+    const knownAgent =
+      adapterIsReadable ||
+      agentId.startsWith("opencode") ||
+      agentId.startsWith("codex") ||
+      agentId.startsWith("claude");
     return {
-      bound: true,
-      available: false,
-      status: "unreadable",
+      bound: Boolean(binding),
+      readable: knownAgent,
+      available: Boolean(binding?.contextUsage),
+      status: knownAgent ? "service-unavailable" : "unreadable",
       diagnostic:
         caught instanceof Error ? caught.message : "无法读取 Agent 上下文",
-      usage: null,
+      usage: binding?.contextUsage || null,
+      limit: positiveInteger(binding?.contextLimit),
       compression: { supported: false },
     };
   }
@@ -5375,39 +6535,79 @@ async function compactNativeAgentContext(actor, binding) {
     error.statusCode = 409;
     throw error;
   }
-  const endpoint = openCodePathFromTemplate(
-    inspected.compression.pathTemplate,
-    binding.agentSessionId,
-  );
-  const model = String(binding.model || "");
-  const body =
-    inspected.compression.mode === "summarize"
-      ? {
-          providerID: model.includes("/")
-            ? model.split("/")[0]
-            : EASYWORK_OPENCODE_PROVIDER_ID,
-          modelID: model.includes("/")
-            ? model.split("/").slice(1).join("/")
-            : model,
-        }
-      : inspected.compression.mode === "command"
-        ? { command: "compact", arguments: "" }
-        : {};
-  if (inspected.compression.mode === "summarize" && !body.modelID) {
-    const error = new Error("Agent 未暴露当前模型，无法调用其原生压缩接口");
-    error.statusCode = 409;
-    throw error;
+  if (inspected.control.agent.adapter === "opencode") {
+    const endpoint = openCodePathFromTemplate(
+      inspected.compression.pathTemplate,
+      binding.agentSessionId,
+    );
+    const model = String(binding.model || "");
+    const body =
+      inspected.compression.mode === "summarize"
+        ? {
+            providerID: model.includes("/")
+              ? model.split("/")[0]
+              : EASYWORK_OPENCODE_PROVIDER_ID,
+            modelID: model.includes("/")
+              ? model.split("/").slice(1).join("/")
+              : model,
+          }
+        : inspected.compression.mode === "command"
+          ? { command: "compact", arguments: "" }
+          : {};
+    if (inspected.compression.mode === "summarize" && !body.modelID) {
+      const error = new Error("Agent 未暴露当前模型，无法调用其原生压缩接口");
+      error.statusCode = 409;
+      throw error;
+    }
+    await openCodeServiceRequest(
+      inspected.control.session,
+      inspected.control.service,
+      {
+        method: "POST",
+        endpoint,
+        directory: binding.workspace,
+        body,
+      },
+    );
+  } else {
+    const { session, agent, scope } = inspected.control;
+    const runtime = await ensureManagedAgentRuntimeConfig(
+      session,
+      actor,
+      agent,
+      scope,
+    );
+    if (!runtime.configured && agent.managed) {
+      throw new Error(`${agent.name} 隔离配置不可用，无法压缩原生会话`);
+    }
+    const compactPrompt = shellQuote("/compact");
+    const command =
+      agent.adapter === "codex"
+        ? [
+            runtime.managed
+              ? `export CODEX_HOME=${shellQuote(runtime.paths.codexHome)}`
+              : "",
+            runtime.managed
+              ? `export CODEX_API_KEY="$(cat ${shellQuote(runtime.paths.apiKeyPath)})"`
+              : "",
+            `cd ${shellQuote(binding.workspace || session.home)}`,
+            `${shellQuote(agent.path)} exec --json --skip-git-repo-check resume ${shellQuote(binding.agentSessionId)} ${compactPrompt} >/dev/null`,
+          ]
+        : [
+            runtime.managed
+              ? `export CLAUDE_CONFIG_DIR=${shellQuote(runtime.paths.claudeConfigDir)}`
+              : "",
+            runtime.managed
+              ? `export ANTHROPIC_AUTH_TOKEN="$(cat ${shellQuote(runtime.paths.apiKeyPath)})"`
+              : "",
+            runtime.managed
+              ? 'export ANTHROPIC_API_KEY="$ANTHROPIC_AUTH_TOKEN"'
+              : "",
+            `cd ${shellQuote(binding.workspace || session.home)}`,
+            `${shellQuote(agent.path)} -p ${compactPrompt} --resume ${shellQuote(binding.agentSessionId)} --output-format json >/dev/null`,
+          ];
+    await remoteExec(session.client, command.filter(Boolean).join("\n"));
   }
-  await openCodeServiceRequest(
-    inspected.control.session,
-    inspected.control.service,
-    {
-      method: "POST",
-      endpoint,
-      directory: binding.workspace,
-      body,
-    },
-  );
   await updateAgentBinding(actor, binding.bindingKey, (current) => ({
     ...(current || binding),
     contextUsage: undefined,
@@ -5426,6 +6626,97 @@ async function compactNativeAgentContext(actor, binding) {
     scheduleSshWorkerPersist(worker, 0);
   }
   return { accepted: true, mode: inspected.compression.mode };
+}
+
+async function updateNativeAgentContextLimit(
+  actor,
+  {
+    serverId,
+    agentId,
+    agentAdapter = "",
+    conversationId = "",
+    workspaceId = "",
+    contextLimit,
+  },
+) {
+  const limit = positiveInteger(contextLimit);
+  if (!limit || limit < 8_000 || limit > 4_000_000) {
+    const error = new Error("Agent 上下文上限应在 8k 到 4M 之间");
+    error.statusCode = 400;
+    throw error;
+  }
+  const inspected = await inspectNativeAgentContext(actor, null, {
+    serverId,
+    agentId,
+    agentAdapter,
+    conversationId,
+    workspaceId,
+  });
+  if (!inspected.readable || !inspected.modifiable || !inspected.control) {
+    const error = new Error("当前 Agent 原生模型配置不支持修改上下文上限");
+    error.statusCode = 409;
+    throw error;
+  }
+  const { session, agent, configuration, configuredModel } = inspected.control;
+  if (agent.adapter !== "opencode") {
+    const scope = { conversationId, workspaceId };
+    await updateAgentRuntimeProfile(actor, session, agent.id, scope, {
+      contextLimit: limit,
+    });
+    await ensureManagedAgentRuntimeConfig(session, actor, agent, scope);
+    return {
+      contextLimit: limit,
+      model: inspected.model || "",
+      configPath:
+        agent.adapter === "codex"
+          ? managedAgentRuntimePaths(
+              session.home,
+              agent.id,
+              agentRuntimeId(session, agent.id, scope),
+            ).codexConfigPath
+          : managedAgentRuntimePaths(
+              session.home,
+              agent.id,
+              agentRuntimeId(session, agent.id, scope),
+            ).claudeSettingsPath,
+    };
+  }
+  const nextContent = setJsoncValue(
+    configuration.configContent,
+    [
+      "provider",
+      configuredModel.providerId,
+      "models",
+      configuredModel.modelId,
+      "limit",
+      "context",
+    ],
+    limit,
+  );
+  parseJsoncObject(nextContent);
+  await remoteSftpWriteAtomic(
+    session.client,
+    configuration.configPath,
+    `${nextContent.trimEnd()}\n`,
+    0o600,
+  );
+  if (configuredModel.providerId === EASYWORK_OPENCODE_PROVIDER_ID) {
+    await updateAgentRuntimeProfile(
+      actor,
+      session,
+      agent.id,
+      { conversationId, workspaceId },
+      { contextLimit: limit },
+    );
+  }
+  await stopOpenCodeService(session, agent);
+  session.agentContextCapabilityCache?.clear();
+  session.agentModelLimitCache?.clear();
+  return {
+    contextLimit: limit,
+    model: configuredModel.model,
+    configPath: configuration.configPath,
+  };
 }
 
 async function openCodeServiceRequest(
@@ -5551,17 +6842,24 @@ async function abortOpenCodeSession(session, control) {
   }
 }
 
-function openCodeSseToolPart(value, { sessionId, directory } = {}) {
+function openCodeSseAgentEvent(value, { sessionId, directory } = {}) {
   let envelope;
   try {
     envelope = typeof value === "string" ? JSON.parse(value) : value;
   } catch {
     return null;
   }
-  const event = envelope?.payload;
-  if (!event || event.type !== "message.part.updated") return null;
+  const event = envelope?.payload || envelope;
+  if (!event || !event.type) return null;
   const properties = event.properties || {};
-  if (String(properties.sessionID || "") !== String(sessionId || "")) {
+  const eventSessionId = String(
+    properties.sessionID ||
+      properties.part?.sessionID ||
+      properties.info?.sessionID ||
+      event.sessionID ||
+      "",
+  );
+  if (eventSessionId !== String(sessionId || "")) {
     return null;
   }
   if (
@@ -5571,12 +6869,85 @@ function openCodeSseToolPart(value, { sessionId, directory } = {}) {
   ) {
     return null;
   }
-  const part = properties.part;
-  if (!part || part.type !== "tool") return null;
-  return {
-    sessionID: properties.sessionID,
-    part,
-  };
+  if (event.type === "message.part.updated") {
+    const part = properties.part;
+    if (!part) return null;
+    return {
+      sessionID: eventSessionId,
+      part,
+    };
+  }
+  if (
+    [
+      "message.updated",
+      "todo.updated",
+      "plan.updated",
+      "permission.asked",
+      "permission.replied",
+      "question.asked",
+      "question.replied",
+      "question.rejected",
+      "session.status",
+      "session.error",
+      "session.diff",
+    ].includes(event.type)
+  ) {
+    return {
+      type: event.type,
+      sessionID: eventSessionId,
+      ...properties,
+    };
+  }
+  return null;
+}
+
+async function replyOpenCodePermission(session, control, requestId, approved) {
+  if (!control?.service || !control?.sessionId) {
+    throw new Error("OpenCode 原生会话当前不可控制");
+  }
+  const normalizedId = String(requestId || "").trim();
+  if (!normalizedId || normalizedId.length > 240) {
+    throw new Error("权限请求标识无效");
+  }
+  await openCodeServiceRequest(session, control.service, {
+    method: "POST",
+    endpoint: `/permission/${encodeURIComponent(normalizedId)}/reply`,
+    directory: control.directory,
+    body: { reply: approved ? "once" : "reject" },
+  });
+}
+
+async function replyOpenCodeQuestion(
+  session,
+  control,
+  requestId,
+  answers = [],
+  rejected = false,
+) {
+  if (!control?.service || !control?.sessionId) {
+    throw new Error("OpenCode 原生会话当前不可控制");
+  }
+  const normalizedId = String(requestId || "").trim();
+  if (!normalizedId || normalizedId.length > 240) {
+    throw new Error("问题请求标识无效");
+  }
+  const normalizedAnswers = (Array.isArray(answers) ? answers : [answers])
+    .map((answer) =>
+      Array.isArray(answer)
+        ? answer.map((item) => String(item || "").trim()).filter(Boolean)
+        : [String(answer || "").trim()].filter(Boolean),
+    );
+  if (!rejected && !normalizedAnswers.some((answer) => answer.length)) {
+    throw new Error("请输入对 Agent 问题的回答");
+  }
+  await openCodeServiceRequest(session, control.service, {
+    method: "POST",
+    endpoint: `/question/${encodeURIComponent(normalizedId)}/${
+      rejected ? "reject" : "reply"
+    }`,
+    directory: control.directory,
+    ...(rejected ? {} : { body: { answers: normalizedAnswers } }),
+  });
 }
 
 async function waitForOpenCodeRunAdmission(session, control, remoteRun) {
@@ -5713,6 +7084,10 @@ async function createRemoteRuntimeRun(session, options) {
     conversationId: String(options.conversationId || ""),
     serverId: String(session.serverId || ""),
     agentId: String(options.agentId || ""),
+    workspaceId: String(options.workspaceId || ""),
+    workspaceName: String(options.workspaceName || ""),
+    workspaceKind: options.workspaceKind === "virtual" ? "virtual" : "physical",
+    versionDomainId: String(options.versionDomainId || ""),
     workspace: String(options.workspace || ""),
     createdAt: isoNow(),
   };
@@ -5852,21 +7227,53 @@ async function monitorRemoteRuntimeRun(session, remoteRun, handlers = {}) {
   };
 }
 
+async function sendRemoteRuntimeInput(session, remoteRun, payload) {
+  if (!session.client || !remoteRun?.runtime?.entrypoint) {
+    throw new Error("远端 Agent 当前不接受追加输入");
+  }
+  const line =
+    typeof payload === "string" ? payload : JSON.stringify(payload);
+  await remoteExec(
+    session.client,
+    `${shellQuote(remoteRun.runtime.entrypoint)} run-input ${shellQuote(remoteRun.runId)}`,
+    {
+      input: `${line.replace(/[\r\n]+$/g, "")}\n`,
+      timeoutMs: 10_000,
+    },
+  );
+}
+
 async function cancelRemoteRuntimeRun(session, activeRun) {
   if (!session.client || !activeRun?.remoteRun?.runtime) return false;
   activeRun.abortRequested = true;
+  if (activeRun.agentControl?.adapter === "opencode") {
+    await abortOpenCodeSession(session, activeRun.agentControl);
+  } else if (
+    activeRun.agentControl?.adapter === "codex" &&
+    activeRun.agentControl.sessionId &&
+    activeRun.agentControl.turnId
+  ) {
+    await sendRemoteRuntimeInput(session, activeRun.remoteRun, {
+      id: `easywork-interrupt-${safeSegment(activeRun.runId || randomId("run"))}`,
+      method: "turn/interrupt",
+      params: {
+        threadId: activeRun.agentControl.sessionId,
+        turnId: activeRun.agentControl.turnId,
+      },
+    }).catch(() => undefined);
+    // Give Codex app-server a brief chance to record an interrupted turn in
+    // its native thread before the remote process-group fallback is applied.
+    await waitFor(240);
+  }
   await remoteExec(
     session.client,
     `${shellQuote(activeRun.remoteRun.runtime.entrypoint)} run-cancel ${shellQuote(activeRun.remoteRun.runId)}`,
     { allowFailure: true },
   );
-  if (activeRun.agentControl?.adapter === "opencode") {
-    await abortOpenCodeSession(session, activeRun.agentControl);
-  }
   return true;
 }
 
-function reconstructOpenCodeTranscript(stdout, runId) {
+function reconstructNativeAgentTranscript(stdout, runId, adapter = "opencode") {
   const parserState = {
     sessionId: "",
     finalText: "",
@@ -5887,16 +7294,17 @@ function reconstructOpenCodeTranscript(stdout, runId) {
   const events = [];
   let steps = [];
   for (const line of String(stdout || "").split(/\r?\n/)) {
-    const parsed = parseOpenCodeLine(line, parserState);
-    if (!parsed) continue;
-    const { sourceId, planSteps, ...event } = parsed;
-    if (Array.isArray(planSteps)) steps = planSteps;
-    const id = sourceId
-      ? `${runId}_${safeSegment(event.kind)}_${safeSegment(sourceId)}`
-      : `${runId}_recovered_${events.length}`;
-    events.push({ id, ...event, timestamp: isoNow() });
-    parserState.eventOrder.push({ id, kind: event.kind });
-    parserState.forwardedEvents.set(id, event);
+    for (const parsed of parseNativeAgentLine(adapter, line, parserState)) {
+      if (!parsed) continue;
+      const { sourceId, planSteps, ...event } = parsed;
+      if (Array.isArray(planSteps)) steps = planSteps;
+      const id = sourceId
+        ? `${runId}_${safeSegment(event.kind)}_${safeSegment(sourceId)}`
+        : `${runId}_recovered_${events.length}`;
+      events.push({ id, ...event, timestamp: isoNow() });
+      parserState.eventOrder.push({ id, kind: event.kind });
+      parserState.forwardedEvents.set(id, event);
+    }
   }
   const finalCandidates = events.filter(
     (event) => event.kind === "message" && event.output,
@@ -5921,7 +7329,11 @@ function reconstructOpenCodeTranscript(stdout, runId) {
 }
 
 async function finishRecoveredWorkerTask(session, actor, task, result) {
-  const reconstructed = reconstructOpenCodeTranscript(result.stdout, task.runId);
+  const reconstructed = reconstructNativeAgentTranscript(
+    result.stdout,
+    task.runId,
+    task.agentControl?.adapter || "opencode",
+  );
   const recoveredWasAborted = Boolean(
     task.abortRequested || result.status === "aborted",
   );
@@ -5947,7 +7359,7 @@ async function finishRecoveredWorkerTask(session, actor, task, result) {
     const workspace = remotePathForSession(session, task.workspace || "~");
     const bindingKey = agentBindingKey({
       serverId: session.serverId,
-      workspace,
+      workspaceId: task.workspaceId,
       agentId: task.agentId,
       conversationId: task.conversationId,
     });
@@ -5961,31 +7373,29 @@ async function finishRecoveredWorkerTask(session, actor, task, result) {
       bindingKey,
       conversationId: task.conversationId,
       serverId: session.serverId,
+      workspaceId: task.workspaceId,
+      workspaceName: task.workspaceName,
       workspace,
       agentId: task.agentId,
+      adapter: task.agentControl?.adapter || "opencode",
       agentSessionId: reconstructed.sessionId,
       lastRunId: task.runId,
       syncMode: "recovered",
-      syncCursor:
-        result.status === "done" && !recoveredWasAborted
-          ? createAgentSyncCursor({
-              state,
-              memoryDocument,
-              conversationId: task.conversationId,
-              lastMessageId: task.assistantMessageId,
-              taskId: task.runId,
-              checkpointId: task.checkpointAfterId,
-              deliveredContent: [`user\u0000${task.prompt}`],
-              deliveredMemoryRecords: task.deliveredMemoryRecords || [],
-              memoryEnabled: state?.settings?.memoryEnabled !== false,
-              previous: previousBinding?.syncCursor,
-            })
-          : previousBinding?.syncCursor || {
-              memoryEnabled: state?.settings?.memoryEnabled !== false,
-              memoryVersions: {},
-              deliveredContentHashes: [],
-              lastMessageId: "",
-            },
+      // A native session has already accepted this turn even when execution was
+      // interrupted later. Advancing the delivery cursor prevents the same web
+      // turn and memory delta from being injected twice when the user resumes.
+      syncCursor: createAgentSyncCursor({
+        state,
+        memoryDocument,
+        conversationId: task.conversationId,
+        lastMessageId: task.assistantMessageId,
+        taskId: task.runId,
+        checkpointId: task.checkpointAfterId,
+        deliveredContent: [`user\u0000${task.prompt}`],
+        deliveredMemoryRecords: task.deliveredMemoryRecords || [],
+        memoryEnabled: state?.settings?.memoryEnabled !== false,
+        previous: previousBinding?.syncCursor,
+      }),
       deliveryState: {
         runId: task.runId,
         status:
@@ -6115,9 +7525,15 @@ async function reconcileRecoveredWorkerTasks(session, actor) {
           }
         : null;
     const activeRun = {
+      serverId: task.serverId || session.serverId,
+      serverIdentity: task.serverIdentity || session.serverIdentity,
       conversationId: task.conversationId,
       runId: task.runId,
       workspace: task.workspace,
+      workspaceId: task.workspaceId,
+      workspaceName: task.workspaceName,
+      versionRoot: task.versionRoot,
+      versionDomainId: task.versionDomainId,
       remoteRun,
       recovered: true,
       supportsLiveInput: Boolean(restoredService && agentSessionId),
@@ -6169,17 +7585,196 @@ async function reconcileRecoveredWorkerTasks(session, actor) {
 function remotePathForSession(session, value = "~") {
   const input = String(value || "~").trim();
   if (!session.home) throw new Error("尚未读取远端主目录");
+  if (!input || /[\r\n\x00]/.test(input)) throw new Error("工作区路径无效");
   if (input === "~") return session.home;
   if (input.startsWith("~/")) return path.posix.join(session.home, input.slice(2));
   if (input.startsWith("/")) return path.posix.normalize(input);
   return path.posix.join(session.home, input);
 }
 
+function workspaceDisplayName(session, canonicalPath) {
+  if (canonicalPath === session.home) return "主目录";
+  return path.posix.basename(canonicalPath) || canonicalPath;
+}
+
+async function inspectRemoteWorkspace(session, requestedPath = "~") {
+  if (session.status !== "connected") throw new Error("SSH 尚未连接");
+  if (session.demo) {
+    const canonicalPath = remotePathForSession(session, requestedPath);
+    return {
+      path: canonicalPath,
+      name: workspaceDisplayName(session, canonicalPath),
+      mode: canonicalPath.startsWith(`${session.home}/.easywork/`)
+        ? "managed"
+        : "attached",
+      versionRoot: canonicalPath,
+      writable: true,
+    };
+  }
+  if (!session.client) throw new Error("SSH 尚未连接");
+  const candidate = remotePathForSession(session, requestedPath);
+  const result = await remoteExec(
+    session.client,
+    [
+      "set -eu",
+      `EW_INPUT=${shellQuote(candidate)}`,
+      'test -d "$EW_INPUT" || { printf "%s\\n" "所选工作区不存在或不是文件夹" >&2; exit 40; }',
+      'test -r "$EW_INPUT" && test -x "$EW_INPUT" || { printf "%s\\n" "没有读取所选工作区的权限" >&2; exit 41; }',
+      'EW_PATH="$(cd "$EW_INPUT" && pwd -P)"',
+      'EW_WRITABLE=0; test -w "$EW_PATH" && EW_WRITABLE=1',
+      'EW_GIT=0; EW_REPO=""; if command -v git >/dev/null 2>&1; then EW_GIT=1; EW_REPO="$(cd "$EW_PATH" && git rev-parse --show-toplevel 2>/dev/null || true)"; fi',
+      'printf "PATH=%s\\n" "$EW_PATH"',
+      'printf "WRITABLE=%s\\n" "$EW_WRITABLE"',
+      'printf "GIT_AVAILABLE=%s\\n" "$EW_GIT"',
+      'printf "REPO_ROOT=%s\\n" "$EW_REPO"',
+    ].join("\n"),
+  );
+  const fields = parseRuntimeFields(result.stdout);
+  const canonicalPath = String(fields.PATH || "").trim();
+  if (!canonicalPath.startsWith("/")) {
+    throw new Error("服务器没有返回有效的工作区路径");
+  }
+  const managedRoots = [
+    `${session.home}/.easywork/workspaces/`,
+    `${session.home}/.easywork/worktrees/`,
+    `${session.home}/.easywork/virtual/`,
+  ];
+  const gitAvailable = String(fields.GIT_AVAILABLE || "0") === "1";
+  const versionRoot = gitAvailable
+    ? String(fields.REPO_ROOT || "").trim() || canonicalPath
+    : undefined;
+  return {
+    path: canonicalPath,
+    name: workspaceDisplayName(session, canonicalPath),
+    mode: managedRoots.some((root) => canonicalPath.startsWith(root))
+      ? "managed"
+      : gitAvailable
+        ? "attached"
+        : "unmanaged",
+    versionRoot,
+    writable: String(fields.WRITABLE || "0") === "1",
+  };
+}
+
+async function registerWorkspace(actor, session, requestedPath = "~", options = {}) {
+  const inspected = await inspectRemoteWorkspace(session, requestedPath);
+  const timestamp = isoNow();
+  const record = normalizeWorkspaceRecord({
+    ...inspected,
+    serverId: session.serverId,
+    serverIdentity: session.serverIdentity,
+    name: String(options.name || "").trim() || inspected.name,
+    kind: options.kind,
+    virtualConversationId: options.virtualConversationId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastUsedAt: timestamp,
+  });
+  if (!record) throw new Error("无法登记工作区");
+  await updateWorkspaceDocument(actor, (document) => {
+    const previous = document.records[record.id];
+    document.records[record.id] = {
+      ...record,
+      createdAt: previous?.createdAt || record.createdAt,
+    };
+    return document;
+  });
+  return record;
+}
+
+async function ensureVirtualWorkspace(actor, session, conversationId) {
+  const safeConversationId = safeSegment(conversationId || "", "");
+  if (!safeConversationId) throw new Error("虚拟工作区缺少对话标识");
+  if (session.status !== "connected") throw new Error("SSH 尚未连接");
+  if (!session.home) throw new Error("尚未读取远端主目录");
+  const virtualPath = `${session.home}/.easywork/virtual/${safeConversationId}`;
+  if (!session.demo) {
+    if (!session.client) throw new Error("SSH 尚未连接");
+    await remoteExec(
+      session.client,
+      [
+        "set -eu",
+        `EW_DIR=${shellQuote(virtualPath)}`,
+        'mkdir -p "$EW_DIR"',
+        'chmod 700 "$HOME/.easywork" "$HOME/.easywork/virtual" "$EW_DIR" 2>/dev/null || true',
+        'if command -v git >/dev/null 2>&1 && ! (cd "$EW_DIR" && git rev-parse --git-dir >/dev/null 2>&1); then (cd "$EW_DIR" && git init -q); fi',
+      ].join("\n"),
+    );
+  }
+  return registerWorkspace(actor, session, virtualPath, {
+    name: "虚拟工作区",
+    kind: "virtual",
+    virtualConversationId: safeConversationId,
+  });
+}
+
+async function registeredWorkspaceForRun(
+  actor,
+  session,
+  workspaceId,
+  expectedConversationId = "",
+) {
+  const requestedId = String(workspaceId || "").trim();
+  if (!requestedId) throw new Error("请先选择工作区");
+  const document = await readWorkspaceDocument(actor);
+  const stored = document.records[requestedId];
+  if (!stored || stored.serverId !== session.serverId) {
+    throw new Error("所选工作区不存在，请重新选择");
+  }
+  if (
+    String(stored.serverIdentity || "") !== String(session.serverIdentity || "")
+  ) {
+    throw new Error("服务器连接目标已经变化，请重新选择工作区");
+  }
+  if (
+    stored.kind === "virtual" &&
+    expectedConversationId &&
+    String(stored.virtualConversationId || "") !==
+      safeSegment(expectedConversationId, "")
+  ) {
+    const error = new Error("虚拟工作区只属于创建它的对话");
+    error.statusCode = 409;
+    throw error;
+  }
+  const inspected = await inspectRemoteWorkspace(session, stored.path);
+  const currentId = workspaceIdFor(session.serverId, inspected.path);
+  if (currentId !== requestedId) {
+    throw new Error("工作区真实路径已经变化，请重新选择");
+  }
+  const timestamp = isoNow();
+  const record = {
+    ...stored,
+    ...inspected,
+    id: requestedId,
+    serverId: session.serverId,
+    serverIdentity: session.serverIdentity,
+    kind: stored.kind === "virtual" ? "virtual" : "physical",
+    virtualConversationId: stored.virtualConversationId,
+    versionDomainId: workspaceVersionDomainIdFor(
+      session.serverIdentity,
+      inspected.versionRoot,
+      inspected.path,
+    ),
+    updatedAt: timestamp,
+    lastUsedAt: timestamp,
+  };
+  await updateWorkspaceDocument(actor, (next) => {
+    next.records[requestedId] = record;
+    return next;
+  });
+  return record;
+}
+
 async function ensureTaskWorkspace(session, task, workspace) {
   if (!session.client) throw new Error("SSH 尚未连接");
-  const managedPrefix = `${session.home}/.easywork/workspaces/`;
+  const managedPrefixes = [
+    `${session.home}/.easywork/workspaces/`,
+    `${session.home}/.easywork/virtual/`,
+    `${session.home}/.easywork/worktrees/`,
+  ];
   const requestedManaged =
-    task.workspaceMode === "managed" && workspace.startsWith(managedPrefix);
+    task.workspaceMode === "managed" &&
+    managedPrefixes.some((prefix) => workspace.startsWith(prefix));
   if (!requestedManaged) return;
   await remoteExec(
     session.client,
@@ -6197,14 +7792,51 @@ function checkpointIdForTask(task, phase) {
   return safeRemoteRunId(`checkpoint-${task.runId}-${phase}`);
 }
 
+function checkpointWorkspaceLayout(session, task, workspaceValue) {
+  const workspace = normalizedWorkspacePath(
+    remotePathForSession(session, workspaceValue),
+  );
+  const requestedRoot = normalizedWorkspacePath(
+    remotePathForSession(session, task.versionRoot || workspace),
+  );
+  const versionRoot = workspacePathContains(requestedRoot, workspace)
+    ? requestedRoot
+    : workspace;
+  const repoRelativePath =
+    versionRoot === workspace
+      ? ""
+      : path.posix.relative(versionRoot, workspace).replace(/\/+$/, "");
+  if (
+    repoRelativePath === ".." ||
+    repoRelativePath.startsWith("../") ||
+    path.posix.isAbsolute(repoRelativePath)
+  ) {
+    throw new Error("工作区不在版本根目录内");
+  }
+  return { workspace, versionRoot, repoRelativePath };
+}
+
 async function createWorkspaceCheckpoint(session, actor, task, phase) {
   const checkpointId = checkpointIdForTask(task, phase);
-  const workspace = remotePathForSession(session, task.workspace || "~");
-  const conversationSegment = safeSegment(task.conversationId, "conversation");
-  const checkpointRoot = `${session.home}/.easywork/checkpoints/${conversationSegment}`;
+  const { workspace, versionRoot, repoRelativePath } =
+    checkpointWorkspaceLayout(session, task, task.workspace);
+  const workspaceSegment = safeSegment(task.workspaceId, "workspace");
+  const versionDomainId =
+    String(task.versionDomainId || "") ||
+    workspaceVersionDomainIdFor(
+      task.serverIdentity || task.serverId,
+      versionRoot,
+      workspace,
+    );
+  const versionDomainSegment = safeSegment(versionDomainId, "version-domain");
+  const versioningRoot = `${session.home}/.easywork/versioning/${versionDomainSegment}`;
+  const shadowRepository = `${versioningRoot}/repository.git`;
+  const gitConfigHome = `${versioningRoot}/git-home`;
+  const checkpointRoot = `${versioningRoot}/checkpoints/${workspaceSegment}`;
+  const indexRoot = `${versioningRoot}/indexes`;
   const bundlePath = `${checkpointRoot}/${checkpointId}.bundle`;
   const metadataPath = `${checkpointRoot}/${checkpointId}.json`;
-  const temporaryIndex = `${session.home}/.easywork/tmp/${checkpointId}.index`;
+  const temporaryIndex = `${indexRoot}/${checkpointId}.index`;
   const temporaryBundle = `${bundlePath}.tmp`;
   const refName = `refs/easywork-snapshot/${crypto
     .createHash("sha256")
@@ -6217,31 +7849,44 @@ async function createWorkspaceCheckpoint(session, actor, task, phase) {
       "set -eu",
       `EW_DIR=${shellQuote(workspace)}`,
       `EW_ROOT=${shellQuote(checkpointRoot)}`,
+      `EW_VERSION_ROOT=${shellQuote(versionRoot)}`,
+      `EW_SCOPE=${shellQuote(repoRelativePath)}`,
+      `EW_SHADOW=${shellQuote(shadowRepository)}`,
+      `EW_GIT_HOME=${shellQuote(gitConfigHome)}`,
+      `EW_INDEX_ROOT=${shellQuote(indexRoot)}`,
       `EW_BUNDLE=${shellQuote(bundlePath)}`,
       `EW_BUNDLE_TMP=${shellQuote(temporaryBundle)}`,
       `EW_INDEX=${shellQuote(temporaryIndex)}`,
       `EW_REF=${shellQuote(refName)}`,
       'EW_EASYWORK="$HOME/.easywork"',
-      'mkdir -p "$EW_ROOT" "$HOME/.easywork/tmp"',
+      'umask 077',
+      'mkdir -p "$EW_ROOT" "$EW_INDEX_ROOT" "$EW_GIT_HOME/.config"',
       'if ! test -d "$EW_DIR"; then echo "MODE=missing"; exit 0; fi',
       'if ! command -v git >/dev/null 2>&1; then echo "MODE=unmanaged"; exit 0; fi',
-      'EW_REPO="$(cd "$EW_DIR" && git rev-parse --show-toplevel 2>/dev/null)" || { echo "MODE=unmanaged"; exit 0; }',
-      'EW_GIT_DIR="$(cd "$EW_REPO" && git rev-parse --git-dir)"',
-      'case "$EW_GIT_DIR" in /*) ;; *) EW_GIT_DIR="$EW_REPO/$EW_GIT_DIR" ;; esac',
-      'EW_INDEX_SOURCE="$EW_GIT_DIR/index"',
+      'test -d "$EW_VERSION_ROOT" || { echo "MODE=missing"; exit 0; }',
+      'EW_GIT_BIN="$(command -v git)"',
+      'ew_git() { env HOME="$EW_GIT_HOME" XDG_CONFIG_HOME="$EW_GIT_HOME/.config" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_DIR="$EW_SHADOW" GIT_WORK_TREE="$EW_VERSION_ROOT" "$EW_GIT_BIN" "$@"; }',
+      'if ! test -d "$EW_SHADOW"; then env HOME="$EW_GIT_HOME" XDG_CONFIG_HOME="$EW_GIT_HOME/.config" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "$EW_GIT_BIN" init -q --bare "$EW_SHADOW"; fi',
+      'mkdir -p "$EW_SHADOW/info"',
+      'printf "%s\\n" "/.easywork/" > "$EW_SHADOW/info/exclude"',
+      'EW_PARENT="$(ew_git rev-parse -q --verify refs/easywork/latest^{commit} 2>/dev/null || true)"',
       'rm -f "$EW_INDEX" "$EW_BUNDLE_TMP"',
-      'if test -f "$EW_INDEX_SOURCE"; then cp "$EW_INDEX_SOURCE" "$EW_INDEX"; else (cd "$EW_REPO" && GIT_INDEX_FILE="$EW_INDEX" git read-tree --empty); fi',
-      'trap \'rm -f "$EW_INDEX" "$EW_BUNDLE_TMP"; (cd "$EW_REPO" && git update-ref -d "$EW_REF" >/dev/null 2>&1) || true\' EXIT HUP INT TERM',
-      '(cd "$EW_REPO" && GIT_INDEX_FILE="$EW_INDEX" git add -A -- .)',
-      'case "$EW_EASYWORK/" in "$EW_REPO"/*) EW_REL="${EW_EASYWORK#"$EW_REPO"/}"; (cd "$EW_REPO" && GIT_INDEX_FILE="$EW_INDEX" git rm -r -q --cached --ignore-unmatch -- "$EW_REL") ;; esac',
-      'EW_TREE="$(cd "$EW_REPO" && GIT_INDEX_FILE="$EW_INDEX" git write-tree)"',
-      'EW_COMMIT="$(cd "$EW_REPO" && printf "%s\\n" "EasyWork checkpoint" | env GIT_AUTHOR_NAME=EasyWork GIT_AUTHOR_EMAIL=runtime@easywork.local GIT_COMMITTER_NAME=EasyWork GIT_COMMITTER_EMAIL=runtime@easywork.local git commit-tree "$EW_TREE")"',
-      '(cd "$EW_REPO" && git update-ref "$EW_REF" "$EW_COMMIT")',
-      '(cd "$EW_REPO" && git bundle create "$EW_BUNDLE_TMP" "$EW_REF" >/dev/null)',
+      'if test -n "$EW_PARENT"; then GIT_INDEX_FILE="$EW_INDEX" ew_git read-tree "$EW_PARENT^{tree}"; else GIT_INDEX_FILE="$EW_INDEX" ew_git read-tree --empty; fi',
+      'trap \'rm -f "$EW_INDEX" "$EW_BUNDLE_TMP"\' EXIT HUP INT TERM',
+      'if test -n "$EW_SCOPE"; then (cd "$EW_VERSION_ROOT" && GIT_INDEX_FILE="$EW_INDEX" ew_git add -A -- "$EW_SCOPE"); else (cd "$EW_VERSION_ROOT" && GIT_INDEX_FILE="$EW_INDEX" ew_git add -A -- .); fi',
+      'case "$EW_EASYWORK/" in "$EW_VERSION_ROOT"/*) EW_REL="${EW_EASYWORK#"$EW_VERSION_ROOT"/}"; GIT_INDEX_FILE="$EW_INDEX" ew_git rm -r -q --cached --ignore-unmatch -- "$EW_REL" ;; esac',
+      'GIT_INDEX_FILE="$EW_INDEX" ew_git rm -r -q --cached --ignore-unmatch -- .git 2>/dev/null || true',
+      'EW_TREE="$(GIT_INDEX_FILE="$EW_INDEX" ew_git write-tree)"',
+      'if test -n "$EW_PARENT"; then EW_COMMIT="$(printf "%s\\n" "EasyWork checkpoint" | env HOME="$EW_GIT_HOME" XDG_CONFIG_HOME="$EW_GIT_HOME/.config" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_DIR="$EW_SHADOW" GIT_AUTHOR_NAME=EasyWork GIT_AUTHOR_EMAIL=runtime@easywork.local GIT_COMMITTER_NAME=EasyWork GIT_COMMITTER_EMAIL=runtime@easywork.local "$EW_GIT_BIN" commit-tree "$EW_TREE" -p "$EW_PARENT")"; else EW_COMMIT="$(printf "%s\\n" "EasyWork checkpoint" | env HOME="$EW_GIT_HOME" XDG_CONFIG_HOME="$EW_GIT_HOME/.config" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_DIR="$EW_SHADOW" GIT_AUTHOR_NAME=EasyWork GIT_AUTHOR_EMAIL=runtime@easywork.local GIT_COMMITTER_NAME=EasyWork GIT_COMMITTER_EMAIL=runtime@easywork.local "$EW_GIT_BIN" commit-tree "$EW_TREE")"; fi',
+      'ew_git update-ref "$EW_REF" "$EW_COMMIT"',
+      'ew_git update-ref refs/easywork/latest "$EW_COMMIT"',
+      'ew_git bundle create "$EW_BUNDLE_TMP" "$EW_REF" >/dev/null',
       'mv -f "$EW_BUNDLE_TMP" "$EW_BUNDLE"',
       'chmod 600 "$EW_BUNDLE"',
-      'echo "MODE=git"',
-      'echo "REPO_ROOT=$EW_REPO"',
+      'echo "MODE=shadow-git"',
+      'echo "REPO_ROOT=$EW_VERSION_ROOT"',
+      'echo "REPO_SCOPE=$EW_SCOPE"',
+      'echo "SHADOW_REPO=$EW_SHADOW"',
       'echo "COMMIT=$EW_COMMIT"',
       'echo "REF=$EW_REF"',
       'echo "BUNDLE=$EW_BUNDLE"',
@@ -6258,31 +7903,39 @@ async function createWorkspaceCheckpoint(session, actor, task, phase) {
     runId: task.runId,
     phase,
     serverId: task.serverId,
-    logicalWorkspaceId:
-      task.logicalWorkspaceId ||
-      crypto.createHash("sha256").update(`${task.serverId}:${workspace}`).digest("hex").slice(0, 24),
+    serverIdentity: task.serverIdentity || session.serverIdentity,
+    workspaceId: String(task.workspaceId || ""),
+    workspaceName: String(task.workspaceName || "") || undefined,
+    workspaceKind: task.workspaceKind === "virtual" ? "virtual" : "physical",
+    versionDomainId,
+    versionRoot,
     workspace,
     workspaceMode:
-      mode === "git"
+      mode === "shadow-git"
         ? workspace.startsWith(`${session.home}/.easywork/worktrees/`) ||
           workspace.startsWith(`${session.home}/.easywork/workspaces/`)
           ? "managed"
           : "attached"
         : "unmanaged",
-    status: mode === "git" ? "available" : "unavailable",
+    status: mode === "shadow-git" ? "available" : "unavailable",
     repoRoot: fields.REPO_ROOT || undefined,
+    repoRelativePath: fields.REPO_SCOPE || repoRelativePath,
+    versionEngine: mode === "shadow-git" ? "easywork-shadow-git" : undefined,
+    shadowRepositoryPath: fields.SHADOW_REPO || undefined,
     snapshotCommit: fields.COMMIT || undefined,
     snapshotRef: fields.REF || undefined,
     remoteBundlePath: fields.BUNDLE || undefined,
     remoteMetadataPath: metadataPath,
     exclusions:
-      mode === "git"
-        ? ["ignored files", "dirty submodule contents", "workspace-external effects"]
-        : ["non-Git workspace", "workspace-external effects"],
+      mode === "shadow-git"
+        ? ["ignored files", "nested repository contents", "workspace-external effects"]
+        : ["Git unavailable", "workspace-external effects"],
     diagnostic:
-      mode === "git"
+      mode === "shadow-git"
         ? ""
-        : String(result.stderr || "未检测到可快照的 Git 工作区").trim().slice(0, 1_000),
+        : String(result.stderr || "服务器没有可用于 EasyWork 快照的 Git 可执行文件")
+            .trim()
+            .slice(0, 1_000),
     createdAt: isoNow(),
   };
   await remoteSftpWriteAtomic(
@@ -6318,6 +7971,16 @@ async function restoreWorkspaceCheckpoint(session, checkpoint, conversationId) {
   }
   const conversationSegment = safeSegment(conversationId, "conversation");
   const target = `${session.home}/.easywork/worktrees/${conversationSegment}/main`;
+  const relativeWorkspace = String(checkpoint.repoRelativePath || "").trim();
+  if (
+    relativeWorkspace.startsWith("/") ||
+    relativeWorkspace.split("/").includes("..")
+  ) {
+    throw new Error("工作区检查点包含无效的相对路径");
+  }
+  const targetWorkspace = relativeWorkspace
+    ? path.posix.join(target, relativeWorkspace)
+    : target;
   const result = await remoteExec(
     session.client,
     [
@@ -6331,16 +7994,18 @@ async function restoreWorkspaceCheckpoint(session, checkpoint, conversationId) {
       '(cd "$EW_TARGET" && git init -q)',
       'if ! (cd "$EW_TARGET" && git fetch -q "$EW_BUNDLE" "$EW_REF"); then rm -rf "$EW_TARGET"; exit 1; fi',
       'if ! (cd "$EW_TARGET" && git checkout -q --detach FETCH_HEAD); then rm -rf "$EW_TARGET"; exit 1; fi',
-      'echo "WORKSPACE=$EW_TARGET"',
+      `mkdir -p ${shellQuote(targetWorkspace)}`,
+      `printf "WORKSPACE=%s\\n" ${shellQuote(targetWorkspace)}`,
       'echo "COMMIT=$(cd "$EW_TARGET" && git rev-parse HEAD)"',
     ].join("\n"),
   );
   const fields = parseRuntimeFields(result.stdout);
-  if (!fields.WORKSPACE || fields.WORKSPACE !== target) {
+  if (!fields.WORKSPACE || fields.WORKSPACE !== targetWorkspace) {
     throw new Error("工作区快照恢复结果无法验证");
   }
   return {
-    workspace: target,
+    workspace: targetWorkspace,
+    repoRoot: target,
     commit: fields.COMMIT,
     mode: "managed",
     sourceCheckpointId: checkpoint.id,
@@ -6354,7 +8019,11 @@ async function selectivelyRevertWorkspaceRuns(
     conversationId,
     serverId,
     workspace,
-    logicalWorkspaceId,
+    workspaceId,
+    workspaceName,
+    workspaceKind,
+    versionRoot,
+    versionDomainId,
     checkpoints,
   },
 ) {
@@ -6367,9 +8036,9 @@ async function selectivelyRevertWorkspaceRuns(
       throw new Error(`任务 ${pair.runId} 缺少可用的前后工作区检查点`);
     }
     if (
-      logicalWorkspaceId &&
-      [pair.before.logicalWorkspaceId, pair.after.logicalWorkspaceId].some(
-        (value) => value && String(value) !== String(logicalWorkspaceId),
+      workspaceId &&
+      [pair.before.workspaceId, pair.after.workspaceId].some(
+        (value) => value && String(value) !== String(workspaceId),
       )
     ) {
       throw new Error(`任务 ${pair.runId} 不属于当前工作区，已停止重置`);
@@ -6385,7 +8054,11 @@ async function selectivelyRevertWorkspaceRuns(
       runId: resetId,
       serverId,
       workspace,
-      logicalWorkspaceId,
+      workspaceId,
+      workspaceName,
+      workspaceKind,
+      versionRoot,
+      versionDomainId,
     },
     "current",
   );
@@ -6401,10 +8074,12 @@ async function selectivelyRevertWorkspaceRuns(
     previewId,
   );
   const tempRoot = `${session.home}/.easywork/tmp/${resetId}`;
+  const repoScope = String(currentCheckpoint.repoRelativePath || "");
   const commands = [
     "set -eu",
-    `EW_PREVIEW=${shellQuote(preview.workspace)}`,
+    `EW_PREVIEW=${shellQuote(preview.repoRoot)}`,
     `EW_ACTUAL=${shellQuote(currentCheckpoint.repoRoot || workspace)}`,
+    `EW_SCOPE=${shellQuote(repoScope)}`,
     `EW_TMP=${shellQuote(tempRoot)}`,
     'case "$EW_PREVIEW" in "$HOME/.easywork/worktrees/reset-preview-"*) ;; *) echo "预演工作区路径校验失败" >&2; exit 91 ;; esac',
     'case "$EW_TMP" in "$HOME/.easywork/tmp/reset-"*) ;; *) echo "临时目录路径校验失败" >&2; exit 92 ;; esac',
@@ -6422,16 +8097,16 @@ async function selectivelyRevertWorkspaceRuns(
       commands.push(
         `(cd "$EW_PREVIEW" && git fetch -q ${shellQuote(pair.before.remoteBundlePath)} ${shellQuote(`${pair.before.snapshotRef}:${beforeRef}`)})`,
         `(cd "$EW_PREVIEW" && git fetch -q ${shellQuote(pair.after.remoteBundlePath)} ${shellQuote(`${pair.after.snapshotRef}:${afterRef}`)})`,
-        `(cd "$EW_PREVIEW" && git diff --binary --no-ext-diff ${shellQuote(afterRef)} ${shellQuote(beforeRef)} -- . > ${shellQuote(patchPath)})`,
+        `(cd "$EW_PREVIEW" && if test -n "$EW_SCOPE"; then git diff --binary --no-ext-diff ${shellQuote(afterRef)} ${shellQuote(beforeRef)} -- "$EW_SCOPE"; else git diff --binary --no-ext-diff ${shellQuote(afterRef)} ${shellQuote(beforeRef)} -- .; fi > ${shellQuote(patchPath)})`,
         `if test -s ${shellQuote(patchPath)}; then (cd "$EW_PREVIEW" && git apply --check ${shellQuote(patchPath)} && git apply ${shellQuote(patchPath)}); fi`,
       );
     });
   const combinedPatch = `${tempRoot}/combined.patch`;
   commands.push(
-    `(cd "$EW_PREVIEW" && git diff --binary --no-ext-diff HEAD -- . > ${shellQuote(combinedPatch)})`,
-    '(cd "$EW_PREVIEW" && git diff --name-only HEAD -- .)',
-    `if test -s ${shellQuote(combinedPatch)}; then (cd "$EW_ACTUAL" && git apply --check ${shellQuote(combinedPatch)}); fi`,
-    `if test -s ${shellQuote(combinedPatch)}; then (cd "$EW_ACTUAL" && git apply ${shellQuote(combinedPatch)}); fi`,
+    `(cd "$EW_PREVIEW" && if test -n "$EW_SCOPE"; then git diff --binary --no-ext-diff HEAD -- "$EW_SCOPE"; else git diff --binary --no-ext-diff HEAD -- .; fi > ${shellQuote(combinedPatch)})`,
+    '(cd "$EW_PREVIEW" && if test -n "$EW_SCOPE"; then git diff --name-only HEAD -- "$EW_SCOPE"; else git diff --name-only HEAD -- .; fi)',
+    `if test -s ${shellQuote(combinedPatch)}; then (cd "$EW_ACTUAL" && git apply --no-index --check ${shellQuote(combinedPatch)}); fi`,
+    `if test -s ${shellQuote(combinedPatch)}; then (cd "$EW_ACTUAL" && git apply --no-index ${shellQuote(combinedPatch)}); fi`,
   );
   const result = await remoteExec(session.client, commands.join("\n"));
   return {
@@ -6551,7 +8226,12 @@ async function generateConversationTitle(actor, prompt, response = "") {
   }
 }
 
-async function agentPromptWithNativePlanning(context, webHandoff = "") {
+async function agentPromptWithNativePlanning(
+  context,
+  webHandoff = "",
+  workspaceScope = "",
+  adapter = "opencode",
+) {
   const agentBrief = webHandoff
     ? await renderPromptTemplate("web/agent-brief.md", {
         CONTENT: webHandoff,
@@ -6561,11 +8241,18 @@ async function agentPromptWithNativePlanning(context, webHandoff = "") {
     renderPromptTemplate("agents/common.md"),
     renderPromptTemplate("agents/protocol.md"),
   ]);
-  return renderPromptTemplate("agents/opencode.md", {
+  const template =
+    adapter === "codex"
+      ? "agents/codex.md"
+      : adapter === "claude"
+        ? "agents/claudecode.md"
+        : "agents/opencode.md";
+  return renderPromptTemplate(template, {
     AGENT_SYSTEM: agentSystem,
     SYNC_CONTEXT:
       typeof context === "string" ? context : String(context?.text || ""),
     AGENT_BRIEF: agentBrief,
+    WORKSPACE_SCOPE: workspaceScope,
     EVENT_PROTOCOL: eventProtocol,
   });
 }
@@ -6576,7 +8263,10 @@ function formatAgentDelta(delta) {
     .map((message) => {
       const speaker = message.role === "user" ? "用户" : "EasyWork";
       const agent = message.agentId ? ` / Agent ${message.agentId}` : "";
-      return `${speaker}${agent}：${message.content}`;
+      const workspace = message.workspaceName
+        ? ` / 工作区 ${message.workspaceName}`
+        : "";
+      return `${speaker}${agent}${workspace}：${message.content}`;
     })
     .join("\n\n");
 }
@@ -6608,6 +8298,7 @@ async function buildAgentSyncContext(context, delta, memoryDelta) {
 
 function agentMemoryDelta(context, binding) {
   const versions = binding?.syncCursor?.memoryVersions || {};
+  const statuses = binding?.syncCursor?.memoryStatuses || {};
   if (!context?.state?.settings?.memoryEnabled) {
     if (binding?.syncCursor?.memoryEnabled === false) return [];
     return Object.entries(versions).map(([id, revision]) => ({
@@ -6622,11 +8313,31 @@ function agentMemoryDelta(context, binding) {
   const candidates = binding?.agentSessionId
     ? context?.memorySyncRecords || []
     : context?.memoryRecords || [];
-  return candidates.filter(
+  const candidateIds = new Set(candidates.map((record) => String(record.id)));
+  const changed = candidates.filter(
     (record) =>
       !binding?.agentSessionId ||
-      Number(record.revision || 0) > Number(versions[record.id] || 0),
+      Number(record.revision || 0) > Number(versions[record.id] || 0) ||
+      String(record.status || "active") !==
+        String(statuses[record.id] || "active"),
   );
+  const outOfScopeRetractions = binding?.agentSessionId
+    ? Object.entries(versions)
+        .filter(
+          ([id]) =>
+            !candidateIds.has(String(id)) &&
+            String(statuses[id] || "active") !== "deleted",
+        )
+        .map(([id, revision]) => ({
+          id,
+          revision: Number(revision || 0),
+          status: "deleted",
+          scope: "conversation",
+          semanticKey: id,
+          source: "memory-out-of-scope",
+        }))
+    : [];
+  return [...changed, ...outOfScopeRetractions];
 }
 
 function workHandoffContext(context, delta, memoryDelta) {
@@ -6655,12 +8366,9 @@ function workHandoffContext(context, delta, memoryDelta) {
     .join("\n\n");
 }
 
-function deterministicWorkHandoff(context, memoryDelta = context.memoryRecords) {
+function deterministicWorkHandoff(context) {
   const sections = [
     `## 本轮用户原文\n\n${context.sections.request}`,
-    memoryDelta.length
-      ? `## 与本轮相关的新记忆\n\n${formatMemoryContext(memoryDelta)}`
-      : "",
     context.sections.skills
       ? `## 本轮技能\n\n${context.sections.skills}`
       : "",
@@ -6672,6 +8380,12 @@ function deterministicWorkHandoff(context, memoryDelta = context.memoryRecords) 
 }
 
 function providerConfigForOpenCode(provider) {
+  const contextLimit =
+    positiveInteger(provider.contextLimit || provider.modelContextLimit) ||
+    DEFAULT_AGENT_CONTEXT_LIMIT;
+  const outputLimit =
+    positiveInteger(provider.outputLimit || provider.modelOutputLimit) ||
+    DEFAULT_AGENT_OUTPUT_LIMIT;
   return {
     $schema: "https://opencode.ai/config.json",
     provider: {
@@ -6687,6 +8401,14 @@ function providerConfigForOpenCode(provider) {
         models: {
           [provider.model]: {
             name: provider.model,
+            ...(contextLimit || outputLimit
+              ? {
+                  limit: {
+                    ...(contextLimit ? { context: contextLimit } : {}),
+                    ...(outputLimit ? { output: outputLimit } : {}),
+                  },
+                }
+              : {}),
           },
         },
       },
@@ -6775,6 +8497,60 @@ function hasOpenCodeCredential(value) {
   return Object.values(value).some((item) => typeof item === "string" && item);
 }
 
+function openCodeConfiguredModelDetails(config, preferredModel = "") {
+  const providers = isPlainObject(config?.provider) ? config.provider : {};
+  const configuredFullModel = String(preferredModel || config?.model || "").trim();
+  const configuredParts = configuredFullModel.includes("/")
+    ? [configuredFullModel.split("/")[0], configuredFullModel.split("/").slice(1).join("/")]
+    : [];
+  const candidates = [];
+  if (configuredParts.length === 2) candidates.push(configuredParts);
+  if (configuredFullModel && !configuredParts.length) {
+    for (const [providerId, providerValue] of Object.entries(providers)) {
+      if (isPlainObject(providerValue?.models?.[configuredFullModel])) {
+        candidates.push([providerId, configuredFullModel]);
+      }
+    }
+  }
+  const easyworkModels = Object.keys(
+    isPlainObject(providers[EASYWORK_OPENCODE_PROVIDER_ID]?.models)
+      ? providers[EASYWORK_OPENCODE_PROVIDER_ID].models
+      : {},
+  );
+  for (const modelId of easyworkModels) {
+    candidates.push([EASYWORK_OPENCODE_PROVIDER_ID, modelId]);
+  }
+  for (const [providerId, providerValue] of Object.entries(providers)) {
+    for (const modelId of Object.keys(
+      isPlainObject(providerValue?.models) ? providerValue.models : {},
+    )) {
+      candidates.push([providerId, modelId]);
+    }
+  }
+  const seen = new Set();
+  for (const [providerId, modelId] of candidates) {
+    const key = `${providerId}/${modelId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const modelConfig = providers[providerId]?.models?.[modelId];
+    if (!isPlainObject(modelConfig)) continue;
+    return {
+      providerId,
+      modelId,
+      model: key,
+      contextLimit: positiveInteger(modelConfig.limit?.context),
+      outputLimit: positiveInteger(modelConfig.limit?.output),
+    };
+  }
+  return {
+    providerId: configuredParts[0] || "",
+    modelId: configuredParts[1] || configuredFullModel,
+    model: configuredFullModel,
+    contextLimit: null,
+    outputLimit: null,
+  };
+}
+
 function openCodeConfigurationStatus(
   configContent,
   authContent,
@@ -6793,6 +8569,7 @@ function openCodeConfigurationStatus(
   }
 
   const providers = isPlainObject(config.provider) ? config.provider : {};
+  const configuredModel = openCodeConfiguredModelDetails(config);
   const authenticatedProviderIds = Object.entries(auth)
     .filter(([, credential]) => hasOpenCodeCredential(credential))
     .map(([providerId]) => providerId);
@@ -6809,6 +8586,16 @@ function openCodeConfigurationStatus(
       configured: easyworkConfigured,
       providerId: EASYWORK_OPENCODE_PROVIDER_ID,
       model: easyworkModels[0] || "",
+      contextLimit:
+        positiveInteger(
+          providers[EASYWORK_OPENCODE_PROVIDER_ID]?.models?.[easyworkModels[0]]
+            ?.limit?.context,
+        ) || undefined,
+      outputLimit:
+        positiveInteger(
+          providers[EASYWORK_OPENCODE_PROVIDER_ID]?.models?.[easyworkModels[0]]
+            ?.limit?.output,
+        ) || undefined,
     };
   }
 
@@ -6832,12 +8619,44 @@ function openCodeConfigurationStatus(
       easyworkConfigured ||
         authenticatedProviderIds.length ||
         String(config.model || "").trim() ||
-        configuredProvider,
+      configuredProvider,
     ),
+    providerId: configuredModel.providerId || undefined,
+    model: configuredModel.modelId || undefined,
+    contextLimit: configuredModel.contextLimit || undefined,
+    outputLimit: configuredModel.outputLimit || undefined,
   };
 }
 
-function agentConfigFor(adapter, home) {
+function agentConfigFor(adapter, home, { managed = false, agentId = "" } = {}) {
+  if (managed) {
+    const id = agentId || (adapter === "claude" ? "claudecode" : adapter);
+    const managedPaths = managedAgentPaths(home, id);
+    if (adapter === "opencode") {
+      return {
+        configPath: managedPaths.opencodeConfigPath,
+        authPath: managedPaths.opencodeAuthPath,
+        dataPath: managedPaths.dataRoot,
+        configRoot: managedPaths.configRoot,
+      };
+    }
+    if (adapter === "codex") {
+      return {
+        configPath: managedPaths.codexConfigPath,
+        dataPath: managedPaths.codexHome,
+        configRoot: managedPaths.configRoot,
+        apiKeyPath: managedPaths.apiKeyPath,
+      };
+    }
+    if (adapter === "claude") {
+      return {
+        configPath: managedPaths.claudeSettingsPath,
+        dataPath: managedPaths.claudeConfigDir,
+        configRoot: managedPaths.configRoot,
+        apiKeyPath: managedPaths.apiKeyPath,
+      };
+    }
+  }
   if (adapter === "opencode") {
     return {
       configPath: `${home}/.config/opencode/opencode.json`,
@@ -6851,10 +8670,10 @@ function agentConfigFor(adapter, home) {
       dataPath: `${home}/.claude`,
     };
   }
-  if (adapter === "qwen") {
+  if (adapter === "codex") {
     return {
-      configPath: `${home}/.qwen/settings.json`,
-      dataPath: `${home}/.qwen`,
+      configPath: `${home}/.codex/config.toml`,
+      dataPath: `${home}/.codex`,
     };
   }
   return {};
@@ -6866,18 +8685,108 @@ function agentRuntimeCapabilities(
   { liveControl = true } = {},
 ) {
   const available = status === "ready";
-  const openCode = adapter === "opencode" && available;
+  const supported = ["opencode", "codex", "claude"].includes(adapter) && available;
   return {
-    liveInput: openCode && liveControl,
-    nativeAbort: openCode && liveControl,
-    resumeSession: openCode,
-    nativePlanning: openCode,
+    // All built-in adapters accept instructions while a run is active.
+    // OpenCode consumes them immediately. Codex and Claude Code execute the
+    // queued text as the next turn on the same native session.
+    liveInput: supported && liveControl,
+    nativeAbort: supported && liveControl,
+    resumeSession: supported,
+    nativePlanning: supported,
     workspaceCheckpoint: true,
+    contextReadable: supported,
+    permissions: supported,
   };
 }
 
 function remoteAgentRegistryPath(actor) {
   return path.join(actorDirectory(actor), "runtime", "remote-agents.json");
+}
+
+function agentRuntimeProfilesPath(actor) {
+  return path.join(actorDirectory(actor), "runtime", "agent-profiles.json");
+}
+
+function normalizeAgentRuntimeScope(scope = {}) {
+  return {
+    conversationId: String(scope.conversationId || ""),
+    workspaceId: String(scope.workspaceId || ""),
+  };
+}
+
+function agentRuntimeProfileKey(session, agentId, scope = {}) {
+  const normalized = normalizeAgentRuntimeScope(scope);
+  return [
+    remoteServerKey(session),
+    safeSegment(agentId),
+    normalized.conversationId ? safeSegment(normalized.conversationId) : "default",
+    normalized.workspaceId ? safeSegment(normalized.workspaceId) : "default",
+  ].join(":");
+}
+
+function agentRuntimeId(session, agentId, scope = {}) {
+  return crypto
+    .createHash("sha256")
+    .update(agentRuntimeProfileKey(session, agentId, scope))
+    .digest("hex")
+    .slice(0, 24);
+}
+
+async function readAgentRuntimeProfiles(actor) {
+  const document = await readJson(agentRuntimeProfilesPath(actor), {
+    schemaVersion: 1,
+    profiles: {},
+  });
+  return {
+    schemaVersion: 1,
+    profiles:
+      document?.profiles && typeof document.profiles === "object"
+        ? document.profiles
+        : {},
+  };
+}
+
+async function getAgentRuntimeProfile(actor, session, agentId, scope = {}) {
+  const document = await readAgentRuntimeProfiles(actor);
+  const scoped =
+    document.profiles[agentRuntimeProfileKey(session, agentId, scope)] || null;
+  if (scoped) return scoped;
+  const normalized = normalizeAgentRuntimeScope(scope);
+  if (normalized.conversationId || normalized.workspaceId) {
+    return (
+      document.profiles[agentRuntimeProfileKey(session, agentId)] || null
+    );
+  }
+  return null;
+}
+
+async function updateAgentRuntimeProfile(
+  actor,
+  session,
+  agentId,
+  scopeOrPatch,
+  maybePatch,
+) {
+  const hasExplicitScope = maybePatch !== undefined;
+  const scope = hasExplicitScope ? normalizeAgentRuntimeScope(scopeOrPatch) : {};
+  const patch = hasExplicitScope ? maybePatch : scopeOrPatch;
+  return enqueueActorMutation(agentProfileMutationQueues, actor, async () => {
+    const document = await readAgentRuntimeProfiles(actor);
+    const key = agentRuntimeProfileKey(session, agentId, scope);
+    const previous = document.profiles[key] || {};
+    document.profiles[key] = {
+      ...previous,
+      ...patch,
+      serverId: session.serverId,
+      agentId,
+      conversationId: scope.conversationId || undefined,
+      workspaceId: scope.workspaceId || undefined,
+      updatedAt: isoNow(),
+    };
+    await writeJson(agentRuntimeProfilesPath(actor), document);
+    return document.profiles[key];
+  });
 }
 
 function remoteServerKey(session) {
@@ -6899,12 +8808,22 @@ async function storedRemoteAgents(actor, session) {
 }
 
 async function inspectOpenCodeNativeConfiguration(session, agent = {}) {
-  const defaults = agentConfigFor("opencode", session.home);
+  const defaults = agentConfigFor("opencode", session.home, {
+    managed: Boolean(agent.managed),
+    agentId: agent.id || "opencode",
+  });
   const jsonPath = agent.configPath || defaults.configPath;
   const jsoncPath = agent.alternateConfigPath || defaults.alternateConfigPath;
-  const authPath = `${session.home}/.local/share/opencode/auth.json`;
-  const jsonBuffer = await remoteSftpReadOptional(session.client, jsonPath);
-  const jsoncBuffer = await remoteSftpReadOptional(session.client, jsoncPath);
+  const authPath =
+    agent.authPath ||
+    defaults.authPath ||
+    `${session.home}/.local/share/opencode/auth.json`;
+  const jsonBuffer = jsonPath
+    ? await remoteSftpReadOptional(session.client, jsonPath)
+    : null;
+  const jsoncBuffer = jsoncPath
+    ? await remoteSftpReadOptional(session.client, jsoncPath)
+    : null;
   const authBuffer = await remoteSftpReadOptional(session.client, authPath);
   const useJsonc = Boolean(jsoncBuffer?.length);
   const configPath = useJsonc ? jsoncPath : jsonPath;
@@ -6915,6 +8834,7 @@ async function inspectOpenCodeNativeConfiguration(session, agent = {}) {
   return {
     configPath,
     authPath,
+    dataPath: agent.dataPath || defaults.dataPath,
     configContent,
     authContent,
     ...openCodeConfigurationStatus(configContent, authContent, {
@@ -6923,7 +8843,7 @@ async function inspectOpenCodeNativeConfiguration(session, agent = {}) {
   };
 }
 
-async function scanRemoteAgents(session, actor) {
+async function scanRemoteAgents(session, actor, scope = {}) {
   if (!session.client) throw new Error("SSH 尚未连接");
   const liveControlCheck = await remoteExec(
     session.client,
@@ -6933,37 +8853,41 @@ async function scanRemoteAgents(session, actor) {
   const liveControlAvailable = liveControlCheck.code === 0;
   const command = [
     "set +e",
-    'managed_opencode="$HOME/.easywork/agents/opencode/bin/opencode"',
-    'user_opencode="$HOME/.opencode/bin/opencode"',
-    'system_opencode="$(command -v opencode 2>/dev/null)"',
-    'if [ -x "$managed_opencode" ]; then printf "opencode\\t%s\\t%s\\t%s\\topencode\\n" "$HOME/.easywork/agents/opencode" "$managed_opencode" "$("$managed_opencode" --version 2>/dev/null | head -n 1)"; fi',
-    'if [ -x "$user_opencode" ]; then printf "opencode-user\\t%s\\t%s\\t%s\\topencode\\n" "$HOME/.opencode" "$user_opencode" "$("$user_opencode" --version 2>/dev/null | head -n 1)"; fi',
-    'if [ -n "$system_opencode" ] && [ -x "$system_opencode" ]; then printf "opencode-system\\t%s\\t%s\\t%s\\topencode\\n" "$(dirname "$system_opencode")" "$system_opencode" "$("$system_opencode" --version 2>/dev/null | head -n 1)"; fi',
-    'for spec in "qwen:$HOME:$(command -v qwen 2>/dev/null):qwen" "claude:$HOME:$(command -v claude 2>/dev/null):claude"; do',
-    '  id="${spec%%:*}"; rest="${spec#*:}"; folder="${rest%%:*}"; rest="${rest#*:}"; bin="${rest%%:*}"; adapter="${rest##*:}";',
-    '  if [ -n "$bin" ] && [ -x "$bin" ]; then ver="$("$bin" --version 2>/dev/null | head -n 1)"; printf "%s\\t%s\\t%s\\t%s\\t%s\\n" "$id" "$folder" "$bin" "$ver" "$adapter"; fi',
-    "done",
+    'emit_agent() { EW_ID="$1"; EW_FOLDER="$2"; EW_BIN="$3"; EW_ADAPTER="$4"; EW_DEPLOYMENT="$5"; test -n "$EW_BIN" && test -x "$EW_BIN" || return 0; EW_VERSION="$("$EW_BIN" --version 2>/dev/null | head -n 1)"; printf "%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$EW_ID" "$EW_FOLDER" "$EW_BIN" "$EW_VERSION" "$EW_ADAPTER" "$EW_DEPLOYMENT"; }',
+    'emit_agent opencode "$HOME/.easywork/agents/opencode" "$HOME/.easywork/agents/opencode/bin/opencode" opencode easywork',
+    'emit_agent codex "$HOME/.easywork/agents/codex" "$HOME/.easywork/agents/codex/bin/codex" codex easywork',
+    'emit_agent claudecode "$HOME/.easywork/agents/claudecode" "$HOME/.easywork/agents/claudecode/bin/claude" claude easywork',
   ].join("\n");
   const result = await remoteExec(session.client, command, { allowFailure: true });
   const discovered = result.stdout
     .split(/\r?\n/)
     .filter(Boolean)
     .map((line) => {
-      const [id, folder, binaryPath, version, adapter = "plain"] = line.split("\t");
-      const isOpenCode = adapter === "opencode";
-      const config = agentConfigFor(adapter, session.home);
+      const [id, folder, binaryPath, version, adapter = "plain", deployment] = line.split("\t");
+      const managed = deployment === "easywork";
+      const managedId = managed ? id : "";
+      const config = agentConfigFor(adapter, session.home, {
+        managed,
+        agentId: managedId,
+      });
       return {
         id,
-        name: isOpenCode ? "OpenCode" : adapter === "qwen" ? "Qwen Code" : "Claude Code",
+        name:
+          adapter === "opencode"
+            ? "OpenCode"
+            : adapter === "codex"
+              ? "Codex"
+              : "Claude Code",
         folder,
         path: binaryPath,
         version: version || undefined,
-        status: isOpenCode ? "ready" : "needs-adapter",
+        status: "ready",
         adapter,
-        managed: folder.includes("/.easywork/agents/opencode"),
+        managed,
+        deployment: managed ? "easywork" : "user",
         capabilities: agentRuntimeCapabilities(
           adapter,
-          isOpenCode ? "ready" : "needs-adapter",
+          "ready",
           { liveControl: liveControlAvailable },
         ),
         ...config,
@@ -6990,166 +8914,409 @@ async function scanRemoteAgents(session, actor) {
       `test -x ${shellQuote(stored.path)} && ${shellQuote(stored.path)} --version 2>/dev/null | head -n 1`,
       { allowFailure: true },
     );
-    if (binaryResult.code !== 0) continue;
+    if (binaryResult.code !== 0 || !["opencode", "codex", "claude"].includes(stored.adapter)) continue;
     discovered.push({
       ...stored,
       version: binaryResult.stdout.trim() || stored.version,
-      status: stored.adapter === "opencode" ? "ready" : "needs-adapter",
+      status: "ready",
+      managed: false,
+      deployment: "user",
+      configured: true,
       capabilities: agentRuntimeCapabilities(
         stored.adapter,
-        stored.adapter === "opencode" ? "ready" : "needs-adapter",
+        "ready",
         { liveControl: liveControlAvailable },
       ),
     });
   }
 
+  const runtimeProfiles = await readAgentRuntimeProfiles(actor);
+  const [accountState, accountSecrets] = await Promise.all([
+    getState(actor),
+    getSecrets(actor),
+  ]);
+  const accountProvider = accountState?.settings?.provider || {};
   for (const agent of discovered) {
-    if (agent.adapter === "opencode") {
-      const configuration = await inspectOpenCodeNativeConfiguration(
-        session,
-        agent,
+    const runtimeProfile =
+      runtimeProfiles.profiles[agentRuntimeProfileKey(session, agent.id, scope)] ||
+      runtimeProfiles.profiles[agentRuntimeProfileKey(session, agent.id)] || {};
+    if (agent.managed) {
+      const model = String(runtimeProfile.model || accountProvider.model || "").trim();
+      const runtimeId = agentRuntimeId(session, agent.id, scope);
+      const runtimePaths = managedAgentRuntimePaths(session.home, agent.id, runtimeId);
+      agent.runtimeId = runtimeId;
+      agent.model = model || undefined;
+      agent.contextLimit =
+        positiveInteger(runtimeProfile.contextLimit) ||
+        positiveInteger(accountProvider.modelContextLimit) ||
+        undefined;
+      agent.outputLimit =
+        positiveInteger(runtimeProfile.outputLimit) ||
+        positiveInteger(accountProvider.modelOutputLimit) ||
+        undefined;
+      agent.configured = Boolean(
+        accountProvider.baseUrl && accountSecrets.providerApiKey && model,
       );
-      agent.configured = configuration.configured;
-      agent.configPath = configuration.configPath;
-      agent.model = configuration.model || undefined;
-      if (configuration.error) agent.configurationError = configuration.error;
+      agent.configPath =
+        agent.adapter === "opencode"
+          ? runtimePaths.opencodeConfigPath
+          : agent.adapter === "codex"
+            ? runtimePaths.codexConfigPath
+            : runtimePaths.claudeSettingsPath;
+      agent.dataPath =
+        agent.adapter === "opencode"
+          ? runtimePaths.opencodeDataHome
+          : agent.adapter === "codex"
+            ? runtimePaths.codexHome
+            : runtimePaths.claudeConfigDir;
+      agent.configRoot = runtimePaths.configRoot;
+      if (agent.adapter === "opencode") {
+        agent.authPath = runtimePaths.opencodeAuthPath;
+        delete agent.apiKeyPath;
+      } else {
+        agent.apiKeyPath = runtimePaths.apiKeyPath;
+        delete agent.authPath;
+      }
     } else {
-      const configCheck = agent.configPath
-        ? await remoteExec(
-            session.client,
-            `test -s ${shellQuote(agent.configPath)}`,
-            { allowFailure: true },
-          )
-        : { code: 1 };
-      agent.configured = configCheck.code === 0;
+      // User deployments keep their native config and credentials. EasyWork
+      // intentionally does not inspect or rewrite them.
+      agent.configured = true;
     }
+    agent.model = runtimeProfile.model || agent.model || undefined;
+    agent.reasoningEffort = runtimeProfile.reasoningEffort || undefined;
+    agent.permissionMode = runtimeProfile.permissionMode || undefined;
+    agent.sandboxMode = runtimeProfile.sandboxMode || undefined;
+    agent.configurationSchema = agent.managed
+      ? managedAgentCapabilitySchema(agent, runtimeProfile)
+      : undefined;
     delete agent.alternateConfigPath;
   }
 
-  if (!discovered.some((agent) => agent.adapter === "opencode")) {
+  let hostManifest = null;
+  try {
+    hostManifest = (await readAgentArtifactManifest()).manifest;
+  } catch {
+    // Scanning remains useful before the host artifact cache is initialized.
+  }
+  for (const catalog of Object.values(MANAGED_AGENT_CATALOG).reverse()) {
+    const existing = discovered.find((agent) => agent.id === catalog.id);
+    const hostVersion = normalizeAgentVersion(
+      hostManifest?.agents?.[catalog.id]?.version,
+    );
+    if (existing) {
+      existing.hostVersion = hostVersion || undefined;
+      existing.updateAvailable = Boolean(
+        hostVersion &&
+          compareAgentVersions(existing.version, hostVersion) < 0,
+      );
+      continue;
+    }
+    const paths = managedAgentPaths(session.home, catalog.id);
     discovered.unshift({
-      id: "opencode",
-      name: "OpenCode",
-      folder: "~/.easywork/agents/opencode",
-      path: "~/.easywork/agents/opencode/bin/opencode",
+      id: catalog.id,
+      name: catalog.name,
+      folder: paths.root,
+      path: paths.binaryPath,
       status: "missing",
-      adapter: "opencode",
+      adapter: catalog.adapter,
       managed: true,
+      deployment: "easywork",
       configured: false,
-      capabilities: agentRuntimeCapabilities("opencode", "missing", {
+      hostVersion: hostVersion || undefined,
+      capabilities: agentRuntimeCapabilities(catalog.adapter, "missing", {
         liveControl: liveControlAvailable,
       }),
-      ...agentConfigFor("opencode", session.home),
+      configurationSchema: managedAgentCapabilitySchema(
+        { adapter: catalog.adapter },
+        runtimeProfiles.profiles[
+          agentRuntimeProfileKey(session, catalog.id, scope)
+        ] || {},
+      ),
+      ...agentConfigFor(catalog.adapter, session.home, {
+        managed: true,
+        agentId: catalog.id,
+      }),
     });
   }
   return discovered;
 }
 
-async function ensureOpenCodeNativeConfig(
+function tomlString(value) {
+  return JSON.stringify(String(value ?? ""));
+}
+
+function managedCodexConfigContent(provider, profile, providerRoute) {
+  const contextLimit =
+    positiveInteger(profile?.contextLimit) ||
+    positiveInteger(provider.modelContextLimit) ||
+    DEFAULT_AGENT_CONTEXT_LIMIT;
+  return [
+    `model = ${tomlString(profile.model)}`,
+    'model_provider = "easywork"',
+    `model_context_window = ${contextLimit}`,
+    `model_reasoning_effort = ${tomlString(profile.reasoningEffort || "medium")}`,
+    `approval_policy = ${tomlString(profile.permissionMode || "never")}`,
+    `sandbox_mode = ${tomlString(profile.sandboxMode || "workspace-write")}`,
+    "",
+    "[sandbox_workspace_write]",
+    `network_access = ${profile.networkAccess === false ? "false" : "true"}`,
+    "",
+    "[model_providers.easywork]",
+    'name = "EasyWork"',
+    `base_url = ${tomlString(providerRoute.baseUrl)}`,
+    'env_key = "EASYWORK_AGENT_API_KEY"',
+    'wire_api = "responses"',
+    "requires_openai_auth = false",
+    "",
+  ].join("\n");
+}
+
+function managedClaudeSettingsContent(provider, profile, providerRoute) {
+  const persistentEffort = ["low", "medium", "high", "xhigh"].includes(
+    profile.reasoningEffort,
+  )
+    ? profile.reasoningEffort
+    : "";
+  return `${JSON.stringify(
+    {
+      $schema: "https://json.schemastore.org/claude-code-settings.json",
+      autoMemoryEnabled: false,
+      ...(persistentEffort ? { effortLevel: persistentEffort } : {}),
+      permissions: {
+        defaultMode: profile.permissionMode || "acceptEdits",
+        allow: Array.isArray(profile.allowedTools)
+          ? profile.allowedTools
+          : ["Read", "Glob", "Grep", "WebFetch", "WebSearch"],
+        ask: Array.isArray(profile.askTools) ? profile.askTools : [],
+        deny: Array.isArray(profile.deniedTools) ? profile.deniedTools : [],
+      },
+      env: {
+        ANTHROPIC_BASE_URL: providerRoute.baseUrl,
+        ANTHROPIC_MODEL: profile.model,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: profile.model,
+        ANTHROPIC_DEFAULT_SONNET_MODEL: profile.model,
+        ANTHROPIC_DEFAULT_OPUS_MODEL: profile.model,
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+        DISABLE_AUTOUPDATER: "1",
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+function managedAgentCapabilitySchema(agent, profile = {}) {
+  if (agent?.adapter === "codex") {
+    return {
+      reasoning: {
+        label: "思考强度",
+        value: profile.reasoningEffort || "medium",
+        options: ["minimal", "low", "medium", "high", "xhigh"],
+      },
+      permission: {
+        label: "审批策略",
+        value: profile.permissionMode || "never",
+        options: ["untrusted", "on-request", "never"],
+      },
+      sandbox: {
+        label: "沙箱权限",
+        value: profile.sandboxMode || "workspace-write",
+        options: ["read-only", "workspace-write", "danger-full-access"],
+      },
+    };
+  }
+  if (agent?.adapter === "claude") {
+    const effortOptions = ["low", "medium", "high", "xhigh", "max"];
+    if (
+      !agent.version ||
+      compareAgentVersions(agent.version, "2.1.203") >= 0
+    ) {
+      effortOptions.push("ultracode");
+    }
+    return {
+      reasoning: {
+        label: "思考强度",
+        value: profile.reasoningEffort || "high",
+        options: effortOptions,
+      },
+      permission: {
+        label: "权限模式",
+        value: profile.permissionMode || "acceptEdits",
+        options: [
+          "default",
+          "acceptEdits",
+          "plan",
+          "auto",
+          "dontAsk",
+          "bypassPermissions",
+        ],
+      },
+    };
+  }
+  if (agent?.adapter === "opencode") {
+    return {
+      permission: {
+        label: "全局工具权限",
+        value: profile.permissionMode || "allow",
+        options: ["ask", "allow", "deny"],
+      },
+    };
+  }
+  return {};
+}
+
+async function ensureManagedAgentRuntimeConfig(
   session,
   actor,
+  agent,
+  scope = {},
   onProgress = () => undefined,
-  modelOverride = "",
 ) {
+  if (!agent?.managed) {
+    return {
+      configured: true,
+      managed: false,
+      model: agent?.model || "",
+      profile: {},
+      paths: agentConfigFor(agent?.adapter, session.home),
+    };
+  }
   const state = await getState(actor);
   const provider = state?.settings?.provider || {};
   const secrets = await getSecrets(actor);
   if (!provider.baseUrl || !secrets.providerApiKey) {
-    return {
-      configured: false,
-      changed: false,
-      reason: "missing-provider",
-    };
+    return { configured: false, reason: "missing-provider" };
   }
+  const previousProfile =
+    (await getAgentRuntimeProfile(actor, session, agent.id, scope)) || {};
+  const model = String(previousProfile.model || provider.model || "").trim();
+  if (!model) return { configured: false, reason: "missing-model" };
+  const defaults =
+    agent.adapter === "codex"
+      ? { reasoningEffort: "medium", permissionMode: "never", sandboxMode: "workspace-write" }
+      : agent.adapter === "claude"
+        ? { reasoningEffort: "high", permissionMode: "acceptEdits" }
+        : { permissionMode: "allow" };
+  const profile = await updateAgentRuntimeProfile(actor, session, agent.id, scope, {
+    ...defaults,
+    ...previousProfile,
+    model,
+    contextLimit:
+      positiveInteger(previousProfile.contextLimit) ||
+      positiveInteger(provider.modelContextLimit) ||
+      DEFAULT_AGENT_CONTEXT_LIMIT,
+    outputLimit:
+      positiveInteger(previousProfile.outputLimit) ||
+      positiveInteger(provider.modelOutputLimit) ||
+      DEFAULT_AGENT_OUTPUT_LIMIT,
+  });
   onProgress("network", "检测远端模型 API 连接");
   const providerRoute = await ensureRemoteProviderRoute(session, provider);
-  const configuration = await inspectOpenCodeNativeConfiguration(session, {
-    ...agentConfigFor("opencode", session.home),
-    managed: true,
-  });
-  const selectedModel = String(
-    modelOverride || configuration.model || provider.model || "",
-  ).trim();
-  if (!selectedModel) {
-    return {
-      configured: false,
-      changed: false,
-      reason: "missing-model",
-      configPath: configuration.configPath,
-    };
-  }
-  const effectiveProvider = {
+  const runtimeId = agentRuntimeId(session, agent.id, scope);
+  const paths = managedAgentRuntimePaths(session.home, agent.id, runtimeId);
+  const runtimeProvider = {
     ...provider,
     baseUrl: providerRoute.baseUrl,
-    model: selectedModel,
+    model,
+    modelContextLimit: profile.contextLimit,
+    modelOutputLimit: profile.outputLimit,
   };
-  const nextConfig = mergeOpenCodeConfigContent(
-    configuration.configContent,
-    effectiveProvider,
-  );
-  const nextAuth = mergeOpenCodeAuthContent(
-    configuration.authContent,
-    secrets.providerApiKey,
-  );
-  const configChanged = nextConfig !== configuration.configContent;
-  const authChanged = nextAuth !== configuration.authContent;
-  if (!configChanged && !authChanged) {
-    return {
-      configured: true,
-      changed: false,
-      configPath: configuration.configPath,
-      model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${selectedModel}`,
-      route: providerRoute.mode,
-    };
-  }
-  onProgress("configure", "同步 OpenCode 原生模型配置");
+  onProgress("configure", `同步 ${agent.name} 对话隔离配置`);
   await remoteExec(
     session.client,
     [
-      `mkdir -p ${shellQuote(path.posix.dirname(configuration.configPath))}`,
-      `mkdir -p ${shellQuote(path.posix.dirname(configuration.authPath))}`,
+      `mkdir -p ${shellQuote(paths.configRoot)} ${shellQuote(paths.dataRoot)}`,
+      `chmod 700 ${shellQuote(paths.root)} ${shellQuote(paths.configRoot)} ${shellQuote(paths.dataRoot)}`,
     ].join(" && "),
   );
-  if (configChanged) {
+  if (agent.adapter === "opencode") {
+    await remoteExec(
+      session.client,
+      `mkdir -p ${shellQuote(path.posix.dirname(paths.opencodeAuthPath))} && chmod 700 ${shellQuote(path.posix.dirname(paths.opencodeAuthPath))}`,
+    );
+    let configContent = mergeOpenCodeConfigContent("{}\n", runtimeProvider);
+    configContent = setJsoncValue(
+      configContent,
+      ["permission"],
+      ["ask", "allow", "deny"].includes(profile.permissionMode)
+        ? profile.permissionMode
+        : "allow",
+    );
+    const authContent = mergeOpenCodeAuthContent("{}\n", secrets.providerApiKey);
     await remoteSftpWriteAtomic(
       session.client,
-      configuration.configPath,
-      nextConfig,
+      paths.opencodeConfigPath,
+      configContent,
       0o600,
     );
-  }
-  if (authChanged) {
     await remoteSftpWriteAtomic(
       session.client,
-      configuration.authPath,
-      nextAuth,
+      paths.opencodeAuthPath,
+      authContent,
       0o600,
     );
-  }
-  if (configChanged) {
-    await stopOpenCodeService(session, {
-      id: "opencode",
-      path: `${session.home}/.easywork/agents/opencode/bin/opencode`,
-    });
+  } else if (agent.adapter === "codex") {
+    await remoteExec(
+      session.client,
+      `mkdir -p ${shellQuote(paths.codexHome)} && chmod 700 ${shellQuote(paths.codexHome)}`,
+    );
+    await remoteSftpWriteAtomic(
+      session.client,
+      paths.codexConfigPath,
+      managedCodexConfigContent(runtimeProvider, profile, providerRoute),
+      0o600,
+    );
+    await remoteSftpWriteAtomic(
+      session.client,
+      paths.apiKeyPath,
+      `${String(secrets.providerApiKey)}\n`,
+      0o600,
+    );
+  } else if (agent.adapter === "claude") {
+    await remoteExec(
+      session.client,
+      `mkdir -p ${shellQuote(paths.claudeConfigDir)} && chmod 700 ${shellQuote(paths.claudeConfigDir)}`,
+    );
+    await remoteSftpWriteAtomic(
+      session.client,
+      paths.claudeSettingsPath,
+      managedClaudeSettingsContent(runtimeProvider, profile, providerRoute),
+      0o600,
+    );
+    await remoteSftpWriteAtomic(
+      session.client,
+      paths.apiKeyPath,
+      `${String(secrets.providerApiKey)}\n`,
+      0o600,
+    );
   }
   return {
     configured: true,
-    changed: true,
-    configPath: configuration.configPath,
-    model: `${EASYWORK_OPENCODE_PROVIDER_ID}/${selectedModel}`,
-    route: providerRoute.mode,
+    managed: true,
+    runtimeId,
+    model,
+    profile,
+    providerRoute,
+    paths,
+    configPath:
+      agent.adapter === "opencode"
+        ? paths.opencodeConfigPath
+        : agent.adapter === "codex"
+          ? paths.codexConfigPath
+          : paths.claudeSettingsPath,
   };
 }
 
-async function configureOpenCodeModel(
+async function configureManagedAgentModel(
   session,
   actor,
   payload,
   onProgress = () => undefined,
 ) {
   const agent = await agentForSession(session, actor, payload.agentId);
-  if (agent.adapter !== "opencode" || agent.status !== "ready") {
-    throw new Error("当前 Agent 不是可配置的 OpenCode");
+  if (!agent.managed || !["opencode", "codex", "claude"].includes(agent.adapter)) {
+    throw new Error("用户部署的 Agent 使用其自身模型配置，EasyWork 不会改写");
   }
   const model = String(payload.model || "").trim();
   if (!model) throw new Error("请选择一个模型");
@@ -7160,51 +9327,100 @@ async function configureOpenCodeModel(
     throw new Error("请先在个人资料中配置 API URL 和 API Key");
   }
   onProgress("正在核对模型");
-  const availableModels = await listProviderModels(
+  const descriptors = await listProviderModelDescriptors(
     provider.baseUrl,
     secrets.providerApiKey,
   );
-  if (!availableModels.includes(model)) {
-    throw new Error("当前 API 已不再返回所选模型，请重新检测");
-  }
-  onProgress("正在写入 OpenCode 原生配置");
-  const result = await ensureOpenCodeNativeConfig(
+  const selected = descriptors.find((item) => item.id === model);
+  if (!selected) throw new Error("当前 API 已不再返回所选模型，请重新检测");
+  const scope = {
+    conversationId: String(payload.conversationId || ""),
+    workspaceId: String(payload.workspaceId || ""),
+  };
+  await updateAgentRuntimeProfile(actor, session, agent.id, scope, {
+    model,
+    contextLimit:
+      positiveInteger(selected.contextLimit) || DEFAULT_AGENT_CONTEXT_LIMIT,
+    outputLimit:
+      positiveInteger(selected.outputLimit) || DEFAULT_AGENT_OUTPUT_LIMIT,
+  });
+  onProgress(`正在写入 ${agent.name} 隔离配置`);
+  const result = await ensureManagedAgentRuntimeConfig(
     session,
     actor,
+    agent,
+    scope,
     (_stage, label) => onProgress(label),
-    model,
   );
-  if (!result.configured) throw new Error("OpenCode 配置未完成");
+  if (!result.configured) throw new Error(`${agent.name} 配置未完成`);
   return {
     model,
     configPath: result.configPath,
-    agents: await scanRemoteAgents(session, actor),
+    agents: await scanRemoteAgents(session, actor, scope),
+  };
+}
+
+async function configureManagedAgentRuntime(
+  session,
+  actor,
+  payload,
+  onProgress = () => undefined,
+) {
+  const agent = await agentForSession(session, actor, payload.agentId);
+  if (!agent.managed || !["opencode", "codex", "claude"].includes(agent.adapter)) {
+    throw new Error("用户部署的 Agent 使用自己的原生配置，EasyWork 不会改写");
+  }
+  const scope = {
+    conversationId: String(payload.conversationId || ""),
+    workspaceId: String(payload.workspaceId || ""),
+  };
+  const current =
+    (await getAgentRuntimeProfile(actor, session, agent.id, scope)) || {};
+  const schema = managedAgentCapabilitySchema(agent, current);
+  const field = String(payload.field || "");
+  const descriptor = schema[field];
+  const value = String(payload.value || "");
+  if (!descriptor || !descriptor.options.includes(value)) {
+    throw new Error("当前 Agent 不支持这个运行选项");
+  }
+  const profileField =
+    field === "reasoning"
+      ? "reasoningEffort"
+      : field === "permission"
+        ? "permissionMode"
+        : "sandboxMode";
+  await updateAgentRuntimeProfile(actor, session, agent.id, scope, {
+    [profileField]: value,
+  });
+  onProgress(`正在写入 ${agent.name} 对话隔离配置`);
+  const runtime = await ensureManagedAgentRuntimeConfig(
+    session,
+    actor,
+    agent,
+    scope,
+  );
+  if (!runtime.configured) throw new Error(`${agent.name} 隔离配置未完成`);
+  return {
+    agentId: agent.id,
+    field,
+    value,
+    agents: await scanRemoteAgents(session, actor, scope),
   };
 }
 
 async function prepareRemoteAgents(
   session,
   actor,
-  onProgress = () => undefined,
+  scope = {},
 ) {
-  let agents = await scanRemoteAgents(session, actor);
-  const managedOpenCode = agents.find(
-    (agent) =>
-      agent.adapter === "opencode" &&
-      agent.status === "ready" &&
-      agent.managed,
-  );
-  if (managedOpenCode) {
-    await ensureOpenCodeNativeConfig(session, actor, onProgress);
-    agents = await scanRemoteAgents(session, actor);
-  }
-  return agents;
+  return scanRemoteAgents(session, actor, scope);
 }
 
 async function publishRemoteAgentScan(
   session,
   actor,
   send = (payload) => sessionSend(session, payload),
+  scope = {},
 ) {
   send({
     type: "agent.scan.status",
@@ -7212,7 +9428,7 @@ async function publishRemoteAgentScan(
     status: "scanning",
   });
   try {
-    const agents = await prepareRemoteAgents(session, actor);
+    const agents = await prepareRemoteAgents(session, actor, scope);
     send({
       type: "agent.list",
       serverId: session.serverId,
@@ -7235,14 +9451,13 @@ async function publishRemoteAgentScan(
   }
 }
 
-async function syncManagedOpenCodeForActor(actor) {
+async function syncManagedAgentsForActor(actor) {
   const worker = await getSshWorker(actor);
   const sessions = [...worker.sessions.values()].filter(
     (session) =>
       session.status === "connected" &&
       session.client &&
       !session.demo &&
-      !session.activeStream &&
       !session.activeRuns?.size,
   );
   const results = await Promise.allSettled(
@@ -7260,17 +9475,15 @@ async function syncManagedOpenCodeForActor(actor) {
   if (failure?.status === "rejected") throw failure.reason;
 }
 
-async function readRemoteOpenCodeTarget(session) {
+async function readRemoteAgentPlatform(session) {
   if (!session.client) throw new Error("SSH 尚未连接");
   const result = await remoteExec(
     session.client,
     [
       'EW_OS="$(uname -s | tr "[:upper:]" "[:lower:]")"',
       'EW_ARCH="$(uname -m)"',
-      'case "$EW_ARCH" in x86_64) EW_ARCH=x64 ;; aarch64|arm64) EW_ARCH=arm64 ;; esac',
       'EW_MUSL=0; if test -f /etc/alpine-release || (command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl); then EW_MUSL=1; fi',
-      'EW_BASELINE=0; if test "$EW_ARCH" = x64 && ! grep -qwi avx2 /proc/cpuinfo 2>/dev/null; then EW_BASELINE=1; fi',
-      'printf "os=%s\\narch=%s\\nmusl=%s\\nbaseline=%s\\n" "$EW_OS" "$EW_ARCH" "$EW_MUSL" "$EW_BASELINE"',
+      'printf "os=%s\\narch=%s\\nmusl=%s\\n" "$EW_OS" "$EW_ARCH" "$EW_MUSL"',
     ].join("\n"),
   );
   const fields = Object.fromEntries(
@@ -7279,303 +9492,251 @@ async function readRemoteOpenCodeTarget(session) {
       .map((line) => line.split("="))
       .filter((parts) => parts.length === 2),
   );
-  if (fields.os !== "linux" || !["x64", "arm64"].includes(fields.arch)) {
-    throw new Error(`OpenCode 暂不支持该服务器平台：${fields.os || "未知"}/${fields.arch || "未知"}`);
-  }
-  let target = `linux-${fields.arch}`;
-  if (fields.baseline === "1") target += "-baseline";
-  if (fields.musl === "1") target += "-musl";
-  return target;
-}
-
-async function fetchOpenCodeRelease() {
-  if (openCodeReleaseCache?.expiresAt > Date.now()) return openCodeReleaseCache.value;
-  let response;
-  try {
-    response = await fetch(
-      "https://api.github.com/repos/anomalyco/opencode/releases/latest",
-      {
-        headers: {
-          Accept: "application/vnd.github+json",
-          "User-Agent": "EasyWork-Agent-Installer",
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
-        signal: AbortSignal.timeout(20_000),
-      },
+  const platform = remoteAgentPlatform(fields);
+  if (!platform) {
+    throw new Error(
+      `Agent 暂不支持该服务器平台：${fields.os || "未知"}/${fields.arch || "未知"}`,
     );
-  } catch (caught) {
-    throw new Error(`EasyWork 主机无法查询 OpenCode 版本：${caught instanceof Error ? caught.message : "网络错误"}`);
   }
-  if (!response.ok) {
-    throw new Error(`EasyWork 主机查询 OpenCode 版本失败（HTTP ${response.status}）`);
-  }
-  const payload = await response.json();
-  const version = String(payload?.tag_name || "").replace(/^v/i, "");
-  const assets = Array.isArray(payload?.assets)
-    ? payload.assets.map((asset) => ({
-        name: String(asset?.name || ""),
-        url: String(asset?.browser_download_url || ""),
-        size: Number(asset?.size || 0),
-        digest: String(asset?.digest || ""),
-      }))
-    : [];
-  if (!/^\d+(?:\.\d+){1,3}(?:[-+][\w.-]+)?$/.test(version) || !assets.length) {
-    throw new Error("OpenCode 最新版本信息格式无效");
-  }
-  const value = { version, assets };
-  openCodeReleaseCache = { expiresAt: Date.now() + 5 * 60 * 1000, value };
-  return value;
+  return platform;
 }
 
-async function hashLocalFile(filePath) {
-  const content = await readFile(filePath);
-  return crypto.createHash("sha256").update(content).digest("hex");
-}
-
-async function prepareOpenCodeArtifact(session, onProgress = () => undefined) {
-  const [target, release] = await Promise.all([
-    readRemoteOpenCodeTarget(session),
-    fetchOpenCodeRelease(),
-  ]);
-  const assetName = `opencode-${target}.tar.gz`;
-  const asset = release.assets.find((candidate) => candidate.name === assetName);
-  if (!asset?.url) throw new Error(`OpenCode ${release.version} 没有 ${assetName} 构建`);
-  const digest = asset.digest.match(/^sha256:([a-f0-9]{64})$/i)?.[1]?.toLowerCase();
-  if (!digest) throw new Error("OpenCode 发布包缺少可验证的 SHA-256 摘要");
-  const cacheDirectory = path.join(
-    DATA_ROOT,
-    "_cache",
-    "opencode",
-    safeSegment(release.version),
-  );
-  const localPath = path.join(cacheDirectory, assetName);
-  const promiseKey = `${release.version}:${assetName}:${digest}`;
-  let preparation = openCodeArtifactPromises.get(promiseKey);
-  if (!preparation) {
-    preparation = (async () => {
-      await mkdir(cacheDirectory, { recursive: true });
-      try {
-        if ((await hashLocalFile(localPath)) === digest) return localPath;
-      } catch {
-        // Missing or incomplete cache entries are downloaded again below.
-      }
-      onProgress("download", "EasyWork 主机正在下载 OpenCode");
-      let response;
-      try {
-        response = await fetch(asset.url, {
-          headers: { "User-Agent": "EasyWork-Agent-Installer" },
-          redirect: "follow",
-          signal: AbortSignal.timeout(5 * 60 * 1000),
-        });
-      } catch (caught) {
-        throw new Error(`EasyWork 主机下载 OpenCode 失败：${caught instanceof Error ? caught.message : "网络错误"}`);
-      }
-      if (!response.ok) {
-        throw new Error(`EasyWork 主机下载 OpenCode 失败（HTTP ${response.status}）`);
-      }
-      const content = Buffer.from(await response.arrayBuffer());
-      const actualDigest = crypto.createHash("sha256").update(content).digest("hex");
-      if (actualDigest !== digest) {
-        throw new Error("OpenCode 发布包校验失败，未向服务器上传");
-      }
-      await writeFile(localPath, content, { mode: 0o600 });
-      return localPath;
-    })().finally(() => openCodeArtifactPromises.delete(promiseKey));
-    openCodeArtifactPromises.set(promiseKey, preparation);
-  }
-  return {
-    target,
-    version: release.version,
-    asset,
-    digest,
-    localPath: await preparation,
-  };
-}
-
-async function uploadOpenCodeArtifact(
+async function deployManagedAgentArtifact(
   session,
-  artifact,
+  actor,
+  agentId,
   onProgress = () => undefined,
-  { candidateOnly = false } = {},
 ) {
   if (!session.client || !session.home) throw new Error("SSH 尚未连接");
-  const agentRoot = `${session.home}/.easywork/agents/opencode`;
-  const uploadRoot = `${agentRoot}/.incoming-${crypto.randomBytes(6).toString("hex")}`;
-  const remoteArchive = `${uploadRoot}/${artifact.asset.name}`;
+  const catalog = MANAGED_AGENT_CATALOG[agentId];
+  if (!catalog) throw new Error("不支持安装这个 Agent");
+  const running = [...(session.activeRuns?.values() || [])].find(
+    (run) => String(run.agentId || "") === agentId,
+  );
+  if (running) throw new Error(`请先结束正在使用 ${catalog.name} 的任务`);
+  onProgress("prepare", "正在识别服务器架构");
+  const platform = await readRemoteAgentPlatform(session);
+  const artifact = await resolveAgentArtifact(agentId, platform);
+  const paths = managedAgentPaths(session.home, agentId);
+  if (agentId === "opencode") {
+    await stopOpenCodeService(session, {
+      id: agentId,
+      path: paths.binaryPath,
+      managed: true,
+    });
+  }
+  const incomingRoot = `${paths.root}/.incoming-${crypto.randomBytes(6).toString("hex")}`;
+  const remoteArtifact = `${incomingRoot}/${path.basename(artifact.localPath)}`;
   await remoteExec(
     session.client,
-    `mkdir -p ${shellQuote(uploadRoot)} ${shellQuote(`${agentRoot}/bin`)}`,
+    `umask 077 && mkdir -p ${shellQuote(incomingRoot)} ${shellQuote(`${paths.root}/bin`)} ${shellQuote(paths.configRoot)} ${shellQuote(paths.dataRoot)}`,
   );
   try {
-    onProgress("upload", "正在上传 OpenCode 到服务器");
+    onProgress("upload", `正在上传 ${catalog.name}`);
     await remoteSftpFastPut(
       session.client,
       artifact.localPath,
-      remoteArchive,
-      (percent) => onProgress("upload", `正在上传 OpenCode · ${percent}%`),
+      remoteArtifact,
+      (percent) => onProgress("upload", `正在上传 ${catalog.name} · ${percent}%`),
     );
-    onProgress("verify", "正在校验 OpenCode");
-    const destination = candidateOnly
-      ? `${agentRoot}/.update-candidate/opencode`
-      : `${agentRoot}/bin/opencode`;
-    await remoteExec(
+    onProgress("verify", `正在校验 ${catalog.name}`);
+    const extraction =
+      artifact.archive === "tar.gz"
+        ? [
+            'mkdir -p "$EW_INCOMING/unpacked"',
+            'tar -xzf "$EW_ARTIFACT" -C "$EW_INCOMING/unpacked"',
+            agentId === "codex"
+              ? 'EW_SOURCE="$(find "$EW_INCOMING/unpacked" -type f -name \"codex-*unknown-linux-*\" | head -n 1)"'
+              : `EW_SOURCE="$(find "$EW_INCOMING/unpacked" -type f -name ${shellQuote(catalog.binary)} | head -n 1)"`,
+          ]
+        : ['EW_SOURCE="$EW_ARTIFACT"'];
+    const verified = await remoteExec(
       session.client,
       [
         "set -eu",
-        `EW_ROOT=${shellQuote(uploadRoot)}`,
-        `EW_ARCHIVE=${shellQuote(remoteArchive)}`,
-        `EW_EXPECTED=${shellQuote(artifact.digest)}`,
-        `EW_DESTINATION=${shellQuote(destination)}`,
-        'if command -v sha256sum >/dev/null 2>&1; then EW_ACTUAL="$(sha256sum "$EW_ARCHIVE" | awk \'{print $1}\')"; elif command -v openssl >/dev/null 2>&1; then EW_ACTUAL="$(openssl dgst -sha256 "$EW_ARCHIVE" | awk \'{print $NF}\')"; else echo "服务器缺少 SHA-256 校验工具" >&2; exit 1; fi',
+        `EW_INCOMING=${shellQuote(incomingRoot)}`,
+        `EW_ARTIFACT=${shellQuote(remoteArtifact)}`,
+        `EW_EXPECTED=${shellQuote(artifact.sha256)}`,
+        `EW_DESTINATION=${shellQuote(paths.binaryPath)}`,
+        'if command -v sha256sum >/dev/null 2>&1; then EW_ACTUAL="$(sha256sum "$EW_ARTIFACT" | awk \'{print $1}\')"; elif command -v openssl >/dev/null 2>&1; then EW_ACTUAL="$(openssl dgst -sha256 "$EW_ARTIFACT" | awk \'{print $NF}\')"; else echo "服务器缺少 SHA-256 校验工具" >&2; exit 1; fi',
         'test "$EW_ACTUAL" = "$EW_EXPECTED"',
-        'mkdir -p "$EW_ROOT/unpacked" "$(dirname "$EW_DESTINATION")"',
-        'tar -xzf "$EW_ARCHIVE" -C "$EW_ROOT/unpacked"',
-        'test -x "$EW_ROOT/unpacked/opencode" || chmod 755 "$EW_ROOT/unpacked/opencode"',
-        '"$EW_ROOT/unpacked/opencode" --version >/dev/null',
-        'mv -f "$EW_ROOT/unpacked/opencode" "$EW_DESTINATION.new"',
+        ...extraction,
+        'test -n "$EW_SOURCE" && test -f "$EW_SOURCE"',
+        'chmod 755 "$EW_SOURCE"',
+        '"$EW_SOURCE" --version >/dev/null',
+        'cp "$EW_SOURCE" "$EW_DESTINATION.new"',
         'chmod 755 "$EW_DESTINATION.new"',
         'mv -f "$EW_DESTINATION.new" "$EW_DESTINATION"',
-        '"$EW_DESTINATION" --version',
+        'find "$(dirname "$EW_DESTINATION")" -maxdepth 1 -type f ! -name "$(basename "$EW_DESTINATION")" -delete',
+        '"$EW_DESTINATION" --version | head -n 1',
       ].join("\n"),
     );
+    await remoteSftpWriteAtomic(
+      session.client,
+      paths.versionPath,
+      `${artifact.version}\n`,
+      0o600,
+    );
+    await remoteSftpWriteAtomic(
+      session.client,
+      paths.manifestPath,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          agentId,
+          version: artifact.version,
+          platform,
+          sha256: artifact.sha256,
+          deployedAt: isoNow(),
+          reportedVersion: verified.stdout.trim(),
+        },
+        null,
+        2,
+      )}\n`,
+      0o600,
+    );
+    const installed = {
+      id: agentId,
+      name: catalog.name,
+      adapter: catalog.adapter,
+      managed: true,
+      path: paths.binaryPath,
+    };
+    const configured = await ensureManagedAgentRuntimeConfig(
+      session,
+      actor,
+      installed,
+      {},
+      onProgress,
+    );
+    return {
+      agentId,
+      version: artifact.version,
+      platform,
+      configured: Boolean(configured.configured),
+      agents: await scanRemoteAgents(session, actor),
+    };
   } finally {
-    await remoteExec(session.client, `rm -rf ${shellQuote(uploadRoot)}`, {
+    await remoteExec(session.client, `rm -rf ${shellQuote(incomingRoot)}`, {
       allowFailure: true,
     }).catch(() => undefined);
   }
 }
 
-async function installOpenCode(session, actor, onProgress = () => undefined) {
-  if (!session.client) throw new Error("SSH 尚未连接");
-  let existingAgents = await scanRemoteAgents(session, actor);
-  let existingOpenCode = existingAgents.find(
-    (agent) =>
-      agent.adapter === "opencode" &&
-      agent.status === "ready" &&
-      agent.managed,
+async function installManagedAgent(
+  session,
+  actor,
+  agentId,
+  onProgress = () => undefined,
+) {
+  const agents = await scanRemoteAgents(session, actor);
+  const existing = agents.find(
+    (agent) => agent.id === agentId && agent.managed && agent.status === "ready",
   );
-  if (existingOpenCode) {
-    await ensureOpenCodeNativeConfig(session, actor, onProgress);
-    return scanRemoteAgents(session, actor);
+  if (!existing) {
+    return (await deployManagedAgentArtifact(session, actor, agentId, onProgress))
+      .agents;
   }
-  existingOpenCode = existingAgents.find(
-    (agent) => agent.adapter === "opencode" && agent.status === "ready",
-  );
-  if (existingOpenCode) return existingAgents;
-
-  onProgress("prepare", "正在识别服务器环境");
-  const artifact = await prepareOpenCodeArtifact(session, onProgress);
-  await uploadOpenCodeArtifact(session, artifact, onProgress);
-  await ensureOpenCodeNativeConfig(session, actor, onProgress);
-  onProgress("verify", "验证 Agent");
+  await ensureManagedAgentRuntimeConfig(session, actor, existing, {}, onProgress);
   return scanRemoteAgents(session, actor);
 }
 
-function normalizeOpenCodeVersion(value) {
-  const match = String(value || "").match(/\bv?(\d+(?:\.\d+){1,3}(?:[-+][\w.-]+)?)\b/i);
-  return match?.[1] || String(value || "").trim().split(/\s+/)[0] || "";
-}
-
-function openCodeUpdateApplyCommand() {
-  return [
-    "set -eu",
-    'EW_AGENT_ROOT="$HOME/.easywork/agents/opencode"',
-    'EW_CURRENT="$EW_AGENT_ROOT/bin/opencode"',
-    'EW_CANDIDATE="$EW_AGENT_ROOT/.update-candidate/opencode"',
-    'EW_BACKUP="$EW_AGENT_ROOT/bin/opencode.easywork-backup"',
-    'test -x "$EW_CURRENT"',
-    'test -x "$EW_CANDIDATE"',
-    'cp -p "$EW_CURRENT" "$EW_BACKUP"',
-    'if cp "$EW_CANDIDATE" "$EW_CURRENT" && chmod 755 "$EW_CURRENT" && "$EW_CURRENT" --version; then',
-    '  rm -f "$EW_BACKUP"',
-    '  rm -rf "$EW_AGENT_ROOT/.update-candidate"',
-    "else",
-    '  cp -p "$EW_BACKUP" "$EW_CURRENT"',
-    '  rm -f "$EW_BACKUP"',
-    '  exit 1',
-    "fi",
-  ].join("\n");
-}
-
-async function checkOpenCodeUpdate(
-  session,
-  actor,
-  onProgress = () => undefined,
-) {
-  if (!session.client) throw new Error("SSH 尚未连接");
-  if (session.activeStream || session.activeRuns?.size) {
-    throw new Error("请等待当前远程任务结束后再检测更新");
-  }
-  const agents = await scanRemoteAgents(session, actor);
-  const openCode = agents.find(
-    (agent) =>
-      agent.adapter === "opencode" &&
-      agent.status === "ready" &&
-      agent.managed,
+async function uninstallManagedAgent(session, actor, agentId) {
+  if (!session.client || !session.home) throw new Error("SSH 尚未连接");
+  const catalog = MANAGED_AGENT_CATALOG[agentId];
+  if (!catalog) throw new Error("不支持卸载这个 Agent");
+  const running = [...(session.activeRuns?.values() || [])].find(
+    (run) => String(run.agentId || "") === agentId,
   );
-  if (!openCode) throw new Error("只能自动更新由 EasyWork 部署的 OpenCode");
-  onProgress("checking", "读取当前版本");
-  const release = await fetchOpenCodeRelease();
-  const currentVersion = normalizeOpenCodeVersion(openCode.version);
-  const latestVersion = normalizeOpenCodeVersion(release.version);
-  if (!currentVersion || !latestVersion) throw new Error("未能识别 OpenCode 版本");
+  if (running) throw new Error(`请先结束正在使用 ${catalog.name} 的任务`);
+  const paths = managedAgentPaths(session.home, agentId);
+  const expectedPrefix = `${session.home}/.easywork/agents/`;
+  if (!paths.root.startsWith(expectedPrefix)) {
+    throw new Error("Agent 卸载目录无效");
+  }
+  if (agentId === "opencode") {
+    await remoteExec(
+      session.client,
+      [
+        "set +e",
+        `EW_AGENT=${shellQuote(paths.binaryPath)}`,
+        `EW_SERVICE_ROOT=${shellQuote(`${session.home}/.easywork/services/opencode`)}`,
+        'find "$EW_SERVICE_ROOT" -type f -name pid 2>/dev/null | while IFS= read -r EW_PID_FILE; do',
+        '  EW_PID=$(cat "$EW_PID_FILE" 2>/dev/null)',
+        '  case "$EW_PID" in ""|*[!0-9]*) continue ;; esac',
+        '  EW_COMMAND=$(ps -p "$EW_PID" -o args= 2>/dev/null)',
+        '  case "$EW_COMMAND" in *"$EW_AGENT"*" serve"*) kill -TERM "$EW_PID" 2>/dev/null || true ;; esac',
+        "done",
+      ].join("\n"),
+      { allowFailure: true },
+    );
+    session.openCodeServices?.clear();
+    session.openCodeServicePromises?.clear();
+  }
+  await remoteExec(
+    session.client,
+    `rm -rf -- ${shellQuote(paths.root)}`,
+  );
+  return scanRemoteAgents(session, actor);
+}
+
+async function checkManagedAgentUpdate(session, actor, agentId) {
+  const agents = await scanRemoteAgents(session, actor);
+  const agent = agents.find(
+    (candidate) =>
+      candidate.id === agentId && candidate.managed && candidate.status === "ready",
+  );
+  if (!agent) throw new Error("只能更新由 EasyWork 部署的 Agent");
+  const platform = await readRemoteAgentPlatform(session);
+  const artifact = await resolveAgentArtifact(agentId, platform);
+  const currentVersion = normalizeAgentVersion(agent.version);
+  const latestVersion = normalizeAgentVersion(artifact.version);
+  if (!currentVersion || !latestVersion) throw new Error("未能识别 Agent 版本");
   const update = {
+    agentId,
     currentVersion,
     latestVersion,
-    updateAvailable: currentVersion !== latestVersion,
+    updateAvailable: compareAgentVersions(currentVersion, latestVersion) < 0,
     checkedAt: isoNow(),
   };
   session.agentUpdates ||= new Map();
-  session.agentUpdates.set("opencode", update);
+  session.agentUpdates.set(agentId, update);
   return update;
 }
 
-async function applyOpenCodeUpdate(
+async function applyManagedAgentUpdate(
   session,
   actor,
+  agentId,
   onProgress = () => undefined,
 ) {
-  if (!session.client) throw new Error("SSH 尚未连接");
-  if (session.activeStream || session.activeRuns?.size) {
-    throw new Error("请等待当前远程任务结束后再更新");
-  }
-  let update = session.agentUpdates?.get("opencode");
+  let update = session.agentUpdates?.get(agentId);
   if (!update?.updateAvailable) {
-    update = await checkOpenCodeUpdate(session, actor, onProgress);
+    update = await checkManagedAgentUpdate(session, actor, agentId);
   }
   if (!update.updateAvailable) {
     return { ...update, agents: await scanRemoteAgents(session, actor) };
   }
-  onProgress("downloading", `正在准备 OpenCode ${update.latestVersion}`);
-  const artifact = await prepareOpenCodeArtifact(session, onProgress);
-  if (normalizeOpenCodeVersion(artifact.version) !== update.latestVersion) {
-    throw new Error("OpenCode 最新版本在检测后发生变化，请重新检测更新");
-  }
-  await uploadOpenCodeArtifact(session, artifact, onProgress, {
-    candidateOnly: true,
-  });
-  onProgress("updating", `正在更新到 ${update.latestVersion}`);
-  await remoteExec(session.client, openCodeUpdateApplyCommand());
-  onProgress("configuring", "核对 OpenCode 原生配置");
-  await ensureOpenCodeNativeConfig(session, actor, onProgress);
-  const agents = await scanRemoteAgents(session, actor);
-  const installed = agents.find(
-    (agent) => agent.adapter === "opencode" && agent.managed,
+  onProgress("updating", `正在部署 ${MANAGED_AGENT_CATALOG[agentId].name} ${update.latestVersion}`);
+  const deployed = await deployManagedAgentArtifact(
+    session,
+    actor,
+    agentId,
+    onProgress,
   );
-  const installedVersion = normalizeOpenCodeVersion(installed?.version);
-  if (installedVersion !== update.latestVersion) {
-    throw new Error(
-      `更新后版本校验失败：期望 ${update.latestVersion}，实际 ${installedVersion || "未知"}`,
-    );
+  if (normalizeAgentVersion(deployed.version) !== update.latestVersion) {
+    throw new Error("更新后的 Agent 版本与主机清单不一致");
   }
   const completed = {
+    agentId,
     currentVersion: update.currentVersion,
-    latestVersion: installedVersion,
+    latestVersion: deployed.version,
     updateAvailable: false,
     checkedAt: isoNow(),
+    agents: deployed.agents,
   };
-  session.agentUpdates?.set("opencode", completed);
-  return { ...completed, agents };
+  session.agentUpdates?.set(agentId, completed);
+  return completed;
 }
 
 function diffPathLabel(filePath) {
@@ -7655,16 +9816,31 @@ function mergeStreamPart(state, mapName, orderName, sourceId, text, fallback) {
 const EASYWORK_PROGRESS_MARKER = "[[EASYWORK_PROGRESS]]";
 const EASYWORK_FINAL_MARKER = "[[EASYWORK_FINAL]]";
 
+function stripTrailingEasyWorkMarkerPrefix(value) {
+  const source = String(value || "");
+  const withoutTrailingWhitespace = source.trimEnd();
+  for (const marker of [EASYWORK_FINAL_MARKER, EASYWORK_PROGRESS_MARKER]) {
+    for (let length = marker.length - 1; length >= 2; length -= 1) {
+      const prefix = marker.slice(0, length);
+      if (withoutTrailingWhitespace.endsWith(prefix)) {
+        return withoutTrailingWhitespace.slice(0, -prefix.length);
+      }
+    }
+  }
+  return source;
+}
+
 function stripEasyWorkProtocolMarkers(value, preferFinal = false) {
   const source = String(value || "");
   const finalIndex = source.lastIndexOf(EASYWORK_FINAL_MARKER);
   if (preferFinal && finalIndex >= 0) {
     return source.slice(finalIndex + EASYWORK_FINAL_MARKER.length).trimStart();
   }
-  return source
-    .replaceAll(EASYWORK_FINAL_MARKER, "")
-    .replaceAll(EASYWORK_PROGRESS_MARKER, "")
-    .trimStart();
+  return stripTrailingEasyWorkMarkerPrefix(
+    source
+      .replaceAll(EASYWORK_FINAL_MARKER, "")
+      .replaceAll(EASYWORK_PROGRESS_MARKER, ""),
+  ).trimStart();
 }
 
 function classifyOpenCodeText(value) {
@@ -7691,17 +9867,7 @@ function classifyOpenCodeText(value) {
   if (waitingForMarker) {
     return { kind: "agent_message", output: "", pending: true };
   }
-  const partialMarkerIndex = leading.lastIndexOf("[[EASY");
-  if (partialMarkerIndex >= 0) {
-    const possibleMarker = leading.slice(partialMarkerIndex);
-    if (
-      [EASYWORK_FINAL_MARKER, EASYWORK_PROGRESS_MARKER].some((marker) =>
-        marker.startsWith(possibleMarker),
-      )
-    ) {
-      leading = leading.slice(0, partialMarkerIndex);
-    }
-  }
+  leading = stripTrailingEasyWorkMarkerPrefix(leading);
   return {
     kind: "agent_message",
     output: stripEasyWorkProtocolMarkers(leading),
@@ -7830,7 +9996,13 @@ function parseOpenCodeLine(line, state) {
   if (payload.sessionID) state.sessionId = payload.sessionID;
   const type = String(payload.type || payload.part?.type || "");
   const part = payload.part || payload;
-  const tokenSource = part.tokens || payload.tokens || part.usage || payload.usage;
+  const tokenSource =
+    part.tokens ||
+    payload.tokens ||
+    part.usage ||
+    payload.usage ||
+    part.info?.tokens ||
+    payload.info?.tokens;
   if (tokenSource && typeof tokenSource === "object") {
     const input = Number(
       tokenSource.input ||
@@ -7868,6 +10040,20 @@ function parseOpenCodeLine(line, state) {
     };
   }
   const sourceId = String(part.id || payload.id || "");
+  if (type === "message.updated") {
+    const info = part.info || payload.info || {};
+    const messageId = String(info.id || info.messageID || "");
+    const role = String(info.role || "").toLowerCase();
+    if (messageId && role) {
+      state.messageRoles ||= new Map();
+      state.messageRoles.set(messageId, role);
+    }
+    return null;
+  }
+  const messageId = String(part.messageID || part.messageId || "");
+  if (messageId && state.messageRoles?.get(messageId) === "user") {
+    return null;
+  }
   if (type === "tool_use" || type === "tool") {
     const tool = String(part.tool || part.name || "tool");
     const input = part.state?.input || part.input || {};
@@ -7883,6 +10069,7 @@ function parseOpenCodeLine(line, state) {
       "";
     const statusValue = part.state?.status || part.status;
     const normalizedTool = `${tool} ${command}`.toLowerCase();
+    const normalizedToolName = tool.toLowerCase().replace(/[^a-z0-9]+/g, "");
     const status =
       statusValue === "error"
         ? "error"
@@ -7899,7 +10086,12 @@ function parseOpenCodeLine(line, state) {
         status: agentPlanEventStatus(planSteps, status),
       };
     }
-    const kind = /write|edit|patch|apply|replace|create_file/.test(normalizedTool)
+    if (isNativePlanTool(tool)) return null;
+    const fileTool =
+      /^(?:write|edit|multiedit|patch|applypatch|replace|createfile|strreplace)$/.test(
+        normalizedToolName,
+      );
+    const kind = fileTool
       ? "file_change"
       : /\b(?:sbatch|srun|salloc|sinfo|squeue|sacct|scontrol|scancel|qsub|qstat|qdel)\b/.test(
             normalizedTool,
@@ -7948,6 +10140,17 @@ function parseOpenCodeLine(line, state) {
       };
     }
   }
+  if (type === "session.status") {
+    const status = part.status || payload.status || {};
+    if (status?.type !== "retry") return null;
+    return {
+      sourceId: `retry-${status.attempt || 1}`,
+      kind: "job_status",
+      title: `Agent 正在重试（第 ${status.attempt || 1} 次）`,
+      detail: String(status.message || "模型服务暂时不可用").slice(0, 800),
+      status: "running",
+    };
+  }
   if (type === "text") {
     const text = String(part.text || payload.text || "");
     if (!text.trim()) return null;
@@ -7960,7 +10163,7 @@ function parseOpenCodeLine(line, state) {
       "message",
     );
     const classified = classifyOpenCodeText(textPart.text);
-    if (classified.pending) return null;
+    if (classified.pending || !classified.output.trim()) return null;
     state.latestText = classified.output;
     if (classified.kind === "message") state.finalText = classified.output;
     return {
@@ -7995,25 +10198,99 @@ function parseOpenCodeLine(line, state) {
   if (type === "step_start") {
     return null;
   }
-  if (/permission|approval|question/.test(type)) {
+  if (/permission|approval/.test(type)) {
+    const approvalId = String(
+      part.id || part.requestID || part.requestId || sourceId,
+    );
+    const permission = String(
+      part.permission || part.title || part.name || "受限操作",
+    );
+    const patterns = Array.isArray(part.patterns)
+      ? part.patterns.map(String).filter(Boolean)
+      : [];
+    const resolved = /replied|resolved|approved|denied|rejected/.test(type);
+    const rejected = /denied|rejected/.test(type) || part.reply === "reject";
     return {
-      sourceId,
+      sourceId: approvalId || sourceId,
       kind: "approval_request",
-      title: String(part.title || part.question || "需要用户确认"),
-      detail: String(part.description || part.message || "").slice(0, 800),
-      status: "pending",
+      title: resolved
+        ? rejected
+          ? "操作已拒绝"
+          : "操作已允许"
+        : `Agent 请求权限 · ${permission}`,
+      detail:
+        patterns.join("\n") ||
+        String(part.description || part.message || "").slice(0, 800),
+      approvalId,
+      approvalType: "permission",
+      status: resolved ? (rejected ? "error" : "done") : "pending",
     };
   }
-  if (/file_change|file_update/.test(type)) {
+  if (/question/.test(type)) {
+    const approvalId = String(
+      part.id || part.requestID || part.requestId || sourceId,
+    );
+    const questions = Array.isArray(part.questions) ? part.questions : [];
+    return {
+      sourceId: approvalId || sourceId,
+      kind: "approval_request",
+      title: String(
+        questions[0]?.header || questions[0]?.question || "Agent 等待用户输入",
+      ),
+      detail: questions
+        .map((question) => String(question?.question || "").trim())
+        .filter(Boolean)
+        .join("\n"),
+      output: questions.length ? JSON.stringify(questions, null, 2) : undefined,
+      approvalId,
+      approvalType: "question",
+      status: /replied/.test(type)
+        ? "done"
+        : /rejected/.test(type)
+          ? "error"
+          : "pending",
+    };
+  }
+  if (/file_change|file_update|session\.diff/.test(type)) {
     const filePath = String(part.path || part.filePath || "");
+    const changes = Array.isArray(part.diff)
+      ? part.diff
+      : Array.isArray(part.changes)
+        ? part.changes
+        : [];
+    const combinedDiff = changes
+      .map((change) =>
+        String(change?.diff || change?.patch || change?.content || ""),
+      )
+      .filter(Boolean)
+      .join("\n")
+      .slice(0, 48_000);
+    if (!filePath && !changes.length && !combinedDiff) return null;
     return {
       sourceId,
       kind: "file_change",
-      title: `${part.status === "completed" ? "已修改" : "正在修改"} ${path.basename(filePath || "文件")}`,
+      title: `${
+        part.status === "completed" || type === "session.diff"
+          ? "已修改"
+          : "正在修改"
+      } ${path.basename(filePath || (changes.length === 1 ? changes[0]?.path : "文件"))}`,
       detail: String(part.summary || "").slice(0, 500),
-      path: filePath || undefined,
-      diff: openCodeFileDiff("file_change", part, part, filePath),
-      status: part.status === "completed" ? "done" : "running",
+      path:
+        filePath ||
+        (changes.length === 1 ? String(changes[0]?.path || "") : undefined),
+      diff:
+        combinedDiff || openCodeFileDiff("file_change", part, part, filePath),
+      output:
+        changes.length > 1
+          ? changes
+              .map((change) => String(change?.path || ""))
+              .filter(Boolean)
+              .join("\n")
+          : undefined,
+      status:
+        part.status === "completed" || type === "session.diff"
+          ? "done"
+          : "running",
     };
   }
   if (/artifact/.test(type)) {
@@ -8026,7 +10303,7 @@ function parseOpenCodeLine(line, state) {
       status: part.status === "error" ? "error" : "done",
     };
   }
-  if (type === "error") {
+  if (type === "error" || type === "session.error") {
     const errorPayload = payload.error;
     const errorMessage =
       errorPayload?.data?.message ||
@@ -8046,75 +10323,1284 @@ function parseOpenCodeLine(line, state) {
   return null;
 }
 
+function canonicalAgentEventStatus(value, fallback = "done") {
+  const status = String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[\s-]+/g, "_")
+    .toLowerCase();
+  if (["in_progress", "running", "started", "pending"].includes(status)) {
+    return "running";
+  }
+  if (["failed", "error", "denied"].includes(status)) return "error";
+  if (["cancelled", "canceled", "aborted", "interrupted"].includes(status)) {
+    return "cancelled";
+  }
+  if (["completed", "complete", "done", "success", "succeeded"].includes(status)) {
+    return "done";
+  }
+  return fallback;
+}
+
+function codexPlanSteps(item) {
+  const entries = Array.isArray(item?.items)
+    ? item.items
+    : Array.isArray(item?.plan)
+      ? item.plan
+      : Array.isArray(item?.steps)
+        ? item.steps
+        : [];
+  return entries
+    .map((step, index) => ({
+      id: String(step?.id || `codex-plan-${index}`),
+      title: String(step?.text || step?.title || step?.step || "").trim(),
+      status: canonicalAgentEventStatus(step?.status, "pending"),
+    }))
+    .filter((step) => step.title);
+}
+
+function codexApplyPatchChanges(item, sourceId, status) {
+  const command = String(item?.command || item?.command_line || "");
+  const output = String(item?.aggregated_output || item?.output || "");
+  if (
+    status !== "done" ||
+    !/(?:^|[\s;&|])apply_patch(?:\s|$)/m.test(command) ||
+    !/Success\. Updated the following files:/i.test(output)
+  ) {
+    return [];
+  }
+
+  const patchStart = command.indexOf("*** Begin Patch");
+  const patchEnd = command.indexOf("*** End Patch", patchStart);
+  if (patchStart < 0 || patchEnd < 0) return [];
+  const patch = command.slice(patchStart, patchEnd + "*** End Patch".length);
+  const headers = [
+    ...patch.matchAll(/^\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*$/gm),
+  ];
+  return headers.map((match, index) => {
+    const nextOffset = headers[index + 1]?.index ?? patch.length;
+    const diff = patch.slice(match.index, nextOffset).trimEnd();
+    const path = String(match[2] || "").trim();
+    return {
+      sourceId: `${sourceId}-patch-${index}`,
+      kind: "file_change",
+      title: path.split(/[\\/]/).at(-1) || "文件",
+      detail: `Codex · ${String(match[1] || "edit").toLowerCase()}`,
+      path,
+      diff,
+      status,
+    };
+  });
+}
+
+function parseCodexLine(line, state) {
+  let payload;
+  try {
+    payload = JSON.parse(String(line || ""));
+  } catch {
+    return [];
+  }
+  if (payload.id === "easywork-thread" && payload.result?.thread?.id) {
+    state.sessionId = String(payload.result.thread.id);
+    return [];
+  }
+  if (payload.id && payload.error) {
+    const message = String(
+      payload.error?.message || payload.error?.data?.message || "Codex 控制请求失败",
+    );
+    state.lastError = message;
+    return [
+      {
+        sourceId: String(payload.id),
+        kind: "error",
+        title: "Codex 实时控制失败",
+        output: message,
+        status: "error",
+      },
+    ];
+  }
+  const appServerMethod = String(payload.method || "");
+  if (appServerMethod) {
+    const params = payload.params || {};
+    if (appServerMethod === "thread/started") {
+      state.sessionId = String(params.thread?.id || params.threadId || "");
+      return [];
+    }
+    if (appServerMethod === "turn/started") {
+      state.sessionId = String(params.threadId || state.sessionId || "");
+      state.activeTurnId = String(params.turn?.id || params.turnId || "");
+      return [];
+    }
+    if (appServerMethod === "turn/completed") {
+      const turn = params.turn || {};
+      state.activeTurnId = String(turn.id || params.turnId || state.activeTurnId || "");
+      if (canonicalAgentEventStatus(turn.status) === "error") {
+        const message = String(turn.error?.message || "Codex 执行失败");
+        state.lastError = message;
+        return [
+          {
+            sourceId: `codex-turn-${state.activeTurnId || state.eventIndex++}`,
+            kind: "error",
+            title: "Codex 执行错误",
+            output: message,
+            status: "error",
+          },
+        ];
+      }
+      return [];
+    }
+    if (appServerMethod === "thread/tokenUsage/updated") {
+      const usage = params.tokenUsage?.total || params.tokenUsage || {};
+      const input = Number(
+        usage.inputTokens || usage.input_tokens || usage.promptTokens || 0,
+      );
+      const output = Number(
+        usage.outputTokens || usage.output_tokens || usage.completionTokens || 0,
+      );
+      const cachedInput = Number(
+        usage.cachedInputTokens || usage.cached_input_tokens || 0,
+      );
+      state.contextUsage = {
+        input,
+        cachedInput,
+        output,
+        reasoning: Number(
+          usage.reasoningOutputTokens || usage.reasoning_output_tokens || 0,
+        ),
+        total: Number(usage.totalTokens || usage.total_tokens || input + output),
+        observedAt: isoNow(),
+      };
+      return [];
+    }
+    if (appServerMethod === "turn/plan/updated") {
+      const planSteps = (params.plan || [])
+        .map((step, index) => ({
+          id: String(step.id || `codex-plan-${index}`),
+          title: String(step.step || step.title || "").trim(),
+          status: canonicalAgentEventStatus(step.status, "pending"),
+        }))
+        .filter((step) => step.title);
+      if (!planSteps.length) return [];
+      return [
+        {
+          sourceId: "agent-native-plan",
+          kind: "plan",
+          title: "执行计划",
+          status: agentPlanEventStatus(planSteps, "running"),
+          planSteps,
+        },
+      ];
+    }
+    if (appServerMethod === "item/agentMessage/delta") {
+      const message = mergeStreamPart(
+        state,
+        "codexMessageParts",
+        "codexMessageOrder",
+        String(params.itemId || "codex-agent-message"),
+        String(params.delta || ""),
+        "codex-agent-message",
+      );
+      const classified = classifyOpenCodeText(message.text);
+      if (classified.pending || !classified.output.trim()) return [];
+      state.latestText = classified.output;
+      if (classified.kind === "message") state.finalText = classified.output;
+      return [
+        {
+          sourceId: message.key,
+          kind: classified.kind,
+          title:
+            classified.kind === "message" ? "Agent 最终回复" : "Agent 输出",
+          output: classified.output,
+          status: "running",
+        },
+      ];
+    }
+    if (
+      appServerMethod === "item/reasoning/summaryTextDelta" ||
+      appServerMethod === "item/reasoning/textDelta"
+    ) {
+      const reasoning = mergeStreamPart(
+        state,
+        "codexReasoningParts",
+        "codexReasoningOrder",
+        String(params.itemId || "codex-reasoning"),
+        String(params.delta || ""),
+        "codex-reasoning",
+      );
+      if (!reasoning.text.trim()) return [];
+      return [
+        {
+          sourceId: reasoning.key,
+          kind: "agent_reasoning",
+          title: "Agent",
+          output: reasoning.text,
+          status: "running",
+        },
+      ];
+    }
+    if (
+      appServerMethod === "item/started" ||
+      appServerMethod === "item/completed"
+    ) {
+      state.codexItems ||= new Map();
+      const item = params.item || {};
+      if (item.id) state.codexItems.set(String(item.id), item);
+      payload = {
+        type:
+          appServerMethod === "item/started" ? "item.started" : "item.completed",
+        item,
+      };
+    } else if (
+      appServerMethod === "item/commandExecution/outputDelta" ||
+      appServerMethod === "item/fileChange/outputDelta"
+    ) {
+      state.codexItems ||= new Map();
+      const itemId = String(params.itemId || "");
+      const previous = state.codexItems.get(itemId);
+      if (!previous) return [];
+      const item = {
+        ...previous,
+        ...(appServerMethod === "item/commandExecution/outputDelta"
+          ? {
+              aggregatedOutput: `${previous.aggregatedOutput || previous.aggregated_output || ""}${String(params.delta || "")}`,
+            }
+          : {
+              diff: `${previous.diff || previous.patch || ""}${String(params.delta || "")}`,
+            }),
+      };
+      state.codexItems.set(itemId, item);
+      payload = { type: "item.started", item };
+    } else if (appServerMethod === "error") {
+      payload = { type: "error", error: params.error || params };
+    } else {
+      return [];
+    }
+  }
+  const type = String(payload.type || "");
+  if (type === "thread.started") {
+    state.sessionId = String(payload.thread_id || payload.thread?.id || "");
+    return [];
+  }
+  if (type === "turn.completed") {
+    const usage = payload.usage || {};
+    state.contextUsage = {
+      input: Number(usage.input_tokens || 0),
+      cachedInput: Number(usage.cached_input_tokens || 0),
+      output: Number(usage.output_tokens || 0),
+      reasoning: Number(usage.reasoning_output_tokens || 0),
+      total:
+        Number(usage.input_tokens || 0) +
+        Number(usage.output_tokens || 0),
+      observedAt: isoNow(),
+    };
+    return [];
+  }
+  if (type === "turn.failed" || type === "error") {
+    const message = String(
+      payload.error?.message || payload.message || payload.error || "Codex 执行失败",
+    );
+    state.lastError = message;
+    return [
+      {
+        sourceId: String(payload.id || `codex-error-${state.eventIndex++}`),
+        kind: "error",
+        title: "Codex 执行错误",
+        output: message,
+        status: "error",
+      },
+    ];
+  }
+  if (!type.startsWith("item.")) return [];
+  const item = payload.item || {};
+  const itemType = String(item.type || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+  // app-server echoes client input as a userMessage item. The user message is
+  // already rendered and persisted by EasyWork, so exposing this protocol
+  // acknowledgement as an Agent activity duplicates the prompt and leaks the
+  // transport envelope into the conversation.
+  if (["user_message", "input_message"].includes(itemType)) return [];
+  const sourceId = String(item.id || `codex-${itemType}-${state.eventIndex++}`);
+  const status = canonicalAgentEventStatus(
+    item.status,
+    type === "item.started" ? "running" : "done",
+  );
+  if (itemType === "agent_message") {
+    const text = stripEasyWorkProtocolMarkers(
+      String(item.text || item.content || ""),
+      true,
+    );
+    if (!text.trim()) return [];
+    state.latestText = text;
+    if (status === "done") state.finalText = text;
+    return [{ sourceId, kind: "message", title: "Agent 最终回复", output: text, status }];
+  }
+  if (itemType === "reasoning") {
+    const text = stripEasyWorkProtocolMarkers(
+      String(item.text || item.summary || item.content || ""),
+    );
+    if (!text.trim()) return [];
+    return [{ sourceId, kind: "agent_reasoning", title: "Agent", output: text, status }];
+  }
+  if (itemType === "command_execution") {
+    const fileChanges = codexApplyPatchChanges(item, sourceId, status);
+    if (fileChanges.length) return fileChanges;
+    return [
+      {
+        sourceId,
+        kind: "tool_call",
+        title: status === "running" ? "正在运行命令" : "运行了命令",
+        detail: "Codex · shell",
+        command: String(item.command || item.command_line || ""),
+        output: String(
+          item.aggregatedOutput || item.aggregated_output || item.output || "",
+        ),
+        status,
+      },
+    ];
+  }
+  if (itemType === "file_change") {
+    const changes = Array.isArray(item.changes) ? item.changes : [];
+    if (!changes.length) {
+      return [
+        {
+          sourceId,
+          kind: "file_change",
+          title: "编辑文件",
+          path: String(item.path || ""),
+          diff: String(item.diff || item.patch || ""),
+          status,
+        },
+      ];
+    }
+    return changes.map((change, index) => ({
+      sourceId: `${sourceId}-${index}`,
+      kind: "file_change",
+      title: String(change.path || "文件").split("/").at(-1) || "文件",
+      detail: `Codex · ${String(change.kind || "edit")}`,
+      path: String(change.path || ""),
+      diff: String(change.diff || change.patch || ""),
+      status,
+    }));
+  }
+  if (
+    ["plan", "plan_update", "update_plan", "todo_list", "todo_update"].includes(
+      itemType,
+    )
+  ) {
+    const planSteps = codexPlanSteps(item);
+    return [
+      {
+        sourceId,
+        kind: "plan",
+        title: "执行计划",
+        status,
+        planSteps,
+      },
+    ];
+  }
+  if (itemType === "mcp_tool_call") {
+    return [
+      {
+        sourceId,
+        kind: "tool_call",
+        title: String(item.tool || item.name || "MCP 工具调用"),
+        detail: String(item.server || "Codex · MCP"),
+        command: String(item.tool || item.name || ""),
+        output: item.result
+          ? typeof item.result === "string"
+            ? item.result
+            : JSON.stringify(item.result, null, 2)
+          : item.error
+            ? String(item.error)
+            : "",
+        status: item.error ? "error" : status,
+      },
+    ];
+  }
+  if (itemType === "web_search") {
+    return [
+      {
+        sourceId,
+        kind: "tool_call",
+        title: "网页搜索",
+        detail: "Codex · web_search",
+        command: String(item.query || ""),
+        output: String(item.result || ""),
+        status,
+      },
+    ];
+  }
+  return [
+    {
+      sourceId,
+      kind: "job_status",
+      title: String(itemType || "Codex 事件").replaceAll("_", " "),
+      output: JSON.stringify(item, null, 2).slice(0, 16_000),
+      status,
+    },
+  ];
+}
+
+function parsePartialJson(value) {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return null;
+  }
+}
+
+function claudeTaskPlanEvent(block, state) {
+  if (!state) return null;
+  state.claudeTasks ||= new Map();
+  state.claudeTaskOrder ||= 0;
+  const input = block?.input && typeof block.input === "object" ? block.input : {};
+  const name = String(block?.name || block?.tool_name || "").toLowerCase();
+  if (name === "taskcreate") {
+    const pendingId = `pending:${String(block?.id || "task")}`;
+    const taskId = String(input.taskId || input.id || pendingId);
+    const previous = state.claudeTasks.get(taskId) || state.claudeTasks.get(pendingId);
+    const title = String(
+      input.subject || input.activeForm || input.description || previous?.title || "",
+    ).trim();
+    if (title) {
+      if (taskId !== pendingId) state.claudeTasks.delete(pendingId);
+      state.claudeTasks.set(taskId, {
+        id: taskId,
+        title,
+        status: canonicalAgentEventStatus(input.status, previous?.status || "pending"),
+        order: previous?.order ?? state.claudeTaskOrder++,
+      });
+    }
+  } else if (name === "taskupdate") {
+    const taskId = String(input.taskId || input.id || "");
+    if (taskId) {
+      const previous = state.claudeTasks.get(taskId) || {
+        id: taskId,
+        title: String(input.subject || input.activeForm || `任务 ${taskId}`),
+        order: state.claudeTaskOrder++,
+      };
+      state.claudeTasks.set(taskId, {
+        ...previous,
+        title: String(input.subject || input.activeForm || previous.title),
+        status: canonicalAgentEventStatus(input.status, previous.status || "pending"),
+      });
+    }
+  } else if (["tasklist", "taskget"].includes(name)) {
+    const tasks = Array.isArray(input.tasks)
+      ? input.tasks
+      : input.task && typeof input.task === "object"
+        ? [input.task]
+        : [];
+    for (const task of tasks) {
+      const taskId = String(task.id || task.taskId || "");
+      const title = String(task.subject || task.title || task.activeForm || "").trim();
+      if (!taskId || !title) continue;
+      const previous = state.claudeTasks.get(taskId);
+      state.claudeTasks.set(taskId, {
+        id: taskId,
+        title,
+        status: canonicalAgentEventStatus(task.status, previous?.status || "pending"),
+        order: previous?.order ?? state.claudeTaskOrder++,
+      });
+    }
+  }
+  const planSteps = [...state.claudeTasks.values()]
+    .sort((left, right) => Number(left.order || 0) - Number(right.order || 0))
+    .map(({ id, title, status: taskStatus }) => ({ id, title, status: taskStatus }));
+  if (!planSteps.length) return null;
+  return {
+    sourceId: "agent-native-plan",
+    kind: "plan",
+    title: "执行计划",
+    status: planSteps.every((step) => step.status === "done") ? "done" : "running",
+    planSteps,
+  };
+}
+
+function claudeToolEvent(block, status = "running", output = "", state = null) {
+  const name = String(block?.name || block?.tool_name || "工具调用");
+  const input = block?.input && typeof block.input === "object" ? block.input : {};
+  const lowerName = name.toLowerCase();
+  const filePath = String(input.file_path || input.path || input.filename || "");
+  if (["write", "edit", "multiedit", "notebookedit"].includes(lowerName)) {
+    return {
+      kind: "file_change",
+      title: filePath.split("/").at(-1) || name,
+      detail: `Claude Code · ${name}`,
+      path: filePath,
+      diff: openCodeFileDiff(lowerName, input, {}, filePath),
+      output,
+      status,
+    };
+  }
+  if (lowerName === "todowrite") {
+    const todos = Array.isArray(input.todos) ? input.todos : [];
+    const planSteps = todos.map((todo, index) => ({
+      id: String(todo.id || `claude-plan-${index}`),
+      title: String(todo.content || todo.title || "").trim(),
+      status: canonicalAgentEventStatus(todo.status, "pending"),
+    })).filter((todo) => todo.title);
+    if (!planSteps.length) return null;
+    return {
+      sourceId: "agent-native-plan",
+      kind: "plan",
+      title: "执行计划",
+      status,
+      planSteps,
+    };
+  }
+  if (["taskcreate", "taskupdate", "tasklist", "taskget"].includes(lowerName)) {
+    return claudeTaskPlanEvent(block, state);
+  }
+  const command = String(
+    input.command || input.query || input.pattern || input.prompt || name,
+  );
+  return {
+    kind: "tool_call",
+    title: lowerName === "bash" ? (status === "running" ? "正在运行命令" : "运行了命令") : name,
+    detail: `Claude Code · ${name}`,
+    command,
+    output,
+    status,
+  };
+}
+
+function parseClaudeCodeLine(line, state) {
+  let payload;
+  try {
+    payload = JSON.parse(String(line || ""));
+  } catch {
+    return [];
+  }
+  state.blocks ||= new Map();
+  state.tools ||= new Map();
+  const sessionId = String(payload.session_id || payload.sessionId || "");
+  if (sessionId) state.sessionId = sessionId;
+  if (payload.type === "system") {
+    if (payload.subtype === "api_retry") {
+      return [
+        {
+          sourceId: String(payload.uuid || `claude-retry-${payload.attempt || 1}`),
+          kind: "job_status",
+          title: "模型请求重试",
+          detail: `${payload.attempt || 1} / ${payload.max_retries || "?"}`,
+          output: payload.retry_delay_ms
+            ? `${Math.round(Number(payload.retry_delay_ms) / 1000)} 秒后重试`
+            : "",
+          status: "running",
+        },
+      ];
+    }
+    if (payload.subtype === "compact_boundary") {
+      return [
+        {
+          sourceId: String(payload.uuid || "claude-compact-boundary"),
+          kind: "job_status",
+          title: "Agent 上下文已压缩",
+          detail: "Claude Code · compact",
+          status: "done",
+        },
+      ];
+    }
+    if (payload.subtype === "task_notification") {
+      return [
+        {
+          sourceId: String(payload.tool_use_id || payload.task_id || payload.uuid),
+          kind: payload.output_file ? "artifact" : "job_status",
+          title: String(payload.summary || "后台任务状态更新"),
+          detail: `Claude Code · ${payload.status || "task"}`,
+          path: String(payload.output_file || "") || undefined,
+          status: canonicalAgentEventStatus(payload.status, "done"),
+        },
+      ];
+    }
+    return [];
+  }
+  if (payload.type === "stream_event") {
+    const event = payload.event || {};
+    const index = Number(event.index ?? event.content_block?.index ?? 0);
+    if (event.type === "content_block_start") {
+      const block = {
+        ...(event.content_block || {}),
+        inputText: "",
+        text: String(event.content_block?.text || ""),
+      };
+      state.blocks.set(index, block);
+      const sourceId = String(block.id || `claude-block-${index}`);
+      if (block.type === "tool_use") {
+        state.tools.set(sourceId, block);
+        const toolEvent = claudeToolEvent(block, "running", "", state);
+        return toolEvent ? [{ sourceId, ...toolEvent }] : [];
+      }
+      if (block.type === "thinking" && block.text) {
+        return [{ sourceId, kind: "agent_reasoning", title: "Agent", output: block.text, status: "running" }];
+      }
+      return [];
+    }
+    if (event.type === "content_block_delta") {
+      const block = state.blocks.get(index) || { id: `claude-block-${index}` };
+      const delta = event.delta || {};
+      const sourceId = String(block.id || `claude-block-${index}`);
+      if (delta.type === "thinking_delta") {
+        block.text = `${block.text || ""}${String(delta.thinking || "")}`;
+        state.blocks.set(index, block);
+        state.latestThinking = block.text;
+        return [{ sourceId, kind: "agent_reasoning", title: "Agent", output: block.text, status: "running" }];
+      }
+      if (delta.type === "text_delta") {
+        block.text = `${block.text || ""}${String(delta.text || "")}`;
+        state.blocks.set(index, block);
+        const classified = classifyOpenCodeText(block.text);
+        state.latestText = classified.output;
+        if (!classified.output.trim()) return [];
+        if (classified.kind === "message") state.finalSourceId = sourceId;
+        return [{
+          sourceId,
+          kind: classified.kind,
+          title: classified.kind === "message" ? "Agent 最终回复" : "Agent 输出",
+          output: classified.output,
+          status: "running",
+        }];
+      }
+      if (delta.type === "input_json_delta") {
+        block.inputText = `${block.inputText || ""}${String(delta.partial_json || "")}`;
+        block.input = parsePartialJson(block.inputText) || block.input || {};
+        state.blocks.set(index, block);
+        state.tools.set(sourceId, block);
+        const toolEvent = claudeToolEvent(block, "running", "", state);
+        return toolEvent ? [{ sourceId, ...toolEvent }] : [];
+      }
+      return [];
+    }
+    if (event.type === "content_block_stop") {
+      const block = state.blocks.get(index);
+      if (!block) return [];
+      const sourceId = String(block.id || `claude-block-${index}`);
+      if (block.type === "tool_use") {
+        const toolEvent = claudeToolEvent(block, "done", "", state);
+        return toolEvent ? [{ sourceId, ...toolEvent }] : [];
+      }
+      if (block.type === "thinking") {
+        state.latestThinking = block.text || "";
+        return [{ sourceId, kind: "agent_reasoning", title: "Agent", output: block.text || "", status: "done" }];
+      }
+      if (block.type === "text") {
+        const classified = classifyOpenCodeText(block.text || "");
+        if (!classified.output.trim()) return [];
+        if (classified.kind === "message") state.finalSourceId = sourceId;
+        return [{
+          sourceId,
+          kind: classified.kind,
+          title: classified.kind === "message" ? "Agent 最终回复" : "Agent 输出",
+          output: classified.output,
+          status: "done",
+        }];
+      }
+      return [];
+    }
+    return [];
+  }
+  if (payload.type === "assistant") {
+    const content = Array.isArray(payload.message?.content)
+      ? payload.message.content
+      : [];
+    const events = [];
+    for (const [index, block] of content.entries()) {
+      const sourceId = String(block.id || `claude-assistant-${index}`);
+      if (block.type === "thinking" && block.thinking) {
+        const thinking = String(block.thinking);
+        if (thinking !== state.latestThinking) {
+          state.latestThinking = thinking;
+          events.push({ sourceId, kind: "agent_reasoning", title: "Agent", output: thinking, status: "done" });
+        }
+      } else if (block.type === "tool_use") {
+        state.tools.set(sourceId, block);
+        const toolEvent = claudeToolEvent(block, "running", "", state);
+        if (toolEvent) events.push({ sourceId, ...toolEvent });
+      } else if (
+        block.type === "text" &&
+        String(block.text || "").trim()
+      ) {
+        const classified = classifyOpenCodeText(block.text || "");
+        if (
+          classified.output.trim() &&
+          classified.output !== state.latestText
+        ) {
+          state.latestText = classified.output;
+          if (classified.kind === "message") state.finalSourceId = sourceId;
+          events.push({
+            sourceId,
+            kind: classified.kind,
+            title:
+              classified.kind === "message"
+                ? "Agent 最终回复"
+                : "Agent 输出",
+            output: state.latestText,
+            status: "done",
+          });
+        }
+      }
+    }
+    return events;
+  }
+  if (payload.type === "user") {
+    const content = Array.isArray(payload.message?.content)
+      ? payload.message.content
+      : [];
+    return content
+      .filter((block) => block.type === "tool_result")
+      .map((block, index) => {
+        const sourceId = String(
+          block.tool_use_id || `claude-tool-result-${index}`,
+        );
+        const output =
+          typeof block.content === "string"
+            ? block.content
+            : JSON.stringify(block.content || "", null, 2);
+        const tool = state.tools.get(sourceId);
+        const nativeTask = payload.tool_use_result?.task;
+        if (
+          tool &&
+          String(tool.name || "").toLowerCase() === "taskcreate" &&
+          nativeTask?.id
+        ) {
+          tool.input = {
+            ...(tool.input || {}),
+            taskId: String(nativeTask.id),
+            subject: String(nativeTask.subject || tool.input?.subject || ""),
+          };
+        }
+        if (tool) {
+          const toolEvent = claudeToolEvent(
+            tool,
+            block.is_error ? "error" : "done",
+            output,
+            state,
+          );
+          if (toolEvent) {
+            return {
+              sourceId,
+              ...toolEvent,
+            };
+          }
+        }
+        return {
+          sourceId,
+          kind: "tool_call",
+          title: "工具执行结果",
+          detail: "Claude Code",
+          output,
+          status: block.is_error ? "error" : "done",
+        };
+      });
+  }
+  if (payload.type === "result") {
+    const usage = payload.usage || {};
+    state.contextUsage = {
+      input: Number(usage.input_tokens || 0),
+      cachedInput:
+        Number(usage.cache_read_input_tokens || 0) +
+        Number(usage.cache_creation_input_tokens || 0),
+      output: Number(usage.output_tokens || 0),
+      total:
+        Number(usage.input_tokens || 0) + Number(usage.output_tokens || 0),
+      observedAt: isoNow(),
+    };
+    const permissionEvents = Array.isArray(payload.permission_denials)
+      ? payload.permission_denials.map((denial, index) => ({
+          sourceId: String(
+            denial.tool_use_id || denial.id || `claude-permission-${index}`,
+          ),
+          kind: "approval_request",
+          title: "权限请求未获批准",
+          detail: String(denial.tool_name || denial.tool || "Claude Code"),
+          output:
+            typeof denial.tool_input === "string"
+              ? denial.tool_input
+              : JSON.stringify(denial.tool_input || denial, null, 2),
+          status: "error",
+        }))
+      : [];
+    if (payload.is_error) {
+      state.lastError = String(payload.result || payload.error || "Claude Code 执行失败");
+      return [
+        ...permissionEvents,
+        { sourceId: "claude-result", kind: "error", title: "Claude Code 执行错误", output: state.lastError, status: "error" },
+      ];
+    }
+    const finalText = stripEasyWorkProtocolMarkers(
+      String(payload.result || "").trim(),
+      true,
+    );
+    if (!finalText) return permissionEvents;
+    state.finalText = finalText;
+    return [
+      ...permissionEvents,
+      {
+        sourceId: state.finalSourceId || "claude-result",
+        kind: "message",
+        title: "Agent 最终回复",
+        output: finalText,
+        status: "done",
+      },
+    ];
+  }
+  if (payload.type === "tool_progress") {
+    const sourceId = String(payload.tool_use_id || payload.uuid || "claude-tool-progress");
+    const tool = state.tools.get(sourceId);
+    if (tool) {
+      const toolEvent = claudeToolEvent(
+        tool,
+        "running",
+        String(payload.content || payload.summary || ""),
+        state,
+      );
+      if (toolEvent) {
+        return [{
+          sourceId,
+          ...toolEvent,
+        }];
+      }
+    }
+    return [
+      {
+        sourceId,
+        kind: "job_status",
+        title: String(payload.tool_name || "工具仍在运行"),
+        detail: payload.elapsed_time_seconds
+          ? `${payload.elapsed_time_seconds} 秒`
+          : "Claude Code",
+        output: String(payload.content || ""),
+        status: "running",
+      },
+    ];
+  }
+  if (payload.type === "tool_use_summary") {
+    const summary = String(payload.summary || "").trim();
+    if (!summary) return [];
+    return [
+      {
+        sourceId: String(payload.uuid || `claude-tool-summary-${state.eventIndex++}`),
+        kind: "agent_message",
+        title: "Agent 输出",
+        output: summary,
+        status: "done",
+      },
+    ];
+  }
+  if (payload.type === "rate_limit_event") {
+    const info = payload.rate_limit_info || {};
+    return [
+      {
+        sourceId: String(payload.uuid || "claude-rate-limit"),
+        kind: "job_status",
+        title:
+          info.status === "rejected" ? "模型限流" : "模型用量提醒",
+        detail:
+          info.utilization !== undefined
+            ? `当前利用率 ${Math.round(Number(info.utilization) * 100)}%`
+            : "Claude Code",
+        status: info.status === "rejected" ? "error" : "running",
+      },
+    ];
+  }
+  return [];
+}
+
+function parseNativeAgentLine(adapter, line, state) {
+  if (adapter === "codex") return parseCodexLine(line, state);
+  if (adapter === "claude") return parseClaudeCodeLine(line, state);
+  const event = parseOpenCodeLine(line, state);
+  return event ? [event] : [];
+}
+
+function nativeAgentCommand({
+  agent,
+  runtimeConfiguration,
+  nativeSession,
+  workspace,
+  runDirectory,
+  openCodeService,
+  managedModel,
+  prompt,
+}) {
+  if (agent.adapter === "opencode") {
+    const [providerID, ...modelParts] = String(managedModel || "").split("/");
+    const modelID = modelParts.join("/");
+    const body = {
+      parts: [{ type: "text", text: String(prompt || "") }],
+      ...(providerID && modelID ? { model: { providerID, modelID } } : {}),
+    };
+    const promptBodyPath = `${runDirectory}/opencode-prompt.json`;
+    const promptUrl = `${openCodeService.baseUrl}/session/${encodeURIComponent(
+      nativeSession.sessionId,
+    )}/prompt_async?directory=${encodeURIComponent(workspace)}`;
+    return [
+      `printf '%s' ${shellQuote(JSON.stringify(body))} > ${shellQuote(promptBodyPath)}`,
+      [
+        "curl --silent --show-error --fail",
+        `--config ${shellQuote(openCodeService.curlConfigPath)}`,
+        "--request POST",
+        "--header 'Content-Type: application/json'",
+        `--data-binary @${shellQuote(promptBodyPath)}`,
+        shellQuote(promptUrl),
+        `2>> ${shellQuote(`${runDirectory}/agent-events.err`)}`,
+      ].join(" "),
+      "EW_EVENT_WAIT=0",
+      'while test ! -s "$EW_EVENT_DONE"; do',
+      '  if ! kill -0 "$EW_EVENT_PID" 2>/dev/null; then',
+      '    echo "OpenCode event stream ended before the session became idle" >&2',
+      "    exit 1",
+      "  fi",
+      "  EW_EVENT_WAIT=$((EW_EVENT_WAIT + 1))",
+      '  if test "$EW_EVENT_WAIT" -ge 86400; then',
+      '    echo "OpenCode session did not finish within 24 hours" >&2',
+      "    exit 1",
+      "  fi",
+      "  sleep 1",
+      "done",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (agent.adapter === "codex") {
+    const profile = runtimeConfiguration.profile || {};
+    const inputFifo = `${runDirectory}/input.fifo`;
+    const outputFifo = `${runDirectory}/codex-output.fifo`;
+    const initializeRequest = JSON.stringify({
+      id: "easywork-initialize",
+      method: "initialize",
+      params: {
+        clientInfo: { name: "easywork", title: "EasyWork", version: "0.1.0" },
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: false,
+        },
+      },
+    });
+    const threadRequest = JSON.stringify({
+      id: "easywork-thread",
+      method: nativeSession.created ? "thread/start" : "thread/resume",
+      params: nativeSession.created
+        ? {
+            model: runtimeConfiguration.model,
+            cwd: workspace,
+            sandbox: profile.sandboxMode || "workspace-write",
+            approvalPolicy: profile.permissionMode || "never",
+          }
+        : {
+            threadId: nativeSession.sessionId,
+            excludeTurns: true,
+            model: runtimeConfiguration.model,
+            cwd: workspace,
+            sandbox: profile.sandboxMode || "workspace-write",
+            approvalPolicy: profile.permissionMode || "never",
+          },
+    });
+    const turnRequest = JSON.stringify({
+      id: "easywork-turn-start",
+      method: "turn/start",
+      params: {
+        threadId: "__EASYWORK_THREAD_ID__",
+        input: [{ type: "text", text: String(prompt || ""), text_elements: [] }],
+        cwd: workspace,
+        approvalPolicy: profile.permissionMode || "never",
+        effort: profile.reasoningEffort || undefined,
+      },
+    });
+    return [
+      agent.managed
+        ? `export CODEX_HOME=${shellQuote(runtimeConfiguration.paths.codexHome)}`
+        : "",
+      agent.managed
+        ? `export EASYWORK_AGENT_API_KEY="$(cat ${shellQuote(runtimeConfiguration.paths.apiKeyPath)})"`
+        : "",
+      agent.managed
+        ? `export CODEX_API_KEY="$EASYWORK_AGENT_API_KEY"`
+        : "",
+      agent.managed
+        ? `EW_AGENT_TMP=${shellQuote(`${runtimeConfiguration.paths.root}/tmp`)}`
+        : "",
+      agent.managed ? 'mkdir -p "$EW_AGENT_TMP" && chmod 700 "$EW_AGENT_TMP"' : "",
+      agent.managed ? 'export TMPDIR="$EW_AGENT_TMP" TMP="$EW_AGENT_TMP" TEMP="$EW_AGENT_TMP"' : "",
+      `cd "$EW_DIR"`,
+      `EW_INPUT_FIFO=${shellQuote(inputFifo)}`,
+      `EW_OUTPUT_FIFO=${shellQuote(outputFifo)}`,
+      'rm -f "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"',
+      'mkfifo "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"',
+      'chmod 600 "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"',
+      `${shellQuote(agent.path)} app-server --listen stdio:// < "$EW_INPUT_FIFO" > "$EW_OUTPUT_FIFO" 2>&2 &`,
+      "EW_AGENT_PID=$!",
+      'cleanup_agent() { exec 3>&- 2>/dev/null || true; kill "$EW_AGENT_PID" 2>/dev/null || true; rm -f "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"; }',
+      "trap cleanup_agent EXIT INT TERM",
+      'exec 3> "$EW_INPUT_FIFO"',
+      `printf '%s\n' ${shellQuote(initializeRequest)} >&3`,
+      "EW_THREAD_ID=''",
+      'while IFS= read -r EW_LINE; do',
+      "  printf '%s\\n' \"$EW_LINE\"",
+      "  if printf '%s\\n' \"$EW_LINE\" | grep -Eq '\"id\"[[:space:]]*:[[:space:]]*\"easywork-initialize\"'; then",
+      "      if ! printf '%s\\n' \"$EW_LINE\" | grep -Eq '\"result\"[[:space:]]*:'; then printf '%s\\n' \"$EW_LINE\" >&2; exit 70; fi",
+      `      printf '%s\n' ${shellQuote(JSON.stringify({ method: "initialized" }))} >&3`,
+      `      printf '%s\n' ${shellQuote(threadRequest)} >&3`,
+      "      continue",
+      "  fi",
+      "  if printf '%s\\n' \"$EW_LINE\" | grep -Eq '\"id\"[[:space:]]*:[[:space:]]*\"easywork-thread\"'; then",
+      "      if ! printf '%s\\n' \"$EW_LINE\" | grep -Eq '\"result\"[[:space:]]*:'; then printf '%s\\n' \"$EW_LINE\" >&2; exit 71; fi",
+      '      EW_THREAD_ID=$(printf "%s\\n" "$EW_LINE" | sed -n "s/.*\\\"thread\\\":{\\\"id\\\":\\\"\\([^\\\"]*\\)\\\".*/\\1/p")',
+      nativeSession.sessionId
+        ? `      [ -n "$EW_THREAD_ID" ] || EW_THREAD_ID=${shellQuote(nativeSession.sessionId)}`
+        : '      [ -n "$EW_THREAD_ID" ] || { printf "%s\\n" "Codex 未返回 thread id" >&2; exit 72; }',
+      `      printf '%s\n' "$EW_THREAD_ID" > ${shellQuote(`${runDirectory}/thread_id`)}`,
+      `      printf '%s\n' ${shellQuote(turnRequest)} | sed "s|__EASYWORK_THREAD_ID__|$EW_THREAD_ID|g" >&3`,
+      "      continue",
+      "  fi",
+      "  if printf '%s\\n' \"$EW_LINE\" | grep -Eq '\"method\"[[:space:]]*:[[:space:]]*\"turn/started\"'; then",
+      '      EW_TURN_ID=$(printf "%s\\n" "$EW_LINE" | sed -n "s/.*\\\"turn\\\":{\\\"id\\\":\\\"\\([^\\\"]*\\)\\\".*/\\1/p")',
+      `      [ -z "$EW_TURN_ID" ] || printf '%s\n' "$EW_TURN_ID" > ${shellQuote(`${runDirectory}/active_turn_id`)}`,
+      "      continue",
+      "  fi",
+      "  if printf '%s\\n' \"$EW_LINE\" | grep -Eq '\"method\"[[:space:]]*:[[:space:]]*\"turn/completed\"'; then break; fi",
+      'done < "$EW_OUTPUT_FIFO"',
+      'exec 3>&-',
+      'wait "$EW_AGENT_PID"',
+      "EW_NATIVE_STATUS=$?",
+      "trap - EXIT INT TERM",
+      'rm -f "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"',
+      '(exit "$EW_NATIVE_STATUS")',
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (agent.adapter === "claude") {
+    const profile = runtimeConfiguration.profile || {};
+    const sessionOption = nativeSession.created
+      ? `--session-id ${shellQuote(nativeSession.sessionId)}`
+      : `--resume ${shellQuote(nativeSession.sessionId)}`;
+    const managedOptions = agent.managed
+      ? [
+          "--setting-sources user",
+          `--model ${shellQuote(runtimeConfiguration.model)}`,
+          `--effort ${shellQuote(profile.reasoningEffort || "medium")}`,
+          `--permission-mode ${shellQuote(profile.permissionMode || "acceptEdits")}`,
+        ].join(" ")
+      : "";
+    const inputFifo = `${runDirectory}/input.fifo`;
+    const outputFifo = `${runDirectory}/claude-output.fifo`;
+    const initialMessage = JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: String(prompt || "") }],
+      },
+    });
+    return [
+      agent.managed
+        ? `export CLAUDE_CONFIG_DIR=${shellQuote(runtimeConfiguration.paths.claudeConfigDir)}`
+        : "",
+      agent.managed
+        ? `export ANTHROPIC_AUTH_TOKEN="$(cat ${shellQuote(runtimeConfiguration.paths.apiKeyPath)})"`
+        : "",
+      agent.managed ? 'export ANTHROPIC_API_KEY="$ANTHROPIC_AUTH_TOKEN"' : "",
+      agent.managed
+        ? `export CLAUDE_CODE_EFFORT_LEVEL=${shellQuote(profile.reasoningEffort || "medium")}`
+        : "",
+      agent.managed
+        ? `EW_AGENT_TMP=${shellQuote(`${runtimeConfiguration.paths.root}/tmp`)}`
+        : "",
+      agent.managed ? 'mkdir -p "$EW_AGENT_TMP" && chmod 700 "$EW_AGENT_TMP"' : "",
+      agent.managed ? 'export TMPDIR="$EW_AGENT_TMP" TMP="$EW_AGENT_TMP" TEMP="$EW_AGENT_TMP"' : "",
+      `cd "$EW_DIR"`,
+      `EW_INPUT_FIFO=${shellQuote(inputFifo)}`,
+      `EW_OUTPUT_FIFO=${shellQuote(outputFifo)}`,
+      'rm -f "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"',
+      'mkfifo "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"',
+      'chmod 600 "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"',
+      [
+        shellQuote(agent.path),
+        "-p",
+        "--output-format stream-json",
+        "--input-format stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--forward-subagent-text",
+        managedOptions,
+        sessionOption,
+        '< "$EW_INPUT_FIFO" > "$EW_OUTPUT_FIFO"',
+        "&",
+      ]
+        .filter(Boolean)
+        .join(" "),
+      "EW_AGENT_PID=$!",
+      'cleanup_agent() { exec 3>&- 2>/dev/null || true; kill "$EW_AGENT_PID" 2>/dev/null || true; rm -f "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"; }',
+      "trap cleanup_agent EXIT INT TERM",
+      'exec 3> "$EW_INPUT_FIFO"',
+      `printf '%s\n' ${shellQuote(initialMessage)} >&3`,
+      'while IFS= read -r EW_LINE; do',
+      "  printf '%s\\n' \"$EW_LINE\"",
+      "  if printf '%s\\n' \"$EW_LINE\" | grep -Eq '\"type\"[[:space:]]*:[[:space:]]*\"result\"'; then break; fi",
+      'done < "$EW_OUTPUT_FIFO"',
+      'exec 3>&-',
+      'wait "$EW_AGENT_PID"',
+      "EW_NATIVE_STATUS=$?",
+      "trap - EXIT INT TERM",
+      'rm -f "$EW_INPUT_FIFO" "$EW_OUTPUT_FIFO"',
+      '(exit "$EW_NATIVE_STATUS")',
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  throw new Error(`不支持的 Agent 适配器：${agent.adapter}`);
+}
+
 async function runRemoteWork(socket, session, actor, payload) {
   if (!session.client) throw new Error("SSH 尚未连接");
-  const requestedWorkspace = String(payload.workspace || "~");
-  const conflictingRun = [...(session.activeRuns?.values() || [])].find(
-    (run) =>
-      run.conversationId === String(payload.conversationId || "") ||
-      run.workspace === requestedWorkspace,
+  const workspaceRecord = await registeredWorkspaceForRun(
+    actor,
+    session,
+    payload.workspaceId,
+    payload.conversationId,
   );
-  if (conflictingRun || session.activeStream) {
+  const conversationWorkspaceRecord =
+    payload.conversationWorkspaceId &&
+    String(payload.conversationWorkspaceId) !== workspaceRecord.id
+      ? await registeredWorkspaceForRun(
+          actor,
+          session,
+          payload.conversationWorkspaceId,
+          payload.conversationId,
+        )
+      : workspaceRecord;
+  const dynamicWorkspace = Boolean(
+    payload.dynamicWorkspace &&
+      conversationWorkspaceRecord.kind === "virtual" &&
+      conversationWorkspaceRecord.id !== workspaceRecord.id,
+  );
+  if (dynamicWorkspace && !workspaceRecord.writable) {
+    throw new Error("动态写入目标是只读目录，请选择具有写权限的工作区");
+  }
+  const workspace = workspaceRecord.path;
+  const workerActiveRuns = [...session.worker.sessions.values()].flatMap(
+    (candidateSession) => [...candidateSession.activeRuns.values()],
+  );
+  const conflictingRun = workspaceRunConflict(
+    workerActiveRuns,
+    String(payload.conversationId || ""),
+    workspaceRecord,
+  );
+  if (conflictingRun) {
+    const overlaps =
+      conflictingRun &&
+      workspaceRecordsOverlap(
+        { serverId: session.serverId, path: conflictingRun.workspace },
+        workspaceRecord,
+      );
+    const sameVersionDomain = Boolean(
+      conflictingRun.versionDomainId &&
+        workspaceRecord.versionDomainId &&
+        String(conflictingRun.versionDomainId) ===
+          String(workspaceRecord.versionDomainId),
+    );
     throw new Error(
-      conflictingRun?.workspace === requestedWorkspace
-        ? "这个工作区仍有任务在运行"
+      overlaps
+        ? `工作区与正在运行的目录范围重叠：${conflictingRun.workspaceName || conflictingRun.workspace}`
+        : sameVersionDomain
+          ? `同一 Git 仓库已有任务运行：${conflictingRun.workspaceName || conflictingRun.workspace}`
         : "这个对话仍有任务在运行",
     );
   }
   touchSshSession(session);
-  const workerTask = createWorkerTask(session, payload);
+  const workerTask = createWorkerTask(session, {
+    ...payload,
+    workspaceId: workspaceRecord.id,
+    workspaceName: workspaceRecord.name,
+    workspace,
+    workspaceMode: workspaceRecord.mode,
+    workspaceKind: workspaceRecord.kind,
+    versionRoot: workspaceRecord.versionRoot,
+    versionDomainId: workspaceRecord.versionDomainId,
+    conversationWorkspaceId: conversationWorkspaceRecord.id,
+    conversationWorkspaceName: conversationWorkspaceRecord.name,
+    conversationWorkspace: conversationWorkspaceRecord.path,
+    conversationWorkspaceMode: conversationWorkspaceRecord.mode,
+    conversationWorkspaceKind: conversationWorkspaceRecord.kind,
+    dynamicWorkspace,
+  });
   const webAbortController = new AbortController();
   const activeRun = {
+    serverId: session.serverId,
+    serverIdentity: session.serverIdentity,
     conversationId: workerTask.conversationId,
     runId: workerTask.runId,
-    workspace: requestedWorkspace,
+    workspaceId: workspaceRecord.id,
+    workspaceName: workspaceRecord.name,
+    workspace,
+    versionRoot: workspaceRecord.versionRoot,
+    versionDomainId: workspaceRecord.versionDomainId,
     agentId: workerTask.agentId,
-    supportsLiveInput: workerTask.agentId === "opencode",
+    supportsLiveInput: false,
     abortController: webAbortController,
   };
   session.activeRun = activeRun;
   session.activeRuns.set(workerTask.runId, activeRun);
   await ensureWorkerTaskConversation(actor, workerTask);
   const emit = (event) => publishWorkerEvent(session, event);
-  const availableAgents = await prepareRemoteAgents(session, actor);
+  emit({
+    type: "agent.event",
+    conversationId: workerTask.conversationId,
+    runId: workerTask.runId,
+    event: {
+      id: `${workerTask.runId}_workspace_scope`,
+      kind: "workspace_scope",
+      title: dynamicWorkspace
+        ? "已附加动态工作区"
+        : workspaceRecord.kind === "virtual"
+          ? "虚拟工作区"
+          : "工作区版本范围",
+      detail:
+        workspaceRecord.mode === "unmanaged"
+          ? "未检测到 Git，本轮文件修改不可自动重置"
+          : "已纳入共享版本域，可创建运行前后检查点",
+      path: workspaceRecord.path,
+      output: dynamicWorkspace
+        ? `本轮使用 ${workspaceRecord.name} 对应的 Agent 会话；任务结束后，对话仍停留在虚拟工作区。`
+        : workspaceRecord.kind === "virtual"
+          ? "当前没有固定项目目录。虚拟目录适合查询和临时文件；修改真实项目时会先确认动态目标。"
+          : "同一目录及其重叠目录共用版本顺序，运行期间不会并发修改。",
+      status: "done",
+      timestamp: isoNow(),
+    },
+  });
+  const runtimeScope = {
+    conversationId: workerTask.conversationId,
+    workspaceId: workerTask.workspaceId,
+  };
+  const availableAgents = await prepareRemoteAgents(
+    session,
+    actor,
+    runtimeScope,
+  );
   const selectedAgent = availableAgents.find(
     (agent) => agent.id === String(payload.agentId || "opencode"),
   );
   if (!selectedAgent || selectedAgent.status !== "ready") {
     throw new Error("所选 Agent 当前不可用，请重新扫描或安装");
   }
-  if (selectedAgent.adapter !== "opencode") {
-    throw new Error("这个 Agent 尚未安装 EasyWork 运行适配器");
+  if (!["opencode", "codex", "claude"].includes(selectedAgent.adapter)) {
+    throw new Error("这个 Agent 没有可用的 EasyWork 运行适配器");
   }
   activeRun.supportsLiveInput = Boolean(
     selectedAgent.capabilities?.liveInput,
   );
-  if (!selectedAgent.configured) {
+  if (!selectedAgent.managed && !selectedAgent.configured) {
     throw new Error("请先打开 Agent 自带配置文件并完成模型配置");
   }
   const secrets = await getSecrets(actor);
   const state = await getState(actor);
   const provider = state?.settings?.provider || {};
-  const managedModel = managedOpenCodeModel(
-    selectedAgent,
-    provider,
-    Boolean(secrets.providerApiKey),
-  );
-  const workspace = remotePathForSession(
-    session,
-    String(payload.workspace || "~"),
-  );
   await ensureTaskWorkspace(session, workerTask, workspace);
-  workerTask.logicalWorkspaceId =
-    workerTask.logicalWorkspaceId ||
-    crypto
-      .createHash("sha256")
-      .update(`${session.serverId}:${workspace}`)
-      .digest("hex")
-      .slice(0, 24);
   const bindingKey = agentBindingKey({
     serverId: session.serverId || session.host || "unknown-host",
-    workspace,
+    workspaceId: workerTask.workspaceId,
     agentId: String(payload.agentId || "opencode"),
     conversationId: String(payload.conversationId || ""),
   });
@@ -8151,7 +11637,7 @@ async function runRemoteWork(socket, session, actor, payload) {
         : "project-and-global",
     conversationId: String(payload.conversationId || ""),
     currentUserMessageId: workerTask.userMessageId,
-    workspaceId: workerTask.logicalWorkspaceId,
+    workspaceId: workerTask.workspaceId,
     taskId: workerTask.runId,
   });
   workerTask.webContextUsage = context.contextUsage;
@@ -8211,7 +11697,7 @@ async function runRemoteWork(socket, session, actor, payload) {
     );
     webHandoff =
       String(handoffResult.content || "").trim() ||
-      deterministicWorkHandoff(context, provisionalMemoryDelta);
+      deterministicWorkHandoff(context);
     const completedReasoning = String(
       handoffResult.reasoning || webReasoning,
     ).trim();
@@ -8233,7 +11719,7 @@ async function runRemoteWork(socket, session, actor, payload) {
       },
     });
   } catch {
-    webHandoff = deterministicWorkHandoff(context, provisionalMemoryDelta);
+    webHandoff = deterministicWorkHandoff(context);
     emit({
       type: "agent.event",
       conversationId: payload.conversationId,
@@ -8274,36 +11760,74 @@ async function runRemoteWork(socket, session, actor, payload) {
     await persistSshWorker(session.worker);
     return;
   }
-  if (selectedAgent.managed && selectedAgent.adapter === "opencode") {
-    const nativeConfiguration = await ensureOpenCodeNativeConfig(
-      session,
-      actor,
-    );
-    if (!nativeConfiguration.configured) {
-      throw new Error("OpenCode 原生模型配置未完成");
-    }
+  const runtimeConfiguration = await ensureManagedAgentRuntimeConfig(
+    session,
+    actor,
+    selectedAgent,
+    runtimeScope,
+  );
+  if (!runtimeConfiguration.configured) {
+    throw new Error(`${selectedAgent.name} 原生模型配置未完成`);
   }
-  const openCodeService = await ensureOpenCodeService(session, selectedAgent);
-  const nativeSession = await ensureOpenCodeSession(session, openCodeService, {
-    sessionId: boundSessionId,
-    directory: workspace,
-    title: workerTask.title || fallbackConversationTitle(workerTask.prompt),
-  });
+  const managedModel = managedOpenCodeModel(
+    { ...selectedAgent, model: runtimeConfiguration.model },
+    { ...provider, model: runtimeConfiguration.model },
+    Boolean(secrets.providerApiKey),
+  );
+  const runtimeAgent = selectedAgent.managed
+    ? {
+        ...selectedAgent,
+        runtimeId: runtimeConfiguration.runtimeId,
+        serviceKey: `${selectedAgent.id}:${runtimeConfiguration.runtimeId}`,
+        configPath:
+          selectedAgent.adapter === "opencode"
+            ? runtimeConfiguration.paths.opencodeConfigPath
+            : selectedAgent.adapter === "codex"
+              ? runtimeConfiguration.paths.codexConfigPath
+              : runtimeConfiguration.paths.claudeSettingsPath,
+        configRoot: runtimeConfiguration.paths.configRoot,
+        dataPath:
+          selectedAgent.adapter === "opencode"
+            ? runtimeConfiguration.paths.opencodeDataHome
+            : selectedAgent.adapter === "codex"
+              ? runtimeConfiguration.paths.codexHome
+              : runtimeConfiguration.paths.claudeConfigDir,
+      }
+    : selectedAgent;
+  let openCodeService = null;
+  let nativeSession;
+  if (selectedAgent.adapter === "opencode") {
+    openCodeService = await ensureOpenCodeService(session, runtimeAgent);
+    nativeSession = await ensureOpenCodeSession(session, openCodeService, {
+      sessionId: boundSessionId,
+      directory: workspace,
+      title: workerTask.title || fallbackConversationTitle(workerTask.prompt),
+    });
+  } else {
+    nativeSession = {
+      sessionId:
+        boundSessionId ||
+        (selectedAgent.adapter === "claude" ? crypto.randomUUID() : ""),
+      created: !boundSessionId,
+    };
+  }
   const reusableBinding = nativeSession.created ? null : effectiveBinding;
   activeRun.agentControl = {
-    adapter: "opencode",
-    service: openCodeService,
+    adapter: selectedAgent.adapter,
+    service: openCodeService || undefined,
     sessionId: nativeSession.sessionId,
     directory: workspace,
+    runtimeId: runtimeConfiguration.runtimeId,
   };
   workerTask.agentSessionId = nativeSession.sessionId;
   workerTask.agentControl = {
-    adapter: "opencode",
-    serviceId: openCodeService.serviceId,
-    serviceRoot: openCodeService.root,
-    servicePort: openCodeService.port,
+    adapter: selectedAgent.adapter,
+    serviceId: openCodeService?.serviceId,
+    serviceRoot: openCodeService?.root,
+    servicePort: openCodeService?.port,
     sessionId: nativeSession.sessionId,
     directory: workspace,
+    runtimeId: runtimeConfiguration.runtimeId,
   };
   scheduleSshWorkerPersist(session.worker, 0);
   const agentDelta = agentConversationDelta(
@@ -8325,9 +11849,26 @@ async function runRemoteWork(socket, session, actor, payload) {
     agentDelta,
     deliveredMemoryRecords,
   );
+  const workspaceScopePrompt = await renderPromptTemplate(
+    "agents/workspace-scope.md",
+    {
+      SCOPE_MODE: dynamicWorkspace
+        ? "虚拟对话的动态真实工作区"
+        : workspaceRecord.kind === "virtual"
+          ? "虚拟工作区"
+          : "固定真实工作区",
+      WORKSPACE_PATH: workspace,
+      VERSION_STATUS:
+        workspaceRecord.mode === "unmanaged"
+          ? "未检测到 Git 检查点能力，文件修改会保留但不能由 EasyWork 自动重置"
+          : "本目录位于共享版本域中，EasyWork 记录本轮运行前后检查点",
+    },
+  );
   const agentPrompt = await agentPromptWithNativePlanning(
     agentSyncContext,
     webHandoff,
+    workspaceScopePrompt,
+    selectedAgent.adapter,
   );
 
   const parserState = {
@@ -8346,6 +11887,7 @@ async function runRemoteWork(socket, session, actor, payload) {
     activeThought: null,
     activeFinal: null,
     contextUsage: null,
+    outsideWorkspacePaths: new Set(),
   };
   const forwardOpenCodeEvent = (event) => {
     if (!event) return;
@@ -8355,6 +11897,37 @@ async function runRemoteWork(socket, session, actor, payload) {
       /\babort(?:ed)?\b/i.test(String(event.output || event.detail || ""))
     ) {
       return;
+    }
+    if (event.kind === "file_change" && event.path) {
+      const reportedPath = String(event.path).trim();
+      const absolutePath = reportedPath.startsWith("/") || reportedPath.startsWith("~")
+        ? remotePathForSession(session, reportedPath)
+        : path.posix.join(workspace, reportedPath);
+      if (
+        !workspacePathContains(workspace, absolutePath) &&
+        !parserState.outsideWorkspacePaths.has(absolutePath)
+      ) {
+        parserState.outsideWorkspacePaths.add(absolutePath);
+        emit({
+          type: "agent.event",
+          conversationId: payload.conversationId,
+          runId: payload.runId,
+          event: {
+            id: `${payload.runId}_workspace_outside_${crypto
+              .createHash("sha256")
+              .update(absolutePath)
+              .digest("hex")
+              .slice(0, 10)}`,
+            kind: "workspace_scope",
+            title: "检测到版本范围外文件",
+            detail: "该路径不属于本轮检查点，自动重置不会覆盖此修改",
+            path: absolutePath,
+            output: "后续如需继续修改此目录，请将它作为动态工作区重新发起任务。",
+            status: "error",
+            timestamp: isoNow(),
+          },
+        });
+      }
     }
     const { sourceId, planSteps, ...eventPayload } = event;
     const eventId = sourceId
@@ -8456,53 +12029,102 @@ async function runRemoteWork(socket, session, actor, payload) {
       caught instanceof Error ? caught.message : "任务前工作区快照失败",
   }));
   workerTask.checkpointBeforeId = checkpointBefore.id || "";
+  emit({
+    type: "agent.event",
+    conversationId: workerTask.conversationId,
+    runId: workerTask.runId,
+    event: {
+      id: `${workerTask.runId}_workspace_scope`,
+      kind: "workspace_scope",
+      title: dynamicWorkspace
+        ? "动态工作区已就绪"
+        : workspaceRecord.kind === "virtual"
+          ? "虚拟工作区已就绪"
+          : "工作区已就绪",
+      detail:
+        checkpointBefore.status === "available"
+          ? "运行前检查点已创建，本轮文件差异可进行安全性校验"
+          : "未建立版本检查点，本轮文件修改不可自动重置",
+      path: workspaceRecord.path,
+      output:
+        checkpointBefore.status === "available"
+          ? dynamicWorkspace
+            ? `正在复用或创建 ${workspaceRecord.name} 对应的 Agent 会话。`
+            : "同一版本域中的重叠目录已进入互斥保护。"
+          : checkpointBefore.diagnostic || "未检测到可快照的 Git 工作区。",
+      status: "done",
+      timestamp: isoNow(),
+    },
+  });
   const remoteRun = await createRemoteRuntimeRun(session, {
     runId: workerTask.runId,
     conversationId: payload.conversationId,
     agentId: selectedAgent.id,
+    workspaceId: workerTask.workspaceId,
+    workspaceName: workerTask.workspaceName,
+    workspaceKind: workerTask.workspaceKind,
+    versionDomainId: workerTask.versionDomainId,
     workspace,
     prompt: agentPrompt,
     command: ({ runDirectory }) => {
       const eventPath = `${runDirectory}/agent-events.sse`;
       const eventErrorPath = `${runDirectory}/agent-events.err`;
-      const agentCommand = [
-        shellQuote(selectedAgent.path),
-        `run --attach ${shellQuote(openCodeService.baseUrl)} --format json --auto --thinking`,
-        `--dir "$EW_DIR"`,
-        managedModel ? `--model ${shellQuote(managedModel)}` : "",
-        `--session ${shellQuote(nativeSession.sessionId)}`,
-        `< ${shellQuote(`${runDirectory}/prompt.txt`)}`,
-      ]
-        .filter(Boolean)
-        .join(" ");
+      const agentCommand = nativeAgentCommand({
+        agent: runtimeAgent,
+        runtimeConfiguration,
+        nativeSession,
+        workspace,
+        runDirectory,
+        openCodeService,
+        managedModel,
+        prompt: agentPrompt,
+      });
+      const openCodeEventLines =
+        selectedAgent.adapter === "opencode"
+          ? [
+              "export OPENCODE_SERVER_USERNAME=opencode",
+              `export OPENCODE_SERVER_PASSWORD="$(cat ${shellQuote(openCodeService.passwordPath)})"`,
+              `EW_EVENT_DONE=${shellQuote(`${runDirectory}/agent-events.done`)}`,
+              'rm -f "$EW_EVENT_DONE"',
+              `: > ${shellQuote(eventPath)}`,
+              "(",
+              [
+                "  curl --no-buffer --silent --show-error",
+                `--config ${shellQuote(openCodeService.curlConfigPath)}`,
+                "--max-time 0",
+                "--header 'Accept: text/event-stream'",
+                shellQuote(`${openCodeService.baseUrl}/global/event`),
+                `2>> ${shellQuote(eventErrorPath)}`,
+                "| while IFS= read -r EW_EVENT_LINE; do",
+              ].join(" "),
+              `    printf '%s\\n' "$EW_EVENT_LINE" >> ${shellQuote(eventPath)}`,
+              "    if printf '%s' \"$EW_EVENT_LINE\" | grep -F 'session.status' >/dev/null 2>&1 &&",
+              `       printf '%s' "$EW_EVENT_LINE" | grep -F ${shellQuote(nativeSession.sessionId)} >/dev/null 2>&1 &&`,
+              "       printf '%s' \"$EW_EVENT_LINE\" | grep -F '\"idle\"' >/dev/null 2>&1; then",
+              '      printf "done\\n" > "$EW_EVENT_DONE"',
+              "      break",
+              "    fi",
+              "  done",
+              ") &",
+              "EW_EVENT_PID=$!",
+              'cleanup_events() { kill "$EW_EVENT_PID" 2>/dev/null || true; wait "$EW_EVENT_PID" 2>/dev/null || true; }',
+              "trap cleanup_events EXIT INT TERM",
+            ]
+          : [`: > ${shellQuote(eventPath)}`, "cleanup_events() { :; }"];
       return [
         "#!/bin/sh",
         "set -eu",
         `EW_DIR=${shellQuote(workspace)}`,
         'test -d "$EW_DIR" || mkdir -p "$EW_DIR"',
-        "export OPENCODE_SERVER_USERNAME=opencode",
-        `export OPENCODE_SERVER_PASSWORD="$(cat ${shellQuote(openCodeService.passwordPath)})"`,
-        `: > ${shellQuote(eventPath)}`,
-        [
-          "curl --no-buffer --silent --show-error",
-          `--config ${shellQuote(openCodeService.curlConfigPath)}`,
-          "--header 'Accept: text/event-stream'",
-          shellQuote(`${openCodeService.baseUrl}/global/event`),
-          `2>> ${shellQuote(eventErrorPath)}`,
-          `| grep --line-buffered '\"type\":\"tool\"' > ${shellQuote(eventPath)}`,
-          "&",
-        ].join(" "),
-        "EW_EVENT_PID=$!",
-        `cleanup_events() { kill "$EW_EVENT_PID" 2>/dev/null || true; wait "$EW_EVENT_PID" 2>/dev/null || true; }`,
-        "trap cleanup_events EXIT INT TERM",
+        ...openCodeEventLines,
         "set +e",
         agentCommand,
         "EW_AGENT_STATUS=$?",
         "set -e",
         "cleanup_events",
-        "trap - EXIT INT TERM",
+        selectedAgent.adapter === "opencode" ? "trap - EXIT INT TERM" : "",
         'exit "$EW_AGENT_STATUS"',
-      ].join("\n");
+      ].filter(Boolean).join("\n");
     },
   });
   workerTask.remoteRun = {
@@ -8511,32 +12133,51 @@ async function runRemoteWork(socket, session, actor, payload) {
     status: remoteRun.status || "starting",
     runDirectory: remoteRun.runDirectory,
     agentSessionId: nativeSession.sessionId,
-    serviceId: openCodeService.serviceId,
-    serviceRoot: openCodeService.root,
-    servicePort: openCodeService.port,
+    serviceId: openCodeService?.serviceId,
+    serviceRoot: openCodeService?.root,
+    servicePort: openCodeService?.port,
     directory: workspace,
   };
   Object.assign(activeRun, {
     remoteRun,
     abortRequested: false,
     agentControl: {
-      adapter: "opencode",
-      service: openCodeService,
+      adapter: selectedAgent.adapter,
+      service: openCodeService || undefined,
       sessionId: nativeSession.sessionId,
       directory: workspace,
+      runtimeId: runtimeConfiguration.runtimeId,
     },
   });
   session.activeRun = activeRun;
   session.activeRuns.set(workerTask.runId, activeRun);
   scheduleSshWorkerPersist(session.worker, 0);
-  const monitorPromise = monitorRemoteRuntimeRun(session, remoteRun, {
+  const synchronizeNativeControlState = () => {
+    if (parserState.sessionId) {
+      activeRun.agentControl.sessionId = parserState.sessionId;
+      workerTask.agentSessionId = parserState.sessionId;
+      workerTask.agentControl.sessionId = parserState.sessionId;
+    }
+    if (parserState.activeTurnId) {
+      activeRun.agentControl.turnId = parserState.activeTurnId;
+      workerTask.agentControl.turnId = parserState.activeTurnId;
+    }
+  };
+  const monitorHandlers = {
     onStdout: (text) => {
       pending += text;
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() || "";
       for (const line of lines) {
-        const event = parseOpenCodeLine(line, parserState);
-        forwardOpenCodeEvent(event);
+        const parsedEvents = parseNativeAgentLine(
+          selectedAgent.adapter,
+          line,
+          parserState,
+        );
+        synchronizeNativeControlState();
+        for (const event of parsedEvents) {
+          forwardOpenCodeEvent(event);
+        }
       }
     },
     onStderr: (text) => {
@@ -8548,7 +12189,7 @@ async function runRemoteWork(socket, session, actor, payload) {
       ssePending = lines.pop() || "";
       for (const line of lines) {
         if (!line.startsWith("data:")) continue;
-        const livePart = openCodeSseToolPart(line.slice(5).trim(), {
+        const livePart = openCodeSseAgentEvent(line.slice(5).trim(), {
           sessionId: nativeSession.sessionId,
           directory: workspace,
         });
@@ -8564,12 +12205,19 @@ async function runRemoteWork(socket, session, actor, payload) {
       workerTask.updatedAt = isoNow();
       scheduleSshWorkerPersist(session.worker);
     },
-  });
-  await waitForOpenCodeRunAdmission(
+  };
+  const monitorPromise = monitorRemoteRuntimeRun(
     session,
-    activeRun.agentControl,
     remoteRun,
+    monitorHandlers,
   );
+  if (selectedAgent.adapter === "opencode") {
+    await waitForOpenCodeRunAdmission(
+      session,
+      activeRun.agentControl,
+      remoteRun,
+    );
+  }
   await flushAppendedInstructions(session, workerTask, activeRun).catch(
     (caught) => {
       emit({
@@ -8588,13 +12236,25 @@ async function runRemoteWork(socket, session, actor, payload) {
       });
     },
   );
+  const flushPendingNativeOutput = () => {
+    if (!pending.trim()) return;
+    for (const event of parseNativeAgentLine(
+      selectedAgent.adapter,
+      pending.trim(),
+      parserState,
+    )) {
+      forwardOpenCodeEvent(event);
+    }
+    synchronizeNativeControlState();
+    pending = "";
+  };
   const result = await monitorPromise;
+  flushPendingNativeOutput();
   const runWasAborted = Boolean(
     activeRun.abortRequested ||
       workerTask.abortRequested ||
       result.status === "aborted",
   );
-  session.activeStream = null;
   const checkpointAfter = await createWorkspaceCheckpoint(
     session,
     actor,
@@ -8606,42 +12266,78 @@ async function runRemoteWork(socket, session, actor, payload) {
       caught instanceof Error ? caught.message : "任务后工作区快照失败",
   }));
   workerTask.checkpointAfterId = checkpointAfter.id || "";
+  emit({
+    type: "agent.event",
+    conversationId: workerTask.conversationId,
+    runId: workerTask.runId,
+    event: {
+      id: `${workerTask.runId}_workspace_scope`,
+      kind: "workspace_scope",
+      title: dynamicWorkspace
+        ? "动态工作区记录完成"
+        : workspaceRecord.kind === "virtual"
+          ? "虚拟工作区记录完成"
+          : "工作区记录完成",
+      detail:
+        checkpointBefore.status === "available" &&
+        checkpointAfter.status === "available"
+          ? "运行前后检查点完整"
+          : "版本检查点不完整，无法保证自动重置",
+      path: workspaceRecord.path,
+      output: dynamicWorkspace
+        ? "对话仍保持虚拟工作区；再次选择此目录和 Agent 时会复用本次原生会话。"
+        : checkpointAfter.diagnostic || undefined,
+      status: "done",
+      timestamp: isoNow(),
+    },
+  });
   let persistedBinding = null;
-  if (parserState.sessionId) {
+  const resolvedAgentSessionId =
+    String(parserState.sessionId || nativeSession.sessionId || "");
+  if (resolvedAgentSessionId) {
     const deliveryAcknowledged = result.status === "done" && !runWasAborted;
     const binding = {
       ...(reusableBinding || {}),
       bindingKey,
       conversationId: String(payload.conversationId || ""),
       serverId: session.serverId,
+      workspaceId: workerTask.workspaceId,
+      workspaceName: workerTask.workspaceName,
       workspace,
       agentId: selectedAgent.id,
-      model: managedModel || selectedAgent.model || undefined,
-      agentSessionId: parserState.sessionId,
-      agentDataPath: selectedAgent.dataPath,
+      adapter: selectedAgent.adapter,
+      model:
+        runtimeConfiguration.model ||
+        managedModel ||
+        selectedAgent.model ||
+        undefined,
+      contextLimit:
+        positiveInteger(runtimeConfiguration.profile?.contextLimit) ||
+        positiveInteger(selectedAgent.contextLimit) ||
+        undefined,
+      agentSessionId: resolvedAgentSessionId,
+      agentDataPath:
+        runtimeAgent.dataPath || selectedAgent.dataPath || undefined,
+      runtimeId: runtimeConfiguration.runtimeId || undefined,
       lastRunId: workerTask.runId,
       syncMode: agentDelta.bootstrap ? "bootstrap" : "turn",
-      syncCursor: deliveryAcknowledged
-        ? createAgentSyncCursor({
-            state: context.state,
-            memoryDocument: context.memoryDocument,
-            conversationId: workerTask.conversationId,
-            lastMessageId: workerTask.assistantMessageId,
-            taskId: workerTask.runId,
-            checkpointId: workerTask.checkpointAfterId,
-            deliveredContent: agentDelta.messages.map(
-              (message) => `${message.role}\u0000${message.content}`,
-            ),
-            deliveredMemoryRecords,
-            memoryEnabled: context.state?.settings?.memoryEnabled !== false,
-            previous: reusableBinding?.syncCursor,
-          })
-        : reusableBinding?.syncCursor || {
-            memoryEnabled: context.state?.settings?.memoryEnabled !== false,
-            memoryVersions: {},
-            deliveredContentHashes: [],
-            lastMessageId: "",
-          },
+      // The request reached the native session before monitoring began. Keep
+      // completion acknowledgement separate from delivery progress so an abort
+      // or browser/network interruption can resume without replaying this turn.
+      syncCursor: createAgentSyncCursor({
+        state: context.state,
+        memoryDocument: context.memoryDocument,
+        conversationId: workerTask.conversationId,
+        lastMessageId: workerTask.assistantMessageId,
+        taskId: workerTask.runId,
+        checkpointId: workerTask.checkpointAfterId,
+        deliveredContent: agentDelta.messages.map(
+          (message) => `${message.role}\u0000${message.content}`,
+        ),
+        deliveredMemoryRecords,
+        memoryEnabled: context.state?.settings?.memoryEnabled !== false,
+        previous: reusableBinding?.syncCursor,
+      }),
       deliveryState: {
         runId: workerTask.runId,
         status: deliveryAcknowledged ? "acknowledged" : "interrupted",
@@ -8704,11 +12400,11 @@ async function runRemoteWork(socket, session, actor, payload) {
     const primaryError =
       parserState.lastError ||
         stderrOutput.trim() ||
-        `OpenCode 退出码 ${result.code}`;
+        `${selectedAgent.name} 退出码 ${result.code}`;
     const needsLog =
       !parserState.lastError ||
       /unexpected server error|unknown error|未知错误/i.test(primaryError);
-    const logDiagnostic = needsLog
+    const logDiagnostic = needsLog && selectedAgent.adapter === "opencode"
       ? await readOpenCodeFailureLog(session)
       : "";
     throw new Error(
@@ -8774,9 +12470,9 @@ async function runRemoteWork(socket, session, actor, payload) {
     sourceTaskId: workerTask.runId,
     sourceCheckpointId: workerTask.checkpointAfterId,
     serverId: workerTask.serverId,
-    workspaceId: workerTask.logicalWorkspaceId,
+    workspaceId: workerTask.workspaceId,
     sourceAgentId: selectedAgent.id,
-    sourceAgentSessionId: parserState.sessionId,
+    sourceAgentSessionId: resolvedAgentSessionId,
     sourceMessageIds: [
       workerTask.userMessageId,
       workerTask.assistantMessageId,
@@ -8799,6 +12495,15 @@ async function runRemoteWork(socket, session, actor, payload) {
               Number(record.revision || 0),
             ]),
           ]),
+          memoryStatuses: Object.fromEntries([
+            ...Object.entries(
+              (current || persistedBinding).syncCursor?.memoryStatuses || {},
+            ),
+            ...distilledRecords.map((record) => [
+              String(record.id),
+              String(record.status || "active"),
+            ]),
+          ]),
         },
         updatedAt: isoNow(),
       }),
@@ -8809,7 +12514,6 @@ async function runRemoteWork(socket, session, actor, payload) {
 }
 
 async function closeSshSession(session) {
-  if (session.activeStream) session.activeStream.close();
   if (session.client) {
     const client = session.client;
     clearProviderRelays(session);
@@ -8818,7 +12522,6 @@ async function closeSshSession(session) {
   } else {
     clearProviderRelays(session);
   }
-  session.activeStream = null;
   if (session.activeRuns?.size) {
     for (const activeRun of session.activeRuns.values()) {
       activeRun.connectionLostAt = isoNow();
@@ -8861,7 +12564,12 @@ async function connectSsh(socket, session, actor, payload) {
   session.serverId = safeSegment(payload.serverId || session.serverId || randomId("server-"));
   if (payload.demo) {
     session.demo = true;
+    session.serverIdentity = sshServerIdentity({
+      serverId: session.serverId,
+      demo: true,
+    });
     session.status = "connected";
+    session.home = "/home/demo";
     session.host = "demo.easywork.local";
     session.username = "demo";
     session.latency = 18;
@@ -9065,6 +12773,11 @@ async function connectSsh(socket, session, actor, payload) {
   connectionPublished = true;
   session.status = "connected";
   session.port = port;
+  session.serverIdentity = sshServerIdentity({
+    host,
+    port,
+    serverId: session.serverId,
+  });
   session.latency = Date.now() - startedAt;
   session.fingerprint = observedFingerprint;
   session.lastConnectedAt = isoNow();
@@ -9152,7 +12865,7 @@ async function connectSsh(socket, session, actor, payload) {
 async function addRemoteAgent(session, actor, payload) {
   if (!session.client) throw new Error("SSH 尚未连接");
   const folder = remotePathForSession(session, payload.folder);
-  const candidateNames = ["opencode", "qwen", "qwen-code", "claude", "qoder"];
+  const candidateNames = ["opencode", "codex", "claude"];
   const checks = candidateNames.flatMap((name) => [
     `${folder}/${name}`,
     `${folder}/bin/${name}`,
@@ -9173,8 +12886,8 @@ async function addRemoteAgent(session, actor, payload) {
   const binaryName = path.posix.basename(binaryPath).toLowerCase();
   const adapter = binaryName.includes("opencode")
     ? "opencode"
-    : binaryName.includes("qwen")
-      ? "qwen"
+    : binaryName === "codex"
+      ? "codex"
       : binaryName.includes("claude")
         ? "claude"
         : "plain";
@@ -9189,8 +12902,8 @@ async function addRemoteAgent(session, actor, payload) {
       payload.name ||
         (adapter === "opencode"
           ? "OpenCode"
-          : adapter === "qwen"
-            ? "Qwen Code"
+          : adapter === "codex"
+            ? "Codex"
             : adapter === "claude"
               ? "Claude Code"
               : path.posix.basename(folder)),
@@ -9201,6 +12914,7 @@ async function addRemoteAgent(session, actor, payload) {
     path: binaryPath,
     adapter,
     managed: false,
+    deployment: "user",
     ...agentConfigFor(adapter, session.home),
   };
   const registryPath = remoteAgentRegistryPath(actor);
@@ -9219,12 +12933,29 @@ async function agentForSession(session, actor, agentId) {
   return agent;
 }
 
-async function readAgentConfig(session, actor, agentId) {
+async function readAgentConfig(session, actor, payload) {
+  const agentId = typeof payload === "object" ? payload.agentId : payload;
+  const scope = {
+    conversationId: String(payload?.conversationId || ""),
+    workspaceId: String(payload?.workspaceId || ""),
+  };
   const agent = await agentForSession(session, actor, agentId);
-  if (!agent.configPath) throw new Error("尚未识别该 Agent 的原生配置文件");
+  if (!agent.managed) {
+    throw new Error("用户部署的 Agent 使用自身原生配置，EasyWork 不读取或改写");
+  }
+  let configPath = agent.configPath;
+  const runtime = await ensureManagedAgentRuntimeConfig(
+    session,
+    actor,
+    agent,
+    scope,
+  );
+  if (!runtime.configured) throw new Error("请先配置用户 API 和 Agent 模型");
+  configPath = runtime.configPath;
+  if (!configPath) throw new Error("尚未识别该 Agent 的原生配置文件");
   let content = "";
   try {
-    content = (await remoteSftpRead(session.client, agent.configPath)).toString("utf8");
+    content = (await remoteSftpRead(session.client, configPath)).toString("utf8");
   } catch (caught) {
     if (caught?.code !== 2) throw caught;
   }
@@ -9239,20 +12970,36 @@ async function readAgentConfig(session, actor, agentId) {
   }
   return {
     agent,
-    path: agent.configPath,
+    path: configPath,
     content,
   };
 }
 
 async function writeAgentConfig(session, actor, payload) {
   const agent = await agentForSession(session, actor, payload.agentId);
-  if (!agent.configPath) throw new Error("尚未识别该 Agent 的原生配置文件");
+  if (!agent.managed) {
+    throw new Error("用户部署的 Agent 使用自身原生配置，EasyWork 不读取或改写");
+  }
+  const scope = {
+    conversationId: String(payload.conversationId || ""),
+    workspaceId: String(payload.workspaceId || ""),
+  };
+  let configPath = agent.configPath;
+  const runtime = await ensureManagedAgentRuntimeConfig(
+    session,
+    actor,
+    agent,
+    scope,
+  );
+  if (!runtime.configured) throw new Error("请先配置用户 API 和 Agent 模型");
+  configPath = runtime.configPath;
+  if (!configPath) throw new Error("尚未识别该 Agent 的原生配置文件");
   const content = String(payload.content || "");
   if (!content.trim()) throw new Error("配置文件不能为空");
   if (Buffer.byteLength(content) > 2 * 1024 * 1024) {
     throw new Error("配置文件不能超过 2 MB");
   }
-  if (agent.configPath.endsWith(".json")) {
+  if (configPath.endsWith(".json")) {
     try {
       JSON.parse(content);
     } catch {
@@ -9261,10 +13008,10 @@ async function writeAgentConfig(session, actor, payload) {
   }
   await remoteExec(
     session.client,
-    `mkdir -p ${shellQuote(path.posix.dirname(agent.configPath))}`,
+      `mkdir -p ${shellQuote(path.posix.dirname(configPath))}`,
   );
-  await remoteSftpWrite(session.client, agent.configPath, content);
-  return scanRemoteAgents(session, actor);
+  await remoteSftpWrite(session.client, configPath, content);
+  return scanRemoteAgents(session, actor, scope);
 }
 
 async function listRemoteFiles(session, requestedPath) {
@@ -9529,33 +13276,6 @@ function attachWebSocketServer(server) {
           });
           return;
         }
-        if (payload.type === "agent.scan") {
-          if (targetSession.demo) {
-            wsSend(socket, {
-              type: "agent.list",
-              serverId: targetSession.serverId,
-              agents: [
-                {
-                  id: "opencode",
-                  name: "OpenCode",
-                  folder: "~/.easywork/agents/opencode",
-                  path: "~/.easywork/agents/opencode/bin/opencode",
-                  version: "demo",
-                  status: "ready",
-                  adapter: "opencode",
-                  managed: true,
-                  configured: true,
-                  capabilities: agentRuntimeCapabilities("opencode", "ready", {
-                    liveControl: false,
-                  }),
-                },
-              ],
-            });
-          } else {
-            await publishRemoteAgentScan(targetSession, actor);
-          }
-          return;
-        }
         if (payload.type === "agent.add") {
           const agents = await addRemoteAgent(targetSession, actor, payload);
           wsSend(socket, {
@@ -9566,52 +13286,63 @@ function attachWebSocketServer(server) {
           return;
         }
         if (payload.type === "agent.install") {
-          const scannedAgents = targetSession.demo
-            ? []
-            : await scanRemoteAgents(targetSession, actor);
-          if (
-            scannedAgents.some(
-              (agent) =>
-                agent.adapter === "opencode" && agent.status === "ready",
-            )
-          ) {
-            const agents = await installOpenCode(targetSession, actor);
-            sessionSend(targetSession, {
-              type: "agent.list",
-              serverId: targetSession.serverId,
-              agents,
-            });
-            return;
-          }
+          const agentId = String(payload.agentId || "opencode");
+          const catalog = MANAGED_AGENT_CATALOG[agentId];
+          if (!catalog) throw new Error("不支持安装这个 Agent");
           sessionSend(targetSession, {
-            type: "agent.list",
+            type: "agent.install.progress",
             serverId: targetSession.serverId,
-            agents: [
-              {
-                id: "opencode",
-                name: "OpenCode",
-                folder: "~/.easywork/agents/opencode",
-                path: "~/.easywork/agents/opencode/bin/opencode",
-                status: "installing",
-                adapter: "opencode",
-                managed: true,
-                configured: false,
-                capabilities: agentRuntimeCapabilities("opencode", "installing"),
-              },
-            ],
+            agentId,
+            stage: "prepare",
+            label: "正在准备安装",
           });
-          const agents = await installOpenCode(
+          const agents = await installManagedAgent(
             targetSession,
             actor,
+            agentId,
             (stage, label) => {
               sessionSend(targetSession, {
                 type: "agent.install.progress",
                 serverId: targetSession.serverId,
+                agentId,
                 stage,
                 label,
               });
             },
           );
+          sessionSend(targetSession, {
+            type: "agent.list",
+            serverId: targetSession.serverId,
+            agents,
+          });
+          return;
+        }
+        if (payload.type === "agent.uninstall") {
+          if (targetSession.demo) {
+            throw new Error("演示环境不能卸载 Agent");
+          }
+          const agentId = String(payload.agentId || "");
+          const catalog = MANAGED_AGENT_CATALOG[agentId];
+          if (!catalog) throw new Error("不支持卸载这个 Agent");
+          wsSend(socket, {
+            type: "agent.uninstall.status",
+            serverId: targetSession.serverId,
+            agentId,
+            status: "running",
+            label: `正在卸载 ${catalog.name}`,
+          });
+          const agents = await uninstallManagedAgent(
+            targetSession,
+            actor,
+            agentId,
+          );
+          wsSend(socket, {
+            type: "agent.uninstall.status",
+            serverId: targetSession.serverId,
+            agentId,
+            status: "done",
+            label: `${catalog.name} 已卸载`,
+          });
           sessionSend(targetSession, {
             type: "agent.list",
             serverId: targetSession.serverId,
@@ -9631,26 +13362,22 @@ function attachWebSocketServer(server) {
             });
             return;
           }
-          const update = await checkOpenCodeUpdate(
+          const agentId = String(payload.agentId || "opencode");
+          const update = await checkManagedAgentUpdate(
             targetSession,
             actor,
-            (status, label) => {
-              wsSend(socket, {
-                type: "agent.update.status",
-                serverId: targetSession.serverId,
-                status,
-                label,
-              });
-            },
+            agentId,
           );
+          const agentName = MANAGED_AGENT_CATALOG[agentId]?.name || agentId;
           wsSend(socket, {
             type: "agent.update.status",
             serverId: targetSession.serverId,
+            agentId,
             status: update.updateAvailable ? "available" : "current",
             ...update,
             label: update.updateAvailable
-              ? `发现 OpenCode ${update.latestVersion}`
-              : "OpenCode 已是最新版",
+              ? `发现 ${agentName} ${update.latestVersion}`
+              : `${agentName} 已与主机版本一致`,
           });
           return;
         }
@@ -9666,13 +13393,16 @@ function attachWebSocketServer(server) {
             });
             return;
           }
-          const update = await applyOpenCodeUpdate(
+          const agentId = String(payload.agentId || "opencode");
+          const update = await applyManagedAgentUpdate(
             targetSession,
             actor,
+            agentId,
             (status, label) => {
               wsSend(socket, {
                 type: "agent.update.status",
                 serverId: targetSession.serverId,
+                agentId,
                 status,
                 label,
               });
@@ -9681,10 +13411,11 @@ function attachWebSocketServer(server) {
           wsSend(socket, {
             type: "agent.update.status",
             serverId: targetSession.serverId,
+            agentId,
             status: "done",
             currentVersion: update.currentVersion,
             latestVersion: update.latestVersion,
-            label: `OpenCode 已更新到 ${update.latestVersion}`,
+            label: `${MANAGED_AGENT_CATALOG[agentId]?.name || agentId} 已更新到 ${update.latestVersion}`,
           });
           sessionSend(targetSession, {
             type: "agent.list",
@@ -9694,6 +13425,9 @@ function attachWebSocketServer(server) {
           return;
         }
         if (payload.type === "agent.model.configure") {
+          const configuredAgentName =
+            MANAGED_AGENT_CATALOG[String(payload.agentId || "opencode")]?.name ||
+            "Agent";
           if (targetSession.demo) {
             wsSend(socket, {
               type: "agent.model.status",
@@ -9709,9 +13443,9 @@ function attachWebSocketServer(server) {
             serverId: targetSession.serverId,
             status: "configuring",
             model: String(payload.model || ""),
-            label: "正在准备 OpenCode 配置",
+            label: `正在准备 ${configuredAgentName} 配置`,
           });
-          const configured = await configureOpenCodeModel(
+          const configured = await configureManagedAgentModel(
             targetSession,
             actor,
             payload,
@@ -9730,7 +13464,7 @@ function attachWebSocketServer(server) {
             serverId: targetSession.serverId,
             status: "done",
             model: configured.model,
-            label: `OpenCode 已切换到 ${configured.model}`,
+            label: `${configuredAgentName} 已切换到 ${configured.model}`,
           });
           sessionSend(targetSession, {
             type: "agent.list",
@@ -9739,11 +13473,49 @@ function attachWebSocketServer(server) {
           });
           return;
         }
+        if (payload.type === "agent.runtime.configure") {
+          try {
+            const configured = await configureManagedAgentRuntime(
+              targetSession,
+              actor,
+              payload,
+              (label) => {
+                wsSend(socket, {
+                  type: "agent.runtime.status",
+                  serverId: targetSession.serverId,
+                  agentId: String(payload.agentId || ""),
+                  status: "configuring",
+                  label,
+                });
+              },
+            );
+            wsSend(socket, {
+              type: "agent.runtime.status",
+              serverId: targetSession.serverId,
+              status: "done",
+              ...configured,
+            });
+            sessionSend(targetSession, {
+              type: "agent.list",
+              serverId: targetSession.serverId,
+              agents: configured.agents,
+            });
+          } catch (error) {
+            wsSend(socket, {
+              type: "agent.runtime.status",
+              serverId: targetSession.serverId,
+              agentId: String(payload.agentId || ""),
+              status: "error",
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          return;
+        }
         if (payload.type === "agent.config.read") {
           const config = await readAgentConfig(
             targetSession,
             actor,
-            payload.agentId,
+            payload,
           );
           wsSend(socket, {
             type: "agent.config",
@@ -9826,7 +13598,11 @@ function attachWebSocketServer(server) {
           ) {
             throw new Error("当前对话没有可追加指令的运行任务");
           }
-          if (!activeRun.supportsLiveInput) {
+          // The web handoff runs before the remote adapter is admitted. Accept
+          // input during that short phase and keep it queued; once the selected
+          // Agent is ready, the adapter either receives it live (OpenCode) or as
+          // the next turn of the same native session (Codex / Claude Code).
+          if (activeRun.agentControl && !activeRun.supportsLiveInput) {
             throw new Error("当前 Agent 不支持在运行中追加指令");
           }
           const content = String(payload.content || "").trim();
@@ -9857,6 +13633,8 @@ function attachWebSocketServer(server) {
               content,
               createdAt: instruction.createdAt,
               mode: "work",
+              workspaceId: task.workspaceId,
+              workspaceName: task.workspaceName,
               appendedToRunId: runId,
             },
           });
@@ -9883,6 +13661,62 @@ function attachWebSocketServer(server) {
           return;
         }
         if (payload.type === "work.approval") {
+          const activeRun =
+            targetSession.activeRuns?.get(String(payload.runId || "")) ||
+            targetSession.activeRun;
+          if (
+            !activeRun ||
+            String(activeRun.runId || "") !== String(payload.runId || "") ||
+            String(activeRun.conversationId || "") !==
+              String(payload.conversationId || "")
+          ) {
+            throw new Error("这个权限请求已不属于当前运行任务");
+          }
+          if (activeRun.agentControl?.adapter !== "opencode") {
+            throw new Error("当前 Agent 不支持从网页回复运行时权限请求");
+          }
+          const approvalType = String(payload.approvalType || "permission");
+          if (approvalType === "question") {
+            await replyOpenCodeQuestion(
+              targetSession,
+              activeRun.agentControl,
+              payload.approvalId,
+              payload.answers,
+              !payload.approved,
+            );
+          } else {
+            await replyOpenCodePermission(
+              targetSession,
+              activeRun.agentControl,
+              payload.approvalId,
+              Boolean(payload.approved),
+            );
+          }
+          publishWorkerEvent(targetSession, {
+            type: "agent.event",
+            conversationId: activeRun.conversationId,
+            runId: activeRun.runId,
+            event: {
+              id: String(payload.eventId || ""),
+              kind: "approval_request",
+              title:
+                approvalType === "question"
+                  ? payload.approved
+                    ? "问题已回答"
+                    : "问题已跳过"
+                  : payload.approved
+                    ? "操作已允许"
+                    : "操作已拒绝",
+              detail: payload.approved
+                ? "用户允许本次操作"
+                : "用户拒绝本次操作",
+              approvalId: String(payload.approvalId || ""),
+              approvalType:
+                approvalType === "question" ? "question" : "permission",
+              status: payload.approved ? "done" : "error",
+              timestamp: isoNow(),
+            },
+          });
           return;
         }
         if (payload.type === "work.abort") {
@@ -9919,8 +13753,7 @@ function attachWebSocketServer(server) {
             return;
           }
           if (!(await cancelRemoteRuntimeRun(targetSession, activeRun))) {
-            if (targetSession.activeStream) targetSession.activeStream.close();
-            else throw new Error("SSH 已断开；重新连接后才能向远端任务发送停止信号");
+            throw new Error("SSH 已断开；重新连接后才能向远端任务发送停止信号");
           }
           return;
         }
@@ -9955,7 +13788,6 @@ function attachWebSocketServer(server) {
           });
         } else if (payload.type === "work.run") {
           if (targetSession) {
-            targetSession.activeStream = null;
             targetSession.activeRuns?.delete(String(payload.runId || ""));
             targetSession.activeRun =
               targetSession.activeRuns?.values().next().value || null;
@@ -9987,39 +13819,46 @@ function attachWebSocketServer(server) {
             await persistSshWorker(worker).catch(() => undefined);
           }
         } else if (payload.type === "agent.install") {
+          const agentId = String(payload.agentId || "opencode");
           wsSend(socket, {
-            type: "agent.list",
+            type: "agent.install.progress",
             serverId: targetSession?.serverId,
-            agents: [
-              {
-                id: "opencode",
-                name: "OpenCode",
-                folder: "~/.easywork/agents/opencode",
-                path: "~/.easywork/agents/opencode/bin/opencode",
-                status: "missing",
-                adapter: "opencode",
-                managed: true,
-                configured: false,
-                capabilities: agentRuntimeCapabilities("opencode", "missing"),
-              },
-            ],
+            agentId,
+            stage: "error",
+            label: message,
           });
-          wsSend(socket, { type: "error", error: message });
+        } else if (payload.type === "agent.uninstall") {
+          const agentId = String(payload.agentId || "");
+          const agentName = MANAGED_AGENT_CATALOG[agentId]?.name || agentId;
+          wsSend(socket, {
+            type: "agent.uninstall.status",
+            serverId: targetSession?.serverId,
+            agentId,
+            status: "error",
+            label: `${agentName} 卸载失败`,
+            error: message,
+          });
         } else if (String(payload.type || "").startsWith("agent.update.")) {
+          const agentId = String(payload.agentId || "opencode");
+          const agentName = MANAGED_AGENT_CATALOG[agentId]?.name || agentId;
           wsSend(socket, {
             type: "agent.update.status",
             serverId: targetSession?.serverId,
+            agentId,
             status: "error",
-            label: "OpenCode 更新失败",
+            label: `${agentName} 更新失败`,
             error: message,
           });
         } else if (payload.type === "agent.model.configure") {
+          const agentId = String(payload.agentId || "opencode");
+          const agentName = MANAGED_AGENT_CATALOG[agentId]?.name || agentId;
           wsSend(socket, {
             type: "agent.model.status",
             serverId: targetSession?.serverId,
+            agentId,
             status: "error",
             model: String(payload.model || ""),
-            label: "OpenCode 模型配置失败",
+            label: `${agentName} 模型配置失败`,
             error: message,
           });
         } else {
@@ -10112,14 +13951,13 @@ export async function createEasyWorkServer() {
 }
 
 export const gatewayTestHelpers = {
+  agentBindingKey,
+  agentMemoryDelta,
   agentRuntimeCapabilities,
   agentPromptWithNativePlanning,
   agentPlanEventStatus,
   createThinkTagRouter,
   describeSshError,
-  ensureOpenCodeNativeConfig,
-  normalizeOpenCodeVersion,
-  openCodeUpdateApplyCommand,
   fallbackConversationTitle,
   extractModelText,
   getSshWorker,
@@ -10128,25 +13966,41 @@ export const gatewayTestHelpers = {
   managedOpenCodeModel,
   mergeConversationCollections,
   normalizeConversationTitle,
+  normalizeWorkspaceRecord,
   normalizeAgentPlanStatus,
   normalizeAgentPlanSteps,
   openCodeConfigurationStatus,
-  openCodeSseToolPart,
+  openCodeConfiguredModelDetails,
+  openCodeProviderContextLimit,
+  openCodeSseAgentEvent,
   classifyOpenCodeText,
   cleanupIdleSshWorkers,
   conciseOpenCodeDiagnostic,
   createSshSession,
+  createAgentSyncCursor,
   createWorkerTask,
   parseOpenCodeLine,
+  parseCodexLine,
+  parseClaudeCodeLine,
+  parseNativeAgentLine,
+  nativeAgentCommand,
+  ensureManagedAgentRuntimeConfig,
+  managedAgentCapabilitySchema,
   prepareRemoteAgents,
   persistWorkerTaskConversation,
   publishWorkerEvent,
   providerConfigForOpenCode,
+  providerModelDescriptor,
   providerRelayTarget,
   readRemoteRuntimeRun,
   remoteOpenCodePortCommand,
   stripEasyWorkProtocolMarkers,
   trailingFinalMessages,
+  workspaceIdFor,
+  workspacePathContains,
+  workspaceRecordsOverlap,
+  workspaceRunConflict,
+  workspaceVersionDomainIdFor,
 };
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

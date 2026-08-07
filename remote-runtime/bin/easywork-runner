@@ -208,9 +208,17 @@ run_cancel() {
   run_status "$run_id"
 }
 
+run_input() {
+  require_run_id "${1:-}"
+  [ -d "$RUN_DIR" ] || fail "run does not exist"
+  input_fifo="$RUN_DIR/input.fifo"
+  [ -p "$input_fifo" ] || fail "run does not accept live input"
+  cat > "$input_fifo"
+}
+
 self_test() {
   missing=""
-  for command_name in sh setsid kill date mkdir mv sed sleep chmod ps awk sort; do
+  for command_name in sh setsid kill date mkdir mv sed sleep chmod ps awk sort cat grep mkfifo; do
     command -v "$command_name" >/dev/null 2>&1 || missing="$missing $command_name"
   done
   if [ -n "$missing" ]; then
@@ -228,6 +236,7 @@ case "${1:-}" in
   run-start) run_start "${2:-}" ;;
   run-status) run_status "${2:-}" ;;
   run-cancel) run_cancel "${2:-}" ;;
+  run-input) run_input "${2:-}" ;;
   __run-job) run_job "${2:-}" ;;
-  *) fail "usage: easywork-runner {self-test|run-start|run-status|run-cancel} [run_id]" ;;
+  *) fail "usage: easywork-runner {self-test|run-start|run-status|run-cancel|run-input} [run_id]" ;;
 esac
