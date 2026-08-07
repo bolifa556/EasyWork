@@ -65,6 +65,8 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /beginConversation/);
   assert.match(app, /\/api\/conversations\/action/);
   assert.match(app, /actOnConversationMessage\(\s*"edit"/);
+  assert.match(app, /actOnConversationMessage\(\s*"rewind"/);
+  assert.match(app, /回溯会保留这条回复/);
   assert.doesNotMatch(app, /\/api\/conversations\/branch/);
   assert.doesNotMatch(app, /branchConversationFromMessage/);
   assert.match(app, /function UnifiedComposer/);
@@ -73,6 +75,29 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /multiline \? " multiline"/);
   assert.match(app, /project-composer-area/);
   assert.match(app, /project-launch-mode/);
+  assert.match(app, /function WorkspacePickerModal/);
+  assert.match(app, /workspace-rail-panel/);
+  assert.match(app, /workspace-kind-selector/);
+  assert.doesNotMatch(app, /workspace-picker-button/);
+  assert.match(app, /conversation-mode-stack/);
+  assert.match(app, /function WebContextMeter/);
+  assert.match(app, /className="context-meter-row web"/);
+  assert.match(app, /onClick=\{onOpen\}/);
+  assert.match(app, /function AgentContextRing/);
+  assert.match(app, /function AgentContextControls/);
+  assert.match(app, /className={`agent-context-ring/);
+  assert.match(app, /该 Agent 不支持修改上下文限制/);
+  assert.match(app, /function ContextDetailModal/);
+  assert.match(app, /title="网页对话上下文"/);
+  assert.match(app, /className="work-connection-copy"/);
+  assert.match(app, /className="work-connection-status-line"/);
+  assert.doesNotMatch(
+    app,
+    /connection\.host \|\|\s*activeServerProfile\?\.host \|\|\s*"连接服务器"/,
+  );
+  assert.match(app, /切换后会使用该工作区对应的 Agent 会话/);
+  assert.match(app, /workspaceId: executionWorkspace\?\.id/);
+  assert.doesNotMatch(app, /logicalWorkspaceId/);
   assert.match(app, /composer-menu-track/);
   assert.match(app, /conversation-work-mark/);
   assert.match(app, /project-conversation-mode/);
@@ -113,6 +138,8 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /callRunning && !finalAnswerStarted/);
   assert.match(app, /finalAnswerStarted=\{Boolean\(message\.content\)\}/);
   assert.match(app, /function AgentThoughtEvent/);
+  assert.match(app, /复制思考内容/);
+  assert.match(app, /复制 Agent 输出/);
   assert.match(app, /Agent调用中/);
   assert.match(app, /Agent调用完成/);
   assert.match(app, /const hasDetails = segments\.length > 0/);
@@ -146,6 +173,9 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /已连接 \$\{boundConversations\.length\} 个对话/);
   assert.match(app, /agent\.scan\.status/);
   assert.match(app, /扫描中/);
+  assert.match(app, /function AgentDirectoryPickerModal/);
+  assert.match(app, /type: "agent\.uninstall"/);
+  assert.doesNotMatch(app, /type: "agent\.scan"/);
   assert.match(app, /服务器地址/);
   assert.match(app, /您可以自定义对该服务器的称呼/);
   assert.match(app, /请输入您在服务器上的用户名/);
@@ -211,6 +241,25 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /\.server-conversation-panel/);
   assert.match(css, /\.modal-card\.modal-wide:has\(\.server-manager\)/);
   assert.match(css, /\.project-sidebar-chats-motion/);
+  assert.doesNotMatch(css, /\.workspace-picker-modal/);
+  assert.doesNotMatch(css, /\.workspace-picker-button/);
+  assert.match(css, /\.workspace-rail-panel/);
+  assert.match(css, /\.context-meters[\s\S]*gap:\s*6px/);
+  assert.match(css, /\.context-meter-row[\s\S]*grid-template-columns:\s*auto minmax\(42px, 1fr\) auto/);
+  assert.match(css, /\.context-meter-row > i[\s\S]*height:\s*5px/);
+  assert.match(css, /\.context-usage-hero/);
+  assert.match(css, /\.agent-context-ring/);
+  assert.match(css, /\.agent-context-controls/);
+  assert.match(css, /\.agent-inline-install/);
+  assert.match(css, /\.agent-menu-option\.danger/);
+  assert.match(app, /\) : agent\.managed \? \([\s\S]*agent-config-shortcut/);
+  assert.match(css, /\.work-connection-copy small/);
+  assert.match(css, /\.work-connection-status-line/);
+  assert.match(css, /\.conversation-mode-stack/);
+  assert.match(
+    css,
+    /\.conversation-surface\.workspace-toolbar[\s\S]*padding-top:\s*100px/,
+  );
   assert.match(css, /grid-template-rows:\s*0fr/);
   assert.match(css, /\.project-sidebar-chats-motion\.expanded/);
   assert.match(css, /\.conversation-toolbar::after\s*\{[\s\S]*display:\s*none/);
@@ -233,18 +282,33 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /function cleanupIdleSshWorkers/);
   assert.match(gateway, /function publishWorkerEvent/);
   assert.match(gateway, /url\.pathname === "\/api\/conversations\/action"/);
+  assert.match(gateway, /\["branch", "edit", "reset", "rewind"\]/);
+  assert.match(gateway, /rewoundToMessageId/);
   assert.doesNotMatch(gateway, /url\.pathname === "\/api\/conversations\/branch"/);
   assert.match(gateway, /worker\.sockets\.delete\(socket\)/);
   assert.doesNotMatch(gateway, /SSH_RECONNECT_GRACE_MS/);
   assert.match(gateway, /deviceToken/);
-  assert.match(gateway, /EasyWork-Agent-Installer/);
+  assert.match(gateway, /resolveAgentArtifact/);
   assert.match(gateway, /remoteSftpFastPut/);
-  assert.match(gateway, /OpenCode 发布包校验失败/);
+  assert.match(gateway, /正在校验/);
   assert.doesNotMatch(gateway, /opencode\.ai\/install/);
   assert.match(gateway, /agentSessions:\s*new Map/);
+  assert.match(gateway, /function workspaceIdFor/);
+  assert.match(gateway, /function sshServerIdentity/);
+  assert.match(gateway, /function workspaceVersionDomainIdFor/);
+  assert.match(gateway, /function workspaceRunConflict/);
+  assert.match(gateway, /DEFAULT_AGENT_CONTEXT_LIMIT\s*=\s*200_000/);
+  assert.match(gateway, /async function inspectNativeAgentContext/);
+  assert.match(gateway, /"ready-no-session"/);
+  assert.match(gateway, /status:\s*knownAgent \? "service-unavailable" : "unreadable"/);
+  assert.match(gateway, /url\.pathname === "\/api\/workspaces"/);
+  assert.match(gateway, /workspaceId:\s*workerTask\.workspaceId/);
+  assert.doesNotMatch(gateway, /logicalWorkspaceId/);
   assert.match(gateway, /agentUpdates:\s*new Map/);
   assert.match(gateway, /agent\.update\.check/);
-  assert.match(gateway, /openCodeUpdateApplyCommand/);
+  assert.match(gateway, /agent\.uninstall/);
+  assert.doesNotMatch(gateway, /payload\.type === "agent\.scan"/);
+  assert.match(gateway, /deployManagedAgentArtifact/);
   assert.match(gateway, /errorPayload\?\.data\?\.message/);
   assert.match(gateway, /readOpenCodeFailureLog/);
   assert.match(gateway, /persistServerProfile/);

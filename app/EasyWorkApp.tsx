@@ -26,6 +26,7 @@ import {
   Gauge,
   GitBranch,
   HardDrive,
+  History,
   Home,
   KeyRound,
   Library,
@@ -90,6 +91,7 @@ type WorkEventKind =
   | "artifact"
   | "error"
   | "reasoning"
+  | "workspace_scope"
   | "connection"
   | "tool"
   | "terminal"
@@ -111,6 +113,8 @@ type WorkEvent = {
   command?: string;
   path?: string;
   language?: string;
+  approvalId?: string;
+  approvalType?: "permission" | "question";
   retractFinal?: boolean;
   status: EventStatus;
   timestamp: string;
@@ -122,6 +126,11 @@ type RunTrace = {
   steps: WorkflowStep[];
   result?: string;
   startedAt: string;
+  workspaceId?: string;
+  workspaceName?: string;
+  workspaceKind?: "physical" | "virtual";
+  dynamicWorkspace?: boolean;
+  versionDomainId?: string;
 };
 
 type Message = {
@@ -137,7 +146,27 @@ type Message = {
   events?: WorkEvent[];
   runId?: string;
   agentId?: string;
+  workspaceId?: string;
+  workspaceName?: string;
+  workspaceKind?: "physical" | "virtual";
+  dynamicWorkspace?: boolean;
   appendedToRunId?: string;
+};
+
+type WorkspaceItem = {
+  id: string;
+  serverId: string;
+  name: string;
+  path: string;
+  mode: "managed" | "attached" | "unmanaged";
+  kind: "physical" | "virtual";
+  virtualConversationId?: string;
+  versionRoot?: string;
+  versionDomainId?: string;
+  writable: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string;
 };
 
 type Conversation = {
@@ -153,19 +182,58 @@ type Conversation = {
     parentMessageId: string;
     action: "branch";
     memorySnapshotSequence?: number;
+    memorySnapshotVersionIds?: string[];
     createdAt: string;
   };
   work?: {
     agentId?: string;
-    agentSessionId?: string;
+    workspaceId?: string;
+    workspaceName?: string;
     workspace?: string;
     workspaceMode?: "managed" | "attached" | "unmanaged";
-    logicalWorkspaceId?: string;
+    workspaceKind?: "physical" | "virtual";
+    versionDomainId?: string;
     sourceCheckpointId?: string;
     serverId?: string;
     connectionEnabled?: boolean;
+    workspaceHistory?: Array<{
+      workspaceId: string;
+      serverId: string;
+      name: string;
+      path: string;
+      kind?: "physical" | "virtual";
+      versionDomainId?: string;
+      activatedAt: string;
+    }>;
   };
 };
+
+type PendingVirtualWrite = {
+  content: string;
+  conversationId?: string;
+  projectId?: string;
+  requestedMode: "work";
+  openChat?: boolean;
+  target?: WorkspaceItem;
+  suggestedPaths: string[];
+};
+
+function appearsToModifyRemoteState(content: string) {
+  return /(?:创建|新建|写入|修改|编辑|替换|删除|移除|重命名|移动|复制|保存|生成|下载|上传|解压|安装|部署|配置|提交|回滚|清理|初始化|mkdir|touch|write|edit|patch|replace|delete|remove|rename|move|copy|save|generate|download|upload|extract|install|deploy|configure|commit|reset)/i.test(
+    content,
+  );
+}
+
+function remotePathSuggestions(content: string) {
+  const matches = String(content || "").match(/(?:~\/|\/)[^\s，。；、,;：:）)\]}>"'`]+/g) || [];
+  return [
+    ...new Set(
+      matches
+        .map((value) => value.replace(/[。.,;；]+$/, ""))
+        .filter((value) => !value.startsWith("//") && !value.includes("://")),
+    ),
+  ].slice(0, 4);
+}
 
 type Project = {
   id: string;
@@ -240,6 +308,8 @@ type AppSettings = {
     model: string;
     protocol: "auto" | "chat-completions" | "responses";
     configured: boolean;
+    modelContextLimit?: number;
+    modelOutputLimit?: number;
   };
   embedding: {
     baseUrl: string;
@@ -291,13 +361,27 @@ type AgentItem = {
   folder?: string;
   path: string;
   version?: string;
-  status: "ready" | "missing" | "installing" | "needs-adapter";
-  adapter: "opencode" | "claude" | "qwen" | "plain";
+  status: "ready" | "missing" | "installing";
+  adapter: "opencode" | "codex" | "claude" | "plain";
   managed?: boolean;
+  deployment?: "easywork" | "user";
   configured?: boolean;
   configPath?: string;
   dataPath?: string;
   model?: string;
+  providerId?: string;
+  contextLimit?: number;
+  outputLimit?: number;
+  hostVersion?: string;
+  updateAvailable?: boolean;
+  reasoningEffort?: string;
+  permissionMode?: string;
+  sandboxMode?: string;
+  configurationSchema?: {
+    reasoning?: { label: string; value: string; options: string[] };
+    permission?: { label: string; value: string; options: string[] };
+    sandbox?: { label: string; value: string; options: string[] };
+  };
   detail?: string;
   capabilities?: {
     liveInput?: boolean;
@@ -305,6 +389,8 @@ type AgentItem = {
     resumeSession?: boolean;
     nativePlanning?: boolean;
     workspaceCheckpoint?: boolean;
+    contextReadable?: boolean;
+    permissions?: boolean;
   };
 };
 
@@ -328,23 +414,36 @@ type ContextUsage = {
   };
   agent: {
     bound: boolean;
+    readable: boolean;
     available: boolean;
     used: number | null;
     limit: number | null;
     ratio: number | null;
     modifiable: boolean;
     compressible: boolean;
+    compressionSupported?: boolean;
     status: string;
     diagnostic?: string;
+    model?: string;
+    limitSource?: string;
     binding?: {
       serverId: string;
       agentId: string;
       agentSessionId: string;
+      workspaceId?: string;
+      workspaceName?: string;
       workspace: string;
       updatedAt: string;
     } | null;
   };
 };
+
+type ContextBusyAction =
+  | "web-save"
+  | "web-compress"
+  | "agent-save"
+  | "agent-compress"
+  | null;
 
 type AgentModelConfigState = {
   status: "idle" | "configuring" | "done" | "error";
@@ -366,8 +465,15 @@ type AgentUpdateState = {
     | "error";
   currentVersion?: string;
   latestVersion?: string;
+  agentId?: string;
   label?: string;
   error?: string;
+};
+
+type AgentRuntimeConfigState = {
+  agentId: string;
+  status: "idle" | "configuring";
+  label?: string;
 };
 
 type RemoteFileEntry = {
@@ -588,6 +694,26 @@ const DEFAULT_AGENTS: AgentItem[] = [
     managed: true,
     configured: false,
   },
+  {
+    id: "codex",
+    name: "Codex",
+    folder: "~/.easywork/agents/codex",
+    path: "~/.easywork/agents/codex/bin/codex",
+    status: "missing",
+    adapter: "codex",
+    managed: true,
+    configured: false,
+  },
+  {
+    id: "claudecode",
+    name: "Claude Code",
+    folder: "~/.easywork/agents/claudecode",
+    path: "~/.easywork/agents/claudecode/bin/claude",
+    status: "missing",
+    adapter: "claude",
+    managed: true,
+    configured: false,
+  },
 ];
 
 function dedupeAgents(items: AgentItem[]) {
@@ -654,10 +780,23 @@ const formatProjectDate = (value: string) =>
     day: "numeric",
   }).format(new Date(value));
 
-const stripEasyWorkProtocolText = (value: string) =>
-  String(value || "")
-    .replace(/\[\[\s*EASYWORK_(?:FINAL|PROGRESS)\s*\]\]/gi, "")
-    .trimStart();
+const stripEasyWorkProtocolText = (value: string) => {
+  let output = String(value || "").replace(
+    /\[\[\s*EASYWORK_(?:FINAL|PROGRESS)\s*\]\]/gi,
+    "",
+  );
+  const trimmed = output.trimEnd();
+  for (const marker of ["[[EASYWORK_FINAL]]", "[[EASYWORK_PROGRESS]]"]) {
+    for (let length = marker.length - 1; length >= 2; length -= 1) {
+      const prefix = marker.slice(0, length);
+      if (trimmed.endsWith(prefix)) {
+        output = trimmed.slice(0, -prefix.length);
+        return output.trimStart();
+      }
+    }
+  }
+  return output.trimStart();
+};
 
 const conversationPreview = (conversation: Conversation) =>
   conversation.messages.find((message) => message.role === "user")?.content ||
@@ -850,101 +989,242 @@ const formatContextTokens = (value: number | null | undefined) => {
   return String(value);
 };
 
-function ContextMeters({
+const positiveContextLimit = (value: string | number) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 8_000 && parsed <= 4_000_000;
+};
+
+const agentVersionText = (value?: string) => {
+  const source = String(value || "").trim();
+  const numeric = source.match(/(?:^|\s|v)(\d+(?:\.\d+){1,3}(?:[-+][\w.-]+)?)/i);
+  return numeric?.[1] ? `v${numeric[1]}` : source;
+};
+
+const agentSettingOptionLabel = (value: string) =>
+  (({
+    default: "手动确认",
+    minimal: "最低",
+    low: "低",
+    medium: "中等",
+    high: "高",
+    xhigh: "极高",
+    max: "最大（本次会话）",
+    ultracode: "深度编排（本次会话）",
+    untrusted: "仅可信命令免确认",
+    "on-request": "Agent 按需请求",
+    never: "不请求确认",
+    acceptEdits: "自动接受文件编辑",
+    plan: "仅规划（只读）",
+    auto: "自动模式（安全审查）",
+    dontAsk: "仅使用预先批准的工具",
+    bypassPermissions: "跳过权限检查（危险）",
+    ask: "每次询问",
+    allow: "全部允许",
+    deny: "全部禁止",
+    "read-only": "只读沙箱",
+    "workspace-write": "工作区可写",
+    "danger-full-access": "完全访问（无沙箱）",
+  } as Record<string, string>)[value] || value);
+
+const agentContextCacheKey = (
+  conversationId: string,
+  serverId: string,
+  workspaceId: string,
+  agentId: string,
+) => `${conversationId}:${serverId}:${workspaceId}:${agentId}`;
+
+function AgentContextRing({ usage }: { usage: ContextUsage["agent"] | null }) {
+  const ratio = Math.max(0, Math.min(1, Number(usage?.ratio || 0)));
+  return (
+    <span
+      className={`agent-context-ring${usage?.readable ? " readable" : " unreadable"}`}
+      style={{ "--context-ratio": `${ratio * 100}%` } as React.CSSProperties}
+      title={
+        usage?.readable
+          ? `Agent 上下文 ${Math.round(ratio * 100)}%`
+          : "Agent 上下文无法读取"
+      }
+      aria-label={
+        usage?.readable
+          ? `Agent 上下文已使用 ${Math.round(ratio * 100)}%`
+          : "Agent 上下文无法读取"
+      }
+    />
+  );
+}
+
+function AgentContextControls({
+  agent,
+  usage,
+  busyAction,
+  onSave,
+  onCompress,
+}: {
+  agent: AgentItem;
+  usage: ContextUsage["agent"] | null;
+  busyAction: ContextBusyAction;
+  onSave: (limit: number) => Promise<void>;
+  onCompress: () => Promise<void>;
+}) {
+  const [limit, setLimit] = useState(
+    usage?.limit ? String(usage.limit) : agent.contextLimit ? String(agent.contextLimit) : "",
+  );
+  const modifiable = Boolean(agent.managed && (usage?.modifiable ?? true));
+  const readable = Boolean(usage?.readable);
+  const ratio = Math.max(0, Math.min(1, Number(usage?.ratio || 0)));
+  const canSave =
+    modifiable && positiveContextLimit(limit) && !Boolean(busyAction);
+  const canCompress = Boolean(
+    modifiable &&
+      usage?.compressionSupported &&
+      usage.compressible &&
+      !busyAction,
+  );
+  return (
+    <div className="agent-context-controls">
+      <div className="agent-context-usage-row">
+        <i aria-hidden="true">
+          <b style={{ width: `${ratio * 100}%` }} />
+        </i>
+        <strong>
+          {readable
+            ? `${formatContextTokens(usage?.used)} / ${formatContextTokens(usage?.limit)}`
+            : "无法读取"}
+        </strong>
+      </div>
+      <div className="agent-context-action-row">
+        <div className="agent-context-limit-control">
+          <input
+            type="number"
+            min={8_000}
+            max={4_000_000}
+            step={1_000}
+            disabled={!modifiable || Boolean(busyAction)}
+            value={modifiable ? limit : ""}
+            placeholder={
+              modifiable
+                ? "上下文上限"
+                : "该 Agent 不支持修改上下文限制"
+            }
+            onChange={(event) => setLimit(event.target.value)}
+          />
+          <button
+            type="button"
+            title="保存上下文上限"
+            aria-label="保存上下文上限"
+            disabled={!canSave}
+            onClick={() => void onSave(Number(limit))}
+          >
+            {busyAction === "agent-save" ? (
+              <LoaderCircle className="spin" size={13} />
+            ) : (
+              <Save size={13} />
+            )}
+          </button>
+        </div>
+        <button
+          className="agent-context-compress"
+          type="button"
+          disabled={!canCompress}
+          title={
+            usage?.compressionSupported
+              ? "压缩 Agent 原生上下文"
+              : "该 Agent 不支持原生压缩"
+          }
+          onClick={() => void onCompress()}
+        >
+          {busyAction === "agent-compress" ? (
+            <LoaderCircle className="spin" size={13} />
+          ) : (
+            <Database size={13} />
+          )}
+          压缩
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function WebContextMeter({
   usage,
   loading,
-  showAgent,
   onOpen,
 }: {
   usage: ContextUsage | null;
   loading: boolean;
-  showAgent: boolean;
   onOpen: () => void;
 }) {
-  const rows = [
-    ...(showAgent
-      ? [{
-      key: "agent",
-      label: "Agent",
-      used: usage?.agent.used ?? null,
-      limit: usage?.agent.limit ?? null,
-      ratio: usage?.agent.ratio ?? 0,
-      unavailable: !usage?.agent.available,
-      }]
-      : []),
-    {
-      key: "web",
-      label: "对话",
-      used: usage?.web.used ?? 0,
-      limit: usage?.web.limit ?? 200_000,
-      ratio: usage?.web.ratio ?? 0,
-      unavailable: false,
-    },
-  ];
   return (
-    <button
-      className={`context-meters${showAgent ? "" : " single"}${loading ? " loading" : ""}`}
-      type="button"
-      onClick={onOpen}
-      aria-label="查看上下文占用"
+    <div
+      className={`context-meters single${loading ? " loading" : ""}`}
+      aria-label="网页对话上下文占用"
     >
-      {rows.map((row) => (
-        <span className="context-meter-row" key={row.key}>
-          <span className="context-meter-copy">
-            <small>{row.label}</small>
-            <strong>
-              {row.unavailable
-                ? "无法读取"
-                : `${formatContextTokens(row.used)} / ${formatContextTokens(row.limit)}`}
-            </strong>
-          </span>
-          <i aria-hidden="true">
-            <b style={{ width: `${Math.max(0, Math.min(100, row.ratio * 100))}%` }} />
-          </i>
-        </span>
-      ))}
-    </button>
+      <button
+        className="context-meter-row web"
+        type="button"
+        onClick={onOpen}
+        aria-label="查看网页对话上下文"
+      >
+        <span>网页对话</span>
+        <i aria-hidden="true">
+          <b
+            style={{
+              width: `${Math.max(
+                0,
+                Math.min(100, (usage?.web.ratio ?? 0) * 100),
+              )}%`,
+            }}
+          />
+        </i>
+        <strong>
+          {loading && !usage
+            ? "读取中"
+            : `${formatContextTokens(usage?.web.used ?? 0)} / ${formatContextTokens(
+                usage?.web.limit ?? 200_000,
+              )}`}
+        </strong>
+      </button>
+    </div>
   );
 }
 
 function ContextDetailModal({
   usage,
-  busy,
-  showAgent,
+  busyAction,
   onClose,
-  onSave,
-  onCompress,
-  onAgentCompress,
+  onSaveWeb,
+  onCompressWeb,
 }: {
   usage: ContextUsage | null;
-  busy: boolean;
-  showAgent: boolean;
+  busyAction: ContextBusyAction;
   onClose: () => void;
-  onSave: (limit: number, threshold: number) => Promise<void>;
-  onCompress: () => Promise<void>;
-  onAgentCompress: () => Promise<void>;
+  onSaveWeb: (limit: number, threshold: number) => Promise<void>;
+  onCompressWeb: () => Promise<void>;
 }) {
   const [limit, setLimit] = useState(usage?.web.limit ?? 200_000);
   const [threshold, setThreshold] = useState(
     usage?.web.automaticCompressionThreshold ?? 0.95,
   );
   return (
-    <Modal title="上下文" onClose={onClose} wide>
-      <div className="context-detail-layout">
-        <section className="context-detail-card">
-          <header>
+    <Modal title="网页对话上下文" onClose={onClose} wide>
+      <div className="context-dialog web-context-dialog">
+        <section className="context-usage-hero web">
+          <div className="context-usage-heading">
+            <span className="context-usage-icon"><MessageCircle size={19} /></span>
             <div>
-              <small>网页对话</small>
-              <strong>
-                {formatContextTokens(usage?.web.used)} / {formatContextTokens(usage?.web.limit)}
-              </strong>
+              <small>当前网页对话</small>
+              <strong>{formatContextTokens(usage?.web.used)} / {formatContextTokens(usage?.web.limit)}</strong>
             </div>
-            <span>{Math.round((usage?.web.ratio ?? 0) * 100)}%</span>
-          </header>
-          <div className="context-detail-bar">
+            <em>{Math.round((usage?.web.ratio ?? 0) * 100)}%</em>
+          </div>
+          <div className="context-dialog-progress web" aria-hidden="true">
             <i style={{ width: `${Math.min(100, (usage?.web.ratio ?? 0) * 100)}%` }} />
           </div>
-          <dl className="context-breakdown">
+        </section>
+
+        <section className="context-dialog-section">
+          <header><strong>占用组成</strong></header>
+          <dl className="context-breakdown context-breakdown-grid">
             <div><dt>消息</dt><dd>{formatContextTokens(usage?.web.breakdown.messages)}</dd></div>
             <div><dt>摘要</dt><dd>{formatContextTokens(usage?.web.breakdown.summary)}</dd></div>
             <div><dt>记忆</dt><dd>{formatContextTokens(usage?.web.breakdown.memory)}</dd></div>
@@ -953,85 +1233,67 @@ function ContextDetailModal({
             <div><dt>知识片段</dt><dd>{formatContextTokens(usage?.web.breakdown.knowledge)}</dd></div>
             <div><dt>回复预留</dt><dd>{formatContextTokens(usage?.web.breakdown.outputReserve)}</dd></div>
           </dl>
-          <label className="context-setting-row">
-            <span>上下文上限</span>
-            <input
-              type="number"
-              min={8_000}
-              max={2_000_000}
-              step={1_000}
-              value={limit}
-              onChange={(event) => setLimit(Number(event.target.value))}
-            />
-          </label>
-          <label className="context-setting-row">
-            <span>自动压缩阈值</span>
-            <input
-              type="number"
-              min={0.5}
-              max={1}
-              step={0.01}
-              value={threshold}
-              onChange={(event) => setThreshold(Number(event.target.value))}
-            />
-          </label>
-          <div className="context-detail-actions">
-            <button type="button" disabled={busy} onClick={() => void onSave(limit, threshold)}>
-              保存设置
-            </button>
-            <button
-              className="primary"
-              type="button"
-              disabled={busy || !usage?.web.compressible}
-              onClick={() => void onCompress()}
-            >
-              {busy ? <LoaderCircle className="spin" size={14} /> : <Database size={14} />}
-              压缩对话
-            </button>
-          </div>
         </section>
-        {showAgent && <section className="context-detail-card agent-context-card">
+
+        <section className="context-dialog-section context-settings-section">
           <header>
             <div>
-              <small>远端 Agent</small>
-              <strong>
-                {usage?.agent.available
-                  ? `${formatContextTokens(usage.agent.used)} / ${formatContextTokens(usage.agent.limit)}`
-                  : usage?.agent.bound
-                    ? "无法读取"
-                    : "尚未绑定 Agent 会话"}
-              </strong>
+              <strong>压缩设置</strong>
+              <small>只调整网页对话，不改动 Agent 原生会话。</small>
             </div>
-            {usage?.agent.ratio !== null && usage?.agent.ratio !== undefined && (
-              <span>{Math.round(usage.agent.ratio * 100)}%</span>
-            )}
           </header>
-          {usage?.agent.ratio !== null && usage?.agent.ratio !== undefined && (
-            <div className="context-detail-bar agent">
-              <i style={{ width: `${Math.min(100, usage.agent.ratio * 100)}%` }} />
-            </div>
-          )}
-          <div className="agent-context-state">
-            {usage?.agent.status === "measured"
-              ? "已从 Agent 原生会话读取上下文用量。"
-              : usage?.agent.bound
-                ? usage.agent.diagnostic || "当前 Agent 上下文无法读取。"
-                : "当前对话尚未绑定 Agent 会话。"}
+          <div className="context-settings-grid">
+            <label className="context-setting-field">
+              <span>上下文上限</span>
+              <input
+                type="number"
+                min={8_000}
+                max={2_000_000}
+                step={1_000}
+                value={limit}
+                onChange={(event) => setLimit(Number(event.target.value))}
+              />
+            </label>
+            <label className="context-setting-field">
+              <span>自动压缩阈值</span>
+              <input
+                type="number"
+                min={0.5}
+                max={1}
+                step={0.01}
+                value={threshold}
+                onChange={(event) => setThreshold(Number(event.target.value))}
+              />
+            </label>
           </div>
-          {usage?.agent.binding && (
-            <dl className="agent-context-binding">
-              <div><dt>Agent</dt><dd>{usage.agent.binding.agentId}</dd></div>
-              <div><dt>服务器</dt><dd>{usage.agent.binding.serverId}</dd></div>
-              <div><dt>工作区</dt><dd>{usage.agent.binding.workspace}</dd></div>
-            </dl>
-          )}
-          {usage?.agent.compressible && (
-            <button type="button" disabled={busy} onClick={() => void onAgentCompress()}>
-              {busy && <LoaderCircle className="spin" size={14} />}
-              让 Agent 压缩原生会话
-            </button>
-          )}
-        </section>}
+        </section>
+        <div className="context-dialog-actions">
+          <button
+            type="button"
+            disabled={Boolean(busyAction)}
+            onClick={() => void onSaveWeb(limit, threshold)}
+          >
+            {busyAction === "web-save" ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
+              <Save size={14} />
+            )}
+            {busyAction === "web-save" ? "配置中" : "保存设置"}
+          </button>
+          <button
+            className="primary"
+            type="button"
+            disabled={Boolean(busyAction) || !usage?.web.compressible}
+            onClick={() => void onCompressWeb()}
+          >
+            {busyAction === "web-compress" ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
+              <Database size={14} />
+            )}
+            {busyAction === "web-compress" ? "压缩中" : "压缩对话"}
+          </button>
+        </div>
       </div>
     </Modal>
   );
@@ -1039,12 +1301,15 @@ function ContextDetailModal({
 
 function Modal({
   title,
+  titleNote,
+  headerAction,
   onClose,
   children,
   wide = false,
 }: {
   title: string;
-  eyebrow?: string;
+  titleNote?: string;
+  headerAction?: React.ReactNode;
   onClose: () => void;
   children: React.ReactNode;
   wide?: boolean;
@@ -1067,12 +1332,16 @@ function Modal({
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className="modal-header">
-          <div>
+          <div className={`modal-title-copy${titleNote ? " with-note" : ""}`}>
             <h2>{title}</h2>
+            {titleNote && <small>{titleNote}</small>}
           </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">
-            <X size={18} />
-          </button>
+          <div className="modal-header-actions">
+            {headerAction}
+            <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">
+              <X size={18} />
+            </button>
+          </div>
         </header>
         {children}
       </section>
@@ -1143,6 +1412,7 @@ function EventGlyph({ event }: { event: WorkEvent }) {
   if (kind === "reasoning") return <Brain size={14} />;
   if (kind === "agent_reasoning") return <Brain size={14} />;
   if (kind === "connection") return <Network size={14} />;
+  if (kind === "workspace_scope") return <GitBranch size={14} />;
   if (kind === "message" || kind === "agent_message") {
     return <MessageCircle size={14} />;
   }
@@ -1181,9 +1451,11 @@ function ReasoningDisclosure({
       <div className="reasoning-motion">
         <div>
           <div className="reasoning-content">
-            {content && <BlockCopyButton content={content} label="复制思考内容" />}
             {content ? (
-              <MarkdownContent content={content} compact />
+              <>
+                <BlockCopyButton content={content} label="复制思考内容" />
+                <MarkdownContent content={content} compact />
+              </>
             ) : (
               <span>正在生成思考内容…</span>
             )}
@@ -1453,12 +1725,28 @@ function AgentEventRow({
   workflowSteps,
 }: {
   event: WorkEvent;
-  onApproval?: (event: WorkEvent, approved: boolean) => void;
+  onApproval?: (
+    event: WorkEvent,
+    approved: boolean,
+    answers?: string[][],
+  ) => void;
   workflowSteps?: WorkflowStep[];
 }) {
   const kind = normalizedEventKind(event.kind);
   const autoOpen = kind === "approval_request" && event.status === "pending";
   const [expanded, setExpanded] = useAutoDisclosure(autoOpen);
+  const questionItems = useMemo(() => {
+    if (event.approvalType !== "question") return [];
+    try {
+      const parsed = JSON.parse(String(event.output || "[]"));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }, [event.approvalType, event.output]);
+  const [questionAnswers, setQuestionAnswers] = useState<string[]>(() =>
+    questionItems.map(() => ""),
+  );
   const disclosable = Boolean(
     event.detail ||
       event.path ||
@@ -1536,7 +1824,7 @@ function AgentEventRow({
                     </div>
                   ))}
                 </div>
-              ) : event.output ? (
+              ) : event.output && event.approvalType !== "question" ? (
                 <div className="agent-event-output">
                   <MarkdownContent content={event.output} compact />
                 </div>
@@ -1544,14 +1832,71 @@ function AgentEventRow({
               {kind === "approval_request" &&
                 event.status === "pending" &&
                 onApproval && (
-                  <div className="approval-actions">
-                    <button type="button" onClick={() => onApproval(event, false)}>
-                      拒绝
-                    </button>
-                    <button type="button" onClick={() => onApproval(event, true)}>
-                      允许
-                    </button>
-                  </div>
+                  event.approvalType === "question" ? (
+                    <div className="approval-question-form">
+                      {questionItems.map((question, index) => (
+                        <label key={String(question?.header || index)}>
+                          <span>
+                            {String(
+                              question?.question ||
+                                question?.header ||
+                                `问题 ${index + 1}`,
+                            )}
+                          </span>
+                          <input
+                            value={questionAnswers[index] || ""}
+                            placeholder="输入回答"
+                            onChange={(changeEvent) =>
+                              setQuestionAnswers((current) => {
+                                const next = [...current];
+                                next[index] = changeEvent.target.value;
+                                return next;
+                              })
+                            }
+                          />
+                        </label>
+                      ))}
+                      {!questionItems.length && (
+                        <label>
+                          <span>{event.title}</span>
+                          <input
+                            value={questionAnswers[0] || ""}
+                            placeholder="输入回答"
+                            onChange={(changeEvent) =>
+                              setQuestionAnswers([changeEvent.target.value])
+                            }
+                          />
+                        </label>
+                      )}
+                      <div className="approval-actions">
+                        <button type="button" onClick={() => onApproval(event, false)}>
+                          跳过
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!questionAnswers.some((answer) => answer.trim())}
+                          onClick={() =>
+                            onApproval(
+                              event,
+                              true,
+                              questionAnswers.map((answer) => [answer.trim()]),
+                            )
+                          }
+                        >
+                          回答
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="approval-actions">
+                      <button type="button" onClick={() => onApproval(event, false)}>
+                        拒绝
+                      </button>
+                      <button type="button" onClick={() => onApproval(event, true)}>
+                        允许
+                      </button>
+                    </div>
+                  )
                 )}
             </div>
           </div>
@@ -1562,7 +1907,9 @@ function AgentEventRow({
 }
 
 function AgentThoughtEvent({ event }: { event: WorkEvent }) {
-  const content = String(event.output || event.detail || "").trim();
+  const content = stripEasyWorkProtocolText(
+    String(event.output || event.detail || ""),
+  ).trim();
   if (!content) return null;
   return (
     <section
@@ -1570,7 +1917,7 @@ function AgentThoughtEvent({ event }: { event: WorkEvent }) {
       aria-label="Agent 中间输出"
     >
       <div className="agent-thought-content">
-        <BlockCopyButton content={content} label="复制 Agent 内容" />
+        <BlockCopyButton content={content} label="复制 Agent 输出" />
         <MarkdownContent content={content} compact />
       </div>
     </section>
@@ -1585,7 +1932,11 @@ function WorkEventFeed({
   finalAnswerStarted = false,
 }: {
   events: WorkEvent[];
-  onApproval?: (event: WorkEvent, approved: boolean) => void;
+  onApproval?: (
+    event: WorkEvent,
+    approved: boolean,
+    answers?: string[][],
+  ) => void;
   runStatus?: RunTrace["status"];
   workflowSteps?: WorkflowStep[];
   finalAnswerStarted?: boolean;
@@ -1655,7 +2006,7 @@ function WorkEventFeed({
     visibleEvents.some((event) => event.status === "running");
   const callFailed =
     runStatus === "error" ||
-    visibleEvents.some((event) => event.status === "error");
+    (!runStatus && visibleEvents.some((event) => event.status === "error"));
   const callAborted = runStatus === "aborted";
   const [expanded, setExpanded] = useAutoDisclosure(
     Boolean(segments.length) && callRunning && !finalAnswerStarted,
@@ -1852,9 +2203,9 @@ function ConversationRow({
       <button className="chat-row-main" type="button" onClick={onSelect}>
         <ScrollingTitle title={conversation.title} />
       </button>
-      {conversation.mode === "work" && (
-        <span className="conversation-work-mark">工作</span>
-      )}
+      <span className={`conversation-work-mark ${conversation.mode}`}>
+        {conversation.mode === "work" ? "工作" : "聊天"}
+      </span>
       <button
         ref={menuButtonRef}
         className="chat-row-menu-button"
@@ -2398,9 +2749,20 @@ export default function EasyWorkApp() {
   const [agentMenuPage, setAgentMenuPage] = useState<
     "root" | "config" | "models"
   >("root");
-  const [manualAgentOpen, setManualAgentOpen] = useState(false);
-  const [manualAgentName, setManualAgentName] = useState("");
-  const [manualAgentFolder, setManualAgentFolder] = useState("");
+  const [manualAgentPickerOpen, setManualAgentPickerOpen] = useState(false);
+  const [manualAgentBrowsePath, setManualAgentBrowsePath] = useState("~");
+  const [manualAgentBrowseHome, setManualAgentBrowseHome] = useState("");
+  const [manualAgentBrowseParent, setManualAgentBrowseParent] = useState<
+    string | null
+  >(null);
+  const [manualAgentBrowseEntries, setManualAgentBrowseEntries] = useState<
+    RemoteFileEntry[]
+  >([]);
+  const [manualAgentBrowseLoading, setManualAgentBrowseLoading] =
+    useState(false);
+  const [uninstallingAgentId, setUninstallingAgentId] = useState("");
+  const [agentPendingUninstall, setAgentPendingUninstall] =
+    useState<AgentItem | null>(null);
   const [agentConfigOpen, setAgentConfigOpen] = useState(false);
   const [agentConfigAgentId, setAgentConfigAgentId] = useState("");
   const [agentConfigPath, setAgentConfigPath] = useState("");
@@ -2412,6 +2774,8 @@ export default function EasyWorkApp() {
   const [agentModelsByServer, setAgentModelsByServer] = useState<
     Record<string, AgentModelConfigState>
   >({});
+  const [agentRuntimeConfig, setAgentRuntimeConfig] =
+    useState<AgentRuntimeConfigState>({ agentId: "", status: "idle" });
   const [agentUpdateModalOpen, setAgentUpdateModalOpen] = useState(false);
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
   const [remoteFilePath, setRemoteFilePath] = useState("~");
@@ -2419,6 +2783,28 @@ export default function EasyWorkApp() {
   const [remoteFileParent, setRemoteFileParent] = useState<string | null>(null);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [remoteFilesLoading, setRemoteFilesLoading] = useState(false);
+  const [draftWorkspace, setDraftWorkspace] = useState<WorkspaceItem | null>(
+    null,
+  );
+  const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
+  const [workspacePickerPurpose, setWorkspacePickerPurpose] = useState<
+    "conversation" | "dynamic"
+  >("conversation");
+  const [workspacePickerLoading, setWorkspacePickerLoading] = useState(false);
+  const [workspaceBrowsePath, setWorkspaceBrowsePath] = useState("~");
+  const [workspaceBrowseHome, setWorkspaceBrowseHome] = useState("");
+  const [workspaceBrowseParent, setWorkspaceBrowseParent] = useState<
+    string | null
+  >(null);
+  const [workspaceBrowseEntries, setWorkspaceBrowseEntries] = useState<
+    RemoteFileEntry[]
+  >([]);
+  const [workspaceSwitchPending, setWorkspaceSwitchPending] =
+    useState<WorkspaceItem | null>(null);
+  const [workspaceSwitchBusy, setWorkspaceSwitchBusy] = useState(false);
+  const [pendingVirtualWrite, setPendingVirtualWrite] =
+    useState<PendingVirtualWrite | null>(null);
+  const [dynamicWorkspaceBusy, setDynamicWorkspaceBusy] = useState(false);
   const [embeddingModalOpen, setEmbeddingModalOpen] = useState(false);
   const [accountTab, setAccountTab] = useState<"login" | "register" | "profile" | "api">(
     "login",
@@ -2463,8 +2849,12 @@ export default function EasyWorkApp() {
   const [providerModelsLoading, setProviderModelsLoading] = useState(false);
   const [providerModelsError, setProviderModelsError] = useState("");
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+  const [agentContextById, setAgentContextById] = useState<
+    Record<string, ContextUsage["agent"]>
+  >({});
   const [contextLoading, setContextLoading] = useState(false);
-  const [contextBusy, setContextBusy] = useState(false);
+  const [contextBusyAction, setContextBusyAction] =
+    useState<ContextBusyAction>(null);
   const [contextModalOpen, setContextModalOpen] = useState(false);
 
   const socketRef = useRef<WebSocket | null>(null);
@@ -2484,10 +2874,12 @@ export default function EasyWorkApp() {
   const skillInputRef = useRef<HTMLInputElement | null>(null);
   const skillFolderInputRef = useRef<HTMLInputElement | null>(null);
   const remoteUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const contextRequestSerialRef = useRef(0);
   const pendingServerBindingRef = useRef<{
     conversationId: string;
     serverId: string;
   } | null>(null);
+  const draftConversationIdRef = useRef("");
 
   const activeConversation = useMemo(
     () => state.conversations.find((item) => item.id === activeConversationId),
@@ -2585,12 +2977,61 @@ export default function EasyWorkApp() {
   };
   const configAgent =
     agents.find((item) => item.id === agentConfigAgentId) || activeAgent;
+  const agentNativeSettingCount = Object.values(
+    configAgent?.configurationSchema || {},
+  ).filter((descriptor) => descriptor?.options?.length).length;
+  const agentConfigMenuHeight =
+    18 +
+    43 +
+    (configAgent?.managed ? 108 : 0) +
+    agentNativeSettingCount * 48 +
+    (configAgent?.status === "ready" ? 82 : 0) +
+    (configAgent?.managed && configAgent.status === "ready" ? 34 : 0);
   const activeServerProfile = state.settings.servers.find(
     (profile) => profile.id === effectiveServerId,
   );
+  const activeWorkspace = useMemo<WorkspaceItem | null>(() => {
+    if (
+      activeConversation?.work?.workspaceId &&
+      activeConversation.work.workspace &&
+      activeConversation.work.serverId
+    ) {
+      return {
+        id: activeConversation.work.workspaceId,
+        serverId: activeConversation.work.serverId,
+        name:
+          activeConversation.work.workspaceName ||
+          activeConversation.work.workspace.split("/").filter(Boolean).at(-1) ||
+          "工作区",
+        path: activeConversation.work.workspace,
+        mode: activeConversation.work.workspaceMode || "unmanaged",
+        kind: activeConversation.work.workspaceKind || "physical",
+        versionDomainId: activeConversation.work.versionDomainId,
+        writable: true,
+        createdAt: "",
+        updatedAt: activeConversation.updatedAt,
+        lastUsedAt: activeConversation.updatedAt,
+      };
+    }
+    if (draftWorkspace?.serverId === effectiveServerId) return draftWorkspace;
+    if (mode !== "work") return null;
+    return {
+      id: "",
+      serverId: effectiveServerId,
+      name: "虚拟工作区",
+      path: "",
+      mode: "managed",
+      kind: "virtual",
+      writable: true,
+      createdAt: "",
+      updatedAt: "",
+      lastUsedAt: "",
+    };
+  }, [activeConversation, draftWorkspace, effectiveServerId, mode]);
   const workReady =
     mode !== "work" ||
     (connection.status === "connected" &&
+      Boolean(activeWorkspace?.id || activeWorkspace?.kind === "virtual") &&
       activeAgent?.status === "ready" &&
       Boolean(activeAgent.configured));
   const activeRunningUserMessage = useMemo(
@@ -2632,9 +3073,13 @@ export default function EasyWorkApp() {
     conversationId: string,
     serverId: string,
     agentId: string,
+    workspaceId: string,
+    agentAdapter = "",
   ) => {
+    const requestSerial = ++contextRequestSerialRef.current;
     if (!conversationId) {
       setContextUsage(null);
+      setContextLoading(false);
       return;
     }
     setContextLoading(true);
@@ -2644,6 +3089,8 @@ export default function EasyWorkApp() {
       });
       if (serverId) query.set("serverId", serverId);
       if (agentId) query.set("agentId", agentId);
+      if (workspaceId) query.set("workspaceId", workspaceId);
+      if (agentAdapter) query.set("agentAdapter", agentAdapter);
       const response = await gatewayFetch(`/api/context?${query.toString()}`);
       const payload = (await response.json().catch(() => ({}))) as
         | ContextUsage
@@ -2651,13 +3098,61 @@ export default function EasyWorkApp() {
       if (!response.ok || !("web" in payload)) {
         throw new Error("error" in payload ? payload.error : "读取上下文失败");
       }
-      setContextUsage(payload);
+      if (contextRequestSerialRef.current === requestSerial) {
+        setContextUsage(payload);
+        if (agentId) {
+          setAgentContextById((current) => ({
+            ...current,
+            [agentContextCacheKey(
+              conversationId,
+              serverId,
+              workspaceId,
+              agentId,
+            )]: payload.agent,
+          }));
+        }
+      }
     } catch {
-      setContextUsage(null);
+      if (contextRequestSerialRef.current === requestSerial) {
+        setContextUsage(null);
+      }
     } finally {
-      setContextLoading(false);
+      if (contextRequestSerialRef.current === requestSerial) {
+        setContextLoading(false);
+      }
     }
   }, []);
+
+  const loadAgentContextForMenu = useCallback(
+    async (agent: AgentItem) => {
+      if (!activeConversationId || !effectiveServerId) return;
+      try {
+        const query = new URLSearchParams({
+          conversationId: activeConversationId,
+          serverId: effectiveServerId,
+          agentId: agent.id,
+          agentAdapter: agent.adapter,
+        });
+        if (activeWorkspace?.id) query.set("workspaceId", activeWorkspace.id);
+        const response = await gatewayFetch(`/api/context?${query.toString()}`);
+        const payload = (await response.json().catch(() => ({}))) as
+          | ContextUsage
+          | { error?: string };
+        if (!response.ok || !("agent" in payload)) return;
+        setAgentContextById((current) => ({
+          ...current,
+          [agentContextCacheKey(
+            activeConversationId,
+            effectiveServerId,
+            activeWorkspace?.id || "",
+            agent.id,
+          )]: payload.agent,
+        }));
+      } catch {
+        // The menu keeps the last measured value when a refresh is unavailable.
+      }
+    }, [activeConversationId, activeWorkspace, effectiveServerId],
+  );
 
   useEffect(() => {
     if (gatewayStatus !== "connected") return;
@@ -2666,6 +3161,8 @@ export default function EasyWorkApp() {
         activeConversationId,
         effectiveServerId,
         activeAgentId,
+        activeWorkspace?.id || "",
+        activeAgent?.adapter || "",
       );
     const initialTimer = window.setTimeout(refresh, 0);
     const pollingTimer = sending
@@ -2677,7 +3174,9 @@ export default function EasyWorkApp() {
     };
   }, [
     activeAgentId,
+    activeAgent?.adapter,
     activeConversationId,
+    activeWorkspace?.id,
     effectiveServerId,
     gatewayStatus,
     loadContextUsage,
@@ -2685,36 +3184,104 @@ export default function EasyWorkApp() {
   ]);
 
   const saveContextSettings = async (limit: number, threshold: number) => {
-      setContextBusy(true);
+      setContextBusyAction("web-save");
       try {
         const response = await gatewayFetch("/api/context/settings", {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            conversationId: activeConversationId,
             conversationLimit: limit,
             automaticCompressionThreshold: threshold,
           }),
         });
         const payload = (await response.json().catch(() => ({}))) as {
           error?: string;
+          autoCompression?: {
+            triggered?: boolean;
+            compressed?: boolean;
+            error?: string;
+          };
         };
         if (!response.ok) throw new Error(payload.error || "保存上下文设置失败");
         await loadContextUsage(
           activeConversationId,
           effectiveServerId,
           activeAgentId,
+          activeWorkspace?.id || "",
+          activeAgent?.adapter || "",
         );
-        showToast("上下文设置已保存");
+        showToast(
+          payload.autoCompression?.error
+            ? `设置已保存；自动压缩失败：${payload.autoCompression.error}`
+            : payload.autoCompression?.compressed
+              ? "设置已保存，并已按新阈值压缩网页对话"
+              : "上下文设置已保存",
+        );
       } catch (caught) {
         showToast(caught instanceof Error ? caught.message : "保存上下文设置失败");
       } finally {
-        setContextBusy(false);
+        setContextBusyAction(null);
       }
+  };
+
+  const saveAgentContextSettings = async (
+    contextLimit: number,
+    agent: AgentItem | undefined = activeAgent,
+  ) => {
+    if (!effectiveServerId || !agent) return;
+    setContextBusyAction("agent-save");
+    try {
+      const response = await gatewayFetch("/api/context/agent/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          serverId: effectiveServerId,
+          agentId: agent.id,
+          agentAdapter: agent.adapter,
+          conversationId: activeConversationId,
+          workspaceId: activeWorkspace?.id || "",
+          contextLimit,
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(payload.error || "保存 Agent 上下文上限失败");
+      }
+      setAgentsByServer((current) => ({
+        ...current,
+        [effectiveServerId]: (current[effectiveServerId] || []).map((item) =>
+          item.id === agent.id ? { ...item, contextLimit } : item,
+        ),
+      }));
+      if (agent.id === activeAgentId) {
+        await loadContextUsage(
+          activeConversationId,
+          effectiveServerId,
+          agent.id,
+          activeWorkspace?.id || "",
+          agent.adapter,
+        );
+      } else {
+        await loadAgentContextForMenu(agent);
+      }
+      showToast("已写入 Agent 原生模型配置");
+    } catch (caught) {
+      showToast(
+        caught instanceof Error
+          ? caught.message
+          : "保存 Agent 上下文上限失败",
+      );
+    } finally {
+      setContextBusyAction(null);
+    }
   };
 
   const compressCurrentContext = async () => {
     if (!activeConversationId) return;
-    setContextBusy(true);
+    setContextBusyAction("web-compress");
     try {
       const response = await gatewayFetch("/api/context/compress", {
         method: "POST",
@@ -2730,18 +3297,22 @@ export default function EasyWorkApp() {
         activeConversationId,
         effectiveServerId,
         activeAgentId,
+        activeWorkspace?.id || "",
+        activeAgent?.adapter || "",
       );
       showToast(payload.compressed ? "对话上下文已压缩" : "当前没有需要压缩的旧消息");
     } catch (caught) {
       showToast(caught instanceof Error ? caught.message : "压缩上下文失败");
     } finally {
-      setContextBusy(false);
+      setContextBusyAction(null);
     }
   };
 
-  const compressAgentContext = async () => {
-    if (!activeConversationId || !effectiveServerId || !activeAgentId) return;
-    setContextBusy(true);
+  const compressAgentContext = async (
+    agent: AgentItem | undefined = activeAgent,
+  ) => {
+    if (!activeConversationId || !effectiveServerId || !agent) return;
+    setContextBusyAction("agent-compress");
     try {
       const response = await gatewayFetch("/api/context/agent/compress", {
         method: "POST",
@@ -2749,7 +3320,8 @@ export default function EasyWorkApp() {
         body: JSON.stringify({
           conversationId: activeConversationId,
           serverId: effectiveServerId,
-          agentId: activeAgentId,
+          agentId: agent.id,
+          workspaceId: activeWorkspace?.id || "",
         }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
@@ -2760,19 +3332,25 @@ export default function EasyWorkApp() {
         throw new Error(payload.error || "Agent 原生压缩失败");
       }
       showToast("Agent 已接受原生压缩请求");
-      window.setTimeout(
-        () =>
-          void loadContextUsage(
-            activeConversationId,
-            effectiveServerId,
-            activeAgentId,
-          ),
-        1_200,
-      );
+      if (agent.id === activeAgentId) {
+        window.setTimeout(
+          () =>
+            void loadContextUsage(
+              activeConversationId,
+              effectiveServerId,
+              agent.id,
+              activeWorkspace?.id || "",
+              agent.adapter,
+            ),
+          1_200,
+        );
+      } else {
+        window.setTimeout(() => void loadAgentContextForMenu(agent), 1_200);
+      }
     } catch (caught) {
       showToast(caught instanceof Error ? caught.message : "Agent 原生压缩失败");
     } finally {
-      setContextBusy(false);
+      setContextBusyAction(null);
     }
   };
 
@@ -2882,6 +3460,305 @@ export default function EasyWorkApp() {
       }));
     },
     [updateConversation],
+  );
+
+  const browseWorkspaceDirectory = useCallback(
+    async (serverId: string, requestedPath: string) => {
+      setWorkspacePickerLoading(true);
+      try {
+        const query = new URLSearchParams({
+          serverId,
+          path: requestedPath || "~",
+        });
+        const response = await gatewayFetch(
+          `/api/workspaces/browse?${query.toString()}`,
+        );
+        const payload = (await response.json().catch(() => ({}))) as {
+          path?: string;
+          home?: string;
+          parent?: string | null;
+          entries?: RemoteFileEntry[];
+          error?: string;
+        };
+        if (!response.ok || !payload.path) {
+          throw new Error(payload.error || "读取远端目录失败");
+        }
+        setWorkspaceBrowsePath(payload.path);
+        setWorkspaceBrowseHome(payload.home || "");
+        setWorkspaceBrowseParent(payload.parent ?? null);
+        setWorkspaceBrowseEntries(
+          (payload.entries || []).filter((entry) => entry.type === "directory"),
+        );
+      } catch (caught) {
+        showToast(caught instanceof Error ? caught.message : "读取远端目录失败");
+      } finally {
+        setWorkspacePickerLoading(false);
+      }
+    },
+    [showToast],
+  );
+
+  const openWorkspacePicker = useCallback(async (
+    purpose: "conversation" | "dynamic" = "conversation",
+  ) => {
+    const serverId =
+      activeConversation?.work?.serverId || effectiveServerId || draftServerId;
+    if (!serverId || connections[serverId]?.status !== "connected") {
+      setSshModalContext(
+        activeConversation?.work?.serverId ? "bound" : "new-work",
+      );
+      setSshModalOpen(true);
+      showToast("请先连接远程服务器");
+      return;
+    }
+    setWorkspacePickerPurpose(purpose);
+    setWorkspacePickerOpen(true);
+    setWorkspacePickerLoading(true);
+    try {
+      const initialBrowseResponse = await gatewayFetch(
+        `/api/workspaces/browse?${new URLSearchParams({
+          serverId,
+          path: activeWorkspace?.path || "~",
+        }).toString()}`,
+      );
+      let browseResponse = initialBrowseResponse;
+      if (!browseResponse.ok && activeWorkspace?.path) {
+        browseResponse = await gatewayFetch(
+          `/api/workspaces/browse?${new URLSearchParams({
+            serverId,
+            path: "~",
+          }).toString()}`,
+        );
+      }
+      const browsePayload = (await browseResponse.json().catch(() => ({}))) as {
+        path?: string;
+        home?: string;
+        parent?: string | null;
+        entries?: RemoteFileEntry[];
+        error?: string;
+      };
+      if (!browseResponse.ok || !browsePayload.path) {
+        throw new Error(browsePayload.error || "读取远端目录失败");
+      }
+      setWorkspaceBrowsePath(browsePayload.path);
+      setWorkspaceBrowseHome(browsePayload.home || "");
+      setWorkspaceBrowseParent(browsePayload.parent ?? null);
+      setWorkspaceBrowseEntries(
+        (browsePayload.entries || []).filter(
+          (entry) => entry.type === "directory",
+        ),
+      );
+    } catch (caught) {
+      setWorkspacePickerOpen(false);
+      showToast(caught instanceof Error ? caught.message : "读取工作区失败");
+    } finally {
+      setWorkspacePickerLoading(false);
+    }
+  }, [
+    activeConversation,
+    activeWorkspace,
+    connections,
+    draftServerId,
+    effectiveServerId,
+    showToast,
+  ]);
+
+  const applyWorkspaceToConversation = useCallback(
+    async (conversationId: string, workspace: WorkspaceItem) => {
+      setWorkspaceSwitchBusy(true);
+      try {
+        const response = await gatewayFetch(
+          `/api/conversations/${encodeURIComponent(conversationId)}/workspace`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workspaceId: workspace.id }),
+          },
+        );
+        const payload = (await response.json().catch(() => ({}))) as {
+          conversation?: Conversation;
+          workspace?: WorkspaceItem;
+          error?: string;
+        };
+        if (!response.ok || !payload.conversation) {
+          throw new Error(payload.error || "切换工作区失败");
+        }
+        setState((current) => ({
+          ...current,
+          conversations: current.conversations.map((conversation) =>
+            conversation.id === conversationId
+              ? payload.conversation!
+              : conversation,
+          ),
+        }));
+        setWorkspaceItems((current) => [
+          payload.workspace || workspace,
+          ...current.filter((item) => item.id !== workspace.id),
+        ]);
+        setContextUsage(null);
+        showToast(`已切换到 ${workspace.name}`);
+      } catch (caught) {
+        showToast(caught instanceof Error ? caught.message : "切换工作区失败");
+      } finally {
+        setWorkspaceSwitchBusy(false);
+        setWorkspaceSwitchPending(null);
+      }
+    },
+    [showToast],
+  );
+
+  const chooseWorkspace = useCallback(
+    (workspace: WorkspaceItem) => {
+      setWorkspacePickerOpen(false);
+      if (workspacePickerPurpose === "dynamic") {
+        setPendingVirtualWrite((current) =>
+          current ? { ...current, target: workspace } : current,
+        );
+        return;
+      }
+      if (!activeConversation) {
+        setDraftWorkspace(workspace);
+        showToast(`已选择 ${workspace.name}`);
+        return;
+      }
+      if (activeConversation.work?.workspaceId === workspace.id) return;
+      if (activeConversation.work?.workspaceId) {
+        setWorkspaceSwitchPending(workspace);
+        return;
+      }
+      void applyWorkspaceToConversation(activeConversation.id, workspace);
+    },
+    [
+      activeConversation,
+      applyWorkspaceToConversation,
+      showToast,
+      workspacePickerPurpose,
+    ],
+  );
+
+  const ensureConversationVirtualWorkspace = useCallback(
+    async (serverId: string, conversationId: string) => {
+      const response = await gatewayFetch("/api/workspaces/virtual", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ serverId, conversationId }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        workspace?: WorkspaceItem;
+        error?: string;
+      };
+      if (!response.ok || !payload.workspace) {
+        throw new Error(payload.error || "创建虚拟工作区失败");
+      }
+      return payload.workspace;
+    },
+    [],
+  );
+
+  const chooseVirtualWorkspace = useCallback(async () => {
+    const serverId =
+      activeConversation?.work?.serverId || effectiveServerId || draftServerId;
+    if (!serverId) {
+      showToast("请先连接远程服务器");
+      return;
+    }
+    setWorkspacePickerLoading(true);
+    try {
+      if (!activeConversation) {
+        setDraftWorkspace(null);
+        setWorkspacePickerOpen(false);
+        showToast("新对话将使用虚拟工作区");
+        return;
+      }
+      const workspace = await ensureConversationVirtualWorkspace(
+        serverId,
+        activeConversation.id,
+      );
+      setWorkspacePickerOpen(false);
+      if (activeConversation.work?.workspaceId === workspace.id) return;
+      if (activeConversation.work?.workspaceId) {
+        setWorkspaceSwitchPending(workspace);
+      } else {
+        await applyWorkspaceToConversation(activeConversation.id, workspace);
+      }
+    } catch (caught) {
+      showToast(caught instanceof Error ? caught.message : "创建虚拟工作区失败");
+    } finally {
+      setWorkspacePickerLoading(false);
+    }
+  }, [
+    activeConversation,
+    applyWorkspaceToConversation,
+    draftServerId,
+    effectiveServerId,
+    ensureConversationVirtualWorkspace,
+    showToast,
+  ]);
+
+  const registerCurrentWorkspace = useCallback(async () => {
+    const serverId =
+      activeConversation?.work?.serverId || effectiveServerId || draftServerId;
+    if (!serverId || !workspaceBrowsePath) return;
+    setWorkspacePickerLoading(true);
+    try {
+      const response = await gatewayFetch("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ serverId, path: workspaceBrowsePath }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        workspace?: WorkspaceItem;
+        error?: string;
+      };
+      if (!response.ok || !payload.workspace) {
+        throw new Error(payload.error || "登记工作区失败");
+      }
+      chooseWorkspace(payload.workspace);
+    } catch (caught) {
+      showToast(caught instanceof Error ? caught.message : "登记工作区失败");
+    } finally {
+      setWorkspacePickerLoading(false);
+    }
+  }, [
+    activeConversation?.work?.serverId,
+    chooseWorkspace,
+    draftServerId,
+    effectiveServerId,
+    showToast,
+    workspaceBrowsePath,
+  ]);
+
+  const chooseSuggestedDynamicWorkspace = useCallback(
+    async (requestedPath: string) => {
+      const serverId =
+        activeConversation?.work?.serverId || effectiveServerId || draftServerId;
+      if (!serverId) return;
+      setDynamicWorkspaceBusy(true);
+      try {
+        const response = await gatewayFetch("/api/workspaces", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ serverId, path: requestedPath }),
+        });
+        const payload = (await response.json().catch(() => ({}))) as {
+          workspace?: WorkspaceItem;
+          error?: string;
+        };
+        if (!response.ok || !payload.workspace) {
+          throw new Error(
+            payload.error || "该路径不能直接作为工作区，请通过目录浏览器选择",
+          );
+        }
+        setPendingVirtualWrite((current) =>
+          current ? { ...current, target: payload.workspace } : current,
+        );
+      } catch (caught) {
+        showToast(caught instanceof Error ? caught.message : "验证动态工作区失败");
+      } finally {
+        setDynamicWorkspaceBusy(false);
+      }
+    },
+    [activeConversation?.work?.serverId, draftServerId, effectiveServerId, showToast],
   );
 
   const simulateWorkRun = useCallback(
@@ -3202,7 +4079,7 @@ export default function EasyWorkApp() {
             updateConversation(pendingBinding.conversationId, (conversation) => ({
               ...conversation,
               work: {
-                ...(conversation.work ?? { workspace: "~" }),
+                ...(conversation.work ?? {}),
                 serverId,
                 connectionEnabled: true,
               },
@@ -3256,7 +4133,10 @@ export default function EasyWorkApp() {
             ...current,
             [serverId]:
               current[serverId] &&
-              incoming.some((agent) => agent.id === current[serverId])
+              incoming.some(
+                (agent) =>
+                  agent.id === current[serverId] && agent.status === "ready",
+              )
                 ? current[serverId]
                 : firstReady.id,
           }));
@@ -3265,15 +4145,38 @@ export default function EasyWorkApp() {
       }
       if (type === "agent.install.progress") {
         const serverId = String(payload.serverId || "");
+        const agentId = String(payload.agentId || "opencode");
         const detail = String(payload.label ?? "正在安装");
+        const failed = String(payload.stage || "") === "error";
         setAgentsByServer((current) => ({
           ...current,
           [serverId]: (current[serverId] ?? DEFAULT_AGENTS).map((agent) =>
-            agent.id === "opencode"
-              ? { ...agent, status: "installing", detail }
+            agent.id === agentId
+              ? {
+                  ...agent,
+                  status: failed ? "missing" : "installing",
+                  detail: failed ? "未安装" : detail,
+                }
               : agent,
           ),
         }));
+        if (failed) showToast(detail || "Agent 安装失败");
+        return;
+      }
+      if (type === "agent.uninstall.status") {
+        const agentId = String(payload.agentId || "");
+        const status = String(payload.status || "");
+        if (status === "running") {
+          setUninstallingAgentId(agentId);
+        } else {
+          setUninstallingAgentId("");
+          if (status === "done") {
+            setAgentMenuPage("root");
+            showToast(String(payload.label || "Agent 已卸载"));
+          } else if (status === "error") {
+            showToast(String(payload.error || payload.label || "Agent 卸载失败"));
+          }
+        }
         return;
       }
       if (type === "agent.update.status") {
@@ -3287,6 +4190,7 @@ export default function EasyWorkApp() {
           latestVersion: payload.latestVersion
             ? String(payload.latestVersion)
             : undefined,
+          agentId: payload.agentId ? String(payload.agentId) : undefined,
           label: payload.label ? String(payload.label) : undefined,
           error: payload.error ? String(payload.error) : undefined,
         };
@@ -3299,7 +4203,7 @@ export default function EasyWorkApp() {
         }));
         if (nextUpdate.status === "current") {
           setAgentUpdateModalOpen(false);
-          showToast(nextUpdate.label || "OpenCode 已是最新版");
+          showToast(nextUpdate.label || "Agent 已与主机版本一致");
         } else if (
           ["available", "updating", "configuring", "done", "error"].includes(
             nextUpdate.status,
@@ -3323,7 +4227,25 @@ export default function EasyWorkApp() {
           [serverId]: nextModelState,
         }));
         if (nextModelState.status === "done") {
-          showToast(nextModelState.label || "OpenCode 模型配置完成");
+          showToast(nextModelState.label || "Agent 模型配置完成");
+        }
+        return;
+      }
+      if (type === "agent.runtime.status") {
+        const status = String(payload.status || "");
+        const agentId = String(payload.agentId || "");
+        if (status === "configuring") {
+          setAgentRuntimeConfig({
+            agentId,
+            status: "configuring",
+            label: String(payload.label || "配置中"),
+          });
+        } else if (status === "done") {
+          setAgentRuntimeConfig({ agentId: "", status: "idle" });
+          showToast("Agent 运行配置已保存");
+        } else if (status === "error") {
+          setAgentRuntimeConfig({ agentId: "", status: "idle" });
+          showToast(String(payload.error || payload.label || "Agent 运行配置失败"));
         }
         return;
       }
@@ -3464,6 +4386,9 @@ export default function EasyWorkApp() {
           command: event.command ? String(event.command) : undefined,
           path: event.path ? String(event.path) : undefined,
           language: event.language ? String(event.language) : undefined,
+          approvalId: event.approvalId ? String(event.approvalId) : undefined,
+          approvalType:
+            event.approvalType === "question" ? "question" : "permission",
           retractFinal: Boolean(event.retractFinal),
           status: String(event.status ?? "done") as EventStatus,
           timestamp: String(event.timestamp ?? now()),
@@ -3788,9 +4713,11 @@ export default function EasyWorkApp() {
   }, [activeMessageCount, activeStreamProgress, sending]);
 
   const selectConversation = (conversation: Conversation) => {
+    draftConversationIdRef.current = "";
     setActiveConversationId(conversation.id);
     setDraftProjectId(undefined);
     setDraftServerId("");
+    setDraftWorkspace(null);
     setActiveProjectId(conversation.projectId ?? "");
     setMode(conversation.mode);
     setView("chat");
@@ -3810,9 +4737,12 @@ export default function EasyWorkApp() {
   };
 
   const beginConversation = (projectId?: string, nextMode: Mode = "chat") => {
+    draftConversationIdRef.current = "";
     setActiveConversationId("");
     setDraftProjectId(projectId);
     setDraftServerId("");
+    setDraftWorkspace(null);
+    setPendingVirtualWrite(null);
     setActiveProjectId(projectId ?? "");
     setMode(nextMode);
     setDraft("");
@@ -3834,10 +4764,12 @@ export default function EasyWorkApp() {
   };
 
   const openProject = (projectId: string) => {
+    draftConversationIdRef.current = "";
     setActiveProjectId(projectId);
     setActiveConversationId("");
     setDraftProjectId(undefined);
     setDraftServerId("");
+    setDraftWorkspace(null);
     setMode("chat");
     setDraft("");
     setSelectedSkills([]);
@@ -3961,6 +4893,7 @@ export default function EasyWorkApp() {
     setMode(nextMode);
     if (nextMode === "chat" && !activeConversation) {
       setDraftServerId("");
+      setDraftWorkspace(null);
     }
     if (activeConversation) {
       updateConversation(activeConversation.id, (conversation) => ({
@@ -3970,7 +4903,6 @@ export default function EasyWorkApp() {
           nextMode === "work"
             ? conversation.work ?? {
                 agentId: activeAgentId,
-                workspace: "~",
               }
             : conversation.work,
       }));
@@ -4000,7 +4932,7 @@ export default function EasyWorkApp() {
       updateConversation(activeConversation.id, (conversation) => ({
         ...conversation,
         work: {
-          ...(conversation.work ?? { workspace: "~" }),
+          ...(conversation.work ?? {}),
           serverId,
           connectionEnabled: true,
         },
@@ -4008,6 +4940,7 @@ export default function EasyWorkApp() {
       setDraftServerId("");
       return;
     }
+    if (draftServerId !== serverId) setDraftWorkspace(null);
     setDraftServerId(serverId);
   };
 
@@ -4065,7 +4998,7 @@ export default function EasyWorkApp() {
       ...conversation,
       updatedAt: now(),
       work: {
-        ...(conversation.work ?? { workspace: "~" }),
+        ...(conversation.work ?? {}),
         connectionEnabled: enabled,
       },
     }));
@@ -4151,6 +5084,9 @@ export default function EasyWorkApp() {
       openChat?: boolean;
       content?: string;
       conversation?: Conversation;
+      conversationId?: string;
+      executionWorkspace?: WorkspaceItem;
+      skipVirtualWriteCheck?: boolean;
     } = {},
   ) => {
     const content = String(options.content ?? draft).trim();
@@ -4159,6 +5095,14 @@ export default function EasyWorkApp() {
     const conversation =
       options.conversation ??
       (options.projectId ? undefined : activeConversation);
+    const conversationId =
+      conversation?.id ||
+      options.conversationId ||
+      draftConversationIdRef.current ||
+      uid("chat");
+    if (!conversation?.id) draftConversationIdRef.current = conversationId;
+    const prospectiveProjectId =
+      options.projectId ?? conversation?.projectId ?? draftProjectId;
     const targetServerId =
       conversation?.work?.serverId || effectiveServerId;
     const targetConnection = connections[targetServerId] ?? connection;
@@ -4214,6 +5158,39 @@ export default function EasyWorkApp() {
       showToast("请先连接一台远程服务器");
       return;
     }
+    let submissionWorkspace: WorkspaceItem | null = conversation?.work?.workspaceId
+      ? {
+          id: conversation.work.workspaceId,
+          serverId: conversation.work.serverId || targetServerId,
+          name: conversation.work.workspaceName || "工作区",
+          path: conversation.work.workspace || "",
+          mode: conversation.work.workspaceMode || "unmanaged",
+          kind: conversation.work.workspaceKind || "physical",
+          versionDomainId: conversation.work.versionDomainId,
+          writable: true,
+          createdAt: "",
+          updatedAt: conversation.updatedAt,
+          lastUsedAt: conversation.updatedAt,
+        }
+      : draftWorkspace?.serverId === targetServerId
+        ? draftWorkspace
+        : null;
+    if (
+      submissionMode === "work" &&
+      (!submissionWorkspace || submissionWorkspace.kind === "virtual") &&
+      !options.skipVirtualWriteCheck &&
+      appearsToModifyRemoteState(content)
+    ) {
+      setPendingVirtualWrite({
+        content,
+        conversationId,
+        projectId: prospectiveProjectId,
+        requestedMode: "work",
+        openChat: options.openChat,
+        suggestedPaths: remotePathSuggestions(content),
+      });
+      return;
+    }
     if (
       submissionMode === "work" &&
       (submissionAgent?.status !== "ready" || !submissionAgent.configured)
@@ -4233,13 +5210,37 @@ export default function EasyWorkApp() {
       return;
     }
 
+    if (submissionMode === "work" && !submissionWorkspace?.id) {
+      try {
+        submissionWorkspace = await ensureConversationVirtualWorkspace(
+          targetServerId,
+          conversationId,
+        );
+      } catch (caught) {
+        showToast(caught instanceof Error ? caught.message : "创建虚拟工作区失败");
+        return;
+      }
+    }
+    const executionWorkspace =
+      submissionMode === "work"
+        ? options.executionWorkspace || submissionWorkspace
+        : null;
+    if (submissionMode === "work" && !executionWorkspace?.id) {
+      showToast("无法确定本轮执行工作区");
+      return;
+    }
+    const dynamicWorkspace = Boolean(
+      submissionMode === "work" &&
+        submissionWorkspace?.kind === "virtual" &&
+        executionWorkspace?.id !== submissionWorkspace.id,
+    );
+
     setAgentMenuOpen(false);
     setAgentMenuPage("root");
 
     const firstTurn = !conversation?.messages.length;
-    const conversationId = conversation?.id ?? uid("chat");
     const projectId =
-      options.projectId ?? conversation?.projectId ?? draftProjectId;
+      prospectiveProjectId;
     const conversationProject = state.projects.find((project) => project.id === projectId);
     const work =
       submissionMode === "work"
@@ -4248,13 +5249,24 @@ export default function EasyWorkApp() {
             agentId: submissionAgentId,
             serverId: targetServerId,
             connectionEnabled: true,
-            workspace:
-              conversation?.work?.workspace ||
-              `~/.easywork/workspaces/${conversationId}/main`,
-            workspaceMode: conversation?.work?.workspaceMode || "managed",
-            logicalWorkspaceId:
-              conversation?.work?.logicalWorkspaceId ||
-              `workspace-${conversationId}`,
+            workspaceId: submissionWorkspace!.id,
+            workspaceName: submissionWorkspace!.name,
+            workspace: submissionWorkspace!.path,
+            workspaceMode: submissionWorkspace!.mode,
+            workspaceKind: submissionWorkspace!.kind,
+            versionDomainId: submissionWorkspace!.versionDomainId,
+            workspaceHistory:
+              conversation?.work?.workspaceHistory || [
+                {
+                  workspaceId: submissionWorkspace!.id,
+                  serverId: submissionWorkspace!.serverId,
+                  name: submissionWorkspace!.name,
+                  path: submissionWorkspace!.path,
+                  kind: submissionWorkspace!.kind,
+                  versionDomainId: submissionWorkspace!.versionDomainId,
+                  activatedAt: now(),
+                },
+              ],
           }
         : conversation?.work;
 
@@ -4267,6 +5279,13 @@ export default function EasyWorkApp() {
       mode: submissionMode,
       selectedSkills,
       runId: submissionMode === "work" ? runId : undefined,
+      workspaceId:
+        submissionMode === "work" ? executionWorkspace!.id : undefined,
+      workspaceName:
+        submissionMode === "work" ? executionWorkspace!.name : undefined,
+      workspaceKind:
+        submissionMode === "work" ? executionWorkspace!.kind : undefined,
+      dynamicWorkspace,
       trace:
         submissionMode === "work"
           ? {
@@ -4274,6 +5293,11 @@ export default function EasyWorkApp() {
               status: "running",
               steps: [],
               startedAt: now(),
+              workspaceId: executionWorkspace!.id,
+              workspaceName: executionWorkspace!.name,
+              workspaceKind: executionWorkspace!.kind,
+              dynamicWorkspace,
+              versionDomainId: executionWorkspace!.versionDomainId,
             }
           : undefined,
     };
@@ -4287,6 +5311,13 @@ export default function EasyWorkApp() {
       reasoningStatus: submissionMode === "work" ? "running" : undefined,
       runId: submissionMode === "work" ? runId : undefined,
       agentId: submissionMode === "work" ? submissionAgentId : undefined,
+      workspaceId:
+        submissionMode === "work" ? executionWorkspace!.id : undefined,
+      workspaceName:
+        submissionMode === "work" ? executionWorkspace!.name : undefined,
+      workspaceKind:
+        submissionMode === "work" ? executionWorkspace!.kind : undefined,
+      dynamicWorkspace,
     };
 
     setState((current) => {
@@ -4329,6 +5360,8 @@ export default function EasyWorkApp() {
     setActiveProjectId(projectId ?? "");
     setDraftProjectId(undefined);
     setDraftServerId("");
+    setDraftWorkspace(null);
+    draftConversationIdRef.current = "";
     setMode(submissionMode);
     if (options.openChat) {
       setView("chat");
@@ -4359,9 +5392,19 @@ export default function EasyWorkApp() {
             agentId: submissionAgentId,
             projectId,
             memoryMode: conversationProject?.memoryMode ?? "project-and-global",
-            workspace: work?.workspace ?? "~",
-            workspaceMode: work?.workspaceMode,
-            logicalWorkspaceId: work?.logicalWorkspaceId,
+            workspaceId: executionWorkspace?.id,
+            workspaceName: executionWorkspace?.name,
+            workspace: executionWorkspace?.path,
+            workspaceMode: executionWorkspace?.mode,
+            workspaceKind: executionWorkspace?.kind,
+            versionRoot: executionWorkspace?.versionRoot,
+            versionDomainId: executionWorkspace?.versionDomainId,
+            conversationWorkspaceId: work?.workspaceId,
+            conversationWorkspaceName: work?.workspaceName,
+            conversationWorkspace: work?.workspace,
+            conversationWorkspaceMode: work?.workspaceMode,
+            conversationWorkspaceKind: work?.workspaceKind,
+            dynamicWorkspace,
             branchId: conversation?.branch
               ? conversation.id
               : conversationId,
@@ -4496,8 +5539,29 @@ export default function EasyWorkApp() {
     }
   };
 
+  const continuePendingVirtualWrite = async (useVirtualDirectory = false) => {
+    const pending = pendingVirtualWrite;
+    if (!pending) return;
+    const pendingConversation = pending.conversationId
+      ? state.conversations.find(
+          (conversation) => conversation.id === pending.conversationId,
+        )
+      : undefined;
+    setPendingVirtualWrite(null);
+    await submitMessage({
+      projectId: pending.projectId,
+      requestedMode: "work",
+      openChat: pending.openChat,
+      content: pending.content,
+      conversation: pendingConversation,
+      conversationId: pending.conversationId,
+      executionWorkspace: useVirtualDirectory ? undefined : pending.target,
+      skipVirtualWriteCheck: true,
+    });
+  };
+
   const actOnConversationMessage = async (
-    action: "branch" | "edit" | "reset",
+    action: "branch" | "edit" | "reset" | "rewind",
     message: Message,
     content?: string,
   ) => {
@@ -4509,6 +5573,14 @@ export default function EasyWorkApp() {
       action === "reset" &&
       !window.confirm(
         "重置会在当前对话中替换最新回复，并清除该轮产生的记忆与后续分支。继续吗？",
+      )
+    ) {
+      return;
+    }
+    if (
+      action === "rewind" &&
+      !window.confirm(
+        "回溯会保留这条回复，删除它之后的对话、记忆、任务和分支，并撤销可恢复的文件修改。工作区外的作业、服务等副作用无法自动撤销。确认继续吗？",
       )
     ) {
       return;
@@ -4540,6 +5612,7 @@ export default function EasyWorkApp() {
       const payload = (await response.json().catch(() => ({}))) as {
         conversation?: Conversation;
         seedPrompt?: string;
+        removedConversationIds?: string[];
         error?: string;
         capability?: {
           workspace?: string;
@@ -4551,12 +5624,17 @@ export default function EasyWorkApp() {
         throw new Error(payload.error || "对话操作失败");
       }
       const nextConversation = payload.conversation;
+      const removedConversationIds = new Set(
+        payload.removedConversationIds ?? [],
+      );
       setState((current) => ({
         ...current,
         conversations: [
           nextConversation,
           ...current.conversations.filter(
-            (item) => item.id !== nextConversation.id,
+            (item) =>
+              item.id !== nextConversation.id &&
+              !removedConversationIds.has(item.id),
           ),
         ],
       }));
@@ -4577,7 +5655,9 @@ export default function EasyWorkApp() {
             ? "已创建对话分支"
             : action === "edit"
               ? "已按修改后的提问重新生成"
-              : "已重置最新回复",
+              : action === "reset"
+                ? "已重置最新回复"
+                : "已回溯到所选回复",
         );
       }
       if (payload.seedPrompt) {
@@ -4624,6 +5704,7 @@ export default function EasyWorkApp() {
       runId: string,
       event: WorkEvent,
       approved: boolean,
+      answers?: string[][],
     ) => {
       if (socketRef.current?.readyState === WebSocket.OPEN) {
         socketRef.current.send(
@@ -4633,7 +5714,10 @@ export default function EasyWorkApp() {
             conversationId,
             runId,
             eventId: event.id,
+            approvalId: event.approvalId,
+            approvalType: event.approvalType,
             approved,
+            answers,
           }),
         );
       }
@@ -4646,7 +5730,14 @@ export default function EasyWorkApp() {
             item.id === event.id
               ? {
                   ...item,
-                  detail: approved ? "用户已允许继续" : "用户已拒绝本次操作",
+                  detail:
+                    event.approvalType === "question"
+                      ? approved
+                        ? "用户已回答"
+                        : "用户已跳过"
+                      : approved
+                        ? "用户已允许继续"
+                        : "用户已拒绝本次操作",
                   status: approved ? "done" : "error",
                 }
               : item,
@@ -4661,6 +5752,7 @@ export default function EasyWorkApp() {
     const serverId = "demo";
     setSelectedServerId(serverId);
     if (sshModalContext !== "manage") {
+      if (draftWorkspace?.serverId !== serverId) setDraftWorkspace(null);
       setDraftServerId(serverId);
       if (activeConversation && !activeConversation.work?.serverId) {
         pendingServerBindingRef.current = {
@@ -4736,7 +5828,7 @@ export default function EasyWorkApp() {
           updateConversation(pendingBinding.conversationId, (conversation) => ({
             ...conversation,
             work: {
-              ...(conversation.work ?? { workspace: "~" }),
+              ...(conversation.work ?? {}),
               serverId,
               connectionEnabled: true,
             },
@@ -4772,6 +5864,9 @@ export default function EasyWorkApp() {
     }
     setSelectedServerId(payload.serverId);
     if (sshModalContext !== "manage") {
+      if (draftWorkspace?.serverId !== payload.serverId) {
+        setDraftWorkspace(null);
+      }
       setDraftServerId(payload.serverId);
       if (activeConversation && !activeConversation.work?.serverId) {
         pendingServerBindingRef.current = {
@@ -4837,58 +5932,9 @@ export default function EasyWorkApp() {
     socket.send(JSON.stringify({ type: "ssh.disconnect", serverId }));
   };
 
-  const scanAgents = () => {
+  const installManagedAgent = (agentId: string) => {
     if (connection.demo) {
-      setAgentScanningByServer((current) => ({
-        ...current,
-        [effectiveServerId]: true,
-      }));
-      setAgentsByServer((current) => ({
-        ...current,
-        [effectiveServerId]: [
-        {
-          id: "opencode",
-          name: "OpenCode",
-          folder: "~/.easywork/agents/opencode",
-          path: "~/.easywork/agents/opencode/bin/opencode",
-          version: "demo",
-          status: "ready",
-          adapter: "opencode",
-          managed: true,
-          configured: true,
-        },
-        {
-          id: "qwen",
-          name: "Qwen Code",
-          path: "~/.local/bin/qwen",
-          version: "0.9.4",
-          status: "needs-adapter",
-          adapter: "qwen",
-        },
-        ],
-      }));
-      setAgentScanningByServer((current) => ({
-        ...current,
-        [effectiveServerId]: false,
-      }));
-      showToast("已扫描用户目录，发现 2 个 agent");
-      return;
-    }
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      setAgentScanningByServer((current) => ({
-        ...current,
-        [effectiveServerId]: true,
-      }));
-      socketRef.current.send(
-        JSON.stringify({ type: "agent.scan", serverId: effectiveServerId }),
-      );
-      showToast("正在扫描远端 agent");
-    }
-  };
-
-  const installManagedAgent = () => {
-    if (connection.demo) {
-      showToast("演示环境已安装 OpenCode");
+      showToast("演示环境无需安装 Agent");
       return;
     }
     if (socketRef.current?.readyState === WebSocket.OPEN) {
@@ -4896,23 +5942,45 @@ export default function EasyWorkApp() {
         JSON.stringify({
           type: "agent.install",
           serverId: effectiveServerId,
-          agentId: "opencode",
+          agentId,
         }),
       );
-      showToast("正在安装到 ~/.easywork/agents/opencode");
+      showToast(`正在安装到 ~/.easywork/agents/${agentId}`);
     }
+  };
+
+  const uninstallManagedAgent = (agent: AgentItem) => {
+    if (
+      !agent.managed ||
+      connection.demo ||
+      socketRef.current?.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    setAgentPendingUninstall(null);
+    setUninstallingAgentId(agent.id);
+    socketRef.current.send(
+      JSON.stringify({
+        type: "agent.uninstall",
+        serverId: effectiveServerId,
+        agentId: agent.id,
+      }),
+    );
+    showToast(`正在卸载 ${agent.name}`);
   };
 
   const checkAgentUpdate = (agent = activeAgent) => {
     if (
       !effectiveServerId ||
       connection.status !== "connected" ||
-      agent?.adapter !== "opencode" ||
       !agent.managed
     ) {
       return;
     }
-    if (activeAgentUpdate.status === "available") {
+    if (
+      activeAgentUpdate.status === "available" &&
+      activeAgentUpdate.agentId === agent.id
+    ) {
       setAgentUpdateModalOpen(true);
       return;
     }
@@ -4924,8 +5992,9 @@ export default function EasyWorkApp() {
       ...current,
       [effectiveServerId]: {
         status: "checking",
+        agentId: agent.id,
         currentVersion: agent.version,
-        label: "正在检测 OpenCode 更新",
+        label: `正在检测 ${agent.name} 更新`,
       },
     }));
     setAgentMenuOpen(false);
@@ -4952,14 +6021,15 @@ export default function EasyWorkApp() {
       [effectiveServerId]: {
         ...(current[effectiveServerId] ?? { status: "idle" }),
         status: "updating",
-        label: "正在更新 OpenCode",
+        label: "正在部署主机安装包",
       },
     }));
     socketRef.current.send(
       JSON.stringify({
         type: "agent.update.apply",
         serverId: effectiveServerId,
-        agentId: "opencode",
+        agentId:
+          activeAgentUpdate.agentId || configAgent?.id || activeAgent?.id,
       }),
     );
   };
@@ -4974,7 +6044,7 @@ export default function EasyWorkApp() {
       updateConversation(activeConversation.id, (conversation) => ({
         ...conversation,
         work: {
-          ...(conversation.work ?? { workspace: "~" }),
+          ...(conversation.work ?? {}),
           serverId: conversation.work?.serverId || effectiveServerId,
           agentId,
         },
@@ -4984,24 +6054,61 @@ export default function EasyWorkApp() {
     setAgentMenuPage("root");
   };
 
+  const browseManualAgentDirectory = async (requestedPath: string) => {
+    if (!effectiveServerId) return;
+    setManualAgentBrowseLoading(true);
+    try {
+      const query = new URLSearchParams({
+        serverId: effectiveServerId,
+        path: requestedPath || "~",
+      });
+      const response = await gatewayFetch(
+        `/api/workspaces/browse?${query.toString()}`,
+      );
+      const payload = (await response.json().catch(() => ({}))) as {
+        path?: string;
+        home?: string;
+        parent?: string | null;
+        entries?: RemoteFileEntry[];
+        error?: string;
+      };
+      if (!response.ok || !payload.path) {
+        throw new Error(payload.error || "读取远端目录失败");
+      }
+      setManualAgentBrowsePath(payload.path);
+      setManualAgentBrowseHome(payload.home || "");
+      setManualAgentBrowseParent(payload.parent ?? null);
+      setManualAgentBrowseEntries(
+        (payload.entries || []).filter((entry) => entry.type === "directory"),
+      );
+    } catch (caught) {
+      showToast(caught instanceof Error ? caught.message : "读取远端目录失败");
+    } finally {
+      setManualAgentBrowseLoading(false);
+    }
+  };
+
+  const openManualAgentPicker = () => {
+    if (connection.status !== "connected" || !effectiveServerId) return;
+    setAgentMenuOpen(false);
+    setAgentMenuPage("root");
+    setManualAgentPickerOpen(true);
+    void browseManualAgentDirectory("~");
+  };
+
   const addManualAgent = () => {
     if (
-      !manualAgentFolder.trim() ||
+      !manualAgentBrowsePath ||
       socketRef.current?.readyState !== WebSocket.OPEN
-    ) {
-      return;
-    }
+    ) return;
     socketRef.current.send(
       JSON.stringify({
         type: "agent.add",
         serverId: effectiveServerId,
-        name: manualAgentName.trim() || undefined,
-        folder: manualAgentFolder.trim(),
+        folder: manualAgentBrowsePath,
       }),
     );
-    setManualAgentName("");
-    setManualAgentFolder("");
-    setManualAgentOpen(false);
+    setManualAgentPickerOpen(false);
     showToast("正在检查 Agent 文件夹");
   };
 
@@ -5017,6 +6124,8 @@ export default function EasyWorkApp() {
         type: "agent.config.read",
         serverId: effectiveServerId,
         agentId: agent.id,
+        conversationId: activeConversationId,
+        workspaceId: activeWorkspace?.id || "",
         requestId: uid("config"),
       }),
     );
@@ -5025,6 +6134,7 @@ export default function EasyWorkApp() {
   const openAgentSettings = (agent: AgentItem) => {
     setAgentConfigAgentId(agent.id);
     setAgentMenuPage("config");
+    void loadAgentContextForMenu(agent);
   };
 
   const openAgentModelPicker = () => {
@@ -5046,7 +6156,7 @@ export default function EasyWorkApp() {
       [effectiveServerId]: {
         status: "configuring",
         model: modelId,
-        label: "正在准备 OpenCode 配置",
+        label: `正在准备 ${configAgent.name} 配置`,
       },
     }));
     if (connection.demo) {
@@ -5056,7 +6166,7 @@ export default function EasyWorkApp() {
           [effectiveServerId]: {
             status: "done",
             model: modelId,
-            label: `OpenCode 已切换到 ${modelId}`,
+            label: `${configAgent.name} 已切换到 ${modelId}`,
           },
         }));
         setAgentsByServer((current) => ({
@@ -5087,6 +6197,37 @@ export default function EasyWorkApp() {
         serverId: effectiveServerId,
         agentId: configAgent.id,
         model: modelId,
+        conversationId: activeConversationId,
+        workspaceId: activeWorkspace?.id || "",
+      }),
+    );
+  };
+
+  const handleAgentRuntimeSettingChange = (
+    event: React.ChangeEvent<HTMLSelectElement>,
+  ) => {
+    const socket = socketRef.current;
+    if (
+      !configAgent?.managed ||
+      !effectiveServerId ||
+      socket?.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    setAgentRuntimeConfig({
+      agentId: configAgent.id,
+      status: "configuring",
+      label: "配置中",
+    });
+    socket.send(
+      JSON.stringify({
+        type: "agent.runtime.configure",
+        serverId: effectiveServerId,
+        agentId: configAgent.id,
+        conversationId: activeConversationId,
+        workspaceId: activeWorkspace?.id || "",
+        field: event.currentTarget.dataset.field || "",
+        value: event.currentTarget.value,
       }),
     );
   };
@@ -5099,6 +6240,8 @@ export default function EasyWorkApp() {
         type: "agent.config.write",
         serverId: effectiveServerId,
         agentId: configAgent.id,
+        conversationId: activeConversationId,
+        workspaceId: activeWorkspace?.id || "",
         requestId: uid("config"),
         content: agentConfigContent,
       }),
@@ -6016,52 +7159,17 @@ export default function EasyWorkApp() {
             </div>
           ) : <div className="topbar-center" />}
 
-          <div className="topbar-actions">
-            {view === "chat" && mode === "work" && (
-              <>
-                {!rightRailOpen && (
-                  <button
-                    className={`connection-pill ${connection.status}`}
-                    type="button"
-                    onClick={openConversationServerManager}
-                  >
-                    {connection.status === "connected" ? <Wifi size={14} /> : <WifiOff size={14} />}
-                    <span>{connection.status === "connected" ? "登录节点在线" : "连接平台"}</span>
-                    {connection.latency && <small>{connection.latency}ms</small>}
-                  </button>
-                )}
-                {connection.status === "connected" && (
-                    <button
-                      className={`agent-picker${activeAgentScanning ? " scanning" : ""}`}
-                      type="button"
-                      disabled={activeAgentScanning}
-                      onClick={() =>
-                        setAgentMenuOpen((current) => {
-                          if (!current) setAgentMenuPage("root");
-                          return !current;
-                        })
-                      }
-                  >
-                    {activeAgentScanning ? (
-                      <LoaderCircle className="spin" size={15} />
-                    ) : (
-                      <Bot size={15} />
-                    )}
-                    <span>
-                      {activeAgentScanning
-                        ? "扫描中"
-                        : activeAgent?.name ?? "选择 Agent"}
-                    </span>
-                    {!activeAgentScanning && <ChevronDown size={13} />}
-                  </button>
-                )}
-              </>
-            )}
-          </div>
+          <div className="topbar-actions" />
         </header>
 
         {view === "chat" && (
-          <section className="conversation-surface">
+          <section
+            className={`conversation-surface${
+              mode === "work" && connection.status === "connected"
+                ? " workspace-toolbar"
+                : ""
+            }`}
+          >
             <div className="conversation-toolbar">
               <div className="conversation-toolbar-left">
                 <button
@@ -6078,6 +7186,7 @@ export default function EasyWorkApp() {
                     {activeProject.name}
                   </span>
                 )}
+                <div className={`conversation-mode-stack ${mode}`}>
                 {activeConversation ? (
                   <div className="conversation-mode-menu">
                     <button
@@ -6130,32 +7239,10 @@ export default function EasyWorkApp() {
                     </button>
                   </div>
                 )}
+                </div>
               </div>
 
               <div className="conversation-toolbar-right">
-                {mode === "work" && !rightRailOpen && (
-                  <button
-                    className={`work-connection-button ${connection.status}`}
-                    type="button"
-                    onClick={openConversationServerManager}
-                    aria-label={
-                      connection.status === "connected"
-                        ? "远程服务器已连接，打开连接详情"
-                        : "远程服务器未连接，打开连接窗口"
-                    }
-                  >
-                    {connection.status === "connecting" ? (
-                      <LoaderCircle className="spin" size={14} />
-                    ) : connection.status === "connected" ? (
-                      <Wifi size={14} />
-                    ) : (
-                      <WifiOff size={14} />
-                    )}
-                    <span>
-                      {connection.status === "connected" ? "已连接" : "未连接"}
-                    </span>
-                  </button>
-                )}
                 {mode === "work" && connection.status === "connected" && (
                   <div className="agent-selector">
                     <button
@@ -6182,6 +7269,10 @@ export default function EasyWorkApp() {
                           ? activeAgent.name
                           : "选择 Agent"}
                       </span>
+                      {!activeAgentScanning &&
+                        activeAgent?.status === "ready" && (
+                          <AgentContextRing usage={contextUsage?.agent ?? null} />
+                        )}
                       {!activeAgentScanning && <ChevronDown size={13} />}
                     </button>
                     {agentMenuOpen && (
@@ -6191,7 +7282,7 @@ export default function EasyWorkApp() {
                           {
                             "--agent-menu-height":
                               agentMenuPage === "config"
-                                ? "145px"
+                                ? `${agentConfigMenuHeight}px`
                                 : agentMenuPage === "models"
                                   ? `${Math.min(
                                       350,
@@ -6199,16 +7290,7 @@ export default function EasyWorkApp() {
                                     )}px`
                                   : `${Math.min(
                                       390,
-                                      66 +
-                                        Math.max(agents.length, 1) * 58 +
-                                        (agents.some(
-                                          (agent) =>
-                                            agent.id === "opencode" &&
-                                            agent.status === "missing",
-                                        )
-                                          ? 45
-                                          : 0) +
-                                        (manualAgentOpen ? 112 : 0),
+                                      54 + Math.max(agents.length, 1) * 58,
                                     )}px`,
                           } as React.CSSProperties
                         }
@@ -6239,15 +7321,28 @@ export default function EasyWorkApp() {
                                       )}
                                     </span>
                                     <span>
-                                      <strong>{agent.name}</strong>
-                                      <small>
+                                      <strong>
+                                        <span>{agent.name}</span>
+                                        {agent.status === "ready" && agent.version && (
+                                          <em className="agent-version">
+                                            {agentVersionText(agent.version)}
+                                          </em>
+                                        )}
+                                      </strong>
+                                      <small className="agent-deployment-label">
                                         {agent.status === "missing"
                                           ? "未安装"
                                           : agent.status === "installing"
                                             ? agent.detail || "安装中"
-                                            : agent.configured
-                                              ? agent.version || "可用"
-                                              : "需要配置"}
+                                            : `${
+                                                agent.managed
+                                                  ? "easywork部署"
+                                                  : "用户部署"
+                                              }${
+                                                agent.configured
+                                                  ? ""
+                                                  : " · 需要配置"
+                                              }`}
                                       </small>
                                     </span>
                                     {agent.id === activeAgentId &&
@@ -6255,40 +7350,61 @@ export default function EasyWorkApp() {
                                         <Check size={14} />
                                       )}
                                   </button>
-                                  {agent.status === "ready" &&
-                                    (agent.configPath ||
-                                      agent.adapter === "opencode") && (
+                                  {agent.status === "missing" ? (
+                                    <button
+                                      className="agent-inline-install"
+                                      type="button"
+                                      onClick={() => installManagedAgent(agent.id)}
+                                      disabled={connection.status !== "connected"}
+                                    >
+                                      <Download size={13} />
+                                      安装
+                                    </button>
+                                  ) : agent.status === "installing" ? (
+                                    <button
+                                      className="agent-inline-install installing"
+                                      type="button"
+                                      disabled
+                                    >
+                                      <LoaderCircle className="spin" size={13} />
+                                    </button>
+                                  ) : agent.managed ? (
                                     <span className="agent-row-actions">
-                                      {agent.adapter === "opencode" &&
-                                        agent.managed && (
-                                          <button
-                                            className={`agent-update-shortcut ${activeAgentUpdate.status}`}
-                                            type="button"
-                                            onClick={() => checkAgentUpdate(agent)}
-                                            disabled={[
+                                      <button
+                                        className={`agent-update-shortcut ${
+                                          activeAgentUpdate.agentId === agent.id
+                                            ? activeAgentUpdate.status
+                                            : "idle"
+                                        }`}
+                                        type="button"
+                                        onClick={() => checkAgentUpdate(agent)}
+                                        disabled={
+                                          activeAgentUpdate.agentId === agent.id &&
+                                          [
+                                            "checking",
+                                            "downloading",
+                                            "updating",
+                                            "configuring",
+                                          ].includes(activeAgentUpdate.status)
+                                        }
+                                        aria-label={`检测 ${agent.name} 更新`}
+                                        title="与主机版本对比"
+                                      >
+                                        <RefreshCw
+                                          className={
+                                            [
                                               "checking",
                                               "downloading",
                                               "updating",
                                               "configuring",
-                                            ].includes(activeAgentUpdate.status)}
-                                            aria-label="检测 OpenCode 更新"
-                                            title="检测更新"
-                                          >
-                                            <RefreshCw
-                                              className={
-                                                [
-                                                  "checking",
-                                                  "downloading",
-                                                  "updating",
-                                                  "configuring",
-                                                ].includes(activeAgentUpdate.status)
-                                                  ? "spin"
-                                                  : undefined
-                                              }
-                                              size={14}
-                                            />
-                                          </button>
-                                        )}
+                                            ].includes(activeAgentUpdate.status) &&
+                                            activeAgentUpdate.agentId === agent.id
+                                              ? "spin"
+                                              : undefined
+                                          }
+                                          size={14}
+                                        />
+                                      </button>
                                       <button
                                         className="agent-config-shortcut"
                                         type="button"
@@ -6298,55 +7414,14 @@ export default function EasyWorkApp() {
                                         <ChevronRight size={15} />
                                       </button>
                                     </span>
-                                  )}
+                                  ) : null}
                                 </div>
                               ))}
                             </div>
-                            {agents.some(
-                              (agent) =>
-                                agent.id === "opencode" && agent.status === "missing",
-                            ) && (
-                              <button
-                                className="agent-install-action"
-                                type="button"
-                                onClick={installManagedAgent}
-                                disabled={connection.status !== "connected"}
-                              >
-                                <Download size={15} />
-                                安装 OpenCode
-                              </button>
-                            )}
-                            {manualAgentOpen && (
-                              <div className="manual-agent-inline">
-                                <input
-                                  value={manualAgentName}
-                                  onChange={(event) =>
-                                    setManualAgentName(event.target.value)
-                                  }
-                                  placeholder="名称（可选）"
-                                />
-                                <input
-                                  value={manualAgentFolder}
-                                  onChange={(event) =>
-                                    setManualAgentFolder(event.target.value)
-                                  }
-                                  placeholder="Agent 文件夹，如 ~/.local/opencode"
-                                />
-                                <button type="button" onClick={addManualAgent}>
-                                  添加
-                                </button>
-                              </div>
-                            )}
                             <div className="agent-dropdown-actions">
-                              <button type="button" onClick={scanAgents}>
-                                <RefreshCw size={14} />
-                                自动扫描
-                              </button>
                               <button
                                 type="button"
-                                onClick={() =>
-                                  setManualAgentOpen((current) => !current)
-                                }
+                                onClick={openManualAgentPicker}
                               >
                                 <Plus size={14} />
                                 手动添加
@@ -6363,15 +7438,20 @@ export default function EasyWorkApp() {
                               <ChevronLeft size={15} />
                               返回
                             </button>
-                            <button
-                              className="agent-menu-option"
-                              type="button"
-                              onClick={() => openAgentConfig(configAgent)}
-                            >
-                              <FileText size={16} />
-                              <span>打开配置</span>
-                            </button>
-                            {configAgent?.adapter === "opencode" && (
+                            {configAgent?.managed && (
+                              <button
+                                className="agent-menu-option"
+                                type="button"
+                                onClick={() => openAgentConfig(configAgent)}
+                              >
+                                <FileText size={16} />
+                                <span>打开配置</span>
+                              </button>
+                            )}
+                            {configAgent?.managed &&
+                              ["opencode", "codex", "claude"].includes(
+                                configAgent.adapter,
+                              ) && (
                               <button
                                 className="agent-menu-option"
                                 type="button"
@@ -6382,6 +7462,124 @@ export default function EasyWorkApp() {
                                 <ChevronRight size={15} />
                               </button>
                             )}
+                            {configAgent?.managed && (
+                              <small
+                                className="agent-current-model"
+                                title={
+                                  activeAgentModelConfig.model ||
+                                  configAgent.model ||
+                                  ""
+                                }
+                              >
+                                当前模型 · {activeAgentModelConfig.model ||
+                                  configAgent.model ||
+                                  "尚未选择"}
+                              </small>
+                            )}
+                            {configAgent?.managed &&
+                              (["reasoning", "permission", "sandbox"] as const).map(
+                                (field) => {
+                                  const descriptor =
+                                    configAgent.configurationSchema?.[field];
+                                  if (!descriptor?.options?.length) return null;
+                                  return (
+                                    <label
+                                      className="agent-native-setting"
+                                      key={field}
+                                    >
+                                      <span>{descriptor.label}</span>
+                                      <select
+                                        data-field={field}
+                                        value={descriptor.value}
+                                        disabled={
+                                          agentRuntimeConfig.status === "configuring" &&
+                                          agentRuntimeConfig.agentId === configAgent.id
+                                        }
+                                        onChange={handleAgentRuntimeSettingChange}
+                                      >
+                                        {descriptor.options.map((option) => (
+                                          <option value={option} key={option}>
+                                            {agentSettingOptionLabel(option)}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </label>
+                                  );
+                                },
+                              )}
+                            {configAgent?.status === "ready" && (
+                              <AgentContextControls
+                                key={`${configAgent.id}:${
+                                  (
+                                    agentContextById[
+                                      agentContextCacheKey(
+                                        activeConversationId,
+                                        effectiveServerId,
+                                        activeWorkspace?.id || "",
+                                        configAgent.id,
+                                      )
+                                    ] ||
+                                    (configAgent.id === activeAgentId
+                                      ? contextUsage?.agent
+                                      : null)
+                                  )?.limit ?? configAgent.contextLimit ?? ""
+                                }`}
+                                agent={configAgent}
+                                usage={
+                                  agentContextById[
+                                    agentContextCacheKey(
+                                      activeConversationId,
+                                      effectiveServerId,
+                                      activeWorkspace?.id || "",
+                                      configAgent.id,
+                                    )
+                                  ] ||
+                                  (configAgent.id === activeAgentId
+                                    ? contextUsage?.agent ?? null
+                                    : null)
+                                }
+                                busyAction={contextBusyAction}
+                                onSave={(limit) =>
+                                  saveAgentContextSettings(limit, configAgent)
+                                }
+                                onCompress={() =>
+                                  compressAgentContext(configAgent)
+                                }
+                              />
+                            )}
+                            {configAgent?.managed &&
+                              configAgent.status === "ready" && (
+                                <div className="agent-config-footer">
+                                  {agentRuntimeConfig.status === "configuring" &&
+                                  agentRuntimeConfig.agentId === configAgent.id ? (
+                                    <span className="agent-runtime-configuring">
+                                      <LoaderCircle className="spin" size={14} />
+                                      配置中
+                                    </span>
+                                  ) : (
+                                    <span aria-hidden="true" />
+                                  )}
+                                  <button
+                                    className="agent-menu-option danger agent-uninstall-option"
+                                    type="button"
+                                    disabled={uninstallingAgentId === configAgent.id}
+                                    onClick={() =>
+                                      setAgentPendingUninstall(configAgent)
+                                    }
+                                  >
+                                    {uninstallingAgentId === configAgent.id ? (
+                                      <LoaderCircle className="spin" size={16} />
+                                    ) : (
+                                      <Trash2 size={16} />
+                                    )}
+                                    <span>
+                                      {uninstallingAgentId === configAgent.id
+                                        ? "卸载中"
+                                        : "卸载 Agent"}
+                                    </span>
+                                  </button>
+                                </div>
+                              )}
                           </div>
 
                           <div className="agent-menu-panel agent-model-panel">
@@ -6458,6 +7656,37 @@ export default function EasyWorkApp() {
                     )}
                   </div>
                 )}
+                {mode === "work" && !rightRailOpen && (
+                  <button
+                    className={`work-connection-button ${connection.status}`}
+                    type="button"
+                    onClick={openConversationServerManager}
+                    aria-label={
+                      connection.status === "connected"
+                        ? "远程服务器已连接，打开连接详情"
+                        : "远程服务器未连接，打开连接窗口"
+                    }
+                  >
+                    <span className="work-connection-copy">
+                      <span className="work-connection-status-line">
+                        {connection.status === "connecting" ? (
+                          <LoaderCircle className="spin" size={14} />
+                        ) : connection.status === "connected" ? (
+                          <Wifi size={14} />
+                        ) : (
+                          <WifiOff size={14} />
+                        )}
+                        <strong>
+                          {connection.status === "connected"
+                            ? "已连接"
+                            : connection.status === "connecting"
+                              ? "连接中"
+                              : "未连接"}
+                        </strong>
+                      </span>
+                    </span>
+                  </button>
+                )}
               </div>
             </div>
             <div
@@ -6497,6 +7726,19 @@ export default function EasyWorkApp() {
                       )}
                       {mode === "work" &&
                         connection.status === "connected" &&
+                        !activeWorkspace && (
+                          <button
+                            className="inline-connect workspace"
+                            type="button"
+                            onClick={() => void openWorkspacePicker()}
+                          >
+                            <FolderOpen size={16} />
+                            选择工作区
+                          </button>
+                        )}
+                      {mode === "work" &&
+                        connection.status === "connected" &&
+                        Boolean(activeWorkspace) &&
                         !activeAgentScanning &&
                         (!activeAgent || !activeAgent.configured) && (
                           <button
@@ -6528,7 +7770,7 @@ export default function EasyWorkApp() {
                 </div>
               ) : (
                 <div className="message-list">
-                  {activeConversation.messages.map((message) => (
+                  {activeConversation.messages.map((message, messageIndex) => (
                     <article
                       className={`message ${message.role} ${message.mode}`}
                       key={message.id}
@@ -6592,12 +7834,13 @@ export default function EasyWorkApp() {
                               }
                               onApproval={
                                 message.runId
-                                  ? (event, approved) =>
+                                  ? (event, approved, answers) =>
                                       respondToApproval(
                                         activeConversation.id,
                                         message.runId!,
                                         event,
                                         approved,
+                                        answers,
                                       )
                                   : undefined
                               }
@@ -6721,6 +7964,22 @@ export default function EasyWorkApp() {
                                     <RefreshCw size={14} />
                                   </button>
                                 )}
+                                {messageIndex <
+                                  activeConversation.messages.length - 1 && (
+                                  <button
+                                    type="button"
+                                    title="回溯"
+                                    aria-label="回溯到这条回复"
+                                    onClick={() =>
+                                      void actOnConversationMessage(
+                                        "rewind",
+                                        message,
+                                      )
+                                    }
+                                  >
+                                    <History size={14} />
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   title="分支"
@@ -6778,6 +8037,8 @@ export default function EasyWorkApp() {
                       ? "给 EasyWork 发消息"
                       : connection.status !== "connected"
                         ? "请先连接远程服务器"
+                        : !activeWorkspace
+                          ? "请先选择工作区"
                         : !activeAgent || activeAgent.status === "missing"
                           ? "请先安装或选择 Agent"
                           : !activeAgent.configured
@@ -6786,10 +8047,9 @@ export default function EasyWorkApp() {
                   }
                 />
                 {activeConversation && (
-                  <ContextMeters
+                  <WebContextMeter
                     usage={contextUsage}
                     loading={contextLoading}
-                    showAgent={mode === "work"}
                     onOpen={() => setContextModalOpen(true)}
                   />
                 )}
@@ -6833,11 +8093,7 @@ export default function EasyWorkApp() {
               </div>
               <UnifiedComposer
                 value={draft}
-                disabled={
-                  mode === "work" &&
-                  connection.status === "connected" &&
-                  !workReady
-                }
+                disabled={appLoading}
                 sending={sending}
                 skills={state.skills}
                 selectedSkills={selectedSkills}
@@ -7493,6 +8749,7 @@ export default function EasyWorkApp() {
             }`}
           >
           {mode === "work" && (
+            <>
             <section className={`remote-connection-panel ${connection.status}`}>
             <div className="remote-connection-heading">
               <span>远程连接</span>
@@ -7502,9 +8759,7 @@ export default function EasyWorkApp() {
                   ? "已连接"
                   : connection.status === "connecting"
                     ? "连接中"
-                    : connection.status === "error"
-                      ? "连接失败"
-                      : "未连接"}
+                    : "未连接"}
               </span>
             </div>
             <strong>
@@ -7538,6 +8793,28 @@ export default function EasyWorkApp() {
               </button>
             </div>
           </section>
+          <section className="workspace-rail-panel">
+            <div className="workspace-rail-heading">
+              <span>当前工作区</span>
+              <button
+                type="button"
+                disabled={activeWorkSending || workspaceSwitchBusy}
+                onClick={() => void openWorkspacePicker()}
+              >
+                {workspacePickerLoading ? (
+                  <LoaderCircle className="spin" size={13} />
+                ) : null}
+                更改
+              </button>
+            </div>
+            <code title={activeWorkspace?.path || undefined}>
+              {activeWorkspace?.path ||
+                (connection.status === "connected"
+                  ? "虚拟工作区将在首次执行时分配"
+                  : "连接服务器后可选择工作区")}
+            </code>
+          </section>
+          </>
           )}
 
           <header className="right-rail-header">
@@ -7776,6 +9053,190 @@ export default function EasyWorkApp() {
           onRetry={() => setGatewayProbe((current) => current + 1)}
         />
       )}
+      {workspacePickerOpen && (
+        <WorkspacePickerModal
+          serverName={
+            activeServerProfile?.name || connection.host || "远程服务器"
+          }
+          activeWorkspaceKind={activeWorkspace?.kind || "virtual"}
+          activeWorkspacePath={activeWorkspace?.path || ""}
+          conversationId={activeConversation?.id || ""}
+          purpose={workspacePickerPurpose}
+          path={workspaceBrowsePath}
+          home={workspaceBrowseHome}
+          parent={workspaceBrowseParent}
+          entries={workspaceBrowseEntries}
+          loading={workspacePickerLoading}
+          onBrowse={(path) =>
+            void browseWorkspaceDirectory(effectiveServerId, path)
+          }
+          onChooseVirtual={() => void chooseVirtualWorkspace()}
+          onChooseCurrent={() => void registerCurrentWorkspace()}
+          onClose={() => setWorkspacePickerOpen(false)}
+        />
+      )}
+      {pendingVirtualWrite && !workspacePickerOpen && (
+        <Modal
+          title="确认本轮写入范围"
+          onClose={() =>
+            !dynamicWorkspaceBusy && setPendingVirtualWrite(null)
+          }
+          wide
+        >
+          <div className="dynamic-workspace-confirm">
+            <div className="dynamic-workspace-intro">
+              <span><Sparkles size={16} /></span>
+              <div>
+                <strong>当前对话使用虚拟工作区</strong>
+                <p>
+                  EasyWork 检测到这条指令可能修改远端状态。选择真实目录后，本轮会使用该目录对应的 Agent 会话；任务结束后仍返回虚拟工作区。
+                  同一对话再次以同一 Agent 写入同一目录时，会继续复用这条 Agent 会话。
+                </p>
+              </div>
+            </div>
+
+            {pendingVirtualWrite.suggestedPaths.length > 0 && (
+              <section className="dynamic-workspace-suggestions">
+                <strong>指令中识别到的路径</strong>
+                <div>
+                  {pendingVirtualWrite.suggestedPaths.map((path) => (
+                    <button
+                      type="button"
+                      key={path}
+                      disabled={dynamicWorkspaceBusy}
+                      onClick={() => void chooseSuggestedDynamicWorkspace(path)}
+                    >
+                      <Folder size={14} />
+                      <code>{path}</code>
+                    </button>
+                  ))}
+                </div>
+                <small>如果识别到的是文件而不是文件夹，请改用目录浏览器选择其上级目录。</small>
+              </section>
+            )}
+
+            <section className={`dynamic-workspace-target${pendingVirtualWrite.target ? " selected" : ""}`}>
+              {pendingVirtualWrite.target ? (
+                <>
+                  <span className="dynamic-workspace-target-icon"><FolderOpen size={18} /></span>
+                  <div>
+                    <strong>{pendingVirtualWrite.target.name}</strong>
+                    <code>{pendingVirtualWrite.target.path}</code>
+                    <small>
+                      {!pendingVirtualWrite.target.writable
+                        ? "该目录只读，不能作为写入目标"
+                        : pendingVirtualWrite.target.mode === "unmanaged"
+                          ? "可以执行，但没有 Git 检查点，文件修改不能自动重置"
+                          : "将创建运行前后检查点；同一 Git 仓库共享版本顺序"}
+                    </small>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void openWorkspacePicker("dynamic")}
+                  >
+                    更换
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  disabled={dynamicWorkspaceBusy}
+                  onClick={() => void openWorkspacePicker("dynamic")}
+                >
+                  <FolderPlus size={17} />
+                  选择真实写入目录
+                </button>
+              )}
+            </section>
+
+            <div className="dynamic-workspace-outcomes">
+              <p><ShieldCheck size={14} />只读查询不会修改真实项目。</p>
+              <p><GitBranch size={14} />同一 Git 仓库或路径重叠的目录不会并发运行。</p>
+              <p><HardDrive size={14} />软件安装、作业、服务和范围外文件不属于可回退的文件版本。</p>
+            </div>
+
+            <div className="modal-actions dynamic-workspace-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={dynamicWorkspaceBusy}
+                onClick={() => setPendingVirtualWrite(null)}
+              >
+                取消
+              </button>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={dynamicWorkspaceBusy}
+                onClick={() => void continuePendingVirtualWrite(true)}
+                title="真实目录之外的修改不会纳入版本管理"
+              >
+                仅在虚拟目录执行
+              </button>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={
+                  dynamicWorkspaceBusy ||
+                  !pendingVirtualWrite.target ||
+                  !pendingVirtualWrite.target.writable
+                }
+                onClick={() => void continuePendingVirtualWrite(false)}
+              >
+                {dynamicWorkspaceBusy && <LoaderCircle className="spin" size={14} />}
+                确认目标并执行
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {workspaceSwitchPending && activeConversation && (
+        <Modal
+          title="切换工作区？"
+          onClose={() =>
+            !workspaceSwitchBusy && setWorkspaceSwitchPending(null)
+          }
+        >
+          <div className="workspace-switch-confirm">
+            <div className="workspace-switch-route" aria-hidden="true">
+              <span>{activeWorkspace?.name || "当前工作区"}</span>
+              <ChevronRight size={16} />
+              <strong>{workspaceSwitchPending.name}</strong>
+            </div>
+            <p>
+              {workspaceSwitchPending.kind === "virtual"
+                ? "切换后不再固定真实项目目录。查询和临时文件在对话专属目录中完成；需要写入真实目录时，EasyWork 会逐次确认目标，并复用该目录与 Agent 对应的原生会话。网页对话、项目上下文和整体记忆保持不变。"
+                : "切换后会使用该工作区对应的 Agent 会话。网页对话、项目上下文和整体记忆会继续保留；再次切回时会恢复原 Agent 会话，并补齐期间新增的记忆。"}
+            </p>
+            <div className="modal-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={workspaceSwitchBusy}
+                onClick={() => setWorkspaceSwitchPending(null)}
+              >
+                取消
+              </button>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={workspaceSwitchBusy}
+                onClick={() =>
+                  void applyWorkspaceToConversation(
+                    activeConversation.id,
+                    workspaceSwitchPending,
+                  )
+                }
+              >
+                {workspaceSwitchBusy && (
+                  <LoaderCircle className="spin" size={14} />
+                )}
+                确认切换
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
       {agentConfigOpen && (
         <AgentConfigModal
           agent={configAgent}
@@ -7793,8 +9254,18 @@ export default function EasyWorkApp() {
       {agentUpdateModalOpen && (
         <AgentUpdateModal
           state={activeAgentUpdate}
+          agentName={
+            agents.find((agent) => agent.id === activeAgentUpdate.agentId)?.name ||
+            "Agent"
+          }
           onUpdate={applyAgentUpdate}
-          onRetry={checkAgentUpdate}
+          onRetry={() =>
+            checkAgentUpdate(
+              agents.find(
+                (agent) => agent.id === activeAgentUpdate.agentId,
+              ) || activeAgent,
+            )
+          }
           onClose={() => setAgentUpdateModalOpen(false)}
         />
       )}
@@ -7814,16 +9285,55 @@ export default function EasyWorkApp() {
           onClose={() => setFileManagerOpen(false)}
         />
       )}
+      {manualAgentPickerOpen && (
+        <AgentDirectoryPickerModal
+          path={manualAgentBrowsePath}
+          home={manualAgentBrowseHome}
+          parent={manualAgentBrowseParent}
+          entries={manualAgentBrowseEntries}
+          loading={manualAgentBrowseLoading}
+          onBrowse={(path) => void browseManualAgentDirectory(path)}
+          onChoose={addManualAgent}
+          onClose={() => setManualAgentPickerOpen(false)}
+        />
+      )}
+      {agentPendingUninstall && (
+        <Modal
+          title={`卸载 ${agentPendingUninstall.name}`}
+          onClose={() => setAgentPendingUninstall(null)}
+        >
+          <div className="confirmation-dialog agent-uninstall-dialog">
+            <p>
+              将从当前服务器删除 EasyWork 部署的 Agent 应用。已有网页对话与配置会保留，重新安装后仍可继续使用。
+            </p>
+            <div className="modal-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setAgentPendingUninstall(null)}
+              >
+                取消
+              </button>
+              <button
+                className="danger-button"
+                type="button"
+                onClick={() => uninstallManagedAgent(agentPendingUninstall)}
+              >
+                <Trash2 size={15} />
+                确认卸载
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
       {contextModalOpen && (
         <ContextDetailModal
           key={`${contextUsage?.web.limit ?? 0}:${contextUsage?.web.automaticCompressionThreshold ?? 0}`}
           usage={contextUsage}
-          busy={contextBusy}
-          showAgent={mode === "work"}
+          busyAction={contextBusyAction}
           onClose={() => setContextModalOpen(false)}
-          onSave={saveContextSettings}
-          onCompress={compressCurrentContext}
-          onAgentCompress={compressAgentContext}
+          onSaveWeb={saveContextSettings}
+          onCompressWeb={compressCurrentContext}
         />
       )}
       {embeddingModalOpen && (
@@ -9414,11 +10924,13 @@ function ServerManagerModal({
 
 function AgentUpdateModal({
   state,
+  agentName,
   onUpdate,
   onRetry,
   onClose,
 }: {
   state: AgentUpdateState;
+  agentName: string;
   onUpdate: () => void;
   onRetry: () => void;
   onClose: () => void;
@@ -9430,7 +10942,7 @@ function AgentUpdateModal({
   const failed = state.status === "error";
   const done = state.status === "done";
   return (
-    <Modal title="OpenCode 更新" onClose={onClose}>
+    <Modal title={`${agentName} 更新`} onClose={onClose}>
       <div className={`agent-update-dialog ${state.status}`}>
         <span className="agent-update-hero">
           {busy ? (
@@ -9448,12 +10960,12 @@ function AgentUpdateModal({
               ? "更新未完成"
               : done
                 ? "更新完成"
-                : "正在检查 OpenCode"}
+                : `正在检查 ${agentName}`}
         </h3>
         <p>
           {state.error ||
             state.label ||
-            (busy ? "正在连接远端服务器…" : "OpenCode 已是最新版")}
+            (busy ? "正在连接远端服务器…" : `${agentName} 已与主机版本一致`)}
         </p>
         {(state.currentVersion || state.latestVersion) && (
           <div className="agent-update-versions">
@@ -9551,6 +11063,281 @@ function AgentConfigModal({
             保存配置
           </button>
         </div>
+      </div>
+    </Modal>
+  );
+}
+
+function WorkspacePickerModal({
+  serverName,
+  activeWorkspaceKind,
+  activeWorkspacePath,
+  conversationId,
+  purpose,
+  path,
+  home,
+  parent,
+  entries,
+  loading,
+  onBrowse,
+  onChooseVirtual,
+  onChooseCurrent,
+  onClose,
+}: {
+  serverName: string;
+  activeWorkspaceKind: "physical" | "virtual";
+  activeWorkspacePath: string;
+  conversationId: string;
+  purpose: "conversation" | "dynamic";
+  path: string;
+  home: string;
+  parent: string | null;
+  entries: RemoteFileEntry[];
+  loading: boolean;
+  onBrowse: (path: string) => void;
+  onChooseVirtual: () => void;
+  onChooseCurrent: () => void;
+  onClose: () => void;
+}) {
+  const [selectionMode, setSelectionMode] = useState<"virtual" | "user">(
+    purpose === "dynamic" ? "user" : "virtual",
+  );
+  const [filter, setFilter] = useState("");
+  const filteredEntries = entries.filter((entry) =>
+    entry.name.toLocaleLowerCase().includes(filter.trim().toLocaleLowerCase()),
+  );
+  const virtualPath =
+    activeWorkspaceKind === "virtual" && activeWorkspacePath
+      ? activeWorkspacePath
+      : home && conversationId
+        ? `${home}/.easywork/virtual/${conversationId}`
+        : "将在对话首次执行时分配";
+  return (
+    <Modal
+      title={purpose === "dynamic" ? "选择动态写入目录" : "选择工作区"}
+      onClose={onClose}
+      wide
+      headerAction={
+        purpose === "conversation" ? (
+          <label className="workspace-kind-selector">
+            <select
+              aria-label="工作区类型"
+              value={selectionMode}
+              onChange={(event) =>
+                setSelectionMode(event.target.value as "virtual" | "user")
+              }
+            >
+              <option value="virtual">虚拟工作区</option>
+              <option value="user">用户工作区</option>
+            </select>
+            <ChevronDown size={13} aria-hidden="true" />
+          </label>
+        ) : undefined
+      }
+    >
+      {selectionMode === "virtual" && purpose === "conversation" ? (
+        <div className="workspace-virtual-picker">
+          <div className="workspace-virtual-address">
+            <span><Sparkles size={18} /></span>
+            <div>
+              <small>{serverName}</small>
+              <code title={virtualPath}>{virtualPath}</code>
+            </div>
+          </div>
+          <p>
+            虚拟工作区属于当前对话，适合查询、临时文件和不固定目录的任务。需要修改真实目录时，EasyWork 会在执行前让你确认目标目录，并复用该目录对应的 Agent 会话。
+          </p>
+          <footer>
+            <button
+              className="primary-button"
+              type="button"
+              disabled={loading}
+              onClick={onChooseVirtual}
+            >
+              {loading && <LoaderCircle className="spin" size={14} />}
+              选择当前文件夹
+            </button>
+          </footer>
+        </div>
+      ) : (
+        <div className="remote-directory-picker">
+          <header>
+            <div className="remote-directory-location">
+              <FolderOpen size={17} />
+              <code title={path}>{path}</code>
+            </div>
+            <div className="remote-directory-actions">
+              <label className="remote-directory-filter">
+                <Search size={14} />
+                <input
+                  value={filter}
+                  onChange={(event) => setFilter(event.target.value)}
+                  placeholder="筛选文件夹"
+                  aria-label="筛选文件夹"
+                />
+              </label>
+              <button
+                type="button"
+                title="主目录"
+                aria-label="打开主目录"
+                disabled={loading || !home || path === home}
+                onClick={() => onBrowse(home)}
+              >
+                <Home size={15} />
+              </button>
+              <button
+                type="button"
+                title="上一级"
+                aria-label="打开上一级目录"
+                disabled={loading || !parent}
+                onClick={() => parent && onBrowse(parent)}
+              >
+                <ChevronLeft size={15} />
+              </button>
+            </div>
+          </header>
+          <div className="remote-directory-list" aria-busy={loading}>
+            {loading ? (
+              <div className="remote-directory-state">
+                <LoaderCircle className="spin" size={18} />
+                <span>正在读取目录</span>
+              </div>
+            ) : filteredEntries.length ? (
+              filteredEntries.map((entry) => (
+                <button
+                  type="button"
+                  key={entry.path}
+                  title={entry.path}
+                  onClick={() => onBrowse(entry.path)}
+                >
+                  <Folder size={17} />
+                  <span>{entry.name}</span>
+                  <ChevronRight size={14} />
+                </button>
+              ))
+            ) : (
+              <div className="remote-directory-state">
+                {filter.trim() ? "没有匹配的文件夹" : "当前目录没有子文件夹"}
+              </div>
+            )}
+          </div>
+          <footer>
+            <button
+              className="primary-button"
+              type="button"
+              disabled={loading || !path}
+              onClick={onChooseCurrent}
+            >
+              选择当前文件夹
+            </button>
+          </footer>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function AgentDirectoryPickerModal({
+  path,
+  home,
+  parent,
+  entries,
+  loading,
+  onBrowse,
+  onChoose,
+  onClose,
+}: {
+  path: string;
+  home: string;
+  parent: string | null;
+  entries: RemoteFileEntry[];
+  loading: boolean;
+  onBrowse: (path: string) => void;
+  onChoose: () => void;
+  onClose: () => void;
+}) {
+  const [filter, setFilter] = useState("");
+  const filteredEntries = entries.filter((entry) =>
+    entry.name.toLocaleLowerCase().includes(filter.trim().toLocaleLowerCase()),
+  );
+  return (
+    <Modal
+      title="手动添加 Agent"
+      titleNote="请选择包含 Agent 可执行文件或 bin 目录的应用主目录"
+      onClose={onClose}
+      wide
+    >
+      <div className="remote-directory-picker">
+        <header>
+          <div className="remote-directory-location">
+            <FolderOpen size={17} />
+            <code title={path}>{path}</code>
+          </div>
+          <div className="remote-directory-actions">
+            <label className="remote-directory-filter">
+              <Search size={14} />
+              <input
+                value={filter}
+                onChange={(event) => setFilter(event.target.value)}
+                placeholder="筛选文件夹"
+                aria-label="筛选文件夹"
+              />
+            </label>
+            <button
+              type="button"
+              title="主目录"
+              aria-label="打开主目录"
+              disabled={loading || !home || path === home}
+              onClick={() => onBrowse(home)}
+            >
+              <Home size={15} />
+            </button>
+            <button
+              type="button"
+              title="上一级"
+              aria-label="打开上一级目录"
+              disabled={loading || !parent}
+              onClick={() => parent && onBrowse(parent)}
+            >
+              <ChevronLeft size={15} />
+            </button>
+          </div>
+        </header>
+        <div className="remote-directory-list" aria-busy={loading}>
+          {loading ? (
+            <div className="remote-directory-state">
+              <LoaderCircle className="spin" size={18} />
+              <span>正在读取目录</span>
+            </div>
+          ) : filteredEntries.length ? (
+            filteredEntries.map((entry) => (
+              <button
+                type="button"
+                key={entry.path}
+                title={entry.path}
+                onClick={() => onBrowse(entry.path)}
+              >
+                <Folder size={17} />
+                <span>{entry.name}</span>
+                <ChevronRight size={14} />
+              </button>
+            ))
+          ) : (
+            <div className="remote-directory-state">
+              {filter.trim() ? "没有匹配的文件夹" : "当前目录没有子文件夹"}
+            </div>
+          )}
+        </div>
+        <footer>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={loading || !path}
+            onClick={onChoose}
+          >
+            选择当前文件夹
+          </button>
+        </footer>
       </div>
     </Modal>
   );
