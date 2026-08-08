@@ -100,6 +100,10 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.doesNotMatch(app, /logicalWorkspaceId/);
   assert.match(app, /composer-menu-track/);
   assert.match(app, /conversation-work-mark/);
+  assert.match(
+    css,
+    /\.conversation-work-mark\s*\{[\s\S]*?font-size:\s*12px/,
+  );
   assert.match(app, /project-conversation-mode/);
   assert.match(app, /hydratedActorIdRef/);
   assert.match(app, /queueStateSave/);

@@ -4687,12 +4687,6 @@ textarea::placeholder {
   padding-right: 67px;
 }
 
-.easywork-app.easywork-app .conversation-work-mark {
-  color: #8a857a;
-  font-size: 11px !important;
-  font-weight: 520;
-}
-
 @media (max-width: 700px) {
   .easywork-app.easywork-app .modal-title-copy.with-note small {
     display: none;
@@ -7024,7 +7018,7 @@ textarea::placeholder {
   top: 50%;
   right: 10px;
   color: var(--green-deep);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 620;
   line-height: 1;
   pointer-events: none;
