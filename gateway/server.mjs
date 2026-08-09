@@ -16,7 +16,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, watch } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Client as SshClient } from "ssh2";
 import { WebSocketServer } from "ws";
@@ -66,14 +66,20 @@ const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 const DATA_ROOT = path.resolve(process.env.EASYWORK_DATA_DIR || path.join(ROOT, "data"));
 const SKILL_ROOT = path.resolve(process.env.EASYWORK_SKILL_DIR || path.join(ROOT, "skill"));
 const PROMPT_ROOT = path.join(ROOT, "prompts");
+const HELP_FILE = path.join(ROOT, "help", "help.md");
+const ADMIN_ROOT = path.join(DATA_ROOT, "admins");
+const ADMIN_LIST_FILE = path.join(ADMIN_ROOT, "adminList");
+const PLATFORM_SETTINGS_FILE = path.join(ADMIN_ROOT, "platform-settings.json");
+const PLATFORM_SECRETS_FILE = path.join(ADMIN_ROOT, "platform-secrets.json");
+const PLATFORM_USAGE_FILE = path.join(ADMIN_ROOT, "api-usage.json");
 const HOST = process.env.EASYWORK_GATEWAY_HOST || "127.0.0.1";
 const PORT = Number(process.env.EASYWORK_GATEWAY_PORT || 8789);
 const BODY_LIMIT = 36 * 1024 * 1024;
 const SESSION_MAX_AGE = 60 * 60 * 24 * 180;
-const SSH_KEEPALIVE_INTERVAL_MS = 60 * 1000;
-const SSH_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const SSH_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const PLATFORM_WEB_PROVIDER_ID = "platform-web";
+const PLATFORM_AGENT_PROVIDER_ID = "platform-agent";
 const EASYWORK_OPENCODE_PROVIDER_ID = "easywork";
+const DEFAULT_PROVIDER_ID = "provider-default";
 const DEFAULT_AGENT_CONTEXT_LIMIT = 200_000;
 const DEFAULT_AGENT_OUTPUT_LIMIT = 32_768;
 const BUILTIN_SKILLS = {
@@ -97,9 +103,57 @@ const conversationTreeMutationQueues = actorMutationQueues;
 const checkpointMutationQueues = actorMutationQueues;
 const workspaceMutationQueues = actorMutationQueues;
 let accountMutationQueue = Promise.resolve();
+let platformMutationQueue = Promise.resolve();
 let sessionSecret;
 let encryptionKey;
 let remoteRuntimeBundlePromise;
+let runtimePlatformSettings = null;
+let lastAutomaticSshCleanupAt = 0;
+
+const DEFAULT_PLATFORM_SETTINGS = Object.freeze({
+  providers: {
+    web: {
+      id: PLATFORM_WEB_PROVIDER_ID,
+      name: "网页公共 API",
+      baseUrl: "",
+      model: "",
+      protocol: "auto",
+      configured: false,
+      audience: "web",
+      managedBy: "platform",
+    },
+    agent: {
+      id: PLATFORM_AGENT_PROVIDER_ID,
+      name: "Agent 公共 API",
+      baseUrl: "",
+      model: "",
+      protocol: "auto",
+      configured: false,
+      audience: "agent",
+      managedBy: "platform",
+    },
+  },
+  embedding: {
+    name: "平台 Embedding",
+    baseUrl: "",
+    model: "",
+    dimensions: "",
+    configured: false,
+    chunkStrategy: "semantic",
+    chunkSize: 3000,
+    chunkOverlap: 600,
+    batchSize: 32,
+    hybridEnabled: true,
+    rerankEnabled: false,
+  },
+  ssh: {
+    idleTtlMinutes: 30 * 24 * 60,
+    keepaliveIntervalSeconds: 60,
+    keepaliveCountMax: 3,
+    connectTimeoutSeconds: 25,
+    cleanupIntervalMinutes: 6 * 60,
+  },
+});
 
 function isoNow() {
   return new Date().toISOString();
@@ -109,8 +163,16 @@ function randomId(prefix = "") {
   return `${prefix}${crypto.randomUUID()}`;
 }
 
-function normalizeEmail(value) {
-  return String(value || "").trim().toLowerCase();
+function normalizeUsername(value) {
+  return String(value || "").normalize("NFKC").trim().toLowerCase();
+}
+
+function displayUsername(value) {
+  return String(value || "").normalize("NFKC").trim().slice(0, 48);
+}
+
+function validUsername(value) {
+  return /^[\p{L}\p{N}._-]{2,48}$/u.test(value);
 }
 
 function safeSegment(value, fallback = "item") {
@@ -502,7 +564,7 @@ function actorSkillDirectory(actor) {
 
 async function readUserRecord(userId) {
   const record = await readJson(actorProfilePath(userId), null);
-  return record?.id === userId && record?.email ? record : null;
+  return record?.id === userId && record?.username ? record : null;
 }
 
 async function listUserRecords() {
@@ -525,6 +587,471 @@ async function mutateAccounts(mutation) {
   const operation = accountMutationQueue.catch(() => undefined).then(mutation);
   accountMutationQueue = operation.catch(() => undefined);
   return operation;
+}
+
+function clampNumber(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(maximum, Math.max(minimum, parsed));
+}
+
+function normalizePlatformProvider(value = {}, audience = "web") {
+  const id = audience === "agent"
+    ? PLATFORM_AGENT_PROVIDER_ID
+    : PLATFORM_WEB_PROVIDER_ID;
+  const fallbackName = audience === "agent" ? "Agent 公共 API" : "网页公共 API";
+  return {
+    id,
+    name: String(value.name || fallbackName).trim().slice(0, 80) || fallbackName,
+    baseUrl: String(value.baseUrl || "").trim(),
+    model: String(value.model || "").trim(),
+    modelContextLimit: positiveInteger(value.modelContextLimit) || undefined,
+    modelOutputLimit: positiveInteger(value.modelOutputLimit) || undefined,
+    protocol:
+      value.protocol === "chat-completions" || value.protocol === "responses"
+        ? value.protocol
+        : "auto",
+    configured: Boolean(value.configured && value.baseUrl),
+    audience,
+    managedBy: "platform",
+  };
+}
+
+function normalizePlatformSettings(value = {}) {
+  const defaults = DEFAULT_PLATFORM_SETTINGS;
+  const embedding = value.embedding || {};
+  const ssh = value.ssh || {};
+  const chunkSize = Math.round(
+    clampNumber(embedding.chunkSize, defaults.embedding.chunkSize, 300, 20_000),
+  );
+  return {
+    providers: {
+      web: normalizePlatformProvider(value.providers?.web, "web"),
+      agent: normalizePlatformProvider(value.providers?.agent, "agent"),
+    },
+    embedding: {
+      name: String(embedding.name || defaults.embedding.name)
+        .trim()
+        .slice(0, 80) || defaults.embedding.name,
+      baseUrl: String(embedding.baseUrl || "").trim(),
+      model: String(embedding.model || "").trim(),
+      dimensions: String(embedding.dimensions || "").trim(),
+      configured: Boolean(embedding.configured && embedding.baseUrl && embedding.model),
+      chunkStrategy: ["semantic", "fixed", "paragraph"].includes(
+        String(embedding.chunkStrategy || ""),
+      )
+        ? String(embedding.chunkStrategy)
+        : defaults.embedding.chunkStrategy,
+      chunkSize,
+      chunkOverlap: Math.round(
+        clampNumber(
+          embedding.chunkOverlap,
+          defaults.embedding.chunkOverlap,
+          0,
+          Math.max(0, chunkSize - 1),
+        ),
+      ),
+      batchSize: Math.round(
+        clampNumber(embedding.batchSize, defaults.embedding.batchSize, 1, 128),
+      ),
+      hybridEnabled: embedding.hybridEnabled !== false,
+      rerankEnabled: Boolean(embedding.rerankEnabled),
+    },
+    ssh: {
+      idleTtlMinutes: Math.round(
+        clampNumber(
+          ssh.idleTtlMinutes,
+          defaults.ssh.idleTtlMinutes,
+          5,
+          365 * 24 * 60,
+        ),
+      ),
+      keepaliveIntervalSeconds: Math.round(
+        clampNumber(
+          ssh.keepaliveIntervalSeconds,
+          defaults.ssh.keepaliveIntervalSeconds,
+          10,
+          600,
+        ),
+      ),
+      keepaliveCountMax: Math.round(
+        clampNumber(
+          ssh.keepaliveCountMax,
+          defaults.ssh.keepaliveCountMax,
+          1,
+          20,
+        ),
+      ),
+      connectTimeoutSeconds: Math.round(
+        clampNumber(
+          ssh.connectTimeoutSeconds,
+          defaults.ssh.connectTimeoutSeconds,
+          5,
+          120,
+        ),
+      ),
+      cleanupIntervalMinutes: Math.round(
+        clampNumber(
+          ssh.cleanupIntervalMinutes,
+          defaults.ssh.cleanupIntervalMinutes,
+          1,
+          24 * 60,
+        ),
+      ),
+    },
+  };
+}
+
+async function readPlatformSettings() {
+  const stored = await readJson(PLATFORM_SETTINGS_FILE, {});
+  runtimePlatformSettings = normalizePlatformSettings(stored);
+  return runtimePlatformSettings;
+}
+
+async function readPlatformSecrets() {
+  const stored = await readJson(PLATFORM_SECRETS_FILE, {});
+  return {
+    webApiKey: decryptString(stored.webApiKey),
+    agentApiKey: decryptString(stored.agentApiKey),
+    embeddingApiKey: decryptString(stored.embeddingApiKey),
+  };
+}
+
+async function updatePlatformConfiguration(input = {}) {
+  const operation = platformMutationQueue
+    .catch(() => undefined)
+    .then(async () => {
+      const current = await readPlatformSettings();
+      const next = normalizePlatformSettings({
+        ...current,
+        ...input,
+        providers: {
+          ...current.providers,
+          ...(input.providers || {}),
+        },
+        embedding: {
+          ...current.embedding,
+          ...(input.embedding || {}),
+        },
+        ssh: {
+          ...current.ssh,
+          ...(input.ssh || {}),
+        },
+      });
+      const storedSecrets = await readJson(PLATFORM_SECRETS_FILE, {});
+      const nextSecrets = { ...storedSecrets };
+      for (const [field, value] of [
+        ["webApiKey", input.webApiKey],
+        ["agentApiKey", input.agentApiKey],
+        ["embeddingApiKey", input.embeddingApiKey],
+      ]) {
+        if (typeof value === "string" && value.trim()) {
+          assertApiKeyShape(value);
+          nextSecrets[field] = encryptString(value.trim());
+        }
+        if (value === null) delete nextSecrets[field];
+      }
+      const effectiveSecrets = {
+        webApiKey: decryptString(nextSecrets.webApiKey),
+        agentApiKey: decryptString(nextSecrets.agentApiKey),
+        embeddingApiKey: decryptString(nextSecrets.embeddingApiKey),
+      };
+      next.providers.web.configured = Boolean(
+        next.providers.web.baseUrl && effectiveSecrets.webApiKey,
+      );
+      next.providers.agent.configured = Boolean(
+        next.providers.agent.baseUrl && effectiveSecrets.agentApiKey,
+      );
+      next.embedding.configured = Boolean(
+        next.embedding.baseUrl && next.embedding.model && effectiveSecrets.embeddingApiKey,
+      );
+      await Promise.all([
+        writeJson(PLATFORM_SETTINGS_FILE, next),
+        writeJson(PLATFORM_SECRETS_FILE, nextSecrets),
+      ]);
+      runtimePlatformSettings = next;
+      return next;
+    });
+  platformMutationQueue = operation.catch(() => undefined);
+  return operation;
+}
+
+async function readAdminNames() {
+  const source = await readFile(ADMIN_LIST_FILE, "utf8").catch(() => "");
+  return new Set(
+    source
+      .split(/\r?\n/)
+      .map((line) => line.replace(/#.*$/, "").trim())
+      .filter(Boolean)
+      .map(normalizeUsername),
+  );
+}
+
+async function writeAdminNames(names) {
+  const normalized = [...new Set([...names].map(normalizeUsername).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+  await mkdir(ADMIN_ROOT, { recursive: true });
+  await writeFile(
+    ADMIN_LIST_FILE,
+    normalized.length ? `${normalized.join("\n")}\n` : "",
+    "utf8",
+  );
+}
+
+async function ensureAdminUsername(username) {
+  const names = await readAdminNames();
+  names.add(normalizeUsername(username));
+  await writeAdminNames(names);
+}
+
+async function ensureInitialAdministrator() {
+  const names = await readAdminNames();
+  if (names.size) return;
+  const records = (await listUserRecords()).sort(
+    (left, right) =>
+      (Date.parse(left.createdAt || "") || 0) -
+      (Date.parse(right.createdAt || "") || 0),
+  );
+  if (records[0]?.username) {
+    await ensureAdminUsername(records[0].username);
+  }
+}
+
+async function isAdminUsername(username) {
+  if (!username) return false;
+  return (await readAdminNames()).has(normalizeUsername(username));
+}
+
+async function requireAdmin(actor) {
+  if (!actor.authenticated || !(await isAdminUsername(actor.username))) {
+    const error = new Error("只有管理员可以访问此页面");
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
+function deviceIdFromRequest(req) {
+  const value = String(req.headers["x-easywork-device-id"] || "").trim();
+  return /^[a-zA-Z0-9._:-]{16,160}$/.test(value) ? value : "";
+}
+
+async function registerDeviceVisit(actor, req) {
+  const deviceId = deviceIdFromRequest(req);
+  if (!deviceId) return { id: "", firstVisit: false };
+  const target = path.join(DATA_ROOT, "devices", `${safeSegment(deviceId)}.json`);
+  const previous = await readJson(target, null);
+  await writeJson(target, {
+    id: deviceId,
+    firstSeenAt: String(previous?.firstSeenAt || isoNow()),
+    lastSeenAt: isoNow(),
+    lastActorId: actor.authenticated ? actor.id : String(previous?.lastActorId || ""),
+    userAgent: String(req.headers["user-agent"] || "").slice(0, 500),
+  });
+  return { id: deviceId, firstVisit: !previous };
+}
+
+async function recordPlatformUsage(category, values = {}) {
+  if (!["web", "agent", "embedding"].includes(category)) return;
+  const operation = platformMutationQueue
+    .catch(() => undefined)
+    .then(async () => {
+      const document = await readJson(PLATFORM_USAGE_FILE, { days: {} });
+      document.days ||= {};
+      const day = isoNow().slice(0, 10);
+      document.days[day] ||= {};
+      const current = document.days[day][category] || {};
+      document.days[day][category] = {
+        requests: Number(current.requests || 0) + Number(values.requests ?? 1),
+        inputTokens: Number(current.inputTokens || 0) + Number(values.inputTokens || 0),
+        outputTokens: Number(current.outputTokens || 0) + Number(values.outputTokens || 0),
+      };
+      document.updatedAt = isoNow();
+      const cutoff = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+      document.days = Object.fromEntries(
+        Object.entries(document.days).filter(([key]) => key >= cutoff),
+      );
+      await writeJson(PLATFORM_USAGE_FILE, document);
+      return document;
+    });
+  platformMutationQueue = operation.catch(() => undefined);
+  await operation;
+}
+
+async function recordProviderModelUsage(category, input, output = "") {
+  if (!["web", "agent"].includes(category)) return;
+  await recordPlatformUsage(category, {
+    inputTokens: estimateContextTokens(String(input || "")),
+    outputTokens: estimateContextTokens(String(output || "")),
+  }).catch(() => undefined);
+}
+
+function usageSummary(document = {}) {
+  const today = isoNow().slice(0, 10);
+  const weekStart = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+  const categories = ["web", "agent", "embedding"];
+  const blank = () => ({ requests: 0, inputTokens: 0, outputTokens: 0 });
+  const totals = Object.fromEntries(categories.map((category) => [category, blank()]));
+  const weekly = Object.fromEntries(categories.map((category) => [category, blank()]));
+  const daily = Object.fromEntries(categories.map((category) => [category, blank()]));
+  const series = Object.entries(document.days || {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .slice(-14)
+    .map(([date, values]) => ({
+      date,
+      ...Object.fromEntries(
+        categories.map((category) => [category, { ...blank(), ...(values?.[category] || {}) }]),
+      ),
+    }));
+  for (const [date, values] of Object.entries(document.days || {})) {
+    for (const category of categories) {
+      for (const field of ["requests", "inputTokens", "outputTokens"]) {
+        const amount = Number(values?.[category]?.[field] || 0);
+        totals[category][field] += amount;
+        if (date >= weekStart) weekly[category][field] += amount;
+        if (date === today) daily[category][field] += amount;
+      }
+    }
+  }
+  return { daily, weekly, total: totals, series };
+}
+
+async function adminPlatformSnapshot() {
+  const [settings, secrets, usageDocument] = await Promise.all([
+    readPlatformSettings(),
+    readPlatformSecrets(),
+    readJson(PLATFORM_USAGE_FILE, { days: {} }),
+  ]);
+  return {
+    settings: {
+      providers: {
+        web: {
+          ...settings.providers.web,
+          configured: Boolean(settings.providers.web.baseUrl && secrets.webApiKey),
+          apiKeyConfigured: Boolean(secrets.webApiKey),
+        },
+        agent: {
+          ...settings.providers.agent,
+          configured: Boolean(
+            settings.providers.agent.baseUrl && secrets.agentApiKey,
+          ),
+          apiKeyConfigured: Boolean(secrets.agentApiKey),
+        },
+      },
+      embedding: {
+        ...settings.embedding,
+        configured: Boolean(
+          settings.embedding.baseUrl &&
+            settings.embedding.model &&
+            secrets.embeddingApiKey
+        ),
+        apiKeyConfigured: Boolean(secrets.embeddingApiKey),
+      },
+      ssh: settings.ssh,
+    },
+    usage: usageSummary(usageDocument),
+  };
+}
+
+async function listAdminSshConnections() {
+  const records = await listUserRecords();
+  const rows = [];
+  for (const record of records) {
+    const actor = {
+      id: record.id,
+      authenticated: true,
+      displayName: record.displayName,
+      username: record.username,
+    };
+    const [state, persisted] = await Promise.all([
+      getState(actor),
+      readJson(sshWorkerRuntimePath(actor), {}),
+    ]);
+    const liveWorker = sshWorkerPool.get(sshWorkerKey(actor));
+    const profiles = new Map(
+      (state.settings?.servers || []).map((profile) => [profile.id, profile]),
+    );
+    const persistedSessions = new Map(
+      (Array.isArray(persisted.sessions) ? persisted.sessions : []).map((session) => [
+        safeSegment(session.serverId || ""),
+        session,
+      ]),
+    );
+    const serverIds = new Set([
+      ...profiles.keys(),
+      ...persistedSessions.keys(),
+      ...(liveWorker ? liveWorker.sessions.keys() : []),
+    ]);
+    for (const serverId of serverIds) {
+      const profile = profiles.get(serverId) || {};
+      const storedSession = persistedSessions.get(serverId) || {};
+      const liveSession = liveWorker?.sessions.get(serverId);
+      const conversationCount = (state.conversations || []).filter(
+        (conversation) =>
+          String(conversation?.work?.serverId || "") === serverId &&
+          conversation?.work?.connectionEnabled !== false,
+      ).length;
+      const activeTaskCount = liveWorker
+        ? [...liveWorker.tasks.values()].filter(
+            (task) => task.serverId === serverId && task.status === "running",
+          ).length
+        : 0;
+      rows.push({
+        id: `${record.id}:${serverId}`,
+        userId: record.id,
+        username: record.username,
+        displayName: record.displayName,
+        serverId,
+        serverName: String(profile.name || storedSession.host || serverId),
+        host: String(profile.host || storedSession.host || ""),
+        port: Number(profile.port || storedSession.port || 22),
+        status: liveSession?.status === "connected" ? "connected" : "disconnected",
+        conversationCount,
+        activeTaskCount,
+        lastConnectedAt: String(
+          liveSession?.lastConnectedAt || storedSession.lastConnectedAt || "",
+        ),
+        lastUserActivityAt: String(
+          liveSession?.lastUserActivityAt || storedSession.lastUserActivityAt || "",
+        ),
+        disconnectReason: String(
+          liveSession?.disconnectReason || storedSession.disconnectReason || "",
+        ),
+        manageable: Boolean(liveSession),
+      });
+    }
+  }
+  return rows.sort((left, right) => {
+    if (left.status !== right.status) return left.status === "connected" ? -1 : 1;
+    return `${left.username}\u0000${left.serverName}`.localeCompare(
+      `${right.username}\u0000${right.serverName}`,
+    );
+  });
+}
+
+async function disconnectAdminSshConnection(userId, serverId) {
+  const record = await readUserRecord(String(userId || ""));
+  if (!record) return false;
+  const actor = {
+    id: record.id,
+    authenticated: true,
+    displayName: record.displayName,
+    username: record.username,
+  };
+  const worker = sshWorkerPool.get(sshWorkerKey(actor));
+  const session = worker?.sessions.get(safeSegment(serverId || ""));
+  if (!session) return false;
+  await closeSshSession(session);
+  sessionSend(session, {
+    type: "connection.status",
+    serverId: session.serverId,
+    status: "disconnected",
+    label: "已由管理员断开",
+  });
+  return true;
 }
 
 function sshWorkerKey(actor) {
@@ -1255,8 +1782,9 @@ async function resolveActor(req, res, createGuest = true) {
         id: record.id,
         authenticated: true,
         displayName: record.displayName,
-        email: record.email,
+        username: record.username,
         avatar: record.avatar || undefined,
+        isAdmin: await isAdminUsername(record.username),
       };
     }
   }
@@ -1276,6 +1804,63 @@ async function resolveActor(req, res, createGuest = true) {
   };
 }
 
+function normalizeModelProvider(value = {}, index = 0) {
+  const fallbackId = index === 0 ? DEFAULT_PROVIDER_ID : `provider-${index + 1}`;
+  return {
+    id: safeSegment(value.id || fallbackId, fallbackId),
+    name: String(value.name || `API ${index + 1}`).trim().slice(0, 80) ||
+      `API ${index + 1}`,
+    baseUrl: String(value.baseUrl || "https://api.openai.com/v1").trim(),
+    model: String(value.model || "").trim(),
+    modelContextLimit: positiveInteger(value.modelContextLimit) || undefined,
+    modelOutputLimit: positiveInteger(value.modelOutputLimit) || undefined,
+    protocol:
+      value.protocol === "chat-completions" || value.protocol === "responses"
+        ? value.protocol
+        : "auto",
+    configured: Boolean(value.configured),
+    audience:
+      value.audience === "web" || value.audience === "agent"
+        ? value.audience
+        : "both",
+    managedBy: value.managedBy === "platform" ? "platform" : "user",
+  };
+}
+
+function normalizeProviderSettings(settings = {}) {
+  const source = Array.isArray(settings?.providers) && settings.providers.length
+    ? settings.providers
+    : [{}];
+  const providers = source.map((provider, index) =>
+    normalizeModelProvider(provider, index),
+  );
+  const requestedActiveId = safeSegment(
+    settings?.activeProviderId || providers[0]?.id || DEFAULT_PROVIDER_ID,
+    DEFAULT_PROVIDER_ID,
+  );
+  const activeProvider =
+    providers.find((item) => item.id === requestedActiveId) || providers[0];
+  return {
+    ...settings,
+    providers,
+    activeProviderId: activeProvider.id,
+  };
+}
+
+function modelProviderFor(settings = {}, providerId = "") {
+  const normalized = normalizeProviderSettings(settings);
+  return (
+    normalized.providers.find(
+      (provider) => provider.id === safeSegment(providerId, normalized.activeProviderId),
+    ) || normalized.providers[0]
+  );
+}
+
+function providerApiKeyFor(secrets = {}, providerId = DEFAULT_PROVIDER_ID) {
+  const id = safeSegment(providerId, DEFAULT_PROVIDER_ID);
+  return String(secrets.providerApiKeys?.[id] || "");
+}
+
 async function getSecrets(actor) {
   const stored = await readJson(actorCredentialPath(actor, "secrets"), {});
   const sshCredentials = {};
@@ -1285,10 +1870,80 @@ async function getSecrets(actor) {
       password: decryptString(credential?.password),
     };
   }
+  const providerApiKeys = Object.fromEntries(
+    Object.entries(stored.providerApiKeys || {}).map(([providerId, value]) => [
+      safeSegment(providerId, DEFAULT_PROVIDER_ID),
+      decryptString(value),
+    ]),
+  );
   return {
-    providerApiKey: decryptString(stored.providerApiKey),
+    providerApiKeys,
     embeddingApiKey: decryptString(stored.embeddingApiKey),
     sshCredentials,
+  };
+}
+
+async function platformProviderAccess(providerId, selectedModel = "") {
+  const settings = await readPlatformSettings();
+  const secrets = await readPlatformSecrets();
+  const audience = providerId === PLATFORM_AGENT_PROVIDER_ID ? "agent" : "web";
+  const provider = settings.providers[audience];
+  const apiKey = audience === "agent" ? secrets.agentApiKey : secrets.webApiKey;
+  return {
+    provider: {
+      ...provider,
+      model: String(selectedModel || provider.model || "").trim(),
+      configured: Boolean(provider.baseUrl && apiKey),
+    },
+    apiKey,
+    category: audience,
+  };
+}
+
+async function effectiveProviderAccess(actor, settings = {}, providerId = "") {
+  const requestedProviderId = safeSegment(
+    providerId || settings?.activeProviderId || "",
+    "",
+  );
+  if ([PLATFORM_WEB_PROVIDER_ID, PLATFORM_AGENT_PROVIDER_ID].includes(requestedProviderId)) {
+    const selected = (settings?.providers || []).find(
+      (candidate) => candidate.id === requestedProviderId,
+    );
+    return platformProviderAccess(requestedProviderId, selected?.model || "");
+  }
+  const provider = modelProviderFor(settings, providerId);
+  if (
+    provider.managedBy === "platform" ||
+    [PLATFORM_WEB_PROVIDER_ID, PLATFORM_AGENT_PROVIDER_ID].includes(provider.id)
+  ) {
+    return platformProviderAccess(provider.id, provider.model);
+  }
+  const secrets = await getSecrets(actor);
+  const access = {
+    provider,
+    apiKey: providerApiKeyFor(secrets, provider.id),
+    category: "user",
+  };
+  if (!access.apiKey && provider.audience !== "agent") {
+    const sharedWeb = await platformProviderAccess(PLATFORM_WEB_PROVIDER_ID);
+    if (sharedWeb.provider.configured) return sharedWeb;
+  }
+  return access;
+}
+
+async function platformEmbeddingAccess() {
+  const settings = await readPlatformSettings();
+  const secrets = await readPlatformSecrets();
+  return {
+    config: {
+      ...settings.embedding,
+      configured: Boolean(
+        settings.embedding.baseUrl &&
+          settings.embedding.model &&
+          secrets.embeddingApiKey
+      ),
+    },
+    apiKey: secrets.embeddingApiKey,
   };
 }
 
@@ -1297,8 +1952,15 @@ async function updateSecrets(actor, patch) {
     const secretPath = actorCredentialPath(actor, "secrets");
     const stored = await readJson(secretPath, {});
     const next = { ...stored };
-    if (typeof patch.providerApiKey === "string" && patch.providerApiKey) {
-      next.providerApiKey = encryptString(patch.providerApiKey);
+    if (patch.providerCredential?.providerId && patch.providerCredential?.apiKey) {
+      const providerId = safeSegment(
+        patch.providerCredential.providerId,
+        DEFAULT_PROVIDER_ID,
+      );
+      next.providerApiKeys ||= {};
+      next.providerApiKeys[providerId] = encryptString(
+        patch.providerCredential.apiKey,
+      );
     }
     if (typeof patch.embeddingApiKey === "string" && patch.embeddingApiKey) {
       next.embeddingApiKey = encryptString(patch.embeddingApiKey);
@@ -1334,7 +1996,13 @@ async function getState(actor) {
     readJson(actorStatePath(actor, "skills"), []),
     readJson(actorAttachmentPath(actor, "files.json"), []),
   ]);
-  return { settings, projects, conversations, skills, files };
+  return {
+    settings: normalizeProviderSettings(settings),
+    projects,
+    conversations,
+    skills,
+    files,
+  };
 }
 
 function conversationTimestamp(conversation) {
@@ -1398,7 +2066,10 @@ async function tombstoneConversation(actor, conversationId) {
 
 async function saveState(actor, state) {
   const safeState = JSON.parse(JSON.stringify(state || {}));
-  if (safeState?.settings?.provider) delete safeState.settings.provider.apiKey;
+  safeState.settings = normalizeProviderSettings(safeState.settings || {});
+  for (const provider of safeState?.settings?.providers || []) {
+    delete provider.apiKey;
+  }
   if (safeState?.settings?.embedding) delete safeState.settings.embedding.apiKey;
   await Promise.all([
     writeJson(actorStatePath(actor, "settings"), safeState.settings || {}),
@@ -1498,13 +2169,69 @@ async function persistServerProfile(actor, input, requestedId) {
 async function stateForClient(actor) {
   const state = await getState(actor);
   const secrets = await getSecrets(actor);
+  const platform = await readPlatformSettings();
+  const platformSecrets = await readPlatformSecrets();
   const memoryDocument = await readMemoryDocument(actor);
-  if (state?.settings?.provider) {
-    state.settings.provider.configured = Boolean(secrets.providerApiKey);
+  state.settings = normalizeProviderSettings(state.settings || {});
+  const userProviders = state.settings.providers
+    .filter(
+      (provider) =>
+        provider.managedBy !== "platform" &&
+        ![PLATFORM_WEB_PROVIDER_ID, PLATFORM_AGENT_PROVIDER_ID].includes(provider.id),
+    )
+    .map((provider) => ({
+      ...provider,
+      audience: provider.audience || "both",
+      managedBy: "user",
+      configured: Boolean(providerApiKeyFor(secrets, provider.id)),
+    }));
+  const storedPlatformSelections = new Map(
+    state.settings.providers
+      .filter(
+        (provider) =>
+          provider.managedBy === "platform" ||
+          [PLATFORM_WEB_PROVIDER_ID, PLATFORM_AGENT_PROVIDER_ID].includes(provider.id),
+      )
+      .map((provider) => [provider.id, provider]),
+  );
+  const platformProviders = [
+    {
+      ...platform.providers.web,
+      model:
+        storedPlatformSelections.get(PLATFORM_WEB_PROVIDER_ID)?.model ||
+        platform.providers.web.model,
+      configured: Boolean(
+        platform.providers.web.baseUrl && platformSecrets.webApiKey,
+      ),
+    },
+    {
+      ...platform.providers.agent,
+      model:
+        storedPlatformSelections.get(PLATFORM_AGENT_PROVIDER_ID)?.model ||
+        platform.providers.agent.model,
+      configured: Boolean(
+        platform.providers.agent.baseUrl && platformSecrets.agentApiKey,
+      ),
+    },
+  ].filter((provider) => provider.configured);
+  state.settings.providers = [...userProviders, ...platformProviders];
+  if (!state.settings.providers.length) {
+    state.settings.providers = [normalizeModelProvider({}, 0)];
   }
-  if (state?.settings?.embedding) {
-    state.settings.embedding.configured = Boolean(secrets.embeddingApiKey);
-  }
+  const requestedProvider = state.settings.providers.find(
+    (provider) => provider.id === state.settings.activeProviderId,
+  );
+  const activeProvider =
+    (requestedProvider?.configured ? requestedProvider : null) ||
+    state.settings.providers.find(
+      (provider) => provider.configured && provider.audience !== "agent",
+    ) ||
+    requestedProvider ||
+    state.settings.providers.find((provider) => provider.audience !== "agent") ||
+    state.settings.providers[0];
+  state.settings.activeProviderId = activeProvider.id;
+  const embeddingAccess = await platformEmbeddingAccess();
+  state.settings.embedding = embeddingAccess.config;
   if (Array.isArray(state?.settings?.servers)) {
     state.settings.servers = state.settings.servers.map((profile) => ({
       ...profile,
@@ -1563,7 +2290,10 @@ function applyCors(req, res) {
   const origin = allowedOrigin(req.headers.origin);
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, X-EasyWork-Device-Id",
+  );
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Private-Network", "true");
   res.setHeader("Vary", "Origin, Access-Control-Request-Private-Network");
@@ -1628,7 +2358,12 @@ async function extractText(buffer, filename, mime = "") {
   return "";
 }
 
-function chunksFromText(text, maxChars = 3000, overlap = 600) {
+function chunksFromText(
+  text,
+  maxChars = 3000,
+  overlap = 600,
+  strategy = "semantic",
+) {
   const cleaned = String(text || "")
     .replace(/\r\n/g, "\n")
     .replace(/[ \t]+\n/g, "\n")
@@ -1639,12 +2374,18 @@ function chunksFromText(text, maxChars = 3000, overlap = 600) {
   let cursor = 0;
   while (cursor < cleaned.length) {
     let end = Math.min(cursor + maxChars, cleaned.length);
-    if (end < cleaned.length) {
-      const candidates = [
-        cleaned.lastIndexOf("\n\n", end),
-        cleaned.lastIndexOf("。", end),
-        cleaned.lastIndexOf("\n", end),
-      ];
+    if (end < cleaned.length && strategy !== "fixed") {
+      const candidates =
+        strategy === "paragraph"
+          ? [cleaned.lastIndexOf("\n\n", end)]
+          : [
+              cleaned.lastIndexOf("\n\n", end),
+              cleaned.lastIndexOf("。", end),
+              cleaned.lastIndexOf("！", end),
+              cleaned.lastIndexOf("？", end),
+              cleaned.lastIndexOf(". ", end),
+              cleaned.lastIndexOf("\n", end),
+            ];
       const boundary = Math.max(...candidates);
       if (boundary > cursor + maxChars * 0.55) end = boundary + 1;
     }
@@ -1760,16 +2501,23 @@ async function callEmbedding(config, apiKey, inputs) {
   return Array.isArray(result.data) ? result.data.map((item) => item.embedding) : [];
 }
 
-async function indexLibraryFile(actor, item, buffer, state) {
+async function indexLibraryFile(actor, item, buffer) {
   const text = await extractText(buffer, item.name, item.type);
-  const textChunks = chunksFromText(text);
-  const secrets = await getSecrets(actor);
-  const embedding = state?.settings?.embedding || {};
+  const { config: embedding, apiKey } = await platformEmbeddingAccess();
+  const textChunks = chunksFromText(
+    text,
+    embedding.chunkSize,
+    embedding.chunkOverlap,
+    embedding.chunkStrategy,
+  );
   let vectors = [];
-  if (embedding.configured && secrets.embeddingApiKey && textChunks.length) {
-    for (let offset = 0; offset < textChunks.length; offset += 32) {
-      const batch = textChunks.slice(offset, offset + 32);
-      vectors.push(...(await callEmbedding(embedding, secrets.embeddingApiKey, batch)));
+  if (embedding.configured && apiKey && textChunks.length) {
+    for (let offset = 0; offset < textChunks.length; offset += embedding.batchSize) {
+      const batch = textChunks.slice(offset, offset + embedding.batchSize);
+      vectors.push(...(await callEmbedding(embedding, apiKey, batch)));
+      await recordPlatformUsage("embedding", {
+        inputTokens: estimateContextTokens(batch.join("\n")),
+      }).catch(() => undefined);
     }
   }
   const indexPath = actorAttachmentPath(actor, "library-index.json");
@@ -1867,16 +2615,18 @@ async function retrieveKnowledge(actor, query, state, limit = 6) {
       return score + inverseDocumentFrequency * ((frequency * (k1 + 1)) / normalization);
     }, 0);
   }
-  const embedding = state?.settings?.embedding || {};
-  const secrets = await getSecrets(actor);
+  const { config: embedding, apiKey } = await platformEmbeddingAccess();
   if (
     embedding.hybridEnabled &&
     embedding.configured &&
-    secrets.embeddingApiKey &&
+    apiKey &&
     rows.some((row) => row.chunk.vector)
   ) {
     try {
-      const [queryVector] = await callEmbedding(embedding, secrets.embeddingApiKey, query);
+      const [queryVector] = await callEmbedding(embedding, apiKey, query);
+      await recordPlatformUsage("embedding", {
+        inputTokens: estimateContextTokens(query),
+      }).catch(() => undefined);
       for (const row of rows) row.semanticScore = cosine(queryVector, row.chunk.vector);
     } catch {
       // Keyword retrieval remains available when the embedding endpoint is temporarily down.
@@ -2339,10 +3089,12 @@ async function compressConversationContext(actor, conversationId) {
         `[${message.id}] ${message.role === "user" ? "用户" : "EasyWork"}：${String(message.content).slice(0, 8_000)}`,
     )
     .join("\n\n");
-  const provider = state?.settings?.provider || {};
-  const secrets = await getSecrets(actor);
+  const { provider, apiKey, category } = await effectiveProviderAccess(
+    actor,
+    state?.settings,
+  );
   let checkpointSource = null;
-  if (provider.configured && provider.model && secrets.providerApiKey) {
+  if (provider.configured && provider.model && apiKey) {
     try {
       const prompt = await renderPromptTemplate(
         "memory/conversation-compact.md",
@@ -2355,10 +3107,12 @@ async function compressConversationContext(actor, conversationId) {
       );
       const response = await callChatProvider(
         provider,
-        secrets.providerApiKey,
+        apiKey,
         prompt,
       );
-      checkpointSource = parseModelJsonObject(extractModelText(response.payload));
+      const responseText = extractModelText(response.payload);
+      await recordProviderModelUsage(category, prompt, responseText);
+      checkpointSource = parseModelJsonObject(responseText);
     } catch {
       checkpointSource = null;
     }
@@ -2895,9 +3649,11 @@ async function callChatProviderStream(
 }
 
 async function runChatModelStream(actor, context, state, onDelta) {
-  const provider = state?.settings?.provider || {};
-  const secrets = await getSecrets(actor);
-  if (!provider.configured || !secrets.providerApiKey) {
+  const { provider, apiKey, category } = await effectiveProviderAccess(
+    actor,
+    state?.settings,
+  );
+  if (!provider.configured || !apiKey) {
     const content =
       "尚未配置模型 API。请登录后在个人资料 → 模型 API 中完成设置。";
     onDelta("content", content);
@@ -2905,13 +3661,21 @@ async function runChatModelStream(actor, context, state, onDelta) {
   }
   const result = await callChatProviderStream(
     provider,
-    secrets.providerApiKey,
+    apiKey,
     context,
     onDelta,
   );
   if (!result.content) {
     result.content = "模型返回了空内容。";
     onDelta("content", result.content);
+  }
+  if (category === "web") {
+    await recordPlatformUsage("web", {
+      inputTokens: estimateContextTokens(context),
+      outputTokens: estimateContextTokens(
+        `${result.reasoning || ""}\n${result.content || ""}`,
+      ),
+    }).catch(() => undefined);
   }
   return { ...result, demo: false };
 }
@@ -3060,9 +3824,11 @@ async function runWorkHandoffModel(
   onReasoning,
   signal,
 ) {
-  const provider = state?.settings?.provider || {};
-  const secrets = await getSecrets(actor);
-  if (!provider.configured || !provider.model || !secrets.providerApiKey) {
+  const { provider, apiKey, category } = await effectiveProviderAccess(
+    actor,
+    state?.settings,
+  );
+  if (!provider.configured || !provider.model || !apiKey) {
     return { content: "", reasoning: "", skipped: true };
   }
   const handoffPrompt = await renderPromptTemplate("web/work-context-router.md", {
@@ -3071,12 +3837,17 @@ async function runWorkHandoffModel(
   });
   const result = await callChatProviderStream(
     provider,
-    secrets.providerApiKey,
+    apiKey,
     handoffPrompt,
     (kind, delta) => {
       if (kind === "reasoning") onReasoning(delta);
     },
     { signal },
+  );
+  await recordProviderModelUsage(
+    category,
+    handoffPrompt,
+    `${result.reasoning || ""}\n${result.content || ""}`,
   );
   return { ...result, skipped: false };
 }
@@ -3134,9 +3905,11 @@ async function distillPortableMemory(actor, {
 
   const state = await getState(actor);
   if (!state?.settings?.memoryEnabled || !state?.settings?.autoCapture) return [];
-  const provider = state?.settings?.provider || {};
-  const secrets = await getSecrets(actor);
-  if (!provider.configured || !provider.model || !secrets.providerApiKey) {
+  const { provider, apiKey, category } = await effectiveProviderAccess(
+    actor,
+    state?.settings,
+  );
+  if (!provider.configured || !provider.model || !apiKey) {
     return [];
   }
 
@@ -3147,10 +3920,12 @@ async function distillPortableMemory(actor, {
   });
   const response = await callChatProvider(
     provider,
-    secrets.providerApiKey,
+    apiKey,
     prompt,
   );
-  const parsed = parseModelJsonObject(extractModelText(response.payload));
+  const responseText = extractModelText(response.payload);
+  await recordProviderModelUsage(category, prompt, responseText);
+  const parsed = parseModelJsonObject(responseText);
   const allowedKinds = new Set(["workflow", "fact", "decision", "constraint"]);
   const allowedScopes = new Set(["project", "workspace", "conversation"]);
   const allowedPortability = new Set([
@@ -3298,18 +4073,198 @@ async function handleHttp(req, res) {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/api/help") {
+      try {
+        const [content, metadata] = await Promise.all([
+          readFile(HELP_FILE, "utf8"),
+          stat(HELP_FILE),
+        ]);
+        sendJson(res, 200, {
+          content,
+          updatedAt: metadata.mtime.toISOString(),
+        });
+      } catch (caught) {
+        sendJson(res, 404, {
+          error:
+            caught?.code === "ENOENT"
+              ? "未找到 help/help.md"
+              : "帮助内容读取失败",
+        });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/help/events") {
+      let helpWatcher;
+      let changeTimer = null;
+      try {
+        helpWatcher = watch(
+          path.dirname(HELP_FILE),
+          { persistent: false },
+          (_eventType, filename) => {
+            if (filename && String(filename) !== path.basename(HELP_FILE)) return;
+            if (changeTimer) clearTimeout(changeTimer);
+            changeTimer = setTimeout(() => {
+              if (!res.writableEnded) {
+                res.write(`event: help.changed\ndata: ${JSON.stringify({ changedAt: isoNow() })}\n\n`);
+              }
+            }, 90);
+          },
+        );
+      } catch {
+        sendJson(res, 404, { error: "无法监听 help/help.md" });
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.write(": connected\n\n");
+      let cleanedUp = false;
+      const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        if (changeTimer) clearTimeout(changeTimer);
+        changeTimer = null;
+        helpWatcher?.close();
+      };
+      helpWatcher.once("error", () => {
+        cleanup();
+        if (!res.writableEnded) res.end();
+      });
+      req.once("close", cleanup);
+      res.once("close", cleanup);
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/api/bootstrap") {
       const actor = await resolveActor(req, res);
       await mkdir(actorDirectory(actor), { recursive: true });
       await mkdir(actorSkillDirectory(actor), { recursive: true });
       await updateMemoryDocument(actor, (document) => document);
+      const device = await registerDeviceVisit(actor, req);
       sendJson(res, 200, {
         actor,
+        device,
         deviceToken: issueDeviceToken(actor),
         state: await stateForClient(actor),
         capabilities: {
           chatStream: true,
         },
+      });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/overview") {
+      const actor = await resolveActor(req, res);
+      await requireAdmin(actor);
+      const [platform, sshConnections, users] = await Promise.all([
+        adminPlatformSnapshot(),
+        listAdminSshConnections(),
+        listUserRecords(),
+      ]);
+      sendJson(res, 200, {
+        ...platform,
+        sshConnections,
+        userCount: users.length,
+        adminCount: (await readAdminNames()).size,
+      });
+      return;
+    }
+
+    if (req.method === "PUT" && url.pathname === "/api/admin/platform") {
+      const actor = await resolveActor(req, res);
+      await requireAdmin(actor);
+      const body = await parseJsonBody(req);
+      await updatePlatformConfiguration({
+        providers: body.providers,
+        embedding: body.embedding,
+        webApiKey:
+          Object.prototype.hasOwnProperty.call(body, "webApiKey")
+            ? body.webApiKey
+            : undefined,
+        agentApiKey:
+          Object.prototype.hasOwnProperty.call(body, "agentApiKey")
+            ? body.agentApiKey
+            : undefined,
+        embeddingApiKey:
+          Object.prototype.hasOwnProperty.call(body, "embeddingApiKey")
+            ? body.embeddingApiKey
+            : undefined,
+      });
+      sendJson(res, 200, await adminPlatformSnapshot());
+      return;
+    }
+
+    if (req.method === "PUT" && url.pathname === "/api/admin/ssh-policy") {
+      const actor = await resolveActor(req, res);
+      await requireAdmin(actor);
+      const body = await parseJsonBody(req);
+      await updatePlatformConfiguration({ ssh: body.ssh || body });
+      sendJson(res, 200, await adminPlatformSnapshot());
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/providers/models") {
+      const actor = await resolveActor(req, res);
+      await requireAdmin(actor);
+      const body = await parseJsonBody(req);
+      const category = ["web", "agent", "embedding"].includes(body.category)
+        ? body.category
+        : "web";
+      const snapshot = await adminPlatformSnapshot();
+      const secrets = await readPlatformSecrets();
+      const configured =
+        category === "embedding"
+          ? snapshot.settings.embedding
+          : snapshot.settings.providers[category];
+      const baseUrl = String(body.baseUrl || configured.baseUrl || "").trim();
+      const apiKey = String(
+        body.apiKey ||
+          (category === "embedding"
+            ? secrets.embeddingApiKey
+            : category === "agent"
+              ? secrets.agentApiKey
+              : secrets.webApiKey) ||
+          "",
+      );
+      if (!baseUrl || !apiKey) {
+        sendJson(res, 400, { error: "请先填写 API URL 和 API Key" });
+        return;
+      }
+      const descriptors = await listProviderModelDescriptors(baseUrl, apiKey);
+      const models = descriptors
+        .filter((descriptor) =>
+          category === "embedding"
+            ? /(embedding|embed|bge|e5|gte|nomic|jina|m3)/i.test(descriptor.id)
+            : !/(embedding|embed|moderation|whisper|tts|dall-e|image|audio|transcrib|realtime)/i.test(
+                descriptor.id,
+              ),
+        )
+        .map((descriptor) => descriptor.id);
+      sendJson(res, 200, {
+        models: models.length ? models : descriptors.map((descriptor) => descriptor.id),
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/ssh/disconnect") {
+      const actor = await resolveActor(req, res);
+      await requireAdmin(actor);
+      const body = await parseJsonBody(req);
+      const disconnected = await disconnectAdminSshConnection(
+        String(body.userId || ""),
+        String(body.serverId || ""),
+      );
+      if (!disconnected) {
+        sendJson(res, 409, { error: "该 SSH 连接当前不在本机 worker 池中" });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        sshConnections: await listAdminSshConnections(),
       });
       return;
     }
@@ -3541,11 +4496,22 @@ async function handleHttp(req, res) {
         const nextState = JSON.parse(JSON.stringify(body.state || {}));
         nextState.settings ||= {};
         const storedSettings = storedState?.settings || {};
+        const persistedSettings = await readJson(
+          actorStatePath(actor, "settings"),
+          {},
+        );
         // These account-level settings have dedicated endpoints. Keeping the
         // server copy prevents a concurrent browser tab from erasing a key or
         // SSH profile that was just saved on another device.
-        for (const key of ["provider", "embedding", "servers", "lastServerId"]) {
-          if (Object.hasOwn(storedSettings, key)) {
+        for (const key of [
+          "provider",
+          "providers",
+          "activeProviderId",
+          "embedding",
+          "servers",
+          "lastServerId",
+        ]) {
+          if (Object.hasOwn(persistedSettings, key)) {
             nextState.settings[key] = storedSettings[key];
           }
         }
@@ -4562,10 +5528,13 @@ async function handleHttp(req, res) {
     ) {
       const guestActor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
-      const email = normalizeEmail(body.email);
+      const submittedUsername = displayUsername(body.username);
+      const username = normalizeUsername(submittedUsername);
       const password = String(body.password || "");
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        sendJson(res, 400, { error: "请输入有效邮箱" });
+      if (!validUsername(username)) {
+        sendJson(res, 400, {
+          error: "用户名需为 2-48 位中文、字母、数字、点、下划线或短横线",
+        });
         return;
       }
       if (password.length < 8) {
@@ -4576,16 +5545,14 @@ async function handleHttp(req, res) {
       if (url.pathname.endsWith("/register")) {
         const result = await mutateAccounts(async () => {
           const records = await listUserRecords();
-          if (records.some((item) => item.email === email)) {
+          if (records.some((item) => item.username === username)) {
             return { conflict: true };
           }
           const created = {
             id: crypto.randomUUID(),
-            email,
+            username,
             passwordHash: hashPassword(password),
-            displayName: String(body.displayName || email.split("@")[0])
-              .trim()
-              .slice(0, 48),
+            displayName: submittedUsername,
             avatar: "",
             createdAt: isoNow(),
           };
@@ -4596,18 +5563,19 @@ async function handleHttp(req, res) {
             });
           }
           await writeUserRecord(created);
-          return { record: created };
+          if (!records.length) await ensureAdminUsername(created.username);
+          return { record: created, firstAccount: !records.length };
         });
         if (result.conflict) {
-          sendJson(res, 409, { error: "该邮箱已注册" });
+          sendJson(res, 409, { error: "该用户名已注册" });
           return;
         }
         record = result.record;
       } else {
         const records = await listUserRecords();
-        record = records.find((item) => item.email === email);
+        record = records.find((item) => item.username === username);
         if (!record || !verifyPassword(password, record.passwordHash)) {
-          sendJson(res, 401, { error: "邮箱或密码不正确" });
+          sendJson(res, 401, { error: "用户名或密码不正确" });
           return;
         }
       }
@@ -4619,8 +5587,9 @@ async function handleHttp(req, res) {
           id: record.id,
           authenticated: true,
           displayName: record.displayName,
-          email: record.email,
+          username: record.username,
           avatar: record.avatar || undefined,
+          isAdmin: await isAdminUsername(record.username),
         },
         deviceToken: session,
       });
@@ -4652,23 +5621,58 @@ async function handleHttp(req, res) {
         return;
       }
       const body = await parseJsonBody(req);
-      const record = await readUserRecord(actor.id);
-      if (!record) {
+      const submittedUsername = displayUsername(body.username);
+      const username = normalizeUsername(submittedUsername);
+      if (!validUsername(username)) {
+        sendJson(res, 400, {
+          error: "用户名需为 2-48 位中文、字母、数字、点、下划线或短横线",
+        });
+        return;
+      }
+      const result = await mutateAccounts(async () => {
+        const records = await listUserRecords();
+        if (
+          records.some(
+            (item) => item.id !== actor.id && item.username === username,
+          )
+        ) {
+          return { conflict: true };
+        }
+        const record = records.find((item) => item.id === actor.id);
+        if (!record) return { missing: true };
+        const previousUsername = record.username;
+        const wasAdmin = await isAdminUsername(previousUsername);
+        record.username = username;
+        record.displayName = submittedUsername;
+        if (typeof body.avatar === "string" && body.avatar.length < 3_000_000) {
+          record.avatar = body.avatar;
+        }
+        await writeUserRecord(record);
+        if (wasAdmin && previousUsername !== username) {
+          const names = await readAdminNames();
+          names.delete(normalizeUsername(previousUsername));
+          names.add(username);
+          await writeAdminNames(names);
+        }
+        return { record };
+      });
+      if (result.conflict) {
+        sendJson(res, 409, { error: "该用户名已注册" });
+        return;
+      }
+      if (result.missing || !result.record) {
         sendJson(res, 404, { error: "账号不存在" });
         return;
       }
-      record.displayName = String(body.displayName || record.displayName).trim().slice(0, 48);
-      if (typeof body.avatar === "string" && body.avatar.length < 3_000_000) {
-        record.avatar = body.avatar;
-      }
-      await writeUserRecord(record);
+      const record = result.record;
       sendJson(res, 200, {
         actor: {
           id: record.id,
           authenticated: true,
           displayName: record.displayName,
-          email: record.email,
+          username: record.username,
           avatar: record.avatar || undefined,
+          isAdmin: await isAdminUsername(record.username),
         },
       });
       return;
@@ -4693,52 +5697,42 @@ async function handleHttp(req, res) {
       return;
     }
 
-    if (
-      req.method === "POST" &&
-      ["/api/settings/provider/models", "/api/settings/embedding/models"].includes(
-        url.pathname,
-      )
-    ) {
+    if (req.method === "POST" && url.pathname === "/api/settings/provider/models") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
-      const secrets = await getSecrets(actor);
-      const embeddingRequest = url.pathname.includes("/embedding/");
-      const apiKey = String(
-        body.apiKey ||
-          (embeddingRequest ? secrets.embeddingApiKey : secrets.providerApiKey) ||
-          "",
-      );
+      const clientState = await stateForClient(actor);
+      const { provider: selectedProvider, apiKey: storedApiKey } =
+        await effectiveProviderAccess(
+          actor,
+          clientState.settings,
+          String(body.providerId || ""),
+        );
+      const apiKey = String(body.apiKey || storedApiKey || "");
       if (!apiKey) {
         sendJson(res, 400, { error: "请输入 API Key" });
         return;
       }
-      const descriptors = await listProviderModelDescriptors(body.baseUrl, apiKey);
+      const baseUrl = String(body.baseUrl || selectedProvider?.baseUrl || "");
+      const descriptors = await listProviderModelDescriptors(baseUrl, apiKey);
       const models = descriptors.map((descriptor) => descriptor.id);
-      const embeddingModels = models.filter((model) =>
-        /(embedding|embed|bge|e5|gte|nomic|jina|m3)/i.test(model),
-      );
-      const chatModels = models.filter(
+      const available = models.filter(
         (model) =>
           !/(embedding|embed|moderation|whisper|tts|dall-e|image|audio|transcrib|realtime)/i.test(
             model,
           ),
       );
-      const available = embeddingRequest
-        ? embeddingModels.length
-          ? embeddingModels
-          : models
-        : chatModels.length
-          ? chatModels
-          : models;
-      if (!available.length) {
+      const visibleModels = available.length ? available : models;
+      if (!visibleModels.length) {
         sendJson(res, 404, { error: "接口没有返回可用模型" });
         return;
       }
       sendJson(res, 200, {
-        models: available,
+        providerId: selectedProvider?.id,
+        providerName: selectedProvider?.name,
+        models: visibleModels,
         modelDetails: Object.fromEntries(
           descriptors
-            .filter((descriptor) => available.includes(descriptor.id))
+            .filter((descriptor) => visibleModels.includes(descriptor.id))
             .map((descriptor) => [descriptor.id, descriptor]),
         ),
       });
@@ -4747,18 +5741,84 @@ async function handleHttp(req, res) {
 
     if (req.method === "GET" && url.pathname === "/api/settings/provider/key") {
       const actor = await resolveActor(req, res);
+      const state = await getState(actor);
       const secrets = await getSecrets(actor);
+      const requestedProviderId = String(
+        url.searchParams.get("providerId") || "",
+      );
+      const provider = [PLATFORM_WEB_PROVIDER_ID, PLATFORM_AGENT_PROVIDER_ID].includes(
+        requestedProviderId,
+      )
+        ? (await platformProviderAccess(requestedProviderId)).provider
+        : modelProviderFor(state.settings, requestedProviderId);
       res.setHeader("Cache-Control", "no-store");
-      sendJson(res, 200, { apiKey: String(secrets.providerApiKey || "") });
+      sendJson(res, 200, {
+        providerId: provider.id,
+        apiKey:
+          provider.managedBy === "platform" ||
+          [PLATFORM_WEB_PROVIDER_ID, PLATFORM_AGENT_PROVIDER_ID].includes(provider.id)
+            ? ""
+            : providerApiKeyFor(secrets, provider.id),
+      });
       return;
     }
 
     if (req.method === "PUT" && url.pathname === "/api/settings/provider") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
-      if (body.apiKey) await updateSecrets(actor, { providerApiKey: String(body.apiKey) });
       const currentState = await getState(actor);
-      const currentProvider = currentState?.settings?.provider || {};
+      const currentSettings = normalizeProviderSettings(
+        currentState?.settings || {},
+      );
+      const requestedProviderId = safeSegment(
+        body.providerId || currentSettings.activeProviderId || DEFAULT_PROVIDER_ID,
+        DEFAULT_PROVIDER_ID,
+      );
+      const currentProvider =
+        currentSettings.providers.find(
+          (provider) => provider.id === requestedProviderId,
+        ) || normalizeModelProvider({ id: requestedProviderId }, currentSettings.providers.length);
+      const activate = body.activate !== false;
+      if ([PLATFORM_WEB_PROVIDER_ID, PLATFORM_AGENT_PROVIDER_ID].includes(requestedProviderId)) {
+        const access = await platformProviderAccess(
+          requestedProviderId,
+          Object.prototype.hasOwnProperty.call(body, "model")
+            ? String(body.model || "")
+            : "",
+        );
+        if (!access.provider.configured) {
+          sendJson(res, 409, { error: "平台管理员尚未配置该公共 API" });
+          return;
+        }
+        const selectedModel = String(body.model || access.provider.model || "").trim();
+        const provider = { ...access.provider, model: selectedModel };
+        await updateState(actor, (state) => {
+          state.settings = normalizeProviderSettings(state.settings || {});
+          state.settings.providers = [
+            ...state.settings.providers.filter((item) => item.id !== requestedProviderId),
+            provider,
+          ];
+          if (activate || !state.settings.activeProviderId) {
+            state.settings.activeProviderId = requestedProviderId;
+          }
+          return state;
+        });
+        const savedState = await stateForClient(actor);
+        sendJson(res, 200, {
+          ok: true,
+          providers: savedState.settings.providers,
+          activeProviderId: savedState.settings.activeProviderId,
+        });
+        return;
+      }
+      if (body.apiKey) {
+        await updateSecrets(actor, {
+          providerCredential: {
+            providerId: requestedProviderId,
+            apiKey: String(body.apiKey),
+          },
+        });
+      }
       const baseUrl = String(
         body.baseUrl || currentProvider.baseUrl || "https://api.openai.com/v1",
       );
@@ -4775,11 +5835,15 @@ async function handleHttp(req, res) {
           ? positiveInteger(currentProvider.modelOutputLimit)
           : null;
       const providerSecrets = await getSecrets(actor);
-      if (selectedModel && providerSecrets.providerApiKey) {
+      const selectedProviderApiKey = providerApiKeyFor(
+        providerSecrets,
+        requestedProviderId,
+      );
+      if (selectedModel && selectedProviderApiKey) {
         try {
           const descriptors = await listProviderModelDescriptors(
             baseUrl,
-            providerSecrets.providerApiKey,
+            selectedProviderApiKey,
           );
           const descriptor = descriptors.find((item) => item.id === selectedModel);
           modelContextLimit = positiveInteger(descriptor?.contextLimit);
@@ -4790,7 +5854,10 @@ async function handleHttp(req, res) {
         }
       }
       const provider = {
-        name: String(body.name || currentProvider.name || "OpenAI Compatible"),
+        id: requestedProviderId,
+        name: String(body.name || currentProvider.name || "默认 API")
+          .trim()
+          .slice(0, 80) || "默认 API",
         baseUrl,
         model: modelWasProvided
           ? selectedModel
@@ -4806,11 +5873,28 @@ async function handleHttp(req, res) {
                 currentProvider.protocol === "responses"
               ? currentProvider.protocol
               : "auto",
-        configured: Boolean(body.apiKey || providerSecrets.providerApiKey),
+        configured: Boolean(body.apiKey || selectedProviderApiKey),
+        audience:
+          body.audience === "web" || body.audience === "agent"
+            ? body.audience
+            : currentProvider.audience || "both",
+        managedBy: "user",
       };
       await updateState(actor, (state) => {
-        state.settings ||= {};
-        state.settings.provider = provider;
+        state.settings = normalizeProviderSettings(state.settings || {});
+        const existingIndex = state.settings.providers.findIndex(
+          (item) => item.id === requestedProviderId,
+        );
+        if (existingIndex >= 0) {
+          state.settings.providers = state.settings.providers.map((item) =>
+            item.id === requestedProviderId ? provider : item,
+          );
+        } else {
+          state.settings.providers = [...state.settings.providers, provider];
+        }
+        if (activate || !state.settings.activeProviderId) {
+          state.settings.activeProviderId = requestedProviderId;
+        }
         return state;
       });
       const shouldSyncManagedAgents = Boolean(body.apiKey) ||
@@ -4825,42 +5909,45 @@ async function handleHttp(req, res) {
           );
         });
       }
-      sendJson(res, 200, { ok: true, provider });
+      const savedState = await stateForClient(actor);
+      sendJson(res, 200, {
+        ok: true,
+        providers: savedState.settings.providers,
+        activeProviderId: savedState.settings.activeProviderId,
+      });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/settings/provider/test") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
-      const secrets = await getSecrets(actor);
-      const apiKey = String(body.apiKey || secrets.providerApiKey || "");
+      const state = await stateForClient(actor);
+      const { provider, apiKey: storedApiKey } = await effectiveProviderAccess(
+        actor,
+        state.settings,
+        String(body.providerId || ""),
+      );
+      const apiKey = String(body.apiKey || storedApiKey || "");
       if (!apiKey) {
         sendJson(res, 400, { error: "缺少模型 API Key" });
         return;
       }
-      const result = await callChatProvider(body, apiKey, "", { test: true });
+      const result = await callChatProvider(
+        { ...provider, ...body, baseUrl: body.baseUrl || provider.baseUrl },
+        apiKey,
+        "",
+        { test: true },
+      );
       sendJson(res, 200, { ok: true, protocol: result.protocol });
       return;
     }
 
-    if (req.method === "PUT" && url.pathname === "/api/settings/embedding") {
-      const actor = await resolveActor(req, res);
-      const body = await parseJsonBody(req);
-      if (body.apiKey) await updateSecrets(actor, { embeddingApiKey: String(body.apiKey) });
-      const embedding = {
-        baseUrl: String(body.baseUrl || "https://api.openai.com/v1"),
-        model: String(body.model || "text-embedding-3-small"),
-        dimensions: String(body.dimensions || ""),
-        configured: Boolean(body.apiKey || (await getSecrets(actor)).embeddingApiKey),
-        hybridEnabled: body.hybridEnabled !== false,
-        rerankEnabled: Boolean(body.rerankEnabled),
-      };
-      await updateState(actor, (state) => {
-        state.settings ||= {};
-        state.settings.embedding = embedding;
-        return state;
-      });
-      sendJson(res, 200, { ok: true, embedding });
+    if (
+      ["/api/settings/embedding", "/api/settings/embedding/models", "/api/settings/embedding/test"].includes(
+        url.pathname,
+      )
+    ) {
+      sendJson(res, 403, { error: "Embedding 由平台管理员统一配置" });
       return;
     }
 
@@ -4872,20 +5959,6 @@ async function handleHttp(req, res) {
       const body = await parseJsonBody(req);
       const profile = await persistServerProfile(actor, body, serverId);
       sendJson(res, 200, { ok: true, profile });
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/api/settings/embedding/test") {
-      const actor = await resolveActor(req, res);
-      const body = await parseJsonBody(req);
-      const secrets = await getSecrets(actor);
-      const apiKey = String(body.apiKey || secrets.embeddingApiKey || "");
-      if (!apiKey) {
-        sendJson(res, 400, { error: "缺少 Embedding API Key" });
-        return;
-      }
-      const vectors = await callEmbedding(body, apiKey, "EasyWork connection test");
-      sendJson(res, 200, { ok: true, dimensions: vectors[0]?.length || 0 });
       return;
     }
 
@@ -4902,12 +5975,10 @@ async function handleHttp(req, res) {
       const fileDir = actorAttachmentPath(actor, "library");
       await mkdir(fileDir, { recursive: true });
       await writeFile(path.join(fileDir, `${id}-${name}`), buffer);
-      const state = await getState(actor);
       const result = await indexLibraryFile(
         actor,
         { id, name: String(body.name || name), type: String(body.type || "") },
         buffer,
-        state,
       );
       sendJson(res, 200, result);
       return;
@@ -8205,9 +9276,11 @@ function normalizeConversationTitle(value, prompt) {
 
 async function generateConversationTitle(actor, prompt, response = "") {
   const state = await getState(actor);
-  const provider = state?.settings?.provider || {};
-  const secrets = await getSecrets(actor);
-  if (!provider.configured || !provider.model || !secrets.providerApiKey) {
+  const { provider, apiKey, category } = await effectiveProviderAccess(
+    actor,
+    state?.settings,
+  );
+  if (!provider.configured || !provider.model || !apiKey) {
     return fallbackConversationTitle(prompt);
   }
   const titlePrompt = await renderPromptTemplate("tasks/conversation-title.md", {
@@ -8217,10 +9290,12 @@ async function generateConversationTitle(actor, prompt, response = "") {
   try {
     const { payload } = await callChatProvider(
       provider,
-      secrets.providerApiKey,
+      apiKey,
       titlePrompt,
     );
-    return normalizeConversationTitle(extractModelText(payload), prompt);
+    const responseText = extractModelText(payload);
+    await recordProviderModelUsage(category, titlePrompt, responseText);
+    return normalizeConversationTitle(responseText, prompt);
   } catch {
     return fallbackConversationTitle(prompt);
   }
@@ -8931,20 +10006,30 @@ async function scanRemoteAgents(session, actor, scope = {}) {
   }
 
   const runtimeProfiles = await readAgentRuntimeProfiles(actor);
-  const [accountState, accountSecrets] = await Promise.all([
-    getState(actor),
-    getSecrets(actor),
-  ]);
-  const accountProvider = accountState?.settings?.provider || {};
+  const accountState = await getState(actor);
+  const accountSettings = normalizeProviderSettings(accountState?.settings || {});
+  const sharedAgentProvider = (await readPlatformSettings()).providers.agent;
   for (const agent of discovered) {
     const runtimeProfile =
       runtimeProfiles.profiles[agentRuntimeProfileKey(session, agent.id, scope)] ||
       runtimeProfiles.profiles[agentRuntimeProfileKey(session, agent.id)] || {};
     if (agent.managed) {
+      const {
+        provider: accountProvider,
+        apiKey: accountProviderApiKey,
+      } = await effectiveProviderAccess(
+        actor,
+        accountSettings,
+        runtimeProfile.providerId ||
+          accountSettings.providers.find((provider) => provider.audience === "agent")?.id ||
+          (sharedAgentProvider.configured ? PLATFORM_AGENT_PROVIDER_ID : "") ||
+          accountSettings.activeProviderId,
+      );
       const model = String(runtimeProfile.model || accountProvider.model || "").trim();
       const runtimeId = agentRuntimeId(session, agent.id, scope);
       const runtimePaths = managedAgentRuntimePaths(session.home, agent.id, runtimeId);
       agent.runtimeId = runtimeId;
+      agent.providerId = accountProvider.id;
       agent.model = model || undefined;
       agent.contextLimit =
         positiveInteger(runtimeProfile.contextLimit) ||
@@ -8955,7 +10040,7 @@ async function scanRemoteAgents(session, actor, scope = {}) {
         positiveInteger(accountProvider.modelOutputLimit) ||
         undefined;
       agent.configured = Boolean(
-        accountProvider.baseUrl && accountSecrets.providerApiKey && model,
+        accountProvider.baseUrl && accountProviderApiKey && model,
       );
       agent.configPath =
         agent.adapter === "opencode"
@@ -9183,13 +10268,22 @@ async function ensureManagedAgentRuntimeConfig(
     };
   }
   const state = await getState(actor);
-  const provider = state?.settings?.provider || {};
-  const secrets = await getSecrets(actor);
-  if (!provider.baseUrl || !secrets.providerApiKey) {
-    return { configured: false, reason: "missing-provider" };
-  }
+  const sharedAgentProvider = (await readPlatformSettings()).providers.agent;
   const previousProfile =
     (await getAgentRuntimeProfile(actor, session, agent.id, scope)) || {};
+  const { provider, apiKey: providerApiKey } = await effectiveProviderAccess(
+    actor,
+    state?.settings,
+    previousProfile.providerId ||
+      normalizeProviderSettings(state?.settings || {}).providers.find(
+        (candidate) => candidate.audience === "agent",
+      )?.id ||
+      (sharedAgentProvider.configured ? PLATFORM_AGENT_PROVIDER_ID : "") ||
+      state?.settings?.activeProviderId,
+  );
+  if (!provider.baseUrl || !providerApiKey) {
+    return { configured: false, reason: "missing-provider" };
+  }
   const model = String(previousProfile.model || provider.model || "").trim();
   if (!model) return { configured: false, reason: "missing-model" };
   const defaults =
@@ -9201,6 +10295,7 @@ async function ensureManagedAgentRuntimeConfig(
   const profile = await updateAgentRuntimeProfile(actor, session, agent.id, scope, {
     ...defaults,
     ...previousProfile,
+    providerId: provider.id,
     model,
     contextLimit:
       positiveInteger(previousProfile.contextLimit) ||
@@ -9243,7 +10338,7 @@ async function ensureManagedAgentRuntimeConfig(
         ? profile.permissionMode
         : "allow",
     );
-    const authContent = mergeOpenCodeAuthContent("{}\n", secrets.providerApiKey);
+    const authContent = mergeOpenCodeAuthContent("{}\n", providerApiKey);
     await remoteSftpWriteAtomic(
       session.client,
       paths.opencodeConfigPath,
@@ -9270,7 +10365,7 @@ async function ensureManagedAgentRuntimeConfig(
     await remoteSftpWriteAtomic(
       session.client,
       paths.apiKeyPath,
-      `${String(secrets.providerApiKey)}\n`,
+      `${String(providerApiKey)}\n`,
       0o600,
     );
   } else if (agent.adapter === "claude") {
@@ -9287,7 +10382,7 @@ async function ensureManagedAgentRuntimeConfig(
     await remoteSftpWriteAtomic(
       session.client,
       paths.apiKeyPath,
-      `${String(secrets.providerApiKey)}\n`,
+      `${String(providerApiKey)}\n`,
       0o600,
     );
   }
@@ -9321,15 +10416,18 @@ async function configureManagedAgentModel(
   const model = String(payload.model || "").trim();
   if (!model) throw new Error("请选择一个模型");
   const state = await getState(actor);
-  const provider = state?.settings?.provider || {};
-  const secrets = await getSecrets(actor);
-  if (!provider.baseUrl || !secrets.providerApiKey) {
+  const { provider, apiKey: providerApiKey } = await effectiveProviderAccess(
+    actor,
+    state?.settings,
+    String(payload.providerId || ""),
+  );
+  if (!provider.baseUrl || !providerApiKey) {
     throw new Error("请先在个人资料中配置 API URL 和 API Key");
   }
   onProgress("正在核对模型");
   const descriptors = await listProviderModelDescriptors(
     provider.baseUrl,
-    secrets.providerApiKey,
+    providerApiKey,
   );
   const selected = descriptors.find((item) => item.id === model);
   if (!selected) throw new Error("当前 API 已不再返回所选模型，请重新检测");
@@ -9338,6 +10436,7 @@ async function configureManagedAgentModel(
     workspaceId: String(payload.workspaceId || ""),
   };
   await updateAgentRuntimeProfile(actor, session, agent.id, scope, {
+    providerId: provider.id,
     model,
     contextLimit:
       positiveInteger(selected.contextLimit) || DEFAULT_AGENT_CONTEXT_LIMIT,
@@ -11594,9 +12693,7 @@ async function runRemoteWork(socket, session, actor, payload) {
   if (!selectedAgent.managed && !selectedAgent.configured) {
     throw new Error("请先打开 Agent 自带配置文件并完成模型配置");
   }
-  const secrets = await getSecrets(actor);
   const state = await getState(actor);
-  const provider = state?.settings?.provider || {};
   await ensureTaskWorkspace(session, workerTask, workspace);
   const bindingKey = agentBindingKey({
     serverId: session.serverId || session.host || "unknown-host",
@@ -11769,10 +12866,21 @@ async function runRemoteWork(socket, session, actor, payload) {
   if (!runtimeConfiguration.configured) {
     throw new Error(`${selectedAgent.name} 原生模型配置未完成`);
   }
+  const { provider: runtimeProvider, apiKey: runtimeProviderApiKey, category } =
+    await effectiveProviderAccess(
+      actor,
+      state?.settings,
+      runtimeConfiguration.profile?.providerId || state?.settings?.activeProviderId,
+    );
+  if (category === "agent") {
+    void recordPlatformUsage("agent", {
+      inputTokens: estimateContextTokens(workerTask.prompt),
+    }).catch(() => undefined);
+  }
   const managedModel = managedOpenCodeModel(
     { ...selectedAgent, model: runtimeConfiguration.model },
-    { ...provider, model: runtimeConfiguration.model },
-    Boolean(secrets.providerApiKey),
+    { ...runtimeProvider, model: runtimeConfiguration.model },
+    Boolean(runtimeProviderApiKey),
   );
   const runtimeAgent = selectedAgent.managed
     ? {
@@ -12426,6 +13534,12 @@ async function runRemoteWork(socket, session, actor, payload) {
   const finalText =
     stripEasyWorkProtocolMarkers(rawFinalText, true) ||
     "Agent 已完成任务，未返回额外文本。";
+  if (category === "agent") {
+    void recordPlatformUsage("agent", {
+      requests: 0,
+      outputTokens: estimateContextTokens(finalText),
+    }).catch(() => undefined);
+  }
   const finalMessageEvents = trailingMessages.length
     ? trailingMessages
     : [{ id: `${payload.runId}_message`, kind: "agent_message" }];
@@ -12640,6 +13754,8 @@ async function connectSsh(socket, session, actor, payload) {
   let observedFingerprint = "";
   const startedAt = Date.now();
   const client = new SshClient();
+  const sshPolicy =
+    runtimePlatformSettings?.ssh || DEFAULT_PLATFORM_SETTINGS.ssh;
   attachProviderRelayHandler(session, client);
   session.demo = false;
   session.status = "connecting";
@@ -12742,9 +13858,9 @@ async function connectSsh(socket, session, actor, payload) {
           password: authMethod === "password" ? password : undefined,
           passphrase: payload.passphrase ? String(payload.passphrase) : undefined,
           tryKeyboard: true,
-          readyTimeout: 25_000,
-          keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
-          keepaliveCountMax: 3,
+          readyTimeout: sshPolicy.connectTimeoutSeconds * 1000,
+          keepaliveInterval: sshPolicy.keepaliveIntervalSeconds * 1000,
+          keepaliveCountMax: sshPolicy.keepaliveCountMax,
           hostVerifier: (key) => {
             observedFingerprint = `SHA256:${crypto.createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
             const known = knownHosts[`${host}:${port}`];
@@ -13887,7 +15003,10 @@ function attachWebSocketServer(server) {
 }
 
 async function cleanupIdleSshWorkers(now = Date.now()) {
-  const cutoff = now - SSH_IDLE_TTL_MS;
+  const idleTtlMinutes =
+    runtimePlatformSettings?.ssh?.idleTtlMinutes ||
+    DEFAULT_PLATFORM_SETTINGS.ssh.idleTtlMinutes;
+  const cutoff = now - idleTtlMinutes * 60 * 1000;
   for (const [workerKey, worker] of sshWorkerPool) {
     let changed = false;
     for (const [serverId, session] of worker.sessions) {
@@ -13933,16 +15052,28 @@ async function cleanupIdleSshWorkers(now = Date.now()) {
 
 export async function createEasyWorkServer() {
   await mkdir(DATA_ROOT, { recursive: true });
+  await mkdir(ADMIN_ROOT, { recursive: true });
   await mkdir(SKILL_ROOT, { recursive: true });
   sessionSecret = await ensureFile(path.join(DATA_ROOT, ".session-secret"));
   encryptionKey = await ensureFile(path.join(DATA_ROOT, ".master-key"));
+  await ensureInitialAdministrator();
+  await readPlatformSettings();
   const server = http.createServer((req, res) => {
     void handleHttp(req, res);
   });
   const wss = attachWebSocketServer(server);
   const cleanupTimer = setInterval(() => {
+    const intervalMinutes =
+      runtimePlatformSettings?.ssh?.cleanupIntervalMinutes ||
+      DEFAULT_PLATFORM_SETTINGS.ssh.cleanupIntervalMinutes;
+    if (
+      Date.now() - lastAutomaticSshCleanupAt < intervalMinutes * 60 * 1000
+    ) {
+      return;
+    }
+    lastAutomaticSshCleanupAt = Date.now();
     void cleanupIdleSshWorkers();
-  }, SSH_CLEANUP_INTERVAL_MS);
+  }, 60 * 1000);
   cleanupTimer.unref?.();
   server.once("close", () => {
     clearInterval(cleanupTimer);
