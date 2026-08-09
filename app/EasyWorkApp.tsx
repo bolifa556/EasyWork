@@ -33,8 +33,10 @@ import {
   LoaderCircle,
   LogIn,
   LogOut,
+  Maximize2,
   Menu,
   MessageCircle,
+  Minimize2,
   Network,
   Paperclip,
   Pin,
@@ -76,7 +78,7 @@ import {
 } from "react";
 
 type Mode = "chat" | "work";
-type ViewName = "chat" | "project" | "library" | "skills" | "memory";
+type ViewName = "chat" | "project" | "library" | "skills" | "help" | "admin";
 type StepStatus = "pending" | "running" | "done" | "error" | "cancelled";
 type EventStatus = "pending" | "running" | "done" | "error" | "cancelled";
 type WorkEventKind =
@@ -297,20 +299,26 @@ type ServerProfileDraft = ServerProfile & {
   password?: string;
 };
 
+type ModelProvider = {
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  protocol: "auto" | "chat-completions" | "responses";
+  configured: boolean;
+  modelContextLimit?: number;
+  modelOutputLimit?: number;
+  audience?: "web" | "agent" | "both";
+  managedBy?: "user" | "platform";
+};
+
 type AppSettings = {
   memoryEnabled: boolean;
   referenceHistory: boolean;
   autoCapture: boolean;
   showMemorySources: boolean;
-  provider: {
-    name: string;
-    baseUrl: string;
-    model: string;
-    protocol: "auto" | "chat-completions" | "responses";
-    configured: boolean;
-    modelContextLimit?: number;
-    modelOutputLimit?: number;
-  };
+  providers: ModelProvider[];
+  activeProviderId: string;
   embedding: {
     baseUrl: string;
     model: string;
@@ -337,8 +345,70 @@ type Actor = {
   id: string;
   authenticated: boolean;
   displayName: string;
-  email?: string;
+  username?: string;
   avatar?: string;
+  isAdmin?: boolean;
+};
+
+type AdminUsageValues = {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+};
+
+type AdminUsage = {
+  daily: Record<"web" | "agent" | "embedding", AdminUsageValues>;
+  weekly: Record<"web" | "agent" | "embedding", AdminUsageValues>;
+  total: Record<"web" | "agent" | "embedding", AdminUsageValues>;
+  series: Array<{
+    date: string;
+    web: AdminUsageValues;
+    agent: AdminUsageValues;
+    embedding: AdminUsageValues;
+  }>;
+};
+
+type AdminProvider = ModelProvider & { apiKeyConfigured?: boolean };
+
+type AdminOverview = {
+  settings: {
+    providers: { web: AdminProvider; agent: AdminProvider };
+    embedding: AppSettings["embedding"] & {
+      name: string;
+      chunkStrategy: "semantic" | "fixed" | "paragraph";
+      chunkSize: number;
+      chunkOverlap: number;
+      batchSize: number;
+      apiKeyConfigured?: boolean;
+    };
+    ssh: {
+      idleTtlMinutes: number;
+      keepaliveIntervalSeconds: number;
+      keepaliveCountMax: number;
+      connectTimeoutSeconds: number;
+      cleanupIntervalMinutes: number;
+    };
+  };
+  usage: AdminUsage;
+  userCount: number;
+  adminCount: number;
+  sshConnections: Array<{
+    id: string;
+    userId: string;
+    username: string;
+    displayName: string;
+    serverId: string;
+    serverName: string;
+    host: string;
+    port: number;
+    status: "connected" | "disconnected";
+    conversationCount: number;
+    activeTaskCount: number;
+    lastConnectedAt?: string;
+    lastUserActivityAt?: string;
+    disconnectReason?: string;
+    manageable: boolean;
+  }>;
 };
 
 type ConnectionState = {
@@ -490,7 +560,21 @@ let GATEWAY_HTTP =
     : process.env.NEXT_PUBLIC_EASYWORK_GATEWAY_URL ?? "http://localhost:3000";
 
 const DEVICE_TOKEN_STORAGE_KEY = "easywork.device-token.v1";
+const DEVICE_ID_STORAGE_KEY = "easywork.device-id.v1";
 const DEVICE_TOKEN_EVENT = "easywork:device-token";
+
+function readOrCreateDeviceId() {
+  if (typeof window === "undefined") return "";
+  const stored = window.localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+  if (stored) return stored;
+  const created = `device-${
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  }`;
+  window.localStorage.setItem(DEVICE_ID_STORAGE_KEY, created);
+  return created;
+}
 
 function readDeviceToken() {
   if (typeof window === "undefined") return "";
@@ -518,6 +602,10 @@ function gatewayFetch(
   const token = readDeviceToken();
   if (token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${token}`);
+  }
+  const deviceId = readOrCreateDeviceId();
+  if (deviceId && !headers.has("X-EasyWork-Device-Id")) {
+    headers.set("X-EasyWork-Device-Id", deviceId);
   }
   return fetch(`${baseUrl}${path}`, {
     ...init,
@@ -566,6 +654,42 @@ function repairConversationTitle(conversation: Conversation) {
     : conversation;
 }
 
+const DEFAULT_PROVIDER_ID = "provider-default";
+
+const defaultModelProvider = (): ModelProvider => ({
+  id: DEFAULT_PROVIDER_ID,
+  name: "默认 API",
+  baseUrl: "https://api.openai.com/v1",
+  model: "",
+  protocol: "auto",
+  configured: false,
+});
+
+function normalizeClientProvider(
+  value: Partial<ModelProvider> | undefined,
+  index = 0,
+): ModelProvider {
+  const fallbackId = index === 0 ? DEFAULT_PROVIDER_ID : `provider-${index + 1}`;
+  return {
+    ...defaultModelProvider(),
+    ...(value ?? {}),
+    id: String(value?.id || fallbackId),
+    name: String(value?.name || `API ${index + 1}`),
+    baseUrl: String(value?.baseUrl || "https://api.openai.com/v1"),
+    model: String(value?.model || ""),
+    protocol:
+      value?.protocol === "chat-completions" || value?.protocol === "responses"
+        ? value.protocol
+        : "auto",
+    configured: Boolean(value?.configured),
+    audience:
+      value?.audience === "web" || value?.audience === "agent"
+        ? value.audience
+        : "both",
+    managedBy: value?.managedBy === "platform" ? "platform" : "user",
+  };
+}
+
 const DEFAULT_STATE: EasyWorkState = {
   projects: [],
   conversations: [],
@@ -606,13 +730,8 @@ const DEFAULT_STATE: EasyWorkState = {
     referenceHistory: true,
     autoCapture: true,
     showMemorySources: true,
-    provider: {
-      name: "OpenAI Compatible",
-      baseUrl: "https://api.openai.com/v1",
-      model: "",
-      protocol: "auto",
-      configured: false,
-    },
+    providers: [defaultModelProvider()],
+    activeProviderId: DEFAULT_PROVIDER_ID,
     embedding: {
       baseUrl: "https://api.openai.com/v1",
       model: "text-embedding-3-small",
@@ -648,6 +767,21 @@ function mergeStoredState(
   const memories = Array.isArray(incoming.memories)
     ? incoming.memories
     : current.memories;
+  const providerSource = Array.isArray(incomingSettings?.providers)
+    ? incomingSettings.providers
+    : current.settings.providers;
+  const providers = (providerSource.length
+    ? providerSource
+    : [defaultModelProvider()]
+  ).map((provider, index) => normalizeClientProvider(provider, index));
+  const activeProviderId = String(
+    incomingSettings?.activeProviderId ||
+      current.settings.activeProviderId ||
+      providers[0]?.id ||
+      DEFAULT_PROVIDER_ID,
+  );
+  const provider =
+    providers.find((item) => item.id === activeProviderId) || providers[0];
 
   return {
     ...current,
@@ -660,10 +794,8 @@ function mergeStoredState(
     settings: {
       ...current.settings,
       ...(incoming.settings ?? {}),
-      provider: {
-        ...current.settings.provider,
-        ...(incoming.settings?.provider ?? {}),
-      },
+      providers,
+      activeProviderId: provider.id,
       embedding: {
         ...current.settings.embedding,
         ...(incoming.settings?.embedding ?? {}),
@@ -744,29 +876,6 @@ const formatBytes = (size: number) => {
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 };
-
-function memoryItemFromApi(record: Record<string, unknown>): MemoryItem {
-  const scope = ["user", "project", "conversation", "workspace", "task"].includes(
-    String(record.scope || ""),
-  )
-    ? (String(record.scope) as MemoryItem["scope"])
-    : "user";
-  const scopeId = String(record.scopeId || "") || undefined;
-  return {
-    id: String(record.id || uid("memory")),
-    content: String(record.content || ""),
-    scope,
-    scopeId,
-    projectId: scope === "project" ? scopeId : undefined,
-    kind: String(record.kind || "preference") as MemoryItem["kind"],
-    source: String(record.source || "用户手动添加"),
-    confidence: Number(record.confidence || 0),
-    enabled: String(record.status || "active") !== "disabled",
-    portability: String(record.portability || "") || undefined,
-    authority: String(record.authority || "") || undefined,
-    updatedAt: String(record.updatedAt || now()),
-  };
-}
 
 const formatTime = (value: string) =>
   new Intl.DateTimeFormat("zh-CN", {
@@ -869,9 +978,11 @@ function BlockCopyButton({
 function MarkdownContent({
   content,
   compact = false,
+  help = false,
 }: {
   content: string;
   compact?: boolean;
+  help?: boolean;
 }) {
   const normalizedContent = String(content || "").replace(
     /^(\s*(?:#{1,6}\s+.+|\*\*[^*\n]+\*\*|__[^_\n]+__))\r?\n(?=\s*\d+[.)]\s+)/gm,
@@ -884,6 +995,20 @@ function MarkdownContent({
     }
     return hash % 5;
   };
+  const helpKeywordTone = (value: string) => {
+    const keyword = value.trim().toLowerCase();
+    if (/easywork/.test(keyword)) return "product";
+    if (/agent|opencode|claude\s*code|claudecode|codex/.test(keyword)) {
+      return "agent";
+    }
+    if (/api/.test(keyword)) return "api";
+    if (/ssh|2fa|服务器|用户名|密码|密钥/.test(keyword)) {
+      return "connection";
+    }
+    if (/聊天|工作模式/.test(keyword)) return "mode";
+    if (/工作区/.test(keyword)) return "workspace";
+    return "emphasis";
+  };
   const fencedCodeLanguage = (children: React.ReactNode) => {
     const child = Children.toArray(children)[0];
     if (!isValidElement<{ className?: string }>(child)) return "";
@@ -891,12 +1016,54 @@ function MarkdownContent({
       .match(/(?:^|\s)language-([^\s]+)/i)?.[1]
       ?.toLowerCase() || "";
   };
+  const highlightHelpKeywords = (children: React.ReactNode) =>
+    Children.map(children, (child) => {
+      if (typeof child !== "string") return child;
+      return child
+        .split(
+          /(EasyWork|Easywork|Agent|opencode|claudecode|codex|SSH|2FA|模型 API|API URL|API Key|聊天模式|工作模式|虚拟工作区|用户工作区)/g,
+        )
+        .map((part, index) =>
+          /^(?:EasyWork|Easywork|Agent|opencode|claudecode|codex|SSH|2FA|模型 API|API URL|API Key|聊天模式|工作模式|虚拟工作区|用户工作区)$/.test(
+            part,
+          ) ? (
+            <strong
+              className={`help-keyword tone-${helpKeywordTone(part)}`}
+              key={`${part}-${index}`}
+            >
+              {part}
+            </strong>
+          ) : (
+            part
+          ),
+        );
+    });
   return (
-    <div className={`markdown-content${compact ? " compact" : ""}`}>
+    <div
+      className={`markdown-content${compact ? " compact" : ""}${
+        help ? " help-markdown" : ""
+      }`}
+    >
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
         components={{
+          p: ({ children }) => (
+            <p>{help ? highlightHelpKeywords(children) : children}</p>
+          ),
+          li: ({ children }) => (
+            <li>{help ? highlightHelpKeywords(children) : children}</li>
+          ),
+          strong: ({ children }) => {
+            const value = reactNodeText(children);
+            return (
+              <strong
+                className={help ? `help-emphasis tone-${helpKeywordTone(value)}` : undefined}
+              >
+                {children}
+              </strong>
+            );
+          },
           a: ({ children, ...props }) => (
             <a {...props} target="_blank" rel="noreferrer">
               {children}
@@ -1145,46 +1312,29 @@ function AgentContextControls({
   );
 }
 
-function WebContextMeter({
+function WebContextRing({
   usage,
   loading,
-  onOpen,
 }: {
   usage: ContextUsage | null;
   loading: boolean;
-  onOpen: () => void;
 }) {
+  const ratio = Math.max(0, Math.min(1, usage?.web.ratio ?? 0));
   return (
-    <div
-      className={`context-meters single${loading ? " loading" : ""}`}
+    <span
+      className={`web-context-ring${loading ? " loading" : ""}`}
+      style={{ "--context-ratio": `${ratio * 100}%` } as React.CSSProperties}
+      title={
+        loading && !usage
+          ? "正在读取网页对话上下文"
+          : `网页对话上下文 ${formatContextTokens(usage?.web.used ?? 0)} / ${formatContextTokens(
+              usage?.web.limit ?? 200_000,
+            )}`
+      }
       aria-label="网页对话上下文占用"
     >
-      <button
-        className="context-meter-row web"
-        type="button"
-        onClick={onOpen}
-        aria-label="查看网页对话上下文"
-      >
-        <span>网页对话</span>
-        <i aria-hidden="true">
-          <b
-            style={{
-              width: `${Math.max(
-                0,
-                Math.min(100, (usage?.web.ratio ?? 0) * 100),
-              )}%`,
-            }}
-          />
-        </i>
-        <strong>
-          {loading && !usage
-            ? "读取中"
-            : `${formatContextTokens(usage?.web.used ?? 0)} / ${formatContextTokens(
-                usage?.web.limit ?? 200_000,
-              )}`}
-        </strong>
-      </button>
-    </div>
+      <span aria-hidden="true" />
+    </span>
   );
 }
 
@@ -1306,6 +1456,7 @@ function Modal({
   onClose,
   children,
   wide = false,
+  className = "",
 }: {
   title: string;
   titleNote?: string;
@@ -1313,6 +1464,7 @@ function Modal({
   onClose: () => void;
   children: React.ReactNode;
   wide?: boolean;
+  className?: string;
 }) {
   useEffect(() => {
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
@@ -1325,7 +1477,9 @@ function Modal({
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section
-        className={`modal-card${wide ? " modal-wide" : ""}`}
+        className={`modal-card${wide ? " modal-wide" : ""}${
+          className ? ` ${className}` : ""
+        }`}
         role="dialog"
         aria-modal="true"
         aria-label={title}
@@ -2113,6 +2267,41 @@ function ScrollingTitle({ title }: { title: string }) {
   );
 }
 
+function ScrollingPath({ path }: { path: string }) {
+  const viewportRef = useRef<HTMLSpanElement | null>(null);
+  const textRef = useRef<HTMLElement | null>(null);
+  const [offset, setOffset] = useState(0);
+
+  useEffect(() => {
+    const measure = () => {
+      const viewport = viewportRef.current;
+      const text = textRef.current;
+      setOffset(
+        viewport && text
+          ? Math.max(0, Math.ceil(text.scrollWidth - viewport.clientWidth))
+          : 0,
+      );
+    };
+    measure();
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    if (viewportRef.current) observer?.observe(viewportRef.current);
+    if (textRef.current) observer?.observe(textRef.current);
+    return () => observer?.disconnect();
+  }, [path]);
+
+  return (
+    <span
+      className={`workspace-path-viewport${offset ? " scrollable" : ""}`}
+      ref={viewportRef}
+      title={path}
+      style={{ "--path-offset": `${offset}px` } as React.CSSProperties}
+    >
+      <code ref={textRef}>{path}</code>
+    </span>
+  );
+}
+
 function useAnchoredMenuPosition(
   open: boolean,
   estimatedWidth = 214,
@@ -2383,9 +2572,13 @@ function UnifiedComposer({
   skills,
   selectedSkills,
   model,
+  providers,
+  activeProviderId,
   models,
   modelsLoading = false,
   modelError = "",
+  contextUsage,
+  contextLoading = false,
   textareaRef,
   menuDirection = "up",
   onChange,
@@ -2395,6 +2588,7 @@ function UnifiedComposer({
   onToggleSkill,
   onDetectModels,
   onSelectModel,
+  onOpenWebContext,
 }: {
   value: string;
   placeholder: string;
@@ -2404,9 +2598,13 @@ function UnifiedComposer({
   skills: SkillItem[];
   selectedSkills: string[];
   model: string;
+  providers: ModelProvider[];
+  activeProviderId: string;
   models: string[];
   modelsLoading?: boolean;
   modelError?: string;
+  contextUsage?: ContextUsage | null;
+  contextLoading?: boolean;
   textareaRef?: React.RefObject<HTMLTextAreaElement | null>;
   menuDirection?: "up" | "down";
   onChange: (value: string) => void;
@@ -2414,15 +2612,21 @@ function UnifiedComposer({
   onStop: () => void;
   onUpload: (files: FileList | null) => void;
   onToggleSkill: (skillId: string) => void;
-  onDetectModels: () => void;
-  onSelectModel: (model: string) => void;
+  onDetectModels: (providerId: string) => void;
+  onSelectModel: (providerId: string, model: string) => void;
+  onOpenWebContext?: () => void;
 }) {
   const localTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const activeTextareaRef = textareaRef ?? localTextareaRef;
   const [multiline, setMultiline] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPage, setMenuPage] = useState<"root" | "skills">("root");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [modelMenuPage, setModelMenuPage] = useState<"providers" | "models">(
+    "providers",
+  );
+  const [modelProviderId, setModelProviderId] = useState(activeProviderId);
   const menuWrapRef = useRef<HTMLDivElement | null>(null);
   const modelWrapRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -2433,7 +2637,7 @@ function UnifiedComposer({
     const textarea = activeTextareaRef.current;
     if (!textarea) return;
     const minimumHeight = 30;
-    const maximumHeight = 140;
+    const maximumHeight = expanded ? Math.max(300, textarea.clientHeight) : 96;
     textarea.style.height = "0px";
     const nextHeight = Math.min(
       maximumHeight,
@@ -2442,11 +2646,7 @@ function UnifiedComposer({
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY =
       textarea.scrollHeight > maximumHeight ? "auto" : "hidden";
-    setMultiline((current) => {
-      const next = nextHeight > minimumHeight;
-      return current === next ? current : next;
-    });
-  }, [activeTextareaRef, value]);
+  }, [activeTextareaRef, expanded, value]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -2471,16 +2671,36 @@ function UnifiedComposer({
     return () => document.removeEventListener("pointerdown", closeOnOutsidePress);
   }, [modelMenuOpen]);
 
+  useEffect(() => {
+    if (!modelMenuOpen) {
+      window.setTimeout(() => {
+        setModelMenuPage("providers");
+        setModelProviderId(activeProviderId);
+      }, 180);
+    }
+  }, [activeProviderId, modelMenuOpen]);
+
   const closeMenu = () => {
     setMenuOpen(false);
     window.setTimeout(() => setMenuPage("root"), 220);
   };
 
+  const submitComposer = () => {
+    setMultiline(false);
+    setExpanded(false);
+    onSubmit();
+  };
+
+  const selectedModelProvider =
+    providers.find((provider) => provider.id === modelProviderId) ||
+    providers.find((provider) => provider.id === activeProviderId) ||
+    providers[0];
+
   return (
     <div
       className={`unified-composer${sending ? " busy" : ""}${
         multiline ? " multiline" : ""
-      }`}
+      }${expanded ? " expanded" : ""}`}
     >
       <div className="composer-add-wrap" ref={menuWrapRef}>
         <button
@@ -2586,14 +2806,34 @@ function UnifiedComposer({
         rows={1}
         aria-label="消息输入框"
         placeholder={placeholder}
-        onChange={(event) => onChange(event.target.value)}
+        onChange={(event) => {
+          const nextValue = event.target.value;
+          if (!nextValue) {
+            setMultiline(false);
+            setExpanded(false);
+          } else if (event.currentTarget.scrollHeight > 32) {
+            setMultiline(true);
+          }
+          onChange(nextValue);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
-            if (!disabled && value.trim()) onSubmit();
+            if (!disabled && value.trim()) submitComposer();
           }
         }}
       />
+      {multiline && value && (
+        <button
+          className="composer-expand-button"
+          type="button"
+          aria-label={expanded ? "收起输入框" : "展开输入框"}
+          title={expanded ? "收起输入框" : "展开输入框"}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+        </button>
+      )}
       <div className="composer-model-wrap" ref={modelWrapRef}>
         <button
           className={`composer-model-button${modelMenuOpen ? " active" : ""}`}
@@ -2605,62 +2845,128 @@ function UnifiedComposer({
           onClick={() => {
             setModelMenuOpen((current) => {
               const next = !current;
-              if (next) onDetectModels();
+              if (next) {
+                setModelMenuPage("providers");
+                setModelProviderId(activeProviderId);
+              }
               return next;
             });
           }}
         >
           <span>{model || "选择模型"}</span>
-          {modelsLoading ? (
-            <LoaderCircle className="spin" size={13} />
-          ) : (
-            <ChevronDown size={13} />
-          )}
+          <WebContextRing usage={contextUsage ?? null} loading={contextLoading} />
+          <ChevronDown size={13} />
         </button>
         {modelMenuOpen && (
-          <div className={`composer-model-popover ${menuDirection}`}>
+          <div
+            className={`composer-model-popover ${menuDirection} show-${modelMenuPage}`}
+          >
             <div className="composer-model-heading">
-              <strong>选择模型</strong>
-              <button
-                type="button"
-                onClick={onDetectModels}
-                disabled={modelsLoading}
-                aria-label="重新检测模型"
-              >
-                <RefreshCw className={modelsLoading ? "spin" : undefined} size={14} />
-              </button>
-            </div>
-            <div className="composer-model-list">
-              {models.map((item) => (
+              {modelMenuPage === "models" ? (
                 <button
-                  className={item === model ? "selected" : ""}
+                  className="composer-model-back"
+                  type="button"
+                  onClick={() => setModelMenuPage("providers")}
+                >
+                  <ChevronLeft size={14} />
+                  <span>{selectedModelProvider?.name || "返回"}</span>
+                </button>
+              ) : (
+                <strong>选择模型</strong>
+              )}
+              {modelMenuPage === "models" && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    selectedModelProvider && onDetectModels(selectedModelProvider.id)
+                  }
+                  disabled={modelsLoading}
+                  aria-label="重新检测模型"
+                >
+                  <RefreshCw className={modelsLoading ? "spin" : undefined} size={14} />
+                </button>
+              )}
+            </div>
+            {modelMenuPage === "providers" ? (
+              <div className="composer-model-list composer-api-list">
+                {providers.map((provider) => (
+                  <button
+                    type="button"
+                    key={provider.id}
+                    disabled={!provider.configured}
+                    onClick={() => {
+                      setModelProviderId(provider.id);
+                      setModelMenuPage("models");
+                      onDetectModels(provider.id);
+                    }}
+                  >
+                    <span>
+                      <strong>{provider.name}</strong>
+                      <small>{provider.configured ? provider.baseUrl : "未配置"}</small>
+                    </span>
+                    <ChevronRight size={14} />
+                  </button>
+                ))}
+                {!providers.length && (
+                  <span className="composer-model-state">请先配置模型 API</span>
+                )}
+              </div>
+            ) : (
+              <div className="composer-model-list">
+                {models.map((item) => (
+                <button
+                  className={
+                    item === model && selectedModelProvider?.id === activeProviderId
+                      ? "selected"
+                      : ""
+                  }
                   type="button"
                   key={item}
                   onClick={() => {
-                    onSelectModel(item);
+                    if (selectedModelProvider) {
+                      onSelectModel(selectedModelProvider.id, item);
+                    }
                     setModelMenuOpen(false);
                   }}
                 >
                   <span title={item}>{item}</span>
-                  {item === model && <Check size={14} />}
+                  {item === model &&
+                    selectedModelProvider?.id === activeProviderId && (
+                      <Check size={14} />
+                    )}
                 </button>
-              ))}
-              {modelsLoading && !models.length && (
+                ))}
+                {modelsLoading && !models.length && (
                 <span className="composer-model-state">
                   <LoaderCircle className="spin" size={15} />
                   正在检测模型
                 </span>
-              )}
-              {!modelsLoading && modelError && (
+                )}
+                {!modelsLoading && modelError && (
                 <span className="composer-model-state error">{modelError}</span>
-              )}
-              {!modelsLoading && !modelError && !models.length && (
+                )}
+                {!modelsLoading && !modelError && !models.length && (
                 <span className="composer-model-state">暂无可用模型</span>
-              )}
+                )}
+              </div>
+            )}
+            <div className="composer-model-footer">
+              <button
+                type="button"
+                disabled={!onOpenWebContext}
+                onClick={() => {
+                  setModelMenuOpen(false);
+                  onOpenWebContext?.();
+                }}
+              >
+                <Gauge size={15} />
+                管理网页对话上下文配置
+              </button>
             </div>
           </div>
         )}
       </div>
+      <div className="composer-send-slot">
       {sending && allowSubmitWhileSending ? (
         <div className="composer-running-actions">
           <button
@@ -2675,7 +2981,7 @@ function UnifiedComposer({
           <button
             className="unified-send-button"
             type="button"
-            onClick={onSubmit}
+            onClick={submitComposer}
             disabled={disabled || !value.trim()}
             aria-label="追加指令"
             title="追加到当前任务"
@@ -2696,13 +3002,14 @@ function UnifiedComposer({
         <button
           className="unified-send-button"
           type="button"
-          onClick={onSubmit}
+          onClick={submitComposer}
           disabled={disabled || !value.trim()}
           aria-label="发送"
         >
           <ArrowUp size={18} />
         </button>
       )}
+      </div>
     </div>
   );
 }
@@ -2749,6 +3056,7 @@ export default function EasyWorkApp() {
   const [agentMenuPage, setAgentMenuPage] = useState<
     "root" | "config" | "models"
   >("root");
+  const [agentModelProviderId, setAgentModelProviderId] = useState("");
   const [manualAgentPickerOpen, setManualAgentPickerOpen] = useState(false);
   const [manualAgentBrowsePath, setManualAgentBrowsePath] = useState("~");
   const [manualAgentBrowseHome, setManualAgentBrowseHome] = useState("");
@@ -2805,13 +3113,13 @@ export default function EasyWorkApp() {
   const [pendingVirtualWrite, setPendingVirtualWrite] =
     useState<PendingVirtualWrite | null>(null);
   const [dynamicWorkspaceBusy, setDynamicWorkspaceBusy] = useState(false);
-  const [embeddingModalOpen, setEmbeddingModalOpen] = useState(false);
   const [accountTab, setAccountTab] = useState<"login" | "register" | "profile" | "api">(
     "login",
   );
   const [connections, setConnections] = useState<Record<string, ConnectionState>>({});
   const [selectedServerId, setSelectedServerId] = useState("");
   const [draftServerId, setDraftServerId] = useState("");
+  const [draftAgentId, setDraftAgentId] = useState("");
   const [gatewayStatus, setGatewayStatus] = useState<
     "checking" | "connected" | "unavailable"
   >("checking");
@@ -2827,15 +3135,12 @@ export default function EasyWorkApp() {
   >({});
   const [sending, setSending] = useState(false);
   const [toast, setToast] = useState("");
+  const [helpContent, setHelpContent] = useState("");
+  const [helpLoading, setHelpLoading] = useState(false);
+  const [helpError, setHelpError] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [sidebarSearchOpen, setSidebarSearchOpen] = useState(false);
   const [fileSearch, setFileSearch] = useState("");
-  const [memoryFilter, setMemoryFilter] = useState<
-    "all" | MemoryItem["scope"]
-  >("all");
-  const [memoryInstruction, setMemoryInstruction] = useState("");
-  const [editingMemoryId, setEditingMemoryId] = useState("");
-  const [editingMemoryText, setEditingMemoryText] = useState("");
   const [conversationMenuId, setConversationMenuId] = useState("");
   const [projectMenuId, setProjectMenuId] = useState("");
   const [conversationPendingDelete, setConversationPendingDelete] =
@@ -2848,6 +3153,7 @@ export default function EasyWorkApp() {
   const [providerModels, setProviderModels] = useState<string[]>([]);
   const [providerModelsLoading, setProviderModelsLoading] = useState(false);
   const [providerModelsError, setProviderModelsError] = useState("");
+  const providerModelRequestRef = useRef(0);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const [agentContextById, setAgentContextById] = useState<
     Record<string, ContextUsage["agent"]>
@@ -2869,6 +3175,10 @@ export default function EasyWorkApp() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesScrollRef = useRef<HTMLDivElement | null>(null);
   const messagesPinnedToBottomRef = useRef(true);
+  const conversationScrollPositionsRef = useRef<
+    Map<string, { scrollTop: number; pinned: boolean }>
+  >(new Map());
+  const deviceOnboardingAppliedRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const projectFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillInputRef = useRef<HTMLInputElement | null>(null);
@@ -2914,6 +3224,7 @@ export default function EasyWorkApp() {
   );
   const activeLastMessage = activeConversation?.messages.at(-1);
   const activeMessageCount = activeConversation?.messages.length ?? 0;
+  const isNewConversation = activeMessageCount === 0;
   const activeStreamProgress = [
     activeLastMessage?.content.length ?? 0,
     activeLastMessage?.reasoning?.length ?? 0,
@@ -2959,6 +3270,7 @@ export default function EasyWorkApp() {
   );
   const activeAgentId =
     activeConversation?.work?.agentId ||
+    (!activeConversation ? draftAgentId : "") ||
     activeAgentByServer[effectiveServerId] ||
     agents.find((item) => item.status === "ready")?.id ||
     "opencode";
@@ -2977,6 +3289,23 @@ export default function EasyWorkApp() {
   };
   const configAgent =
     agents.find((item) => item.id === agentConfigAgentId) || activeAgent;
+  const webModelProviders = state.settings.providers.filter(
+    (provider) => provider.audience !== "agent",
+  );
+  const activeWebModelProvider =
+    webModelProviders.find(
+      (provider) => provider.id === state.settings.activeProviderId,
+    ) ||
+    webModelProviders.find((provider) => provider.configured) ||
+    webModelProviders[0] ||
+    defaultModelProvider();
+  const agentModelProviders = state.settings.providers.filter(
+    (provider) => provider.audience !== "web",
+  );
+  const selectedAgentModelProvider =
+    agentModelProviders.find(
+      (provider) => provider.id === agentModelProviderId,
+    ) || null;
   const agentNativeSettingCount = Object.values(
     configAgent?.configurationSchema || {},
   ).filter((descriptor) => descriptor?.options?.length).length;
@@ -3014,24 +3343,12 @@ export default function EasyWorkApp() {
       };
     }
     if (draftWorkspace?.serverId === effectiveServerId) return draftWorkspace;
-    if (mode !== "work") return null;
-    return {
-      id: "",
-      serverId: effectiveServerId,
-      name: "虚拟工作区",
-      path: "",
-      mode: "managed",
-      kind: "virtual",
-      writable: true,
-      createdAt: "",
-      updatedAt: "",
-      lastUsedAt: "",
-    };
-  }, [activeConversation, draftWorkspace, effectiveServerId, mode]);
+    return null;
+  }, [activeConversation, draftWorkspace, effectiveServerId]);
   const workReady =
     mode !== "work" ||
     (connection.status === "connected" &&
-      Boolean(activeWorkspace?.id || activeWorkspace?.kind === "virtual") &&
+      Boolean(activeWorkspace?.id) &&
       activeAgent?.status === "ready" &&
       Boolean(activeAgent.configured));
   const activeRunningUserMessage = useMemo(
@@ -3354,11 +3671,21 @@ export default function EasyWorkApp() {
     }
   };
 
-  const detectProviderModels = useCallback(async () => {
-    const provider = state.settings.provider;
+  const detectProviderModels = useCallback(async (providerId?: string) => {
+    const requestId = ++providerModelRequestRef.current;
+    const provider =
+      state.settings.providers.find((item) => item.id === providerId) ||
+      state.settings.providers.find(
+        (item) => item.id === state.settings.activeProviderId,
+      ) ||
+      state.settings.providers[0] ||
+      defaultModelProvider();
     if (!provider.baseUrl || !provider.configured) {
-      setProviderModels([]);
-      setProviderModelsError("请先在个人资料中配置模型 API");
+      if (requestId === providerModelRequestRef.current) {
+        setProviderModelsLoading(false);
+        setProviderModels([]);
+        setProviderModelsError("请先在个人资料中配置模型 API");
+      }
       return;
     }
     setProviderModelsLoading(true);
@@ -3368,7 +3695,10 @@ export default function EasyWorkApp() {
       const response = await gatewayFetch("/api/settings/provider/models", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ baseUrl: provider.baseUrl }),
+        body: JSON.stringify({
+          providerId: provider.id,
+          baseUrl: provider.baseUrl,
+        }),
       });
       const payload = (await response.json()) as {
         models?: string[];
@@ -3377,60 +3707,67 @@ export default function EasyWorkApp() {
       if (!response.ok || !payload.models?.length) {
         throw new Error(payload.error || "没有检测到可用模型");
       }
-      setProviderModels(payload.models);
+      if (requestId === providerModelRequestRef.current) {
+        setProviderModels(payload.models);
+      }
     } catch (caught) {
-      setProviderModels([]);
-      setProviderModelsError(
-        caught instanceof Error ? caught.message : "模型检测失败",
-      );
+      if (requestId === providerModelRequestRef.current) {
+        setProviderModels([]);
+        setProviderModelsError(
+          caught instanceof Error ? caught.message : "模型检测失败",
+        );
+      }
     } finally {
-      setProviderModelsLoading(false);
+      if (requestId === providerModelRequestRef.current) {
+        setProviderModelsLoading(false);
+      }
     }
-  }, [state.settings.provider]);
+  }, [state.settings.activeProviderId, state.settings.providers]);
 
   const selectProviderModel = useCallback(
-    async (modelId: string) => {
-      const previousModel = state.settings.provider.model;
-      setState((current) => ({
-        ...current,
-        settings: {
-          ...current.settings,
-          provider: { ...current.settings.provider, model: modelId },
-        },
-      }));
+    async (providerId: string, modelId: string) => {
+      const selectedProvider =
+        state.settings.providers.find((item) => item.id === providerId) ||
+        state.settings.providers.find(
+          (item) => item.id === state.settings.activeProviderId,
+        ) ||
+        state.settings.providers[0] ||
+        defaultModelProvider();
       try {
         const response = await gatewayFetch("/api/settings/provider", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            baseUrl: state.settings.provider.baseUrl,
+            providerId: selectedProvider.id,
+            name: selectedProvider.name,
+            baseUrl: selectedProvider.baseUrl,
             model: modelId,
+            activate: true,
           }),
         });
         const payload = (await response.json().catch(() => ({}))) as {
-          provider?: AppSettings["provider"];
+          providers?: ModelProvider[];
+          activeProviderId?: string;
           error?: string;
         };
         if (!response.ok) throw new Error(payload.error || "模型保存失败");
-        if (payload.provider) {
+        if (payload.providers?.length) {
           setState((current) => ({
             ...current,
-            settings: { ...current.settings, provider: payload.provider! },
+            settings: {
+              ...current.settings,
+              providers: payload.providers!,
+              activeProviderId:
+                payload.activeProviderId ?? current.settings.activeProviderId,
+            },
           }));
         }
         showToast(`已选择 ${modelId}`);
       } catch (caught) {
-        setState((current) => ({
-          ...current,
-          settings: {
-            ...current.settings,
-            provider: { ...current.settings.provider, model: previousModel },
-          },
-        }));
         showToast(caught instanceof Error ? caught.message : "模型保存失败");
       }
     },
-    [showToast, state.settings.provider],
+    [showToast, state.settings.activeProviderId, state.settings.providers],
   );
 
   const updateConversation = useCallback(
@@ -3591,10 +3928,6 @@ export default function EasyWorkApp() {
               : conversation,
           ),
         }));
-        setWorkspaceItems((current) => [
-          payload.workspace || workspace,
-          ...current.filter((item) => item.id !== workspace.id),
-        ]);
         setContextUsage(null);
         showToast(`已切换到 ${workspace.name}`);
       } catch (caught) {
@@ -3665,9 +3998,16 @@ export default function EasyWorkApp() {
     setWorkspacePickerLoading(true);
     try {
       if (!activeConversation) {
-        setDraftWorkspace(null);
+        const conversationId =
+          draftConversationIdRef.current || uid("chat");
+        draftConversationIdRef.current = conversationId;
+        const workspace = await ensureConversationVirtualWorkspace(
+          serverId,
+          conversationId,
+        );
+        setDraftWorkspace(workspace);
         setWorkspacePickerOpen(false);
-        showToast("新对话将使用虚拟工作区");
+        showToast("虚拟工作区已就绪");
         return;
       }
       const workspace = await ensureConversationVirtualWorkspace(
@@ -4560,6 +4900,7 @@ export default function EasyWorkApp() {
             actor?: Actor;
             deviceToken?: string;
             state?: Partial<EasyWorkState>;
+            device?: { id?: string; firstVisit?: boolean };
           };
           if (!payload.actor) continue;
           if (disposed) return;
@@ -4582,6 +4923,15 @@ export default function EasyWorkApp() {
               });
               return changed ? { ...current, conversations } : current;
             });
+          }
+          if (
+            !deviceOnboardingAppliedRef.current &&
+            payload.device?.firstVisit
+          ) {
+            deviceOnboardingAppliedRef.current = true;
+            setView("help");
+          } else if (!deviceOnboardingAppliedRef.current) {
+            deviceOnboardingAppliedRef.current = true;
           }
           setAppLoading(false);
           return;
@@ -4608,6 +4958,56 @@ export default function EasyWorkApp() {
     );
     return () => window.clearTimeout(timer);
   }, [gatewayProbe, gatewayStatus]);
+
+  useEffect(() => {
+    if (view !== "help" || gatewayStatus !== "connected") return;
+    let disposed = false;
+
+    const loadHelp = async (initial: boolean) => {
+      if (initial) setHelpLoading(true);
+      try {
+        const response = await gatewayFetch("/api/help", {
+          cache: "no-store",
+        });
+        const payload = (await response.json().catch(() => ({}))) as {
+          content?: string;
+          error?: string;
+        };
+        if (!response.ok || typeof payload.content !== "string") {
+          throw new Error(payload.error || "帮助内容读取失败");
+        }
+        if (!disposed) {
+          setHelpContent((current) =>
+            current === payload.content ? current : payload.content!,
+          );
+          setHelpError("");
+        }
+      } catch (caught) {
+        if (!disposed) {
+          setHelpError(
+            caught instanceof Error ? caught.message : "帮助内容读取失败",
+          );
+        }
+      } finally {
+        if (initial && !disposed) setHelpLoading(false);
+      }
+    };
+
+    void loadHelp(true);
+    const helpEvents = new EventSource(
+      new URL("/api/help/events", GATEWAY_HTTP).toString(),
+      { withCredentials: true },
+    );
+    const refreshChangedHelp = () => {
+      void loadHelp(false);
+    };
+    helpEvents.addEventListener("help.changed", refreshChangedHelp);
+    return () => {
+      disposed = true;
+      helpEvents.removeEventListener("help.changed", refreshChangedHelp);
+      helpEvents.close();
+    };
+  }, [gatewayStatus, view]);
 
   useEffect(() => {
     if (gatewayStatus !== "connected") return;
@@ -4700,8 +5100,39 @@ export default function EasyWorkApp() {
     if (!scroller) return;
     const distanceToBottom =
       scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-    messagesPinnedToBottomRef.current = distanceToBottom <= 72;
-  }, []);
+    const pinned = distanceToBottom <= 72;
+    messagesPinnedToBottomRef.current = pinned;
+    if (activeConversationId) {
+      conversationScrollPositionsRef.current.set(activeConversationId, {
+        scrollTop: scroller.scrollTop,
+        pinned,
+      });
+    }
+  }, [activeConversationId]);
+
+  useLayoutEffect(() => {
+    if (view !== "chat" || !activeConversationId) return;
+    const conversationId = activeConversationId;
+    const scroller = messagesScrollRef.current;
+    const positions = conversationScrollPositionsRef.current;
+    if (!scroller) return;
+    const saved = positions.get(conversationId);
+    messagesPinnedToBottomRef.current = saved?.pinned ?? true;
+    const frame = window.requestAnimationFrame(() => {
+      if (saved) {
+        scroller.scrollTo({ top: saved.scrollTop, behavior: "auto" });
+      } else {
+        scroller.scrollTo({ top: scroller.scrollHeight, behavior: "auto" });
+      }
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      positions.set(conversationId, {
+        scrollTop: scroller.scrollTop,
+        pinned: messagesPinnedToBottomRef.current,
+      });
+    };
+  }, [activeConversationId, view]);
 
   useEffect(() => {
     const scroller = messagesScrollRef.current;
@@ -4713,11 +5144,9 @@ export default function EasyWorkApp() {
   }, [activeMessageCount, activeStreamProgress, sending]);
 
   const selectConversation = (conversation: Conversation) => {
-    draftConversationIdRef.current = "";
+    trackMessageScrollPosition();
     setActiveConversationId(conversation.id);
     setDraftProjectId(undefined);
-    setDraftServerId("");
-    setDraftWorkspace(null);
     setActiveProjectId(conversation.projectId ?? "");
     setMode(conversation.mode);
     setView("chat");
@@ -4737,11 +5166,9 @@ export default function EasyWorkApp() {
   };
 
   const beginConversation = (projectId?: string, nextMode: Mode = "chat") => {
-    draftConversationIdRef.current = "";
+    trackMessageScrollPosition();
     setActiveConversationId("");
     setDraftProjectId(projectId);
-    setDraftServerId("");
-    setDraftWorkspace(null);
     setPendingVirtualWrite(null);
     setActiveProjectId(projectId ?? "");
     setMode(nextMode);
@@ -4764,12 +5191,10 @@ export default function EasyWorkApp() {
   };
 
   const openProject = (projectId: string) => {
-    draftConversationIdRef.current = "";
+    trackMessageScrollPosition();
     setActiveProjectId(projectId);
     setActiveConversationId("");
     setDraftProjectId(undefined);
-    setDraftServerId("");
-    setDraftWorkspace(null);
     setMode("chat");
     setDraft("");
     setSelectedSkills([]);
@@ -4891,10 +5316,6 @@ export default function EasyWorkApp() {
 
   const changeMode = (nextMode: Mode) => {
     setMode(nextMode);
-    if (nextMode === "chat" && !activeConversation) {
-      setDraftServerId("");
-      setDraftWorkspace(null);
-    }
     if (activeConversation) {
       updateConversation(activeConversation.id, (conversation) => ({
         ...conversation,
@@ -4940,7 +5361,10 @@ export default function EasyWorkApp() {
       setDraftServerId("");
       return;
     }
-    if (draftServerId !== serverId) setDraftWorkspace(null);
+    if (draftServerId !== serverId) {
+      setDraftWorkspace(null);
+      setDraftAgentId("");
+    }
     setDraftServerId(serverId);
   };
 
@@ -5108,6 +5532,7 @@ export default function EasyWorkApp() {
     const targetConnection = connections[targetServerId] ?? connection;
     const submissionAgentId =
       conversation?.work?.agentId ||
+      (!conversation ? draftAgentId : "") ||
       activeAgentByServer[targetServerId] ||
       activeAgentId;
     const submissionAgent = (agentsByServer[targetServerId] ?? []).find(
@@ -5158,7 +5583,7 @@ export default function EasyWorkApp() {
       showToast("请先连接一台远程服务器");
       return;
     }
-    let submissionWorkspace: WorkspaceItem | null = conversation?.work?.workspaceId
+    const submissionWorkspace: WorkspaceItem | null = conversation?.work?.workspaceId
       ? {
           id: conversation.work.workspaceId,
           serverId: conversation.work.serverId || targetServerId,
@@ -5211,15 +5636,9 @@ export default function EasyWorkApp() {
     }
 
     if (submissionMode === "work" && !submissionWorkspace?.id) {
-      try {
-        submissionWorkspace = await ensureConversationVirtualWorkspace(
-          targetServerId,
-          conversationId,
-        );
-      } catch (caught) {
-        showToast(caught instanceof Error ? caught.message : "创建虚拟工作区失败");
-        return;
-      }
+      showToast("请先设置工作区");
+      void openWorkspacePicker();
+      return;
     }
     const executionWorkspace =
       submissionMode === "work"
@@ -5360,6 +5779,7 @@ export default function EasyWorkApp() {
     setActiveProjectId(projectId ?? "");
     setDraftProjectId(undefined);
     setDraftServerId("");
+    setDraftAgentId("");
     setDraftWorkspace(null);
     draftConversationIdRef.current = "";
     setMode(submissionMode);
@@ -5753,6 +6173,7 @@ export default function EasyWorkApp() {
     setSelectedServerId(serverId);
     if (sshModalContext !== "manage") {
       if (draftWorkspace?.serverId !== serverId) setDraftWorkspace(null);
+      if (draftServerId !== serverId) setDraftAgentId("");
       setDraftServerId(serverId);
       if (activeConversation && !activeConversation.work?.serverId) {
         pendingServerBindingRef.current = {
@@ -5864,9 +6285,8 @@ export default function EasyWorkApp() {
     }
     setSelectedServerId(payload.serverId);
     if (sshModalContext !== "manage") {
-      if (draftWorkspace?.serverId !== payload.serverId) {
-        setDraftWorkspace(null);
-      }
+      if (draftWorkspace?.serverId !== payload.serverId) setDraftWorkspace(null);
+      if (draftServerId !== payload.serverId) setDraftAgentId("");
       setDraftServerId(payload.serverId);
       if (activeConversation && !activeConversation.work?.serverId) {
         pendingServerBindingRef.current = {
@@ -6049,6 +6469,8 @@ export default function EasyWorkApp() {
           agentId,
         },
       }));
+    } else {
+      setDraftAgentId(agentId);
     }
     setAgentMenuOpen(false);
     setAgentMenuPage("root");
@@ -6145,12 +6567,12 @@ export default function EasyWorkApp() {
           ? current[effectiveServerId]
           : { status: "idle" },
     }));
+    setAgentModelProviderId("");
     setAgentMenuPage("models");
-    void detectProviderModels();
   };
 
-  const configureAgentModel = (modelId: string) => {
-    if (!configAgent || !effectiveServerId) return;
+  const configureAgentModel = (providerId: string, modelId: string) => {
+    if (!configAgent || !effectiveServerId || !providerId) return;
     setAgentModelsByServer((current) => ({
       ...current,
       [effectiveServerId]: {
@@ -6196,6 +6618,7 @@ export default function EasyWorkApp() {
         type: "agent.model.configure",
         serverId: effectiveServerId,
         agentId: configAgent.id,
+        providerId,
         model: modelId,
         conversationId: activeConversationId,
         workspaceId: activeWorkspace?.id || "",
@@ -6436,22 +6859,6 @@ export default function EasyWorkApp() {
     if (skillFolderInputRef.current) skillFolderInputRef.current.value = "";
   };
 
-  const deleteGuestData = async () => {
-    try {
-      await gatewayFetch("/api/guest", {
-        method: "DELETE",
-      });
-    } catch {
-      // Gateway may already be gone; clearing local UI still honors the visible action.
-    }
-    setState(DEFAULT_STATE);
-    setActiveConversationId("");
-    setActiveProjectId("");
-    setDraftProjectId(undefined);
-    setView("chat");
-    showToast("访客临时数据已清除");
-  };
-
   const visibleConversations = state.conversations.filter((conversation) => {
     if (!searchQuery.trim()) return true;
     return conversation.title.toLowerCase().includes(searchQuery.trim().toLowerCase());
@@ -6490,143 +6897,6 @@ export default function EasyWorkApp() {
   const projectFiles = projectPage
     ? state.files.filter((file) => (projectPage.fileIds ?? []).includes(file.id))
     : [];
-
-  const visibleMemories = state.memories.filter((memory) => {
-    if (memoryFilter === "all") return true;
-    return memory.scope === memoryFilter;
-  });
-
-  const refreshMemorySummary = async () => {
-    const response = await gatewayFetch("/api/memories/overview", {
-      method: "POST",
-    });
-    if (!response.ok) throw new Error("记忆摘要刷新失败");
-    const payload = (await response.json()) as { overview?: string };
-    setState((current) => ({
-      ...current,
-      memorySummary: payload.overview || "当前没有启用的长期记忆。",
-    }));
-    showToast("记忆摘要已刷新");
-  };
-
-  const addMemory = () => {
-    const id = uid("memory-draft");
-    setState((current) => ({
-      ...current,
-      memories: [
-        {
-          id,
-          content: "",
-          scope: "user",
-          kind: "preference",
-          source: "手动添加",
-          confidence: 1,
-          enabled: true,
-          updatedAt: now(),
-        },
-        ...current.memories,
-      ],
-    }));
-    setEditingMemoryId(id);
-    setEditingMemoryText("");
-  };
-
-  const saveMemoryItem = async (memory: MemoryItem, content: string) => {
-    const normalized = content.trim();
-    if (!normalized) return;
-    const creating = memory.id.startsWith("memory-draft");
-    const response = await gatewayFetch(
-      creating ? "/api/memories" : `/api/memories/${encodeURIComponent(memory.id)}`,
-      {
-        method: creating ? "POST" : "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(
-          creating
-            ? {
-                content: normalized,
-                scope: memory.scope,
-                scopeId: memory.scopeId,
-                kind: memory.kind,
-              }
-            : { content: normalized },
-        ),
-      },
-    );
-    if (!response.ok) throw new Error("记忆保存失败");
-    const payload = (await response.json()) as {
-      record?: Record<string, unknown>;
-    };
-    if (!payload.record) return;
-    const saved = memoryItemFromApi(payload.record);
-    setState((current) => ({
-      ...current,
-      memories: [
-        saved,
-        ...current.memories.filter((item) => item.id !== memory.id && item.id !== saved.id),
-      ],
-      memorySummary: "",
-    }));
-    setEditingMemoryId("");
-  };
-
-  const toggleMemory = async (memory: MemoryItem) => {
-    const response = await gatewayFetch(
-      `/api/memories/${encodeURIComponent(memory.id)}`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: !memory.enabled }),
-      },
-    );
-    if (!response.ok) throw new Error("记忆状态更新失败");
-    const payload = (await response.json()) as {
-      record?: Record<string, unknown>;
-    };
-    if (!payload.record) return;
-    const saved = memoryItemFromApi(payload.record);
-    setState((current) => ({
-      ...current,
-      memories: current.memories.map((item) =>
-        item.id === memory.id ? saved : item,
-      ),
-      memorySummary: "",
-    }));
-  };
-
-  const deleteMemory = async (memoryId: string) => {
-    const response = await gatewayFetch(
-      `/api/memories/${encodeURIComponent(memoryId)}`,
-      { method: "DELETE" },
-    );
-    if (!response.ok) throw new Error("记忆删除失败");
-    setState((current) => ({
-      ...current,
-      memories: current.memories.filter((item) => item.id !== memoryId),
-      memorySummary: "",
-    }));
-  };
-
-  const applyMemoryInstruction = async () => {
-    const instruction = memoryInstruction.trim();
-    if (!instruction) return;
-    const response = await gatewayFetch("/api/memories/instruction", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ instruction }),
-    });
-    if (!response.ok) throw new Error("记忆更新失败");
-    const payload = (await response.json()) as {
-      records?: Record<string, unknown>[];
-      overview?: string;
-    };
-    setState((current) => ({
-      ...current,
-      memories: (payload.records ?? []).map(memoryItemFromApi),
-      memorySummary: payload.overview || "",
-    }));
-    setMemoryInstruction("");
-    showToast("记忆已更新");
-  };
 
   const deleteLibraryFile = async (fileId: string) => {
     setState((current) => ({
@@ -6722,6 +6992,7 @@ export default function EasyWorkApp() {
             className={`sidebar-nav-item${view === "library" ? " active" : ""}`}
             type="button"
             onClick={() => {
+              trackMessageScrollPosition();
               setView("library");
               setSidebarOpen(false);
             }}
@@ -6733,6 +7004,7 @@ export default function EasyWorkApp() {
             className={`sidebar-nav-item${view === "skills" ? " active" : ""}`}
             type="button"
             onClick={() => {
+              trackMessageScrollPosition();
               setView("skills");
               setSidebarOpen(false);
             }}
@@ -6741,15 +7013,16 @@ export default function EasyWorkApp() {
             <span>技能</span>
           </button>
           <button
-            className={`sidebar-nav-item${view === "memory" ? " active" : ""}`}
+            className={`sidebar-nav-item${view === "help" ? " active" : ""}`}
             type="button"
             onClick={() => {
-              setView("memory");
+              trackMessageScrollPosition();
+              setView("help");
               setSidebarOpen(false);
             }}
           >
-            <Brain size={17} />
-            <span>记忆</span>
+            <BookOpen size={17} />
+            <span>帮助</span>
           </button>
           <button
             className="sidebar-nav-item"
@@ -7038,6 +7311,26 @@ export default function EasyWorkApp() {
         </div>
 
         <div className="profile-wrap">
+          {actor.isAdmin && (
+            <button
+              className={`admin-nav-button${view === "admin" ? " active" : ""}`}
+              type="button"
+              onClick={() => {
+                trackMessageScrollPosition();
+                setView("admin");
+                setSidebarOpen(false);
+              }}
+            >
+              <span className="admin-nav-icon">
+                <ShieldCheck size={16} />
+              </span>
+              <span>
+                <strong>管理员面板</strong>
+                <small>平台 API 与 SSH</small>
+              </span>
+              <ChevronRight size={15} />
+            </button>
+          )}
           <button
             className="profile-button"
             type="button"
@@ -7060,7 +7353,7 @@ export default function EasyWorkApp() {
               <strong>{actor.displayName}</strong>
               <small>
                 {actor.authenticated
-                  ? state.settings.provider.configured
+                  ? webModelProviders.some((provider) => provider.configured)
                     ? "模型 API 已配置"
                     : "配置模型 API"
                   : "登录或注册"}
@@ -7103,7 +7396,9 @@ export default function EasyWorkApp() {
                     ? "文件库"
                     : view === "skills"
                       ? "技能"
-                      : "记忆"}
+                      : view === "admin"
+                        ? "管理员面板"
+                        : "帮助"}
                 </strong>
               </div>
             )}
@@ -7168,7 +7463,7 @@ export default function EasyWorkApp() {
               mode === "work" && connection.status === "connected"
                 ? " workspace-toolbar"
                 : ""
-            }`}
+            }${isNewConversation ? " new-conversation" : ""}`}
           >
             <div className="conversation-toolbar">
               <div className="conversation-toolbar-left">
@@ -7180,15 +7475,16 @@ export default function EasyWorkApp() {
                 >
                   <Menu size={18} />
                 </button>
-                {activeProject && (
-                  <span className="conversation-project-label">
-                    <Folder size={14} />
-                    {activeProject.name}
-                  </span>
-                )}
-                <div className={`conversation-mode-stack ${mode}`}>
-                {activeConversation ? (
-                  <div className="conversation-mode-menu">
+                {!isNewConversation && (
+                  <>
+                    {activeProject && (
+                      <span className="conversation-project-label">
+                        <Folder size={14} />
+                        {activeProject.name}
+                      </span>
+                    )}
+                    <div className={`conversation-mode-stack ${mode}`}>
+                      <div className="conversation-mode-menu">
                     <button
                       className={`conversation-mode-badge ${mode}`}
                       type="button"
@@ -7221,29 +7517,15 @@ export default function EasyWorkApp() {
                       </div>
                     )}
                   </div>
-                ) : (
-                  <div className="mode-switch compact" role="group" aria-label="选择对话类型">
-                    <button
-                      className={mode === "chat" ? "active" : ""}
-                      type="button"
-                      onClick={() => changeMode("chat")}
-                    >
-                      聊天
-                    </button>
-                    <button
-                      className={mode === "work" ? "active" : ""}
-                      type="button"
-                      onClick={() => changeMode("work")}
-                    >
-                      工作
-                    </button>
-                  </div>
+                    </div>
+                  </>
                 )}
-                </div>
               </div>
 
               <div className="conversation-toolbar-right">
-                {mode === "work" && connection.status === "connected" && (
+                {!isNewConversation &&
+                  mode === "work" &&
+                  connection.status === "connected" && (
                   <div className="agent-selector">
                     <button
                       className={`agent-picker${activeAgentScanning ? " scanning" : ""}`}
@@ -7285,8 +7567,15 @@ export default function EasyWorkApp() {
                                 ? `${agentConfigMenuHeight}px`
                                 : agentMenuPage === "models"
                                   ? `${Math.min(
-                                      350,
-                                      112 + Math.max(providerModels.length, 1) * 40,
+                                      390,
+                                      104 +
+                                        Math.max(
+                                          agentModelProviderId
+                                            ? providerModels.length
+                                            : agentModelProviders.length,
+                                          1,
+                                        ) *
+                                          44,
                                     )}px`
                                   : `${Math.min(
                                       390,
@@ -7458,23 +7747,22 @@ export default function EasyWorkApp() {
                                 onClick={openAgentModelPicker}
                               >
                                 <Bot size={16} />
-                                <span>选择模型</span>
+                                <span className="agent-model-option-copy">
+                                  <span>选择模型</span>
+                                  <small
+                                    title={
+                                      activeAgentModelConfig.model ||
+                                      configAgent.model ||
+                                      ""
+                                    }
+                                  >
+                                    {activeAgentModelConfig.model ||
+                                      configAgent.model ||
+                                      "尚未选择"}
+                                  </small>
+                                </span>
                                 <ChevronRight size={15} />
                               </button>
-                            )}
-                            {configAgent?.managed && (
-                              <small
-                                className="agent-current-model"
-                                title={
-                                  activeAgentModelConfig.model ||
-                                  configAgent.model ||
-                                  ""
-                                }
-                              >
-                                当前模型 · {activeAgentModelConfig.model ||
-                                  configAgent.model ||
-                                  "尚未选择"}
-                              </small>
                             )}
                             {configAgent?.managed &&
                               (["reasoning", "permission", "sandbox"] as const).map(
@@ -7586,12 +7874,19 @@ export default function EasyWorkApp() {
                             <button
                               className="agent-menu-back"
                               type="button"
-                              onClick={() => setAgentMenuPage("config")}
+                              onClick={() => {
+                                if (agentModelProviderId) {
+                                  setAgentModelProviderId("");
+                                  setProviderModels([]);
+                                  setProviderModelsError("");
+                                } else {
+                                  setAgentMenuPage("config");
+                                }
+                              }}
                             >
                               <ChevronLeft size={15} />
                               返回
                             </button>
-                            <p>基于用户 API 进行配置</p>
                             {activeAgentModelConfig.status === "configuring" && (
                               <div className="agent-model-progress" role="status">
                                 <LoaderCircle className="spin" size={15} />
@@ -7611,7 +7906,31 @@ export default function EasyWorkApp() {
                               </div>
                             )}
                             <div className="agent-model-list">
-                              {providerModels.map((modelId) => {
+                              {!selectedAgentModelProvider &&
+                                agentModelProviders.map((provider) => (
+                                  <button
+                                    className="agent-provider-row"
+                                    type="button"
+                                    key={provider.id}
+                                    disabled={!provider.configured}
+                                    onClick={() => {
+                                      setAgentModelProviderId(provider.id);
+                                      void detectProviderModels(provider.id);
+                                    }}
+                                  >
+                                    <span>
+                                      <strong>{provider.name}</strong>
+                                      <small>
+                                        {provider.configured
+                                          ? provider.baseUrl
+                                          : "未配置"}
+                                      </small>
+                                    </span>
+                                    <ChevronRight size={14} />
+                                  </button>
+                                ))}
+                              {selectedAgentModelProvider &&
+                                providerModels.map((modelId) => {
                                 const selectedModel =
                                   activeAgentModelConfig.status === "done"
                                     ? activeAgentModelConfig.model
@@ -7626,7 +7945,12 @@ export default function EasyWorkApp() {
                                     disabled={
                                       activeAgentModelConfig.status === "configuring"
                                     }
-                                    onClick={() => configureAgentModel(modelId)}
+                                    onClick={() =>
+                                      configureAgentModel(
+                                        selectedAgentModelProvider.id,
+                                        modelId,
+                                      )
+                                    }
                                   >
                                     <span title={modelId}>{modelId}</span>
                                     {activeAgentModelConfig.status === "configuring" &&
@@ -7638,13 +7962,17 @@ export default function EasyWorkApp() {
                                   </button>
                                 );
                               })}
-                              {providerModelsLoading && !providerModels.length && (
+                              {selectedAgentModelProvider &&
+                                providerModelsLoading &&
+                                !providerModels.length && (
                                 <span className="agent-model-empty">
                                   <LoaderCircle className="spin" size={15} />
                                   正在检测模型
                                 </span>
                               )}
-                              {!providerModelsLoading && providerModelsError && (
+                              {selectedAgentModelProvider &&
+                                !providerModelsLoading &&
+                                providerModelsError && (
                                 <span className="agent-model-empty error">
                                   {providerModelsError}
                                 </span>
@@ -7656,7 +7984,7 @@ export default function EasyWorkApp() {
                     )}
                   </div>
                 )}
-                {mode === "work" && !rightRailOpen && (
+                {!isNewConversation && mode === "work" && !rightRailOpen && (
                   <button
                     className={`work-connection-button ${connection.status}`}
                     type="button"
@@ -7707,64 +8035,35 @@ export default function EasyWorkApp() {
                     </div>
                   ) : (
                     <>
-                      <div>
-                        <h1>
+                      <div
+                        className="new-conversation-mode-switch"
+                        role="group"
+                        aria-label="选择新对话类型"
+                      >
+                        <button
+                          className={`chat${mode === "chat" ? " active" : ""}`}
+                          type="button"
+                          onClick={() => changeMode("chat")}
+                        >
+                          <MessageCircle size={14} />
+                          聊天
+                        </button>
+                        <button
+                          className={`work${mode === "work" ? " active" : ""}`}
+                          type="button"
+                          onClick={() => changeMode("work")}
+                        >
+                          <Terminal size={14} />
+                          工作
+                        </button>
+                      </div>
+                      <div className="new-conversation-heading">
+                        <h1 className={mode}>
                           {mode === "chat"
                             ? "有什么可以帮你？"
-                            : "在算力平台上开始工作"}
+                            : "准备好后，开始工作"}
                         </h1>
                       </div>
-                      {mode === "work" && connection.status !== "connected" && (
-                        <button
-                          className="inline-connect"
-                          type="button"
-                          onClick={openConversationServerManager}
-                        >
-                          <KeyRound size={16} />
-                          连接远程服务器
-                        </button>
-                      )}
-                      {mode === "work" &&
-                        connection.status === "connected" &&
-                        !activeWorkspace && (
-                          <button
-                            className="inline-connect workspace"
-                            type="button"
-                            onClick={() => void openWorkspacePicker()}
-                          >
-                            <FolderOpen size={16} />
-                            选择工作区
-                          </button>
-                        )}
-                      {mode === "work" &&
-                        connection.status === "connected" &&
-                        Boolean(activeWorkspace) &&
-                        !activeAgentScanning &&
-                        (!activeAgent || !activeAgent.configured) && (
-                          <button
-                            className="inline-connect"
-                            type="button"
-                            onClick={() =>
-                              activeAgent?.status === "missing"
-                                ? (() => {
-                                    setAgentMenuPage("root");
-                                    setAgentMenuOpen(true);
-                                  })()
-                                : (() => {
-                                    if (activeAgent) {
-                                      setAgentConfigAgentId(activeAgent.id);
-                                    }
-                                    setAgentMenuPage("config");
-                                    setAgentMenuOpen(true);
-                                  })()
-                            }
-                          >
-                            <Settings2 size={16} />
-                            {activeAgent?.status === "missing"
-                              ? "安装或选择 Agent"
-                              : "配置 Agent"}
-                          </button>
-                        )}
                     </>
                   )}
                 </div>
@@ -8005,7 +8304,6 @@ export default function EasyWorkApp() {
             </div>
 
             <div className="composer-zone">
-              <div className="composer-with-context">
                 <UnifiedComposer
                   value={draft}
                   textareaRef={textareaRef}
@@ -8014,10 +8312,14 @@ export default function EasyWorkApp() {
                   allowSubmitWhileSending={canAppendToActiveRun}
                   skills={state.skills}
                   selectedSkills={selectedSkills}
-                  model={state.settings.provider.model}
+                  model={activeWebModelProvider.model}
+                  providers={webModelProviders}
+                  activeProviderId={state.settings.activeProviderId}
                   models={providerModels}
                   modelsLoading={providerModelsLoading}
                   modelError={providerModelsError}
+                  contextUsage={contextUsage}
+                  contextLoading={contextLoading}
                   menuDirection="up"
                   onChange={setDraft}
                   onSubmit={() => void submitMessage()}
@@ -8026,8 +8328,13 @@ export default function EasyWorkApp() {
                     void handleLibraryUpload(files, activeProject?.id)
                   }
                   onToggleSkill={toggleSelectedSkill}
-                  onDetectModels={() => void detectProviderModels()}
-                  onSelectModel={(modelId) => void selectProviderModel(modelId)}
+                  onDetectModels={(providerId) =>
+                    void detectProviderModels(providerId)
+                  }
+                  onSelectModel={(providerId, modelId) =>
+                    void selectProviderModel(providerId, modelId)
+                  }
+                  onOpenWebContext={() => setContextModalOpen(true)}
                   placeholder={
                     appLoading
                       ? "正在加载 EasyWork"
@@ -8046,15 +8353,92 @@ export default function EasyWorkApp() {
                             : "描述要在远程服务器完成的工作"
                   }
                 />
-                {activeConversation && (
-                  <WebContextMeter
-                    usage={contextUsage}
-                    loading={contextLoading}
-                    onOpen={() => setContextModalOpen(true)}
-                  />
-                )}
-              </div>
-              {mode === "chat" && <p>EasyWork 可能会出错，请核对重要信息。</p>}
+              {isNewConversation && mode === "work" && !appLoading && (
+                <div className="new-work-setup" aria-label="工作对话准备">
+                  {connection.status !== "connected" ? (
+                    <button
+                      className="new-work-setup-action primary-stage"
+                      type="button"
+                      disabled={connection.status === "connecting"}
+                      onClick={openConversationServerManager}
+                    >
+                      {connection.status === "connecting" ? (
+                        <LoaderCircle className="spin" size={16} />
+                      ) : (
+                        <KeyRound size={16} />
+                      )}
+                      <span>
+                        <strong>
+                          {connection.status === "connecting"
+                            ? "正在连接"
+                            : "连接远程服务器"}
+                        </strong>
+                      </span>
+                    </button>
+                  ) : (
+                    <>
+                      <div className="new-work-setup-value server-ready">
+                        <Wifi size={16} />
+                        <span title={activeServerProfile?.host || connection.host}>
+                          {activeServerProfile?.host || connection.host || "远程服务器"}
+                        </span>
+                      </div>
+                      {activeAgentScanning ? (
+                        <button
+                          className="new-work-setup-action agent-stage"
+                          type="button"
+                          disabled
+                        >
+                          <LoaderCircle className="spin" size={16} />
+                          <span>正在扫描 Agent</span>
+                        </button>
+                      ) : activeAgent?.status === "ready" && activeAgent.configured ? (
+                        <div className="new-work-setup-value agent-ready">
+                          <Bot size={16} />
+                          <span>{activeAgent.name}</span>
+                        </div>
+                      ) : (
+                        <button
+                          className="new-work-setup-action agent-stage"
+                          type="button"
+                          onClick={() => {
+                            if (!activeAgent || activeAgent.status === "missing") {
+                              setAgentMenuPage("root");
+                            } else {
+                              setAgentConfigAgentId(activeAgent.id);
+                              setAgentMenuPage("config");
+                            }
+                            setAgentMenuOpen(true);
+                          }}
+                        >
+                          <Settings2 size={16} />
+                          <span>配置 Agent</span>
+                        </button>
+                      )}
+                      {activeAgent?.status === "ready" &&
+                        activeAgent.configured &&
+                        (activeWorkspace?.id ? (
+                          <div className="new-work-setup-value workspace-ready">
+                            <FolderOpen size={16} />
+                            <span title={activeWorkspace.path}>{activeWorkspace.path}</span>
+                          </div>
+                        ) : (
+                          <button
+                            className="new-work-setup-action workspace-stage"
+                            type="button"
+                            onClick={() => void openWorkspacePicker()}
+                          >
+                            <FolderPlus size={16} />
+                            <span>设置工作区</span>
+                          </button>
+                        ))}
+                    </>
+                  )}
+                </div>
+              )}
+              {isNewConversation && (
+                <p>EasyWork 可能会出错，请核对重要信息。</p>
+              )}
             </div>
           </section>
         )}
@@ -8097,7 +8481,9 @@ export default function EasyWorkApp() {
                 sending={sending}
                 skills={state.skills}
                 selectedSkills={selectedSkills}
-                model={state.settings.provider.model}
+                model={activeWebModelProvider.model}
+                providers={webModelProviders}
+                activeProviderId={state.settings.activeProviderId}
                 models={providerModels}
                 modelsLoading={providerModelsLoading}
                 modelError={providerModelsError}
@@ -8115,8 +8501,12 @@ export default function EasyWorkApp() {
                   void handleLibraryUpload(files, projectPage.id)
                 }
                 onToggleSkill={toggleSelectedSkill}
-                onDetectModels={() => void detectProviderModels()}
-                onSelectModel={(modelId) => void selectProviderModel(modelId)}
+                onDetectModels={(providerId) =>
+                  void detectProviderModels(providerId)
+                }
+                onSelectModel={(providerId, modelId) =>
+                  void selectProviderModel(providerId, modelId)
+                }
                 placeholder={`在 ${projectPage.name} 中发起${
                   mode === "work" ? "工作" : "聊天"
                 }`}
@@ -8253,14 +8643,6 @@ export default function EasyWorkApp() {
                 <p>上传资料，在聊天中检索并引用。</p>
               </div>
               <div className="page-actions">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={() => setEmbeddingModalOpen(true)}
-                >
-                  <Settings2 size={16} />
-                  Embedding API
-                </button>
                 <button
                   className="primary-button"
                   type="button"
@@ -8460,272 +8842,27 @@ export default function EasyWorkApp() {
           </section>
         )}
 
-        {view === "memory" && (
-          <section className="workspace-page memory-page">
-            <div className="page-intro">
-              <div>
-                <h1>记忆</h1>
-                <p>查看、修改或删除 EasyWork 保存的信息。</p>
-              </div>
-              <div className="page-actions">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={() =>
-                    void refreshMemorySummary().catch(() =>
-                      showToast("记忆摘要刷新失败"),
-                    )
-                  }
-                >
-                  <RefreshCw size={16} />
-                  刷新摘要
-                </button>
-                <button
-                  className="primary-button"
-                  type="button"
-                  onClick={addMemory}
-                >
-                  <Plus size={16} />
-                  添加记忆
-                </button>
-              </div>
-            </div>
-
-            <div className="memory-layout">
-              <div className="content-card memory-summary-card">
-                <div className="card-heading">
-                  <div>
-                    <h2>记忆摘要</h2>
-                  </div>
+        {view === "help" && (
+          <section className="workspace-page help-page">
+            <article className="help-document">
+              {helpLoading && !helpContent ? (
+                <div className="help-loading-state" role="status">
+                  <LoaderCircle className="spin" size={20} />
+                  <span>正在读取帮助</span>
                 </div>
-                <p className="summary-text">
-                  {state.memorySummary ||
-                    "当前还没有摘要。点击“刷新摘要”可根据生效记忆重新生成。"}
-                </p>
-                <div className="summary-edit">
-                  <Pencil size={15} />
-                  <input
-                    value={memoryInstruction}
-                    onChange={(event) => setMemoryInstruction(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        void applyMemoryInstruction().catch(() =>
-                          showToast("记忆更新失败"),
-                        );
-                      }
-                    }}
-                    placeholder="告诉 EasyWork 要修改、补充或忘记什么"
-                  />
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void applyMemoryInstruction().catch(() =>
-                        showToast("记忆更新失败"),
-                      )
-                    }
-                  >
-                    更新
-                  </button>
-                </div>
-              </div>
-
-              <div className="memory-controls">
-                <label>
-                  <span>
-                    <strong>启用记忆</strong>
-                    <small>在回答前检索相关长期记忆</small>
-                  </span>
-                  <span className="switch">
-                    <input
-                      type="checkbox"
-                      checked={state.settings.memoryEnabled}
-                      onChange={() =>
-                        setState((current) => ({
-                          ...current,
-                          settings: {
-                            ...current.settings,
-                            memoryEnabled: !current.settings.memoryEnabled,
-                          },
-                        }))
-                      }
-                    />
-                    <span />
-                  </span>
-                </label>
-                <label>
-                  <span>
-                    <strong>引用聊天历史</strong>
-                    <small>从相关旧对话提取上下文</small>
-                  </span>
-                  <span className="switch">
-                    <input
-                      type="checkbox"
-                      checked={state.settings.referenceHistory}
-                      onChange={() =>
-                        setState((current) => ({
-                          ...current,
-                          settings: {
-                            ...current.settings,
-                            referenceHistory: !current.settings.referenceHistory,
-                          },
-                        }))
-                      }
-                    />
-                    <span />
-                  </span>
-                </label>
-                <label>
-                  <span>
-                    <strong>自动记录</strong>
-                    <small>从明确要求和已完成结果中提取可复用记忆</small>
-                  </span>
-                  <span className="switch">
-                    <input
-                      type="checkbox"
-                      checked={state.settings.autoCapture}
-                      onChange={() =>
-                        setState((current) => ({
-                          ...current,
-                          settings: {
-                            ...current.settings,
-                            autoCapture: !current.settings.autoCapture,
-                          },
-                        }))
-                      }
-                    />
-                    <span />
-                  </span>
-                </label>
-              </div>
-            </div>
-
-            <div className="memory-list-heading">
-              <div>
-                <h2>可管理记忆</h2>
-                <span>来源可以追溯，关闭后不会进入模型上下文</span>
-              </div>
-              <div className="filter-chips">
-                {([
-                  ["all", "全部"],
-                  ["user", "全局"],
-                  ["project", "项目"],
-                  ["conversation", "对话"],
-                  ["workspace", "工作区"],
-                  ["task", "任务"],
-                ] as const).map(([scope, label]) => (
-                  <button
-                    className={memoryFilter === scope ? "active" : ""}
-                    type="button"
-                    key={scope}
-                    onClick={() => setMemoryFilter(scope)}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div className="memory-list">
-              {visibleMemories.map((memory) => (
-                <article className={`memory-row${memory.enabled ? "" : " disabled"}`} key={memory.id}>
-                  <span className="memory-kind-icon">
-                    {memory.kind === "workflow" ? (
-                      <Activity size={17} />
-                    ) : memory.kind === "goal" ? (
-                      <Gauge size={17} />
-                    ) : (
-                      <Brain size={17} />
-                    )}
-                  </span>
-                  <div className="memory-copy">
-                    {editingMemoryId === memory.id ? (
-                      <input
-                        className="memory-edit-input"
-                        value={editingMemoryText}
-                        onChange={(event) => setEditingMemoryText(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key !== "Enter") return;
-                          void saveMemoryItem(memory, editingMemoryText).catch(() =>
-                            showToast("记忆保存失败"),
-                          );
-                        }}
-                        autoFocus
-                      />
-                    ) : (
-                      <p>{memory.content}</p>
-                    )}
-                    <span>
-                      <b className={memory.scope}>
-                        {memory.scope === "user"
-                          ? "全局"
-                          : memory.scope === "project"
-                            ? state.projects.find((project) => project.id === memory.scopeId)?.name ??
-                              "项目"
-                            : memory.scope === "workspace"
-                              ? "工作区"
-                              : memory.scope === "conversation"
-                                ? "对话"
-                                : "任务"}
-                      </b>
-                      <small>来源：{memory.source}</small>
-                      <small>置信度 {Math.round(memory.confidence * 100)}%</small>
-                    </span>
-                  </div>
-                  <label className="switch compact">
-                    <input
-                      type="checkbox"
-                      checked={memory.enabled}
-                      onChange={() =>
-                        void toggleMemory(memory).catch(() =>
-                          showToast("记忆状态更新失败"),
-                        )
-                      }
-                    />
-                    <span />
-                  </label>
-                  <button
-                    type="button"
-                    aria-label={editingMemoryId === memory.id ? "保存记忆" : "编辑记忆"}
-                    onClick={() => {
-                      if (editingMemoryId === memory.id) {
-                        void saveMemoryItem(memory, editingMemoryText).catch(() =>
-                          showToast("记忆保存失败"),
-                        );
-                      } else {
-                        setEditingMemoryId(memory.id);
-                        setEditingMemoryText(memory.content);
-                      }
-                    }}
-                  >
-                    {editingMemoryId === memory.id ? (
-                      <Check size={15} />
-                    ) : (
-                      <Pencil size={14} />
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="删除记忆"
-                    onClick={() =>
-                      void deleteMemory(memory.id).catch(() =>
-                        showToast("记忆删除失败"),
-                      )
-                    }
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                </article>
-              ))}
-              {!visibleMemories.length && (
-                <div className="data-empty-state memory-empty-state">
-                  <p>{memoryFilter === "all" ? "还没有记忆" : "该范围内没有记忆"}</p>
-                  <button type="button" onClick={addMemory}>
-                    添加记忆
-                  </button>
+              ) : helpContent ? (
+                <MarkdownContent content={helpContent} help />
+              ) : (
+                <div className="help-loading-state error" role="alert">
+                  <BookOpen size={20} />
+                  <span>{helpError || "帮助内容暂时无法读取"}</span>
                 </div>
               )}
-            </div>
+            </article>
           </section>
         )}
+
+        {view === "admin" && actor.isAdmin && <AdminPanel />}
       </main>
 
       {view === "chat" && activeConversation && (
@@ -8807,12 +8944,14 @@ export default function EasyWorkApp() {
                 更改
               </button>
             </div>
-            <code title={activeWorkspace?.path || undefined}>
-              {activeWorkspace?.path ||
+            <ScrollingPath
+              path={
+                activeWorkspace?.path ||
                 (connection.status === "connected"
                   ? "虚拟工作区将在首次执行时分配"
-                  : "连接服务器后可选择工作区")}
-            </code>
+                  : "连接服务器后可选择工作区")
+              }
+            />
           </section>
           </>
           )}
@@ -8991,6 +9130,7 @@ export default function EasyWorkApp() {
       )}
       {profileModalOpen && (
         <ProfileModal
+          key={actor.id}
           actor={actor}
           state={state}
           tab={accountTab}
@@ -9002,7 +9142,11 @@ export default function EasyWorkApp() {
           }}
           onState={setState}
           onToast={showToast}
-          onDeleteGuest={deleteGuestData}
+          onFirstDevice={() => {
+            deviceOnboardingAppliedRef.current = true;
+            setProfileModalOpen(false);
+            setView("help");
+          }}
         />
       )}
       {sshModalOpen && (
@@ -9336,39 +9480,730 @@ export default function EasyWorkApp() {
           onCompressWeb={compressCurrentContext}
         />
       )}
-      {embeddingModalOpen && (
-        <EmbeddingModal
-          settings={state.settings}
-          onClose={() => setEmbeddingModalOpen(false)}
-          onSave={async (embedding) => {
-            const publicEmbedding: AppSettings["embedding"] = {
-              baseUrl: embedding.baseUrl,
-              model: embedding.model,
-              dimensions: embedding.dimensions,
-              configured: embedding.configured,
-              hybridEnabled: embedding.hybridEnabled,
-              rerankEnabled: embedding.rerankEnabled,
-            };
-            setState((current) => ({
-              ...current,
-              settings: { ...current.settings, embedding: publicEmbedding },
-            }));
-            try {
-              await gatewayFetch("/api/settings/embedding", {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(embedding),
-              });
-            } catch {
-              // Keep the visible configuration in this browser session.
-            }
-            setEmbeddingModalOpen(false);
-            showToast("Embedding API 设置已保存");
-          }}
-        />
-      )}
       {toast && <div className="toast">{toast}</div>}
     </div>
+  );
+}
+
+function AdminPanel() {
+  const [activeTab, setActiveTab] = useState<"api" | "ssh">("api");
+  const [overview, setOverview] = useState<AdminOverview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState<"api" | "ssh" | "">("");
+  const [error, setError] = useState("");
+  const [disconnecting, setDisconnecting] = useState("");
+  const [showKeys, setShowKeys] = useState<Set<string>>(new Set());
+  const [detectedModels, setDetectedModels] = useState<
+    Partial<Record<"web" | "agent" | "embedding", string[]>>
+  >({});
+  const [detectingModel, setDetectingModel] = useState<
+    "web" | "agent" | "embedding" | ""
+  >("");
+  const [apiDraft, setApiDraft] = useState({
+    web: { name: "", baseUrl: "", model: "", apiKey: "" },
+    agent: { name: "", baseUrl: "", model: "", apiKey: "" },
+    embedding: {
+      name: "",
+      baseUrl: "",
+      model: "",
+      apiKey: "",
+      dimensions: "",
+      chunkStrategy: "semantic" as "semantic" | "fixed" | "paragraph",
+      chunkSize: 3000,
+      chunkOverlap: 600,
+      batchSize: 32,
+      hybridEnabled: true,
+      rerankEnabled: false,
+    },
+  });
+  const [sshDraft, setSshDraft] = useState({
+    idleTtlMinutes: 43200,
+    keepaliveIntervalSeconds: 60,
+    keepaliveCountMax: 3,
+    connectTimeoutSeconds: 25,
+    cleanupIntervalMinutes: 360,
+  });
+
+  const hydrateDrafts = useCallback((payload: AdminOverview) => {
+    setApiDraft({
+      web: {
+        name: payload.settings.providers.web.name,
+        baseUrl: payload.settings.providers.web.baseUrl,
+        model: payload.settings.providers.web.model,
+        apiKey: "",
+      },
+      agent: {
+        name: payload.settings.providers.agent.name,
+        baseUrl: payload.settings.providers.agent.baseUrl,
+        model: payload.settings.providers.agent.model,
+        apiKey: "",
+      },
+      embedding: {
+        name: payload.settings.embedding.name,
+        baseUrl: payload.settings.embedding.baseUrl,
+        model: payload.settings.embedding.model,
+        apiKey: "",
+        dimensions: payload.settings.embedding.dimensions,
+        chunkStrategy: payload.settings.embedding.chunkStrategy,
+        chunkSize: payload.settings.embedding.chunkSize,
+        chunkOverlap: payload.settings.embedding.chunkOverlap,
+        batchSize: payload.settings.embedding.batchSize,
+        hybridEnabled: payload.settings.embedding.hybridEnabled,
+        rerankEnabled: payload.settings.embedding.rerankEnabled,
+      },
+    });
+    setSshDraft(payload.settings.ssh);
+  }, []);
+
+  const loadOverview = useCallback(
+    async (quiet = false) => {
+      if (!quiet) setLoading(true);
+      try {
+        const response = await gatewayFetch("/api/admin/overview", {
+          cache: "no-store",
+        });
+        const payload = (await response.json().catch(() => ({}))) as
+          | AdminOverview
+          | { error?: string };
+        if (!response.ok || !("settings" in payload)) {
+          throw new Error("error" in payload ? payload.error : "管理员数据读取失败");
+        }
+        setOverview(payload);
+        if (!quiet) hydrateDrafts(payload);
+        setError("");
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "管理员数据读取失败");
+      } finally {
+        if (!quiet) setLoading(false);
+      }
+    },
+    [hydrateDrafts],
+  );
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => void loadOverview());
+    return () => window.cancelAnimationFrame(frame);
+  }, [loadOverview]);
+
+  useEffect(() => {
+    if (activeTab !== "ssh") return;
+    const timer = window.setInterval(() => void loadOverview(true), 10_000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, loadOverview]);
+
+  const saveApiSettings = async () => {
+    setSaving("api");
+    setError("");
+    try {
+      const response = await gatewayFetch("/api/admin/platform", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          providers: {
+            web: { ...apiDraft.web, configured: true },
+            agent: { ...apiDraft.agent, configured: true },
+          },
+          embedding: {
+            ...apiDraft.embedding,
+            configured: true,
+            apiKey: undefined,
+          },
+          ...(apiDraft.web.apiKey ? { webApiKey: apiDraft.web.apiKey } : {}),
+          ...(apiDraft.agent.apiKey
+            ? { agentApiKey: apiDraft.agent.apiKey }
+            : {}),
+          ...(apiDraft.embedding.apiKey
+            ? { embeddingApiKey: apiDraft.embedding.apiKey }
+            : {}),
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as
+        | { settings?: AdminOverview["settings"]; usage?: AdminUsage; error?: string }
+        | AdminOverview;
+      if (!response.ok || !payload.settings) {
+        throw new Error(payload.error || "平台 API 保存失败");
+      }
+      await loadOverview();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "平台 API 保存失败");
+    } finally {
+      setSaving("");
+    }
+  };
+
+  const saveSshSettings = async () => {
+    setSaving("ssh");
+    setError("");
+    try {
+      const response = await gatewayFetch("/api/admin/ssh-policy", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ssh: sshDraft }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        settings?: AdminOverview["settings"];
+        error?: string;
+      };
+      if (!response.ok || !payload.settings) {
+        throw new Error(payload.error || "SSH 策略保存失败");
+      }
+      await loadOverview();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "SSH 策略保存失败");
+    } finally {
+      setSaving("");
+    }
+  };
+
+  const detectAdminModels = async (
+    category: "web" | "agent" | "embedding",
+  ) => {
+    setDetectingModel(category);
+    setError("");
+    const draft = category === "embedding" ? apiDraft.embedding : apiDraft[category];
+    try {
+      const response = await gatewayFetch("/api/admin/providers/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          category,
+          baseUrl: draft.baseUrl,
+          apiKey: draft.apiKey,
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        models?: string[];
+        error?: string;
+      };
+      if (!response.ok || !payload.models?.length) {
+        throw new Error(payload.error || "没有检测到可用模型");
+      }
+      setDetectedModels((current) => ({ ...current, [category]: payload.models }));
+      if (!payload.models.includes(draft.model)) {
+        if (category === "embedding") {
+          setApiDraft((current) => ({
+            ...current,
+            embedding: { ...current.embedding, model: payload.models![0] },
+          }));
+        } else {
+          setApiDraft((current) => ({
+            ...current,
+            [category]: { ...current[category], model: payload.models![0] },
+          }));
+        }
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "模型检测失败");
+    } finally {
+      setDetectingModel("");
+    }
+  };
+
+  const disconnectSsh = async (
+    connection: AdminOverview["sshConnections"][number],
+  ) => {
+    setDisconnecting(connection.id);
+    setError("");
+    try {
+      const response = await gatewayFetch("/api/admin/ssh/disconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: connection.userId,
+          serverId: connection.serverId,
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        sshConnections?: AdminOverview["sshConnections"];
+        error?: string;
+      };
+      if (!response.ok) throw new Error(payload.error || "断开 SSH 失败");
+      setOverview((current) =>
+        current && payload.sshConnections
+          ? { ...current, sshConnections: payload.sshConnections }
+          : current,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "断开 SSH 失败");
+    } finally {
+      setDisconnecting("");
+    }
+  };
+
+  const toggleKey = (category: string) =>
+    setShowKeys((current) => {
+      const next = new Set(current);
+      if (next.has(category)) next.delete(category);
+      else next.add(category);
+      return next;
+    });
+
+  const usageTotal = (
+    period: "daily" | "weekly" | "total",
+    field: keyof AdminUsageValues,
+  ) =>
+    (overview
+      ? Object.values(overview.usage[period]).reduce(
+          (sum, item) => sum + Number(item[field] || 0),
+          0,
+        )
+      : 0);
+
+  const providerCard = (
+    category: "web" | "agent" | "embedding",
+    title: string,
+    description: string,
+    icon: React.ReactNode,
+  ) => {
+    const draft = category === "embedding" ? apiDraft.embedding : apiDraft[category];
+    const saved =
+      category === "embedding"
+        ? overview?.settings.embedding
+        : overview?.settings.providers[category];
+    const models = detectedModels[category] || (draft.model ? [draft.model] : []);
+    return (
+      <article className={`admin-api-card ${category}`}>
+        <header>
+          <span className="admin-api-icon">{icon}</span>
+          <span>
+            <strong>{title}</strong>
+            <small>{description}</small>
+          </span>
+          <span className={`admin-config-status${saved?.configured ? " ready" : ""}`}>
+            <i />
+            {saved?.configured ? "已启用" : "未配置"}
+          </span>
+        </header>
+        <div className="admin-api-fields">
+          <label>
+            <span>配置名称</span>
+            <input
+              value={draft.name}
+              onChange={(event) =>
+                setApiDraft((current) => ({
+                  ...current,
+                  [category]: { ...current[category], name: event.target.value },
+                }))
+              }
+            />
+          </label>
+          <label className="admin-api-url">
+            <span>API URL</span>
+            <input
+              value={draft.baseUrl}
+              placeholder="https://api.example.com/v1"
+              onChange={(event) =>
+                setApiDraft((current) => ({
+                  ...current,
+                  [category]: { ...current[category], baseUrl: event.target.value },
+                }))
+              }
+            />
+          </label>
+          <label className="admin-api-key">
+            <span>API Key</span>
+            <span className="admin-secret-input">
+              <input
+                type={showKeys.has(category) ? "text" : "password"}
+                value={draft.apiKey}
+                placeholder={saved?.apiKeyConfigured ? "已安全保存；留空不修改" : "请输入 API Key"}
+                onChange={(event) =>
+                  setApiDraft((current) => ({
+                    ...current,
+                    [category]: { ...current[category], apiKey: event.target.value },
+                  }))
+                }
+              />
+              <button type="button" onClick={() => toggleKey(category)}>
+                {showKeys.has(category) ? "隐藏" : "显示"}
+              </button>
+            </span>
+          </label>
+          <label className="admin-model-field">
+            <span>模型</span>
+            <span className="admin-model-control">
+              <select
+                value={draft.model}
+                onChange={(event) =>
+                  setApiDraft((current) => ({
+                    ...current,
+                    [category]: { ...current[category], model: event.target.value },
+                  }))
+                }
+              >
+                {!models.length && <option value="">请检测模型</option>}
+                {models.map((model) => (
+                  <option key={model} value={model}>{model}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                disabled={detectingModel === category || !draft.baseUrl}
+                onClick={() => void detectAdminModels(category)}
+              >
+                {detectingModel === category ? (
+                  <LoaderCircle className="spin" size={14} />
+                ) : (
+                  <RefreshCw size={14} />
+                )}
+                检测
+              </button>
+            </span>
+          </label>
+          {category === "embedding" && (
+            <div className="admin-embedding-options">
+              <label>
+                <span>分块策略</span>
+                <select
+                  value={apiDraft.embedding.chunkStrategy}
+                  onChange={(event) =>
+                    setApiDraft((current) => ({
+                      ...current,
+                      embedding: {
+                        ...current.embedding,
+                        chunkStrategy: event.target.value as typeof current.embedding.chunkStrategy,
+                      },
+                    }))
+                  }
+                >
+                  <option value="semantic">语义边界</option>
+                  <option value="paragraph">段落优先</option>
+                  <option value="fixed">固定长度</option>
+                </select>
+              </label>
+              {[
+                ["chunkSize", "分块字符数"],
+                ["chunkOverlap", "重叠字符数"],
+                ["batchSize", "批处理数量"],
+              ].map(([field, label]) => (
+                <label key={field}>
+                  <span>{label}</span>
+                  <input
+                    type="number"
+                    value={apiDraft.embedding[field as "chunkSize"]}
+                    onChange={(event) =>
+                      setApiDraft((current) => ({
+                        ...current,
+                        embedding: {
+                          ...current.embedding,
+                          [field]: Number(event.target.value),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+              ))}
+              <label>
+                <span>向量维度</span>
+                <input
+                  value={apiDraft.embedding.dimensions}
+                  placeholder="由模型自动决定"
+                  onChange={(event) =>
+                    setApiDraft((current) => ({
+                      ...current,
+                      embedding: { ...current.embedding, dimensions: event.target.value },
+                    }))
+                  }
+                />
+              </label>
+              <label className="admin-check-option">
+                <input
+                  type="checkbox"
+                  checked={apiDraft.embedding.hybridEnabled}
+                  onChange={(event) =>
+                    setApiDraft((current) => ({
+                      ...current,
+                      embedding: { ...current.embedding, hybridEnabled: event.target.checked },
+                    }))
+                  }
+                />
+                <span>混合检索</span>
+              </label>
+              <label className="admin-check-option">
+                <input
+                  type="checkbox"
+                  checked={apiDraft.embedding.rerankEnabled}
+                  onChange={(event) =>
+                    setApiDraft((current) => ({
+                      ...current,
+                      embedding: { ...current.embedding, rerankEnabled: event.target.checked },
+                    }))
+                  }
+                />
+                <span>结果重排</span>
+              </label>
+            </div>
+          )}
+        </div>
+      </article>
+    );
+  };
+
+  const chartMax = Math.max(
+    1,
+    ...(overview?.usage.series.flatMap((item) => [
+      item.web.requests,
+      item.agent.requests,
+      item.embedding.requests,
+    ]) || [1]),
+  );
+
+  return (
+    <section className="workspace-page admin-page">
+      <header className="admin-hero">
+        <div>
+          <span className="admin-eyebrow">EasyWork Control</span>
+          <h1>管理员面板</h1>
+          <p>统一管理模型入口、知识库索引与全站远程连接。</p>
+        </div>
+        <div className="admin-hero-stats">
+          <span><strong>{overview?.userCount ?? "—"}</strong><small>用户</small></span>
+          <span><strong>{overview?.adminCount ?? "—"}</strong><small>管理员</small></span>
+          <span>
+            <strong>{overview?.sshConnections.filter((item) => item.status === "connected").length ?? "—"}</strong>
+            <small>在线 SSH</small>
+          </span>
+        </div>
+      </header>
+
+      <nav className="admin-tabs" aria-label="管理员配置分类">
+        <button
+          className={activeTab === "api" ? "active" : ""}
+          type="button"
+          onClick={() => setActiveTab("api")}
+        >
+          <Database size={16} />
+          平台 API
+        </button>
+        <button
+          className={activeTab === "ssh" ? "active" : ""}
+          type="button"
+          onClick={() => setActiveTab("ssh")}
+        >
+          <Network size={16} />
+          SSH 管理
+        </button>
+      </nav>
+
+      {error && (
+        <div className="admin-alert" role="alert">
+          <Circle size={10} fill="currentColor" />
+          {error}
+          <button type="button" onClick={() => setError("")} aria-label="关闭提示">
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      {loading ? (
+        <div className="admin-loading" role="status">
+          <LoaderCircle className="spin" size={22} />
+          正在读取平台配置
+        </div>
+      ) : activeTab === "api" ? (
+        <div className="admin-api-layout">
+          <div className="admin-api-configs">
+            <div className="admin-section-heading">
+              <div>
+                <span>模型与索引</span>
+                <h2>公共 API 配置</h2>
+              </div>
+              <button
+                className="admin-save-button"
+                type="button"
+                disabled={saving === "api"}
+                onClick={() => void saveApiSettings()}
+              >
+                {saving === "api" ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}
+                {saving === "api" ? "保存中" : "保存全部"}
+              </button>
+            </div>
+            {providerCard(
+              "web",
+              "网页模型对话 API",
+              "面向所有用户的网页聊天与上下文整理",
+              <MessageCircle size={18} />,
+            )}
+            {providerCard(
+              "agent",
+              "Agent 模型对话 API",
+              "用于 EasyWork 部署的 OpenCode、Claude Code 与 Codex",
+              <Bot size={18} />,
+            )}
+            {providerCard(
+              "embedding",
+              "Embedding 模型 API",
+              "自动为全站文件库执行切块、向量化与混合检索",
+              <Sparkles size={18} />,
+            )}
+          </div>
+
+          <aside className="admin-usage-panel">
+            <div className="admin-section-heading compact">
+              <div>
+                <span>Usage</span>
+                <h2>API 用量</h2>
+              </div>
+              <Activity size={18} />
+            </div>
+            <div className="admin-usage-metrics">
+              {[
+                ["daily", "今日"],
+                ["weekly", "近 7 天"],
+                ["total", "累计"],
+              ].map(([period, label]) => (
+                <div key={period}>
+                  <span>{label}</span>
+                  <strong>{usageTotal(period as "daily" | "weekly" | "total", "requests").toLocaleString()}</strong>
+                  <small>
+                    次请求 · {(
+                      usageTotal(period as "daily" | "weekly" | "total", "inputTokens") +
+                      usageTotal(period as "daily" | "weekly" | "total", "outputTokens")
+                    ).toLocaleString()} tokens
+                  </small>
+                </div>
+              ))}
+            </div>
+            <div className="admin-usage-chart" aria-label="最近十四日 API 请求量">
+              <div className="admin-chart-legend">
+                <span className="web">网页</span>
+                <span className="agent">Agent</span>
+                <span className="embedding">Embedding</span>
+              </div>
+              <div className="admin-chart-bars">
+                {overview?.usage.series.length ? (
+                  overview.usage.series.map((day) => (
+                    <div className="admin-chart-day" key={day.date} title={`${day.date} · ${day.web.requests + day.agent.requests + day.embedding.requests} 次`}>
+                      <span className="admin-chart-stack">
+                        <i className="web" style={{ height: `${Math.max(2, (day.web.requests / chartMax) * 100)}%` }} />
+                        <i className="agent" style={{ height: `${Math.max(2, (day.agent.requests / chartMax) * 100)}%` }} />
+                        <i className="embedding" style={{ height: `${Math.max(2, (day.embedding.requests / chartMax) * 100)}%` }} />
+                      </span>
+                      <small>{day.date.slice(5)}</small>
+                    </div>
+                  ))
+                ) : (
+                  <div className="admin-chart-empty">产生调用后将在这里绘制趋势</div>
+                )}
+              </div>
+            </div>
+            <div className="admin-usage-breakdown">
+              {(["web", "agent", "embedding"] as const).map((category) => (
+                <div key={category}>
+                  <span className={category} />
+                  <strong>{category === "web" ? "网页对话" : category === "agent" ? "Agent" : "Embedding"}</strong>
+                  <span>{overview?.usage.total[category].requests.toLocaleString() ?? 0}</span>
+                  <small>{((overview?.usage.total[category].inputTokens || 0) + (overview?.usage.total[category].outputTokens || 0)).toLocaleString()} tokens</small>
+                </div>
+              ))}
+            </div>
+          </aside>
+        </div>
+      ) : (
+        <div className="admin-ssh-layout">
+          <section className="admin-ssh-policy">
+            <div className="admin-section-heading">
+              <div>
+                <span>Worker pool</span>
+                <h2>连接策略</h2>
+              </div>
+              <button
+                className="admin-save-button"
+                type="button"
+                disabled={saving === "ssh"}
+                onClick={() => void saveSshSettings()}
+              >
+                {saving === "ssh" ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}
+                {saving === "ssh" ? "保存中" : "保存策略"}
+              </button>
+            </div>
+            <div className="admin-policy-grid">
+              {[
+                ["idleTtlMinutes", "空闲断开时间", "分钟", "用户一个月未操作时释放连接"],
+                ["keepaliveIntervalSeconds", "保活间隔", "秒", "主机发送 SSH keepalive 的频率"],
+                ["keepaliveCountMax", "保活失败次数", "次", "连续失败后允许连接自然中断"],
+                ["connectTimeoutSeconds", "连接超时", "秒", "SSH 握手最长等待时间"],
+                ["cleanupIntervalMinutes", "清理周期", "分钟", "后台检查空闲 worker 的频率"],
+              ].map(([field, label, unit, hint]) => (
+                <label key={field}>
+                  <span><strong>{label}</strong><small>{hint}</small></span>
+                  <span className="admin-number-input">
+                    <input
+                      type="number"
+                      min="1"
+                      value={sshDraft[field as keyof typeof sshDraft]}
+                      onChange={(event) =>
+                        setSshDraft((current) => ({
+                          ...current,
+                          [field]: Number(event.target.value),
+                        }))
+                      }
+                    />
+                    <em>{unit}</em>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </section>
+
+          <section className="admin-ssh-connections">
+            <div className="admin-section-heading">
+              <div>
+                <span>Live connections</span>
+                <h2>用户 SSH 连接</h2>
+              </div>
+              <button className="admin-refresh-button" type="button" onClick={() => void loadOverview()}>
+                <RefreshCw size={14} />
+                刷新
+              </button>
+            </div>
+            <div className="admin-connection-table">
+              <div className="admin-connection-head">
+                <span>用户</span><span>服务器</span><span>连接状态</span><span>对话 / 任务</span><span>最近活动</span><span />
+              </div>
+              {overview?.sshConnections.map((connection) => (
+                <div className="admin-connection-row" key={connection.id}>
+                  <span className="admin-user-cell">
+                    <i>{connection.displayName.slice(0, 1).toUpperCase()}</i>
+                    <span><strong>{connection.displayName}</strong><small>@{connection.username}</small></span>
+                  </span>
+                  <span className="admin-server-cell">
+                    <strong>{connection.serverName}</strong>
+                    <small>{connection.host ? `${connection.host}:${connection.port}` : connection.serverId}</small>
+                  </span>
+                  <span>
+                    <span className={`admin-connection-status ${connection.status}`}><i />{connection.status === "connected" ? "已连接" : "未连接"}</span>
+                  </span>
+                  <span className="admin-count-cell">
+                    <strong>{connection.conversationCount}</strong><small>个对话</small>
+                    <strong>{connection.activeTaskCount}</strong><small>项任务</small>
+                  </span>
+                  <span className="admin-time-cell">
+                    {connection.lastUserActivityAt
+                      ? new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(connection.lastUserActivityAt))
+                      : "—"}
+                  </span>
+                  <span>
+                    <button
+                      className="admin-disconnect-button"
+                      type="button"
+                      disabled={connection.status !== "connected" || !connection.manageable || disconnecting === connection.id}
+                      onClick={() => void disconnectSsh(connection)}
+                    >
+                      {disconnecting === connection.id ? <LoaderCircle className="spin" size={13} /> : <WifiOff size={13} />}
+                      断开
+                    </button>
+                  </span>
+                </div>
+              ))}
+              {!overview?.sshConnections.length && (
+                <div className="admin-connection-empty">还没有用户保存远程服务器配置</div>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -9424,7 +10259,7 @@ function ProjectModal({
   const [memoryMode, setMemoryMode] =
     useState<Project["memoryMode"]>("project-only");
   return (
-    <Modal title="新建项目" eyebrow="PROJECT" onClose={onClose}>
+    <Modal title="新建项目" onClose={onClose}>
       <form
         className="modal-form"
         onSubmit={(event) => {
@@ -9666,7 +10501,7 @@ function ProfileModal({
   onActor,
   onState,
   onToast,
-  onDeleteGuest,
+  onFirstDevice,
 }: {
   actor: Actor;
   state: EasyWorkState;
@@ -9676,28 +10511,53 @@ function ProfileModal({
   onActor: (actor: Actor) => void;
   onState: React.Dispatch<React.SetStateAction<EasyWorkState>>;
   onToast: (message: string) => void;
-  onDeleteGuest: () => Promise<void>;
+  onFirstDevice: () => void;
 }) {
-  const [email, setEmail] = useState(actor.email ?? "");
+  const [username, setUsername] = useState(actor.username ?? "");
   const [password, setPassword] = useState("");
   const [name, setName] = useState(actor.authenticated ? actor.displayName : "");
   const [avatar, setAvatar] = useState(actor.avatar ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [provider, setProvider] = useState({
-    ...state.settings.provider,
-    apiKey: "",
-  });
+  const [providers, setProviders] = useState<ModelProvider[]>(
+    state.settings.providers.some((item) => item.managedBy !== "platform")
+      ? state.settings.providers.filter((item) => item.managedBy !== "platform")
+      : [defaultModelProvider()],
+  );
+  const [selectedProviderId, setSelectedProviderId] = useState(
+    state.settings.providers.some(
+      (item) =>
+        item.id === state.settings.activeProviderId && item.managedBy !== "platform",
+    )
+      ? state.settings.activeProviderId
+      : state.settings.providers.find((item) => item.managedBy !== "platform")?.id ||
+          DEFAULT_PROVIDER_ID,
+  );
+  const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [apiKeyLoading, setApiKeyLoading] = useState(
-    tab === "api" && state.settings.provider.configured,
+    tab === "api" && providers.some((item) => item.configured),
   );
+  const [providerSaving, setProviderSaving] = useState(false);
   const [modelError, setModelError] = useState("");
+  const provider =
+    providers.find((item) => item.id === selectedProviderId) || providers[0];
+
+  const updateProviderDraft = (patch: Partial<ModelProvider>) => {
+    if (!provider) return;
+    setProviders((current) =>
+      current.map((item) =>
+        item.id === provider.id ? { ...item, ...patch } : item,
+      ),
+    );
+  };
 
   useEffect(() => {
-    if (tab !== "api" || !provider.configured) return;
+    if (tab !== "api" || !provider?.configured) return;
     let cancelled = false;
-    void gatewayFetch("/api/settings/provider/key")
+    void gatewayFetch(
+      `/api/settings/provider/key?providerId=${encodeURIComponent(provider.id)}`,
+    )
       .then(async (response) => {
         const payload = (await response.json()) as {
           apiKey?: string;
@@ -9705,9 +10565,9 @@ function ProfileModal({
         };
         if (!response.ok) throw new Error(payload.error || "API Key 读取失败");
         if (!cancelled) {
-          setProvider((current) => ({
+          setProviderKeys((current) => ({
             ...current,
-            apiKey: String(payload.apiKey || ""),
+            [provider.id]: String(payload.apiKey || ""),
           }));
         }
       })
@@ -9724,7 +10584,7 @@ function ProfileModal({
     return () => {
       cancelled = true;
     };
-  }, [provider.configured, tab]);
+  }, [provider?.configured, provider?.id, tab]);
 
   const authenticate = async (kind: "login" | "register") => {
     setBusy(true);
@@ -9744,26 +10604,39 @@ function ProfileModal({
       const response = await gatewayFetch(`/api/auth/${kind}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password, displayName: name }),
+        body: JSON.stringify({ username, password }),
       });
       const payload = (await response.json()) as {
         actor?: Actor;
         deviceToken?: string;
         error?: string;
       };
-      if (!response.ok || !payload.actor) throw new Error(payload.error || "认证失败");
+      if (!response.ok || !payload.actor) {
+        const responseMessage = payload.error || "认证失败";
+        throw new Error(
+          /邮箱/.test(responseMessage)
+            ? kind === "login"
+              ? "用户名或密码不正确"
+              : "请输入有效用户名"
+            : responseMessage,
+        );
+      }
       storeDeviceToken(payload.deviceToken);
       onActor(payload.actor);
       const bootstrapResponse = await gatewayFetch("/api/bootstrap");
       if (bootstrapResponse.ok) {
         const bootstrap = (await bootstrapResponse.json()) as {
+          actor?: Actor;
           deviceToken?: string;
           state?: Partial<EasyWorkState>;
+          device?: { firstVisit?: boolean };
         };
         storeDeviceToken(bootstrap.deviceToken);
+        if (bootstrap.actor) onActor(bootstrap.actor);
         if (bootstrap.state) {
           onState(mergeStoredState(DEFAULT_STATE, bootstrap.state ?? {}));
         }
+        if (bootstrap.device?.firstVisit) onFirstDevice();
       }
       setTab("profile");
       onToast(kind === "register" ? "账号已创建" : "登录成功");
@@ -9775,52 +10648,80 @@ function ProfileModal({
   };
 
   const saveProfile = async () => {
-    const nextActor = { ...actor, displayName: name || actor.displayName, avatar };
-    onActor(nextActor);
+    const nextActor = {
+      ...actor,
+      displayName: name || actor.displayName,
+      username: name || actor.username,
+      avatar,
+    };
     try {
-      await gatewayFetch("/api/profile", {
+      const response = await gatewayFetch("/api/profile", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ displayName: nextActor.displayName, avatar }),
+        body: JSON.stringify({ username: nextActor.displayName, avatar }),
       });
-    } catch {
-      // Keep the visible update for the current session.
+      const payload = (await response.json().catch(() => ({}))) as {
+        actor?: Actor;
+        error?: string;
+      };
+      if (!response.ok) throw new Error(payload.error || "个人资料保存失败");
+      onActor(payload.actor ?? nextActor);
+      onToast("个人资料已保存");
+    } catch (caught) {
+      onToast(caught instanceof Error ? caught.message : "个人资料保存失败");
     }
-    onToast("个人资料已保存");
   };
 
   const saveProvider = async () => {
-    if (/^https?:\/\//i.test(provider.apiKey.trim())) {
+    if (!provider) return;
+    const apiKey = String(providerKeys[provider.id] || "");
+    if (/^https?:\/\//i.test(apiKey.trim())) {
       setModelError("API Key 不能填写 API URL");
       return;
     }
+    if (!provider.name.trim()) {
+      setModelError("请输入 API 名称");
+      return;
+    }
     setModelError("");
+    setProviderSaving(true);
     try {
       const response = await gatewayFetch("/api/settings/provider", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: "OpenAI Compatible",
+          providerId: provider.id,
+          name: provider.name,
           baseUrl: provider.baseUrl,
-          ...(provider.apiKey ? { apiKey: provider.apiKey } : {}),
+          activate: false,
+          ...(apiKey ? { apiKey } : {}),
         }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         error?: string;
-        provider?: AppSettings["provider"];
+        providers?: ModelProvider[];
+        activeProviderId?: string;
       };
       if (!response.ok) throw new Error(payload.error || "模型 API 保存失败");
+      const responseProviders = payload.providers ?? providers;
+      const nextProviders = responseProviders.filter(
+        (item) => item.managedBy !== "platform",
+      );
+      setProviders(nextProviders);
       onState((current) => ({
         ...current,
         settings: {
           ...current.settings,
-          provider: payload.provider ?? current.settings.provider,
+          providers: responseProviders,
+          activeProviderId:
+            payload.activeProviderId ?? current.settings.activeProviderId,
         },
       }));
       onToast("模型 API 已保存");
-      onClose();
     } catch (caught) {
       setModelError(caught instanceof Error ? caught.message : "模型 API 保存失败");
+    } finally {
+      setProviderSaving(false);
     }
   };
 
@@ -9835,8 +10736,11 @@ function ProfileModal({
               ? "创建账号"
               : "登录 EasyWork"
       }
-      eyebrow="ACCOUNT"
       onClose={onClose}
+      wide={actor.authenticated}
+      className={`account-modal ${
+        actor.authenticated ? "account-modal-authenticated" : "account-modal-entry"
+      }`}
     >
       <div className="account-tabs">
         {!actor.authenticated ? (
@@ -9868,7 +10772,10 @@ function ProfileModal({
             <button
               className={tab === "api" ? "active" : ""}
               type="button"
-              onClick={() => setTab("api")}
+              onClick={() => {
+                setApiKeyLoading(Boolean(provider?.configured));
+                setTab("api");
+              }}
             >
               模型 API
             </button>
@@ -9884,20 +10791,14 @@ function ProfileModal({
             void authenticate(tab);
           }}
         >
-          {tab === "register" && (
-            <label className="field">
-              <span>用户名</span>
-              <input value={name} onChange={(event) => setName(event.target.value)} placeholder="你的显示名称" />
-            </label>
-          )}
           <label className="field">
-            <span>邮箱</span>
+            <span>用户名</span>
             <input
-              type="email"
-              autoComplete="email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              placeholder="name@example.com"
+              type="text"
+              autoComplete="username"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              placeholder="输入用户名"
             />
           </label>
           <label className="field">
@@ -9911,19 +10812,14 @@ function ProfileModal({
             />
           </label>
           {error && <div className="form-error">{error}</div>}
-          <button className="primary-button full" type="submit" disabled={busy || !email || !password}>
+          <button
+            className="primary-button full"
+            type="submit"
+            disabled={busy || !username.trim() || !password}
+          >
             {busy ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
             {tab === "register" ? "创建账号" : "登录"}
           </button>
-          <div className="guest-data-card">
-            <HardDrive size={17} />
-            <div>
-              <strong>访客数据保存在临时目录</strong>
-            </div>
-            <button type="button" onClick={() => void onDeleteGuest()}>
-              删除
-            </button>
-          </div>
         </form>
       )}
 
@@ -9959,10 +10855,6 @@ function ProfileModal({
             <span>用户名</span>
             <input value={name} onChange={(event) => setName(event.target.value)} />
           </label>
-          <label className="field">
-            <span>邮箱</span>
-            <input value={actor.email ?? ""} disabled />
-          </label>
           <div className="modal-actions spread">
             <button
               className="text-danger-button"
@@ -9992,63 +10884,130 @@ function ProfileModal({
       )}
 
       {actor.authenticated && tab === "api" && (
-        <div className="modal-form api-form">
-          <label className="field">
-            <span>API URL</span>
-            <input
-              value={provider.baseUrl}
-              onChange={(event) =>
-                setProvider((current) => ({ ...current, baseUrl: event.target.value }))
-              }
-              placeholder="https://api.example.com/v1"
-            />
-          </label>
-          <label className="field">
-            <span>API Key</span>
-            <span className="api-key-control">
-              <input
-                type={apiKeyVisible ? "text" : "password"}
-                autoComplete="new-password"
-                spellCheck={false}
-                value={provider.apiKey}
-                onChange={(event) =>
-                  setProvider((current) => ({
-                    ...current,
-                    apiKey: event.target.value,
-                  }))
-                }
-                placeholder={
-                  apiKeyLoading
-                    ? "正在读取…"
-                    : provider.configured
-                      ? "••••••••••••••••"
-                      : "sk-…"
-                }
-              />
-              <button
-                type="button"
-                onClick={() => setApiKeyVisible((current) => !current)}
-                disabled={apiKeyLoading || !provider.apiKey}
-              >
-                {apiKeyVisible ? "隐藏" : "显示"}
-              </button>
-            </span>
-          </label>
-          {modelError && <div className="form-error">{modelError}</div>}
-          <div className="modal-actions">
+        <div className="provider-manager">
+          <nav className="provider-tabs" aria-label="模型 API 列表">
+            <div className="provider-tab-list">
+              {providers.map((item) => (
+                <button
+                  className={item.id === provider?.id ? "active" : ""}
+                  type="button"
+                  key={item.id}
+                  title={item.name}
+                  onClick={() => {
+                    setSelectedProviderId(item.id);
+                    setApiKeyLoading(item.configured);
+                    setApiKeyVisible(false);
+                    setModelError("");
+                  }}
+                >
+                  <span>{item.name || "未命名 API"}</span>
+                  {item.id === state.settings.activeProviderId && (
+                    <small>当前</small>
+                  )}
+                </button>
+              ))}
+            </div>
             <button
-              className="primary-button"
+              className="provider-add-button"
               type="button"
-              disabled={
-                !provider.baseUrl ||
-                (!provider.apiKey && !provider.configured) ||
-                apiKeyLoading
-              }
-              onClick={() => void saveProvider()}
+              aria-label="添加模型 API"
+              title="添加模型 API"
+              onClick={() => {
+                const nextProvider = normalizeClientProvider(
+                  {
+                    id: uid("provider"),
+                    name: `API ${providers.length + 1}`,
+                    baseUrl: "https://api.openai.com/v1",
+                  },
+                  providers.length,
+                );
+                setProviders((current) => [...current, nextProvider]);
+                setSelectedProviderId(nextProvider.id);
+                setApiKeyLoading(false);
+                setApiKeyVisible(false);
+                setModelError("");
+              }}
             >
-              保存 API
+              <Plus size={16} />
             </button>
-          </div>
+          </nav>
+          {provider && (
+            <div className="modal-form api-form provider-form">
+              <label className="field">
+                <span>API 名称</span>
+                <input
+                  value={provider.name}
+                  onChange={(event) =>
+                    updateProviderDraft({ name: event.target.value })
+                  }
+                  placeholder="自定义 API 名称"
+                />
+              </label>
+              <label className="field">
+                <span>API URL</span>
+                <input
+                  value={provider.baseUrl}
+                  onChange={(event) =>
+                    updateProviderDraft({ baseUrl: event.target.value })
+                  }
+                  placeholder="https://api.example.com/v1"
+                />
+              </label>
+              <label className="field">
+                <span>API Key</span>
+                <span className="api-key-control">
+                  <input
+                    type={apiKeyVisible ? "text" : "password"}
+                    autoComplete="new-password"
+                    spellCheck={false}
+                    value={providerKeys[provider.id] || ""}
+                    onChange={(event) =>
+                      setProviderKeys((current) => ({
+                        ...current,
+                        [provider.id]: event.target.value,
+                      }))
+                    }
+                    placeholder={
+                      apiKeyLoading
+                        ? "正在读取…"
+                        : provider.configured
+                          ? "••••••••••••••••"
+                          : "sk-…"
+                    }
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setApiKeyVisible((current) => !current)}
+                    disabled={
+                      apiKeyLoading || !String(providerKeys[provider.id] || "")
+                    }
+                  >
+                    {apiKeyVisible ? "隐藏" : "显示"}
+                  </button>
+                </span>
+              </label>
+              {modelError && <div className="form-error">{modelError}</div>}
+              <div className="modal-actions">
+                <button
+                  className="primary-button"
+                  type="button"
+                  disabled={
+                    providerSaving ||
+                    !provider.name.trim() ||
+                    !provider.baseUrl ||
+                    (!providerKeys[provider.id] && !provider.configured) ||
+                    apiKeyLoading
+                  }
+                  onClick={() => void saveProvider()}
+                >
+                  {providerSaving && (
+                    <LoaderCircle className="spin" size={15} />
+                  )}
+                  {providerSaving ? "保存中" : "保存 API"}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </Modal>
@@ -10660,180 +11619,185 @@ function ServerManagerModal({
                   required
                 />
               </label>
-              <div className="field auth-method-field">
-                <span>登录方式</span>
-                <div className="auth-method-switch" role="group" aria-label="选择登录方式">
-                  <button
-                    className={authMethod === "password" ? "active" : ""}
-                    type="button"
-                    onClick={() => {
-                      setAuthMethod("password");
-                      setUseSavedCredential(
-                        Boolean(
-                          selectedProfile?.configured &&
-                            selectedProfile.authMethod === "password",
-                        ),
-                      );
-                    }}
-                  >
-                    <KeyRound size={15} />
-                    密码
-                  </button>
-                  <button
-                    className={authMethod === "key" ? "active" : ""}
-                    type="button"
-                    onClick={() => {
-                      setAuthMethod("key");
-                      setUseSavedCredential(
-                        Boolean(
-                          selectedProfile?.configured &&
-                            selectedProfile.authMethod !== "password",
-                        ),
-                      );
-                    }}
-                  >
-                    <ShieldCheck size={15} />
-                    私钥
-                  </button>
-                </div>
-              </div>
-
-              {authMethod === "password" ? (
-                <div className="field credential-panel">
-                  <span>登录密码</span>
-                  {selectedProfile?.configured &&
-                    selectedProfile.authMethod === "password" && (
-                      <button
-                        className={`saved-key-choice${
-                          useSavedCredential ? " selected" : ""
-                        }`}
-                        type="button"
-                        onClick={() => {
-                          setUseSavedCredential(true);
-                          setPassword("");
-                        }}
-                      >
-                        <ShieldCheck size={16} />
-                        <span>
-                          <strong>已保存的密码</strong>
-                          <small>使用账号中加密保存的凭据</small>
-                        </span>
-                        {useSavedCredential && <Check size={15} />}
-                      </button>
-                    )}
-                  <input
-                    type="password"
-                    value={password}
-                    onChange={(event) => {
-                      setPassword(event.target.value);
-                      setUseSavedCredential(false);
-                    }}
-                    placeholder={
-                      selectedProfile?.configured ? "输入新密码" : "输入登录密码"
-                    }
-                    autoComplete="current-password"
-                  />
-                </div>
-              ) : (
-                <div className="field key-picker-field credential-panel">
-                  <span>SSH 私钥</span>
-                  {selectedProfile?.configured &&
-                    selectedProfile.authMethod !== "password" && (
-                      <button
-                        className={`saved-key-choice${
-                          useSavedCredential ? " selected" : ""
-                        }`}
-                        type="button"
-                        onClick={() => {
-                          setUseSavedCredential(true);
-                          setPrivateKey("");
-                          setPrivateKeyName("");
-                          setPasteKeyOpen(false);
-                        }}
-                      >
-                        <ShieldCheck size={16} />
-                        <span>
-                          <strong>{selectedProfile.keyName || "已保存的私钥"}</strong>
-                          <small>使用账号中加密保存的私钥</small>
-                        </span>
-                        {useSavedCredential && <Check size={15} />}
-                      </button>
-                    )}
-                  <div className="key-picker-actions">
-                    <label className="secondary-button">
-                      <Upload size={15} />
-                      {selectedProfile?.configured ? "更换文件" : "选择文件"}
-                      <input
-                        type="file"
-                        hidden
-                        onChange={(event) => {
-                          const file = event.target.files?.[0];
-                          if (!file) return;
-                          const reader = new FileReader();
-                          reader.onload = () => {
-                            setPrivateKey(String(reader.result ?? ""));
-                            setPrivateKeyName(file.name);
-                            setUseSavedCredential(false);
-                            setPasteKeyOpen(false);
-                          };
-                          reader.readAsText(file);
-                        }}
-                      />
-                    </label>
+              <fieldset className="ssh-authentication-panel">
+                <legend>登录认证</legend>
+                <div className="field auth-method-field">
+                  <span>登录方式</span>
+                  <div className="auth-method-switch" role="group" aria-label="选择登录方式">
                     <button
-                      className="text-button"
+                      className={authMethod === "password" ? "active" : ""}
                       type="button"
                       onClick={() => {
-                        setPasteKeyOpen((value) => !value);
-                        if (!pasteKeyOpen) setUseSavedCredential(false);
+                        setAuthMethod("password");
+                        setUseSavedCredential(
+                          Boolean(
+                            selectedProfile?.configured &&
+                              selectedProfile.authMethod === "password",
+                          ),
+                        );
                       }}
                     >
-                      {pasteKeyOpen ? "收起" : "粘贴私钥"}
+                      <KeyRound size={15} />
+                      密码
+                    </button>
+                    <button
+                      className={authMethod === "key" ? "active" : ""}
+                      type="button"
+                      onClick={() => {
+                        setAuthMethod("key");
+                        setUseSavedCredential(
+                          Boolean(
+                            selectedProfile?.configured &&
+                              selectedProfile.authMethod !== "password",
+                          ),
+                        );
+                      }}
+                    >
+                      <ShieldCheck size={15} />
+                      私钥
                     </button>
                   </div>
-                  {privateKeyName && (
-                    <div className="selected-key-file">
-                      <Check size={14} />
-                      {privateKeyName}
-                    </div>
-                  )}
-                  {pasteKeyOpen && (
-                    <textarea
-                      className="private-key-paste"
-                      value={privateKey}
-                      onChange={(event) => {
-                        setPrivateKey(event.target.value);
-                        setUseSavedCredential(false);
-                      }}
-                      placeholder="粘贴 SSH 私钥"
-                      rows={4}
-                      autoComplete="off"
-                    />
-                  )}
-                  <label className="nested-field">
-                    <span>私钥密码（可选）</span>
+                </div>
+
+                {authMethod === "password" ? (
+                  <div className="field credential-panel">
+                    <span>登录密码</span>
+                    {selectedProfile?.configured &&
+                      selectedProfile.authMethod === "password" && (
+                        <button
+                          className={`saved-key-choice${
+                            useSavedCredential ? " selected" : ""
+                          }`}
+                          type="button"
+                          onClick={() => {
+                            setUseSavedCredential(true);
+                            setPassword("");
+                          }}
+                        >
+                          <ShieldCheck size={16} />
+                          <span>
+                            <strong>已保存的密码</strong>
+                            <small>使用账号中加密保存的凭据</small>
+                          </span>
+                          {useSavedCredential && <Check size={15} />}
+                        </button>
+                      )}
                     <input
                       type="password"
-                      value={passphrase}
-                      onChange={(event) => setPassphrase(event.target.value)}
-                      placeholder="私钥未加密可留空"
+                      value={password}
+                      onChange={(event) => {
+                        setPassword(event.target.value);
+                        setUseSavedCredential(false);
+                      }}
+                      placeholder={
+                        selectedProfile?.configured ? "输入新密码" : "输入登录密码"
+                      }
+                      autoComplete="current-password"
                     />
-                  </label>
-                </div>
+                  </div>
+                ) : (
+                  <div className="field key-picker-field credential-panel">
+                    <span>SSH 私钥</span>
+                    {selectedProfile?.configured &&
+                      selectedProfile.authMethod !== "password" && (
+                        <button
+                          className={`saved-key-choice${
+                            useSavedCredential ? " selected" : ""
+                          }`}
+                          type="button"
+                          onClick={() => {
+                            setUseSavedCredential(true);
+                            setPrivateKey("");
+                            setPrivateKeyName("");
+                            setPasteKeyOpen(false);
+                          }}
+                        >
+                          <ShieldCheck size={16} />
+                          <span>
+                            <strong>{selectedProfile.keyName || "已保存的私钥"}</strong>
+                            <small>使用账号中加密保存的私钥</small>
+                          </span>
+                          {useSavedCredential && <Check size={15} />}
+                        </button>
+                      )}
+                    <div className="key-picker-actions">
+                      <label className="secondary-button">
+                        <Upload size={15} />
+                        {selectedProfile?.configured ? "更换文件" : "选择文件"}
+                        <input
+                          type="file"
+                          hidden
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            if (!file) return;
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                              setPrivateKey(String(reader.result ?? ""));
+                              setPrivateKeyName(file.name);
+                              setUseSavedCredential(false);
+                              setPasteKeyOpen(false);
+                            };
+                            reader.readAsText(file);
+                          }}
+                        />
+                      </label>
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => {
+                          setPasteKeyOpen((value) => !value);
+                          if (!pasteKeyOpen) setUseSavedCredential(false);
+                        }}
+                      >
+                        {pasteKeyOpen ? "收起" : "粘贴私钥"}
+                      </button>
+                    </div>
+                    {privateKeyName && (
+                      <div className="selected-key-file">
+                        <Check size={14} />
+                        {privateKeyName}
+                      </div>
+                    )}
+                    {pasteKeyOpen && (
+                      <textarea
+                        className="private-key-paste"
+                        value={privateKey}
+                        onChange={(event) => {
+                          setPrivateKey(event.target.value);
+                          setUseSavedCredential(false);
+                        }}
+                        placeholder="粘贴 SSH 私钥"
+                        rows={4}
+                        autoComplete="off"
+                      />
+                    )}
+                    <label className="nested-field">
+                      <span>私钥密码（可选）</span>
+                      <input
+                        type="password"
+                        value={passphrase}
+                        onChange={(event) => setPassphrase(event.target.value)}
+                        placeholder="私钥未加密可留空"
+                      />
+                    </label>
+                  </div>
+                )}
+              </fieldset>
+              {context !== "manage" && (
+                <label className="field connection-otp-field">
+                  <span>2FA 验证码（可选）</span>
+                  <input
+                    value={otp}
+                    inputMode="numeric"
+                    onChange={(event) =>
+                      setOtp(event.target.value.replace(/\D/g, ""))
+                    }
+                    placeholder="请输入当前动态验证码"
+                    aria-label="2FA 验证码（可选）"
+                    autoComplete="one-time-code"
+                  />
+                </label>
               )}
-
-              <label className="field optional-otp-field">
-                <span>2FA 验证码 <small>可选</small></span>
-                <input
-                  value={otp}
-                  inputMode="numeric"
-                  onChange={(event) =>
-                    setOtp(event.target.value.replace(/\D/g, ""))
-                  }
-                  placeholder="服务器要求时填写"
-                  autoComplete="one-time-code"
-                />
-              </label>
               {connection.status === "error" && !connection.fingerprint && (
                 <div className="form-error" role="alert">
                   {connection.label}
@@ -11123,9 +12087,12 @@ function WorkspacePickerModal({
             <select
               aria-label="工作区类型"
               value={selectionMode}
-              onChange={(event) =>
-                setSelectionMode(event.target.value as "virtual" | "user")
-              }
+              onChange={(event) => {
+                const nextMode = event.target.value as "virtual" | "user";
+                setSelectionMode(nextMode);
+                setFilter("");
+                if (nextMode === "user" && home) onBrowse(home);
+              }}
             >
               <option value="virtual">虚拟工作区</option>
               <option value="user">用户工作区</option>
@@ -11469,128 +12436,6 @@ function RemoteFileManagerModal({
               正在读取
             </div>
           )}
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function EmbeddingModal({
-  settings,
-  onClose,
-  onSave,
-}: {
-  settings: AppSettings;
-  onClose: () => void;
-  onSave: (
-    embedding: AppSettings["embedding"] & { apiKey?: string },
-  ) => void | Promise<void>;
-}) {
-  const [draft, setDraft] = useState({ ...settings.embedding, apiKey: "" });
-  const [detectedModels, setDetectedModels] = useState<string[]>(
-    settings.embedding.model ? [settings.embedding.model] : [],
-  );
-  const [detecting, setDetecting] = useState(false);
-  const [detectError, setDetectError] = useState("");
-  const detectModels = async () => {
-    setDetecting(true);
-    setDetectError("");
-    try {
-      const response = await gatewayFetch("/api/settings/embedding/models", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(draft),
-      });
-      const payload = (await response.json()) as { models?: string[]; error?: string };
-      if (!response.ok || !payload.models?.length) {
-        throw new Error(payload.error || "没有检测到 Embedding 模型");
-      }
-      setDetectedModels(payload.models);
-      setDraft((current) => ({
-        ...current,
-        model: payload.models?.includes(current.model)
-          ? current.model
-          : payload.models?.[0] ?? "",
-        dimensions: "",
-      }));
-    } catch (caught) {
-      setDetectError(caught instanceof Error ? caught.message : "模型检测失败");
-    } finally {
-      setDetecting(false);
-    }
-  };
-  return (
-    <Modal title="Embedding API" onClose={onClose}>
-      <div className="modal-form embedding-form">
-        <label className="field">
-          <span>API URL</span>
-          <input
-            value={draft.baseUrl}
-            onChange={(event) => setDraft((current) => ({ ...current, baseUrl: event.target.value }))}
-            placeholder="https://api.example.com/v1"
-          />
-        </label>
-        <label className="field">
-          <span>API Key</span>
-          <input
-            type="password"
-            value={draft.apiKey}
-            onChange={(event) => setDraft((current) => ({ ...current, apiKey: event.target.value }))}
-            placeholder={draft.configured ? "已保存；留空表示不修改" : "sk-…"}
-          />
-        </label>
-        <div className="model-picker">
-          <label className="field">
-            <span>模型</span>
-            <select
-              value={draft.model}
-              onChange={(event) =>
-                setDraft((current) => ({
-                  ...current,
-                  model: event.target.value,
-                  dimensions: "",
-                }))
-              }
-              disabled={!detectedModels.length}
-            >
-              {!detectedModels.length && <option value="">请先检测模型</option>}
-              {detectedModels.map((model) => (
-                <option value={model} key={model}>
-                  {model}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={() => void detectModels()}
-            disabled={detecting || !draft.baseUrl || (!draft.apiKey && !draft.configured)}
-          >
-            {detecting ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
-            {detecting ? "检测中" : "检测模型"}
-          </button>
-        </div>
-        {detectError && <div className="form-error">{detectError}</div>}
-        <div className="modal-actions">
-          <button
-            className="primary-button"
-            type="button"
-            disabled={!draft.baseUrl || !draft.model}
-            onClick={() =>
-              void onSave({
-                baseUrl: draft.baseUrl,
-                model: draft.model,
-                dimensions: "",
-                configured: Boolean(draft.apiKey || draft.configured),
-                hybridEnabled: true,
-                rerankEnabled: false,
-                apiKey: draft.apiKey,
-              })
-            }
-          >
-            保存设置
-          </button>
         </div>
       </div>
     </Modal>
