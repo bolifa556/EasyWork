@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import os from "node:os";
@@ -1605,9 +1605,8 @@ test("managed OpenCode uses a conversation-scoped native configuration", async (
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: "agent-config@example.com",
+        username: "agent-config",
         password: "correct-horse",
-        displayName: "Agent 配置用户",
       }),
     });
     assert.equal(registration.status, 200);
@@ -1717,6 +1716,24 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     assert.equal(health.status, 200);
     assert.equal((await health.json()).service, "easywork-gateway");
 
+    const helpResponse = await fetch(`${base}/api/help`);
+    assert.equal(helpResponse.status, 200);
+    assert.equal(helpResponse.headers.get("cache-control"), "no-store");
+    const helpPayload = await helpResponse.json();
+    assert.match(helpPayload.content, /^# EasyWork 使用帮助/m);
+    assert.match(helpPayload.updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+
+    const helpEventsResponse = await fetch(`${base}/api/help/events`);
+    assert.equal(helpEventsResponse.status, 200);
+    assert.match(
+      helpEventsResponse.headers.get("content-type") || "",
+      /^text\/event-stream\b/,
+    );
+    const helpEventsReader = helpEventsResponse.body.getReader();
+    const firstHelpEvent = await helpEventsReader.read();
+    assert.match(new TextDecoder().decode(firstHelpEvent.value), /connected/);
+    await helpEventsReader.cancel();
+
     const bootstrap = await fetch(`${base}/api/bootstrap`);
     cookies = mergeCookies(cookies, bootstrap);
     const initial = await bootstrap.json();
@@ -1743,13 +1760,17 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
         memoryEnabled: true,
         referenceHistory: true,
         autoCapture: true,
-        provider: {
-          name: "OpenAI Compatible",
-          baseUrl: "https://api.openai.com/v1",
-          model: "test-model",
-          protocol: "responses",
-          configured: false,
-        },
+        providers: [
+          {
+            id: "provider-default",
+            name: "OpenAI Compatible",
+            baseUrl: "https://api.openai.com/v1",
+            model: "test-model",
+            protocol: "responses",
+            configured: false,
+          },
+        ],
+        activeProviderId: "provider-default",
         embedding: {
           baseUrl: "https://api.openai.com/v1",
           model: "text-embedding-3-small",
@@ -1768,7 +1789,7 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     assert.equal(stateResponse.status, 200);
 
     const staleState = structuredClone(state);
-    staleState.settings.provider.protocol = "auto";
+    staleState.settings.providers[0].protocol = "auto";
     const staleStateResponse = await fetch(`${base}/api/state`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", Cookie: cookies },
@@ -1780,7 +1801,7 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     });
     const preservedState = await preservedStateResponse.json();
     assert.equal(
-      preservedState.state.settings.provider.protocol,
+      preservedState.state.settings.providers[0].protocol,
       "responses",
     );
 
@@ -2307,15 +2328,16 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: cookies },
       body: JSON.stringify({
-        email: "test@example.com",
+        username: "测试用户",
         password: "correct-horse",
-        displayName: "测试用户",
       }),
     });
     assert.equal(registration.status, 200);
     cookies = mergeCookies(cookies, registration);
     const registered = await registration.json();
     assert.equal(registered.actor.authenticated, true);
+    assert.equal(registered.actor.username, "测试用户");
+    assert.equal("email" in registered.actor, false);
     assert.ok(registered.deviceToken);
 
     const authenticatedBootstrap = await fetch(`${base}/api/bootstrap`, {
@@ -2324,6 +2346,42 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     const authenticated = await authenticatedBootstrap.json();
     assert.equal(authenticated.actor.displayName, "测试用户");
     assert.equal(authenticated.state.settings.memoryEnabled, true);
+
+    const renamedProfileResponse = await fetch(`${base}/api/profile`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${registered.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ username: "重命名用户" }),
+    });
+    assert.equal(renamedProfileResponse.status, 200);
+    const renamedProfile = await renamedProfileResponse.json();
+    assert.equal(renamedProfile.actor.username, "重命名用户");
+
+    const oldUsernameLogin = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "测试用户",
+        password: "correct-horse",
+      }),
+    });
+    assert.equal(oldUsernameLogin.status, 401);
+    assert.equal(
+      (await oldUsernameLogin.json()).error,
+      "用户名或密码不正确",
+    );
+
+    const renamedLogin = await fetch(`${base}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "重命名用户",
+        password: "correct-horse",
+      }),
+    });
+    assert.equal(renamedLogin.status, 200);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     const resolved = path.resolve(temporaryRoot);
@@ -2348,9 +2406,8 @@ test("host worker persists a Work result without any browser subscriber", async 
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: "background-work@example.com",
+        username: "background-work",
         password: "correct-horse",
-        displayName: "后台任务用户",
       }),
     });
     const account = await registration.json();
@@ -2511,13 +2568,13 @@ test("account settings follow the user across devices and stay isolated from oth
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: "multi-device@example.com",
+        username: "multi-device",
         password: "correct-horse",
-        displayName: "多设备用户",
       }),
     });
     assert.equal(registration.status, 200);
     const firstDevice = await registration.json();
+    assert.equal(firstDevice.actor.username, "multi-device");
     const firstAuthorization = `Bearer ${firstDevice.deviceToken}`;
 
     const providerResponse = await fetch(`${base}/api/settings/provider`, {
@@ -2561,7 +2618,7 @@ test("account settings follow the user across devices and stay isolated from oth
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: "multi-device@example.com",
+        username: "multi-device",
         password: "correct-horse",
       }),
     });
@@ -2571,10 +2628,14 @@ test("account settings follow the user across devices and stay isolated from oth
       headers: { Authorization: `Bearer ${secondDevice.deviceToken}` },
     });
     const sharedAccount = await secondBootstrap.json();
-    assert.equal(sharedAccount.state.settings.provider.baseUrl, "https://llm.example.com/v1");
-    assert.equal(sharedAccount.state.settings.provider.model, "shared-model");
-    assert.equal(sharedAccount.state.settings.provider.configured, true);
-    assert.equal("apiKey" in sharedAccount.state.settings.provider, false);
+    const sharedProvider = sharedAccount.state.settings.providers.find(
+      (provider) => provider.id === sharedAccount.state.settings.activeProviderId,
+    );
+    assert.equal(sharedProvider.baseUrl, "https://llm.example.com/v1");
+    assert.equal(sharedProvider.model, "shared-model");
+    assert.equal(sharedProvider.configured, true);
+    assert.equal("apiKey" in sharedProvider, false);
+    assert.equal("provider" in sharedAccount.state.settings, false);
     assert.deepEqual(
       sharedAccount.state.settings.servers.find(
         (profile) => profile.id === "shared-cluster",
@@ -2593,12 +2654,16 @@ test("account settings follow the user across devices and stay isolated from oth
     assert.equal(JSON.stringify(sharedAccount).includes("draft-account-key"), false);
 
     const staleState = structuredClone(sharedAccount.state);
-    staleState.settings.provider = {
-      ...staleState.settings.provider,
-      baseUrl: "https://stale-device.invalid/v1",
-      model: "stale-model",
-      configured: false,
-    };
+    staleState.settings.providers = staleState.settings.providers.map((provider) =>
+      provider.id === staleState.settings.activeProviderId
+        ? {
+            ...provider,
+            baseUrl: "https://stale-device.invalid/v1",
+            model: "stale-model",
+            configured: false,
+          }
+        : provider,
+    );
     staleState.settings.servers = [];
     const staleSave = await fetch(`${base}/api/state`, {
       method: "PUT",
@@ -2613,7 +2678,12 @@ test("account settings follow the user across devices and stay isolated from oth
       headers: { Authorization: `Bearer ${secondDevice.deviceToken}` },
     });
     const protectedAccount = await protectedBootstrap.json();
-    assert.equal(protectedAccount.state.settings.provider.model, "shared-model");
+    assert.equal(
+      protectedAccount.state.settings.providers.find(
+        (provider) => provider.id === protectedAccount.state.settings.activeProviderId,
+      ).model,
+      "shared-model",
+    );
     assert.ok(
       protectedAccount.state.settings.servers.some(
         (profile) => profile.id === "shared-cluster",
@@ -2624,9 +2694,8 @@ test("account settings follow the user across devices and stay isolated from oth
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: "isolated-user@example.com",
+        username: "isolated-user",
         password: "correct-horse",
-        displayName: "隔离用户",
       }),
     });
     assert.equal(otherRegistration.status, 200);
@@ -2635,7 +2704,8 @@ test("account settings follow the user across devices and stay isolated from oth
       headers: { Authorization: `Bearer ${otherAccount.deviceToken}` },
     });
     const isolated = await otherBootstrap.json();
-    assert.equal(isolated.state.settings?.provider, undefined);
+    assert.equal(isolated.state.settings?.providers?.[0]?.configured, false);
+    assert.equal(isolated.state.settings?.providers?.length, 1);
     assert.equal(isolated.state.settings?.servers, undefined);
   } finally {
     await new Promise((resolve) => server.close(resolve));
@@ -2862,9 +2932,8 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: "ssh-profile@example.com",
+        username: "ssh-profile",
         password: "correct-horse",
-        displayName: "SSH 用户",
       }),
     });
     assert.equal(registration.status, 200);
@@ -2914,7 +2983,7 @@ test("an authenticated account can reuse encrypted SSH keys and passwords", asyn
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: "ssh-profile@example.com",
+        username: "ssh-profile",
         password: "correct-horse",
       }),
     });
@@ -3361,8 +3430,37 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ baseUrl: providerBase, apiKey: "test-key" }),
     });
-    assert.equal(embeddingResponse.status, 200);
-    assert.deepEqual((await embeddingResponse.json()).models, [
+    assert.equal(embeddingResponse.status, 403);
+    assert.match((await embeddingResponse.json()).error, /管理员统一配置/);
+
+    const adminRegistration = await fetch(`${base}/api/auth/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-EasyWork-Device-Id": "model-test-device-0001",
+      },
+      body: JSON.stringify({
+        username: "platform-admin",
+        password: "correct-horse",
+      }),
+    });
+    assert.equal(adminRegistration.status, 200);
+    const adminAccount = await adminRegistration.json();
+    assert.equal(adminAccount.actor.isAdmin, true);
+    const adminEmbeddingResponse = await fetch(`${base}/api/admin/providers/models`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        category: "embedding",
+        baseUrl: providerBase,
+        apiKey: "test-key",
+      }),
+    });
+    assert.equal(adminEmbeddingResponse.status, 200);
+    assert.deepEqual((await adminEmbeddingResponse.json()).models, [
       "text-embedding-test",
     ]);
 
@@ -3404,6 +3502,66 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
     );
     assert.equal(storedKeyResponse.status, 200);
     assert.equal((await storedKeyResponse.json()).apiKey, "test-key");
+    const saveSecondProviderResponse = await fetch(
+      `${base}/api/settings/provider`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authorization,
+        },
+        body: JSON.stringify({
+          providerId: "provider-backup",
+          name: "备用 API",
+          baseUrl: providerBase,
+          apiKey: "backup-key",
+          activate: false,
+        }),
+      },
+    );
+    assert.equal(saveSecondProviderResponse.status, 200);
+    const secondProviderPayload = await saveSecondProviderResponse.json();
+    assert.equal(secondProviderPayload.activeProviderId, "provider-default");
+    assert.equal(secondProviderPayload.providers.length, 2);
+    const secondStoredKeyResponse = await fetch(
+      `${base}/api/settings/provider/key?providerId=provider-backup`,
+      { headers: { Authorization: authorization } },
+    );
+    assert.equal(secondStoredKeyResponse.status, 200);
+    assert.equal((await secondStoredKeyResponse.json()).apiKey, "backup-key");
+    const originalStoredKeyResponse = await fetch(
+      `${base}/api/settings/provider/key?providerId=provider-default`,
+      { headers: { Authorization: authorization } },
+    );
+    assert.equal((await originalStoredKeyResponse.json()).apiKey, "test-key");
+    const activateSecondProviderResponse = await fetch(
+      `${base}/api/settings/provider`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authorization,
+        },
+        body: JSON.stringify({
+          providerId: "provider-backup",
+          name: "备用 API",
+          baseUrl: providerBase,
+          model: "chat-model",
+          protocol: "chat-completions",
+          activate: true,
+        }),
+      },
+    );
+    assert.equal(activateSecondProviderResponse.status, 200);
+    const activatedSecondProvider = await activateSecondProviderResponse.json();
+    assert.equal(activatedSecondProvider.activeProviderId, "provider-backup");
+    assert.equal("provider" in activatedSecondProvider, false);
+    assert.equal(
+      activatedSecondProvider.providers.find(
+        (provider) => provider.id === activatedSecondProvider.activeProviderId,
+      ).model,
+      "chat-model",
+    );
     const storedCredentialModelsResponse = await fetch(
       `${base}/api/settings/provider/models`,
       {
@@ -3503,6 +3661,141 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
       responsesStreamEvents.find((event) => event.type === "done")?.content,
       "我是 **EasyWork Chat 助手**，很高兴见到你。",
     );
+
+    const firstDeviceBootstrap = await fetch(`${base}/api/bootstrap`, {
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "X-EasyWork-Device-Id": "admin-browser-device-0001",
+      },
+    });
+    assert.equal(firstDeviceBootstrap.status, 200);
+    assert.equal((await firstDeviceBootstrap.json()).device.firstVisit, true);
+    const returningDeviceBootstrap = await fetch(`${base}/api/bootstrap`, {
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "X-EasyWork-Device-Id": "admin-browser-device-0001",
+      },
+    });
+    assert.equal(returningDeviceBootstrap.status, 200);
+    assert.equal((await returningDeviceBootstrap.json()).device.firstVisit, false);
+
+    const platformSettingsResponse = await fetch(`${base}/api/admin/platform`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        providers: {
+          web: { name: "站点网页模型", baseUrl: providerBase, model: "chat-model" },
+          agent: { name: "站点 Agent 模型", baseUrl: providerBase, model: "chat-model" },
+        },
+        embedding: {
+          name: "站点向量模型",
+          baseUrl: providerBase,
+          model: "text-embedding-test",
+          chunkStrategy: "paragraph",
+          chunkSize: 1200,
+          chunkOverlap: 120,
+          batchSize: 16,
+          hybridEnabled: true,
+          rerankEnabled: true,
+        },
+        webApiKey: "platform-web-secret",
+        agentApiKey: "platform-agent-secret",
+        embeddingApiKey: "platform-embedding-secret",
+      }),
+    });
+    assert.equal(platformSettingsResponse.status, 200);
+    const platformSettings = await platformSettingsResponse.json();
+    assert.equal(platformSettings.settings.providers.web.configured, true);
+    assert.equal(platformSettings.settings.providers.agent.configured, true);
+    assert.equal(platformSettings.settings.embedding.chunkStrategy, "paragraph");
+    assert.equal(platformSettings.settings.embedding.chunkSize, 1200);
+    assert.equal("apiKey" in platformSettings.settings.providers.web, false);
+
+    const sshPolicyResponse = await fetch(`${base}/api/admin/ssh-policy`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        ssh: {
+          idleTtlMinutes: 1440,
+          keepaliveIntervalSeconds: 45,
+          keepaliveCountMax: 4,
+          connectTimeoutSeconds: 18,
+          cleanupIntervalMinutes: 90,
+        },
+      }),
+    });
+    assert.equal(sshPolicyResponse.status, 200);
+    assert.equal((await sshPolicyResponse.json()).settings.ssh.idleTtlMinutes, 1440);
+
+    const publicBootstrap = await fetch(`${base}/api/bootstrap`, {
+      headers: { "X-EasyWork-Device-Id": "public-model-device-0001" },
+    });
+    assert.equal(publicBootstrap.status, 200);
+    const publicPayload = await publicBootstrap.json();
+    assert.ok(
+      publicPayload.state.settings.providers.some(
+        (provider) => provider.id === "platform-web" && provider.managedBy === "platform",
+      ),
+    );
+    assert.equal(publicPayload.state.settings.embedding.model, "text-embedding-test");
+    const publicChatResponse = await fetch(`${base}/api/chat/stream`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${publicPayload.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        conversationId: "platform-usage-chat",
+        userMessageId: "platform-usage-user",
+        assistantMessageId: "platform-usage-assistant",
+        prompt: "验证平台公共模型",
+        firstTurn: false,
+      }),
+    });
+    assert.equal(publicChatResponse.status, 200);
+    assert.match(await publicChatResponse.text(), /"type":"done"/);
+
+    const secondRegistration = await fetch(`${base}/api/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "ordinary-user", password: "correct-horse" }),
+    });
+    assert.equal(secondRegistration.status, 200);
+    const secondAccount = await secondRegistration.json();
+    assert.equal(secondAccount.actor.isAdmin, false);
+    const forbiddenOverview = await fetch(`${base}/api/admin/overview`, {
+      headers: { Authorization: `Bearer ${secondAccount.deviceToken}` },
+    });
+    assert.equal(forbiddenOverview.status, 403);
+
+    const adminListPath = path.join(
+      process.env.EASYWORK_DATA_DIR,
+      "admins",
+      "adminList",
+    );
+    const initialAdminList = await readFile(adminListPath, "utf8");
+    assert.match(initialAdminList, /platform-admin/);
+    await writeFile(adminListPath, `${initialAdminList.trim()}\nordinary-user\n`, "utf8");
+    const delegatedOverview = await fetch(`${base}/api/admin/overview`, {
+      headers: { Authorization: `Bearer ${secondAccount.deviceToken}` },
+    });
+    assert.equal(delegatedOverview.status, 200);
+    const overviewPayload = await delegatedOverview.json();
+    assert.equal(overviewPayload.userCount, 2);
+    assert.equal(overviewPayload.adminCount, 2);
+    assert.ok(overviewPayload.usage.daily.web.requests >= 1);
+
+    const platformSecretsSource = await readFile(
+      path.join(process.env.EASYWORK_DATA_DIR, "admins", "platform-secrets.json"),
+      "utf8",
+    );
+    assert.doesNotMatch(platformSecretsSource, /platform-(?:web|agent|embedding)-secret/);
 
   } finally {
     await Promise.all([

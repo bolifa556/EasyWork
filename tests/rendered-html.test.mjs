@@ -38,12 +38,14 @@ test("server-renders the EasyWork shell with an in-workspace loading state", asy
 });
 
 test("includes the two-mode product architecture and removes starter artifacts", async () => {
-  const [app, css, gateway, prompts, builtIns] = await Promise.all([
+  const [app, css, layout, gateway, prompts, builtIns, help] = await Promise.all([
     readFile(new URL("../app/EasyWorkApp.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../gateway/server.mjs", import.meta.url), "utf8"),
     readdir(new URL("../prompts/", import.meta.url)),
     readdir(new URL("../skill/built-in/", import.meta.url)),
+    readFile(new URL("../help/help.md", import.meta.url), "utf8"),
   ]);
 
   assert.deepEqual(prompts.sort(), [
@@ -70,9 +72,63 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.doesNotMatch(app, /\/api\/conversations\/branch/);
   assert.doesNotMatch(app, /branchConversationFromMessage/);
   assert.match(app, /function UnifiedComposer/);
+  assert.match(app, /const isNewConversation = activeMessageCount === 0/);
+  assert.match(app, /new-conversation-mode-switch/);
+  assert.match(app, /className="new-work-setup"/);
+  assert.match(app, /请先设置工作区/);
+  assert.match(app, /setDraftWorkspace\(workspace\)/);
+  assert.doesNotMatch(app, /访客数据保存在临时目录/);
+  assert.doesNotMatch(app, /onDeleteGuest/);
+  assert.match(app, /key=\{actor\.id\}/);
+  assert.match(app, /if \(bootstrap\.actor\) onActor\(bootstrap\.actor\)/);
+  assert.match(app, /account-modal-authenticated/);
+  assert.match(app, /type ViewName = "chat" \| "project" \| "library" \| "skills" \| "help"/);
+  assert.match(app, /<span>帮助<\/span>/);
+  assert.match(app, /gatewayFetch\("\/api\/help"/);
+  assert.match(app, /new EventSource\(/);
+  assert.match(app, /addEventListener\("help\.changed", refreshChangedHelp\)/);
+  assert.doesNotMatch(app, /1_500/);
+  assert.match(app, /<MarkdownContent content=\{helpContent\} help \/>/);
+  assert.doesNotMatch(app, /help\.md\?raw/);
+  assert.doesNotMatch(app, /view === "memory"/);
+  assert.doesNotMatch(app, /<span>记忆<\/span>/);
+  assert.doesNotMatch(app, /<span>邮箱<\/span>/);
+  assert.match(app, /\/邮箱\/\.test\(responseMessage\)/);
+  assert.match(app, /"用户名或密码不正确"/);
+  assert.match(app, /body: JSON\.stringify\(\{ username, password \}\)/);
+  assert.match(
+    app,
+    /new-work-setup-value server-ready[\s\S]*配置 Agent[\s\S]*设置工作区/,
+  );
+  assert.match(
+    app,
+    /\{isNewConversation && \(\s*<p>EasyWork 可能会出错，请核对重要信息。<\/p>/,
+  );
+  const beginConversationSource = app.match(
+    /const beginConversation =[\s\S]*?const openProject =/,
+  )?.[0] ?? "";
+  assert.doesNotMatch(beginConversationSource, /setDraftServerId\(""\)/);
+  assert.doesNotMatch(beginConversationSource, /setDraftWorkspace\(null\)/);
+  assert.match(help, /# EasyWork 使用帮助/);
+  assert.match(help, /登录/);
+  assert.match(help, /配置模型 API/);
+  assert.match(help, /聊天模式/);
+  assert.match(help, /工作模式/);
+  assert.match(help, /连接服务器/);
+  assert.match(help, /配置 Agent/);
+  assert.match(help, /选择工作区/);
+  assert.match(gateway, /function normalizeUsername/);
+  assert.match(gateway, /url\.pathname === "\/api\/help\/events"/);
+  assert.match(gateway, /event: help\.changed/);
+  assert.doesNotMatch(gateway, /function normalizeEmail/);
+  assert.doesNotMatch(app, /mode === "chat" && <p>EasyWork 可能会出错/);
   assert.match(app, /useLayoutEffect/);
-  assert.match(app, /maximumHeight = 140/);
+  assert.match(app, /maximumHeight = expanded \? Math\.max\(300/);
   assert.match(app, /multiline \? " multiline"/);
+  assert.match(app, /expanded \? " expanded"/);
+  assert.match(app, /function WebContextRing/);
+  assert.match(app, /function ScrollingPath/);
+  assert.match(app, /workspace-path-viewport/);
   assert.match(app, /project-composer-area/);
   assert.match(app, /project-launch-mode/);
   assert.match(app, /function WorkspacePickerModal/);
@@ -80,9 +136,14 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /workspace-kind-selector/);
   assert.doesNotMatch(app, /workspace-picker-button/);
   assert.match(app, /conversation-mode-stack/);
-  assert.match(app, /function WebContextMeter/);
-  assert.match(app, /className="context-meter-row web"/);
-  assert.match(app, /onClick=\{onOpen\}/);
+  assert.doesNotMatch(app, /function WebContextMeter/);
+  assert.doesNotMatch(app, /className="context-meter-row web"/);
+  assert.match(app, /className={`web-context-ring/);
+  assert.match(app, /管理网页对话上下文配置/);
+  assert.match(app, /providers: ModelProvider\[\]/);
+  assert.match(app, /className="provider-manager"/);
+  assert.match(app, /className="provider-tabs"/);
+  assert.match(app, /agent-model-option-copy/);
   assert.match(app, /function AgentContextRing/);
   assert.match(app, /function AgentContextControls/);
   assert.match(app, /className={`agent-context-ring/);
@@ -187,9 +248,24 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(app, /running \|\| connection\.status !== "connected"/);
   assert.doesNotMatch(app, /返回连接/);
   assert.match(app, /请输入2FA验证码（可选）/);
+  assert.match(
+    app,
+    /context !== "manage" && \(\s*<label className="field connection-otp-field">/,
+  );
+  assert.match(app, /placeholder="请输入当前动态验证码"/);
+  assert.doesNotMatch(app, /optional-otp-field/);
+  assert.match(app, /<fieldset className="ssh-authentication-panel">/);
+  assert.match(app, /<legend>登录认证<\/legend>/);
+  assert.match(
+    css,
+    /\.ssh-authentication-panel[\s\S]*background:\s*rgb\(246 241 230 \/ 62%\)/,
+  );
   assert.match(app, /转换为\{mode === "chat" \? "工作" : "聊天"\}模式/);
   assert.doesNotMatch(app, /const EMPTY_CONVERSATION_ID/);
-  assert.match(app, /Embedding API/);
+  assert.match(app, /Embedding 模型 API/);
+  assert.match(app, /管理员面板/);
+  assert.match(app, /X-EasyWork-Device-Id/);
+  assert.match(app, /conversationScrollPositionsRef/);
   assert.match(app, /project-only/);
   assert.match(css, /grid-template-columns:\s*var\(--left-width\).*var\(--right-width\)/);
   assert.match(css, /@media \(max-width: 720px\)/);
@@ -208,6 +284,31 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /width:\s*16px/);
   assert.match(css, /height:\s*48px/);
   assert.match(css, /backdrop-filter:\s*blur\(9px\)/);
+  assert.match(css, /\.help-document \.help-keyword/);
+  assert.match(css, /\.help-document \.help-markdown > h4 \+ p/);
+  assert.match(
+    css,
+    /\.help-document \.help-markdown\s*\{[\s\S]*?font-size:\s*20px/,
+  );
+  assert.match(
+    css,
+    /\.help-document \.help-markdown > h2\s*\{[\s\S]*?font-size:\s*25px/,
+  );
+  assert.match(
+    css,
+    /\.help-document \.help-markdown > h3\s*\{[\s\S]*?font-size:\s*22px/,
+  );
+  assert.match(
+    css,
+    /\.help-document \.help-markdown > h4\s*\{[\s\S]*?font-size:\s*21px/,
+  );
+  assert.doesNotMatch(css, /\.easywork-app\.easywork-app \*\s*\{[\s\S]*?font-size/);
+  assert.match(css, /\.help-keyword, \.help-emphasis\)\.tone-agent/);
+  assert.match(css, /\.help-keyword, \.help-emphasis\)\.tone-api/);
+  assert.match(css, /\.help-keyword, \.help-emphasis\)\.tone-connection/);
+  assert.match(css, /\.admin-page/);
+  assert.match(css, /\.admin-api-layout/);
+  assert.match(css, /\.admin-connection-row/);
   assert.match(css, /\.agent-event-detail-motion/);
   assert.match(css, /\.file-change-list-motion/);
   assert.match(css, /\.file-diff-line\.added/);
@@ -231,8 +332,67 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /\.workspace-loading-indicator/);
   assert.match(css, /\.agent-update-dialog/);
   assert.match(css, /\.unified-composer/);
+  assert.match(css, /\.conversation-surface\.new-conversation/);
+  assert.match(css, /\.new-conversation-mode-switch/);
+  assert.match(
+    css,
+    /\.new-conversation \.new-conversation-mode-switch[\s\S]*width:\s*min\(228px[\s\S]*height:\s*37px/,
+  );
+  assert.match(
+    css,
+    /\.new-conversation \.messages-scroll[\s\S]*flex:\s*0 0 43%/,
+  );
+  assert.match(
+    css,
+    /\.new-conversation \.composer-zone[\s\S]*flex:\s*1 1 57%/,
+  );
+  assert.match(app, /className=\{`chat\$\{mode === "chat"/);
+  assert.match(app, /<MessageCircle size=\{14\} \/>[\s\S]*聊天/);
+  assert.match(app, /<Terminal size=\{14\} \/>[\s\S]*工作/);
+  assert.match(css, /\.new-conversation-heading h1\.chat[\s\S]*27px/);
+  assert.match(css, /\.new-work-setup-action\.primary-stage[\s\S]*border-radius:\s*999px/);
+  assert.match(layout, /viewportFit:\s*"cover"/);
+  assert.match(
+    css,
+    /@media \(max-width: 900px\)[\s\S]*\.left-sidebar[\s\S]*transform:\s*translateX\(-104%\)/,
+  );
+  assert.match(
+    css,
+    /@media \(max-width: 720px\)[\s\S]*\.provider-manager[\s\S]*grid-template-rows:\s*auto minmax\(0, 1fr\)/,
+  );
+  assert.match(
+    css,
+    /@media \(max-width: 720px\)[\s\S]*\.remote-directory-picker[\s\S]*100dvh/,
+  );
+  assert.match(
+    css,
+    /@media \(max-width: 720px\)[\s\S]*\.server-conversation-row[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\) auto/,
+  );
+  assert.match(
+    css,
+    /@media \(max-width: 720px\)[\s\S]*\.new-conversation \.messages-scroll\s*\{[\s\S]*flex:\s*1 1 auto/,
+  );
+  assert.match(
+    css,
+    /@media \(max-width: 720px\)[\s\S]*\.new-conversation \.composer-zone\s*\{[\s\S]*position:\s*absolute;[\s\S]*bottom:\s*0/,
+  );
+  assert.match(
+    css,
+    /@media \(max-width: 720px\)[\s\S]*\.new-conversation \.empty-chat\s*\{[\s\S]*justify-content:\s*center/,
+  );
+  assert.match(css, /@media \(hover: none\), \(pointer: coarse\)/);
+  assert.match(css, /\.new-work-setup-value\.workspace-ready/);
+  assert.match(css, /\.help-page[\s\S]*background-attachment:\s*local/);
+  assert.match(css, /\.account-modal-authenticated/);
+  assert.match(
+    css,
+    /\.account-modal \.account-tabs[\s\S]*background:\s*transparent/,
+  );
   assert.match(css, /\.unified-composer\.multiline/);
-  assert.match(css, /max-height:\s*140px/);
+  assert.match(css, /max-height:\s*96px/);
+  assert.match(css, /\.unified-composer\.expanded/);
+  assert.match(css, /grid-template-areas:\s*"add input model send"/);
+  assert.match(css, /"input input input input"[\s\S]*"add spacer model send"/);
   assert.match(css, /\.composer-menu-popover\.show-skills/);
   assert.match(css, /\.message\.user \.message-text\s*\{[\s\S]*font-size:\s*17px !important/);
   assert.match(css, /\.markdown-content:not\(\.compact\)[\s\S]*table\s*\{[\s\S]*font-size:\s*16px !important/);
@@ -248,9 +408,15 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.doesNotMatch(css, /\.workspace-picker-modal/);
   assert.doesNotMatch(css, /\.workspace-picker-button/);
   assert.match(css, /\.workspace-rail-panel/);
-  assert.match(css, /\.context-meters[\s\S]*gap:\s*6px/);
-  assert.match(css, /\.context-meter-row[\s\S]*grid-template-columns:\s*auto minmax\(42px, 1fr\) auto/);
-  assert.match(css, /\.context-meter-row > i[\s\S]*height:\s*5px/);
+  assert.doesNotMatch(css, /\.context-meters/);
+  assert.doesNotMatch(css, /\.context-meter-row/);
+  assert.match(css, /\.web-context-ring[\s\S]*#8564b4/);
+  assert.match(css, /\.provider-manager/);
+  assert.match(css, /\.workspace-path-viewport\.scrollable:hover code/);
+  assert.match(
+    css,
+    /Adaptive composer and the four-section Work rail[\s\S]*grid-template-rows:\s*auto auto auto minmax\(0, 1fr\)/,
+  );
   assert.match(css, /\.context-usage-hero/);
   assert.match(css, /\.agent-context-ring/);
   assert.match(css, /\.agent-context-controls/);
@@ -269,9 +435,8 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /\.conversation-toolbar::after\s*\{[\s\S]*display:\s*none/);
   assert.match(css, /\.remote-file-manager/);
   assert.match(css, /@keyframes chat-title-scroll/);
-  assert.match(css, /LLMGame-inspired conversation/);
-  assert.match(gateway, /SSH_KEEPALIVE_INTERVAL_MS\s*=\s*60 \* 1000/);
-  assert.match(gateway, /keepaliveInterval:\s*SSH_KEEPALIVE_INTERVAL_MS/);
+  assert.match(gateway, /keepaliveIntervalSeconds:\s*60/);
+  assert.match(gateway, /keepaliveInterval:\s*sshPolicy\.keepaliveIntervalSeconds \* 1000/);
   assert.match(gateway, /hostVerifier/);
   assert.match(gateway, /Access-Control-Allow-Private-Network/);
   assert.match(gateway, /\/api\/settings\/provider\/models/);
@@ -282,7 +447,12 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /connections\.snapshot/);
   assert.match(gateway, /conversation\.title/);
   assert.match(gateway, /const sshWorkerPool = new Map/);
-  assert.match(gateway, /SSH_IDLE_TTL_MS\s*=\s*30 \* 24 \* 60 \* 60 \* 1000/);
+  assert.match(gateway, /url\.pathname === "\/api\/admin\/overview"/);
+  assert.match(gateway, /url\.pathname === "\/api\/admin\/platform"/);
+  assert.match(gateway, /url\.pathname === "\/api\/admin\/ssh-policy"/);
+  assert.match(gateway, /path\.join\(DATA_ROOT, "devices"/);
+  assert.match(gateway, /async function ensureInitialAdministrator/);
+  assert.match(gateway, /idleTtlMinutes:\s*30 \* 24 \* 60/);
   assert.match(gateway, /function cleanupIdleSshWorkers/);
   assert.match(gateway, /function publishWorkerEvent/);
   assert.match(gateway, /url\.pathname === "\/api\/conversations\/action"/);
@@ -316,7 +486,9 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(gateway, /errorPayload\?\.data\?\.message/);
   assert.match(gateway, /readOpenCodeFailureLog/);
   assert.match(gateway, /persistServerProfile/);
-  assert.match(gateway, /\["provider", "embedding", "servers", "lastServerId"\]/);
+  assert.match(gateway, /"providers",[\s\S]*"activeProviderId"/);
+  assert.match(gateway, /providerApiKeys/);
+  assert.match(gateway, /providerId:\s*provider\.id/);
   assert.match(gateway, /function normalizeAgentPlanSteps/);
   assert.match(gateway, /sourceId: "agent-native-plan"/);
   assert.match(gateway, /title: "执行计划"/);
