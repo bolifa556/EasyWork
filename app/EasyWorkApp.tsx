@@ -78,6 +78,7 @@ import {
 } from "react";
 
 type Mode = "chat" | "work";
+type AgentMenuOwner = "toolbar" | "new-work" | "project";
 type ViewName = "chat" | "project" | "library" | "skills" | "help" | "admin";
 type StepStatus = "pending" | "running" | "done" | "error" | "cancelled";
 type EventStatus = "pending" | "running" | "done" | "error" | "cancelled";
@@ -144,6 +145,7 @@ type Message = {
   createdAt: string;
   mode: Mode;
   selectedSkills?: string[];
+  selectedLibraryCollectionIds?: string[];
   trace?: RunTrace;
   events?: WorkEvent[];
   runId?: string;
@@ -176,6 +178,7 @@ type Conversation = {
   title: string;
   mode: Mode;
   projectId?: string;
+  libraryCollectionIds?: string[];
   pinned?: boolean;
   messages: Message[];
   updatedAt: string;
@@ -242,7 +245,7 @@ type Project = {
   name: string;
   icon: string;
   memoryMode: "project-and-global" | "project-only";
-  fileIds?: string[];
+  libraryCollectionIds?: string[];
   pinned?: boolean;
   createdAt: string;
 };
@@ -262,8 +265,35 @@ type LibraryFile = {
   name: string;
   size: number;
   type: string;
-  status: "ready" | "indexing" | "keyword-only" | "error";
+  status: "ready" | "indexing" | "stale" | "error";
   chunks: number;
+  updatedAt: string;
+  indexedAt?: string;
+  embeddingModel?: string;
+  collectionId?: string;
+  projectId?: string;
+  conversationId?: string;
+  relativePath?: string;
+  parentPath?: string;
+  source: "collection" | "project" | "conversation";
+  error?: string;
+  failedStage?: "upload" | "extracting" | "embedding" | "storage";
+  retryable?: boolean;
+};
+
+type LibraryFileSort = {
+  key: "name" | "updatedAt" | "size";
+  direction: "asc" | "desc";
+};
+
+type LibraryTreeRow =
+  | { kind: "folder"; path: string; name: string; depth: number; size: number; updatedAt: string }
+  | { kind: "file"; file: LibraryFile; depth: number };
+
+type LibraryCollection = {
+  id: string;
+  name: string;
+  createdAt: string;
   updatedAt: string;
 };
 
@@ -325,7 +355,6 @@ type AppSettings = {
     dimensions: string;
     configured: boolean;
     hybridEnabled: boolean;
-    rerankEnabled: boolean;
   };
   servers: ServerProfile[];
   lastServerId?: string;
@@ -336,6 +365,7 @@ type EasyWorkState = {
   conversations: Conversation[];
   skills: SkillItem[];
   files: LibraryFile[];
+  libraryCollections: LibraryCollection[];
   memories: MemoryItem[];
   memorySummary?: string;
   settings: AppSettings;
@@ -387,6 +417,13 @@ type AdminOverview = {
       keepaliveCountMax: number;
       connectTimeoutSeconds: number;
       cleanupIntervalMinutes: number;
+      allowedCidrs: string[];
+      blockedCidrs: string[];
+      allowedPorts: number[];
+      maxConnectionsPerUser: number;
+      maxTotalConnections: number;
+      allowKeyAuth: boolean;
+      allowPasswordAuth: boolean;
     };
   };
   usage: AdminUsage;
@@ -723,6 +760,7 @@ const DEFAULT_STATE: EasyWorkState = {
     },
   ],
   files: [],
+  libraryCollections: [],
   memories: [],
   memorySummary: "",
   settings: {
@@ -733,12 +771,11 @@ const DEFAULT_STATE: EasyWorkState = {
     providers: [defaultModelProvider()],
     activeProviderId: DEFAULT_PROVIDER_ID,
     embedding: {
-      baseUrl: "https://api.openai.com/v1",
-      model: "text-embedding-3-small",
-      dimensions: "1536",
+      baseUrl: "",
+      model: "",
+      dimensions: "",
       configured: false,
       hybridEnabled: true,
-      rerankEnabled: false,
     },
     servers: [],
     lastServerId: "",
@@ -764,6 +801,9 @@ function mergeStoredState(
   const files = Array.isArray(incoming.files)
     ? incoming.files
     : current.files;
+  const libraryCollections = Array.isArray(incoming.libraryCollections)
+    ? incoming.libraryCollections
+    : current.libraryCollections;
   const memories = Array.isArray(incoming.memories)
     ? incoming.memories
     : current.memories;
@@ -789,6 +829,7 @@ function mergeStoredState(
     projects,
     conversations,
     files,
+    libraryCollections,
     memories,
     memorySummary: incoming.memorySummary ?? current.memorySummary,
     settings: {
@@ -797,8 +838,11 @@ function mergeStoredState(
       providers,
       activeProviderId: provider.id,
       embedding: {
-        ...current.settings.embedding,
-        ...(incoming.settings?.embedding ?? {}),
+        baseUrl: incoming.settings?.embedding?.baseUrl ?? "",
+        model: incoming.settings?.embedding?.model ?? "",
+        dimensions: incoming.settings?.embedding?.dimensions ?? "",
+        configured: Boolean(incoming.settings?.embedding?.configured),
+        hybridEnabled: incoming.settings?.embedding?.hybridEnabled !== false,
       },
       servers,
       lastServerId:
@@ -1356,7 +1400,12 @@ function ContextDetailModal({
     usage?.web.automaticCompressionThreshold ?? 0.95,
   );
   return (
-    <Modal title="网页对话上下文" onClose={onClose} wide>
+    <Modal
+      title="网页对话上下文"
+      onClose={onClose}
+      wide
+      className="configuration-modal context-config-modal"
+    >
       <div className="context-dialog web-context-dialog">
         <section className="context-usage-hero web">
           <div className="context-usage-heading">
@@ -1457,6 +1506,7 @@ function Modal({
   children,
   wide = false,
   className = "",
+  hideTitle = false,
 }: {
   title: string;
   titleNote?: string;
@@ -1465,6 +1515,7 @@ function Modal({
   children: React.ReactNode;
   wide?: boolean;
   className?: string;
+  hideTitle?: boolean;
 }) {
   useEffect(() => {
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
@@ -1485,11 +1536,13 @@ function Modal({
         aria-label={title}
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <header className="modal-header">
-          <div className={`modal-title-copy${titleNote ? " with-note" : ""}`}>
-            <h2>{title}</h2>
-            {titleNote && <small>{titleNote}</small>}
-          </div>
+        <header className={`modal-header${hideTitle ? " title-hidden" : ""}`}>
+          {!hideTitle && (
+            <div className={`modal-title-copy${titleNote ? " with-note" : ""}`}>
+              <h2>{title}</h2>
+              {titleNote && <small>{titleNote}</small>}
+            </div>
+          )}
           <div className="modal-header-actions">
             {headerAction}
             <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">
@@ -2571,6 +2624,8 @@ function UnifiedComposer({
   allowSubmitWhileSending = false,
   skills,
   selectedSkills,
+  libraryCollections,
+  selectedLibraryCollectionIds,
   model,
   providers,
   activeProviderId,
@@ -2586,6 +2641,7 @@ function UnifiedComposer({
   onStop,
   onUpload,
   onToggleSkill,
+  onToggleLibraryCollection,
   onDetectModels,
   onSelectModel,
   onOpenWebContext,
@@ -2597,6 +2653,8 @@ function UnifiedComposer({
   allowSubmitWhileSending?: boolean;
   skills: SkillItem[];
   selectedSkills: string[];
+  libraryCollections: LibraryCollection[];
+  selectedLibraryCollectionIds: string[];
   model: string;
   providers: ModelProvider[];
   activeProviderId: string;
@@ -2612,6 +2670,7 @@ function UnifiedComposer({
   onStop: () => void;
   onUpload: (files: FileList | null) => void;
   onToggleSkill: (skillId: string) => void;
+  onToggleLibraryCollection: (collectionId: string) => void;
   onDetectModels: (providerId: string) => void;
   onSelectModel: (providerId: string, model: string) => void;
   onOpenWebContext?: () => void;
@@ -2621,7 +2680,9 @@ function UnifiedComposer({
   const [multiline, setMultiline] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [menuPage, setMenuPage] = useState<"root" | "skills">("root");
+  const [menuPage, setMenuPage] = useState<"root" | "skills" | "collections">(
+    "root",
+  );
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelMenuPage, setModelMenuPage] = useState<"providers" | "models">(
     "providers",
@@ -2632,6 +2693,10 @@ function UnifiedComposer({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const enabledSkills = skills.filter((skill) => skill.enabled);
   const skillMenuHeight = Math.min(54 + Math.max(enabledSkills.length, 1) * 52, 314);
+  const collectionMenuHeight = Math.min(
+    54 + Math.max(libraryCollections.length, 1) * 48,
+    314,
+  );
 
   useLayoutEffect(() => {
     const textarea = activeTextareaRef.current;
@@ -2732,12 +2797,11 @@ function UnifiedComposer({
         />
         {menuOpen && (
           <div
-            className={`composer-menu-popover ${menuDirection} ${
-              menuPage === "skills" ? "show-skills" : ""
-            }`}
+            className={`composer-menu-popover ${menuDirection} show-${menuPage}`}
             style={
               {
                 "--composer-skill-height": `${skillMenuHeight}px`,
+                "--composer-collection-height": `${collectionMenuHeight}px`,
               } as React.CSSProperties
             }
           >
@@ -2757,6 +2821,13 @@ function UnifiedComposer({
                     <Sparkles size={17} />
                   </span>
                   <span>选择技能</span>
+                  <ChevronRight className="composer-menu-next" size={16} />
+                </button>
+                <button type="button" onClick={() => setMenuPage("collections")}>
+                  <span className="composer-menu-icon">
+                    <Library size={17} />
+                  </span>
+                  <span>选择文件集</span>
                   <ChevronRight className="composer-menu-next" size={16} />
                 </button>
               </div>
@@ -2792,6 +2863,44 @@ function UnifiedComposer({
                   })}
                   {!enabledSkills.length && (
                     <span className="composer-menu-empty">暂无已安装的技能</span>
+                  )}
+                </div>
+              </div>
+              <div className="composer-menu-panel collections-panel">
+                <button
+                  className="composer-menu-back"
+                  type="button"
+                  onClick={() => setMenuPage("root")}
+                >
+                  <ChevronLeft size={16} />
+                  <span>返回</span>
+                </button>
+                <div className="composer-collection-list">
+                  {libraryCollections.map((collection) => {
+                    const selected = selectedLibraryCollectionIds.includes(
+                      collection.id,
+                    );
+                    return (
+                      <button
+                        className={selected ? "selected" : ""}
+                        type="button"
+                        key={collection.id}
+                        onClick={() => onToggleLibraryCollection(collection.id)}
+                      >
+                        <span className="composer-menu-icon">
+                          <Folder size={16} />
+                        </span>
+                        <span className="composer-skill-copy">
+                          <strong>{collection.name}</strong>
+                        </span>
+                        <span className="composer-skill-check">
+                          {selected && <Check size={14} />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                  {!libraryCollections.length && (
+                    <span className="composer-menu-empty">还没有文件集</span>
                   )}
                 </div>
               </div>
@@ -3024,6 +3133,14 @@ export default function EasyWorkApp() {
   const [view, setView] = useState<ViewName>("chat");
   const [draft, setDraft] = useState("");
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
+  const [selectedLibraryCollectionIds, setSelectedLibraryCollectionIds] =
+    useState<string[]>([]);
+  const [activeLibraryCollectionId, setActiveLibraryCollectionId] =
+    useState("");
+  const [libraryCollectionEditor, setLibraryCollectionEditor] = useState<
+    LibraryCollection | "new" | null
+  >(null);
+  const [libraryCollectionMenuId, setLibraryCollectionMenuId] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightRailOpen, setRightRailOpen] = useState(false);
   const [expandedTraces, setExpandedTraces] = useState<Set<string>>(new Set());
@@ -3034,7 +3151,9 @@ export default function EasyWorkApp() {
   const [chatSectionOpen, setChatSectionOpen] = useState(true);
   const [expandedProjectConversationIds, setExpandedProjectConversationIds] =
     useState<Set<string>>(new Set());
-  const [projectPageTab, setProjectPageTab] = useState<"chats" | "files">(
+  const [projectPageTab, setProjectPageTab] = useState<
+    "chats" | "files" | "collections"
+  >(
     "chats",
   );
   const [projectModalOpen, setProjectModalOpen] = useState(false);
@@ -3053,9 +3172,20 @@ export default function EasyWorkApp() {
     "bound" | "new-work" | "manage"
   >("new-work");
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
+  const [agentMenuOwner, setAgentMenuOwner] =
+    useState<AgentMenuOwner>("toolbar");
+  const [agentMenuAnchorRect, setAgentMenuAnchorRect] = useState<{
+    top: number;
+    right: number;
+    bottom: number;
+    left: number;
+  } | null>(null);
   const [agentMenuPage, setAgentMenuPage] = useState<
     "root" | "config" | "models"
   >("root");
+  const toolbarAgentButtonRef = useRef<HTMLButtonElement | null>(null);
+  const newWorkAgentButtonRef = useRef<HTMLButtonElement | null>(null);
+  const projectAgentButtonRef = useRef<HTMLButtonElement | null>(null);
   const [agentModelProviderId, setAgentModelProviderId] = useState("");
   const [manualAgentPickerOpen, setManualAgentPickerOpen] = useState(false);
   const [manualAgentBrowsePath, setManualAgentBrowsePath] = useState("~");
@@ -3141,6 +3271,13 @@ export default function EasyWorkApp() {
   const [searchQuery, setSearchQuery] = useState("");
   const [sidebarSearchOpen, setSidebarSearchOpen] = useState(false);
   const [fileSearch, setFileSearch] = useState("");
+  const [libraryFileSort, setLibraryFileSort] = useState<LibraryFileSort>({
+    key: "updatedAt",
+    direction: "desc",
+  });
+  const [expandedLibraryFolders, setExpandedLibraryFolders] = useState<Set<string>>(
+    new Set(),
+  );
   const [conversationMenuId, setConversationMenuId] = useState("");
   const [projectMenuId, setProjectMenuId] = useState("");
   const [conversationPendingDelete, setConversationPendingDelete] =
@@ -3180,6 +3317,7 @@ export default function EasyWorkApp() {
   >(new Map());
   const deviceOnboardingAppliedRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const libraryFolderInputRef = useRef<HTMLInputElement | null>(null);
   const projectFileInputRef = useRef<HTMLInputElement | null>(null);
   const skillInputRef = useRef<HTMLInputElement | null>(null);
   const skillFolderInputRef = useRef<HTMLInputElement | null>(null);
@@ -3290,7 +3428,7 @@ export default function EasyWorkApp() {
   const configAgent =
     agents.find((item) => item.id === agentConfigAgentId) || activeAgent;
   const webModelProviders = state.settings.providers.filter(
-    (provider) => provider.audience !== "agent",
+    (provider) => provider.audience !== "agent" && provider.configured,
   );
   const activeWebModelProvider =
     webModelProviders.find(
@@ -4851,12 +4989,14 @@ export default function EasyWorkApp() {
         setSending(false);
       }
     },
-    [showToast, updateConversation, updateMessage],
+    [setFileManagerOpen, showToast, updateConversation, updateMessage],
   );
 
   useEffect(() => {
     skillFolderInputRef.current?.setAttribute("webkitdirectory", "");
     skillFolderInputRef.current?.setAttribute("directory", "");
+    libraryFolderInputRef.current?.setAttribute("webkitdirectory", "");
+    libraryFolderInputRef.current?.setAttribute("directory", "");
   }, []);
 
   useEffect(() => {
@@ -4872,7 +5012,7 @@ export default function EasyWorkApp() {
       if (!(target instanceof Element)) return;
       if (
         !target.closest(
-          ".chat-row, .project-list-item, .conversation-menu, .conversation-mode-menu, .agent-selector",
+          ".chat-row, .project-list-item, .conversation-menu, .conversation-mode-menu, .agent-selector, .easywork-agent-menu-portal, .agent-menu-launcher",
         )
       ) {
         setConversationMenuId("");
@@ -5149,6 +5289,7 @@ export default function EasyWorkApp() {
     setDraftProjectId(undefined);
     setActiveProjectId(conversation.projectId ?? "");
     setMode(conversation.mode);
+    setSelectedLibraryCollectionIds(conversation.libraryCollectionIds ?? []);
     setView("chat");
     setRightRailOpen(false);
     setConversationMenuId("");
@@ -5174,6 +5315,7 @@ export default function EasyWorkApp() {
     setMode(nextMode);
     setDraft("");
     setSelectedSkills([]);
+    setSelectedLibraryCollectionIds([]);
     setView("chat");
     setRightRailOpen(false);
     setConversationMenuId("");
@@ -5198,6 +5340,7 @@ export default function EasyWorkApp() {
     setMode("chat");
     setDraft("");
     setSelectedSkills([]);
+    setSelectedLibraryCollectionIds([]);
     setView("project");
     setRightRailOpen(false);
     setConversationMenuId("");
@@ -5228,7 +5371,7 @@ export default function EasyWorkApp() {
       name: name.trim() || "未命名项目",
       icon: (name.trim()[0] || "P").toUpperCase(),
       memoryMode,
-      fileIds: [],
+      libraryCollectionIds: [],
       createdAt: now(),
     };
     setState((current) => ({
@@ -5621,12 +5764,11 @@ export default function EasyWorkApp() {
       (submissionAgent?.status !== "ready" || !submissionAgent.configured)
     ) {
       if (submissionAgent?.status === "ready") {
-        setAgentConfigAgentId(submissionAgent.id);
-        setAgentMenuPage("config");
+        openAgentSettings(submissionAgent);
+        openAgentMenuFor(defaultAgentMenuOwner(), "config");
       } else {
-        setAgentMenuPage("root");
+        openAgentMenuFor(defaultAgentMenuOwner(), "root");
       }
-      setAgentMenuOpen(true);
       showToast(
         submissionAgent?.status === "missing"
           ? "请先安装或选择 Agent"
@@ -5697,6 +5839,7 @@ export default function EasyWorkApp() {
       createdAt: now(),
       mode: submissionMode,
       selectedSkills,
+      selectedLibraryCollectionIds,
       runId: submissionMode === "work" ? runId : undefined,
       workspaceId:
         submissionMode === "work" ? executionWorkspace!.id : undefined,
@@ -5747,6 +5890,7 @@ export default function EasyWorkApp() {
           title: "新对话",
           mode: submissionMode,
           projectId,
+          libraryCollectionIds: selectedLibraryCollectionIds,
           messages: [userMessage, assistantMessage],
           updatedAt: now(),
           work,
@@ -5765,6 +5909,7 @@ export default function EasyWorkApp() {
                 title: item.messages.length ? item.title : "新对话",
                 mode: submissionMode,
                 updatedAt: now(),
+                libraryCollectionIds: selectedLibraryCollectionIds,
                 work:
                   submissionMode === "work"
                     ? { ...(item.work ?? {}), ...(work ?? {}) }
@@ -5809,6 +5954,7 @@ export default function EasyWorkApp() {
             firstTurn,
             prompt: content,
             skills: selectedSkills,
+            libraryCollectionIds: selectedLibraryCollectionIds,
             agentId: submissionAgentId,
             projectId,
             memoryMode: conversationProject?.memoryMode ?? "project-and-global",
@@ -5843,6 +5989,7 @@ export default function EasyWorkApp() {
       prompt: content,
       firstTurn,
       skillIds: selectedSkills,
+      libraryCollectionIds: selectedLibraryCollectionIds,
       projectId,
       memoryMode: conversationProject?.memoryMode ?? "project-and-global",
     });
@@ -6738,32 +6885,46 @@ export default function EasyWorkApp() {
 
   const handleLibraryUpload = async (
     files: FileList | null,
-    projectId?: string,
+    target: {
+      collectionId?: string;
+      projectId?: string;
+      conversationId?: string;
+      draftConversation?: boolean;
+    },
   ) => {
     if (!files?.length) return;
+    if (!target.collectionId && !target.projectId && !target.conversationId) {
+      showToast("无法确定文件所属位置");
+      return;
+    }
+    if (!state.settings.embedding.configured) {
+      showToast("文件库暂不可用：Embedding 尚未配置");
+      return;
+    }
+    let successful = 0;
     for (const file of Array.from(files)) {
       const item: LibraryFile = {
         id: uid("file"),
         name: file.name,
+        relativePath: file.webkitRelativePath || file.name,
+        parentPath: (file.webkitRelativePath || "").split("/").slice(0, -1).join("/"),
         size: file.size,
         type: file.type || "application/octet-stream",
-        status: state.settings.embedding.configured ? "indexing" : "keyword-only",
+        status: "indexing",
         chunks: 0,
         updatedAt: now(),
+        collectionId: target.collectionId,
+        projectId: target.projectId,
+        conversationId: target.conversationId,
+        source: target.collectionId
+          ? "collection"
+          : target.projectId
+            ? "project"
+            : "conversation",
       };
       setState((current) => ({
         ...current,
         files: [item, ...current.files],
-        projects: projectId
-          ? current.projects.map((project) =>
-              project.id === projectId
-                ? {
-                    ...project,
-                    fileIds: [...new Set([...(project.fileIds ?? []), item.id])],
-                  }
-                : project,
-            )
-          : current.projects,
       }));
       try {
         const contentBase64 = await fileToBase64(file);
@@ -6775,46 +6936,108 @@ export default function EasyWorkApp() {
             name: file.name,
             type: item.type,
             size: item.size,
+            collectionId: target.collectionId,
+            projectId: target.projectId,
+            conversationId: target.conversationId,
+            draftConversation: target.draftConversation,
+            relativePath: item.relativePath,
             contentBase64,
           }),
         });
-        const payload = response.ok
-          ? ((await response.json()) as { chunks?: number; status?: LibraryFile["status"] })
-          : {};
+        const payload = (await response.json().catch(() => ({}))) as Partial<LibraryFile> & {
+          error?: string;
+        };
         setState((current) => ({
           ...current,
           files: current.files.map((entry) =>
             entry.id === item.id
               ? {
                   ...entry,
-                  status:
-                    payload.status ??
-                    (current.settings.embedding.configured ? "ready" : "keyword-only"),
-                  chunks: payload.chunks ?? Math.max(1, Math.ceil(file.size / 2200)),
+                  ...payload,
+                  status: payload.status ?? (response.ok ? "ready" : "error"),
+                  chunks: payload.chunks ?? 0,
+                  indexedAt: payload.indexedAt,
+                  embeddingModel: payload.embeddingModel,
+                  collectionId: target.collectionId,
+                  projectId: target.projectId,
+                  conversationId: target.conversationId,
+                  relativePath: payload.relativePath || item.relativePath,
+                  parentPath: payload.parentPath || item.parentPath,
+                  source: target.collectionId
+                    ? "collection"
+                    : target.projectId
+                      ? "project"
+                      : "conversation",
+                  updatedAt: payload.updatedAt || entry.updatedAt,
+                  error: response.ok ? undefined : payload.error,
                 }
               : entry,
           ),
         }));
-      } catch {
+        if (!response.ok) {
+          showToast(`${file.name}：${payload.error || "文件索引失败"}`);
+          continue;
+        }
+        successful += 1;
+      } catch (caught) {
+        const message = caught instanceof Error ? caught.message : "文件索引失败";
         setState((current) => ({
           ...current,
           files: current.files.map((entry) =>
             entry.id === item.id
               ? {
                   ...entry,
-                  status: current.settings.embedding.configured
-                    ? "ready"
-                    : "keyword-only",
-                  chunks: Math.max(1, Math.ceil(file.size / 2200)),
+                  status: "error",
+                  chunks: 0,
+                  error: message,
                 }
               : entry,
           ),
         }));
+        showToast(`${file.name}：${message}`);
       }
     }
-    showToast(`已接收 ${files.length} 个文件`);
+    if (successful) showToast(`已上传 ${successful} 个文件`);
     if (fileInputRef.current) fileInputRef.current.value = "";
+    if (libraryFolderInputRef.current) libraryFolderInputRef.current.value = "";
     if (projectFileInputRef.current) projectFileInputRef.current.value = "";
+  };
+
+  const retryLibraryFileIndex = async (file: LibraryFile) => {
+    setState((current) => ({
+      ...current,
+      files: current.files.map((entry) =>
+        entry.id === file.id
+          ? { ...entry, status: "indexing", error: undefined }
+          : entry,
+      ),
+    }));
+    try {
+      const response = await gatewayFetch(
+        `/api/files/${encodeURIComponent(file.id)}/reindex`,
+        { method: "POST" },
+      );
+      const payload = (await response.json().catch(() => ({}))) as Partial<LibraryFile> & {
+        error?: string;
+      };
+      setState((current) => ({
+        ...current,
+        files: current.files.map((entry) =>
+          entry.id === file.id
+            ? {
+                ...entry,
+                ...payload,
+                status: payload.status ?? (response.ok ? "ready" : "error"),
+                error: response.ok ? undefined : payload.error || "重新索引失败",
+              }
+            : entry,
+        ),
+      }));
+      if (!response.ok) throw new Error(payload.error || "重新索引失败");
+      showToast(`${file.name} 已重新建立索引`);
+    } catch (caught) {
+      showToast(caught instanceof Error ? caught.message : "重新索引失败");
+    }
   };
 
   const handleSkillUpload = async (files: FileList | null) => {
@@ -6891,12 +7114,197 @@ export default function EasyWorkApp() {
     ),
   );
 
-  const visibleLibraryFiles = state.files.filter((file) =>
-    file.name.toLowerCase().includes(fileSearch.trim().toLowerCase()),
+  const activeLibraryCollection = state.libraryCollections.find(
+    (collection) => collection.id === activeLibraryCollectionId,
   );
+  const visibleLibraryCollections = state.libraryCollections.filter(
+    (collection) =>
+      collection.name.toLowerCase().includes(fileSearch.trim().toLowerCase()),
+  );
+  const visibleLibraryFiles = state.files.filter(
+    (file) =>
+      file.collectionId === activeLibraryCollectionId &&
+      `${file.relativePath || file.name} ${file.name}`
+        .toLowerCase()
+        .includes(fileSearch.trim().toLowerCase()),
+  );
+  const libraryTreeRows = useMemo<LibraryTreeRow[]>(() => {
+    const query = fileSearch.trim();
+    const compareValues = (left: string | number, right: string | number) => {
+      const result =
+        typeof left === "string" && typeof right === "string"
+          ? left.localeCompare(right, "zh-CN", { numeric: true, sensitivity: "base" })
+          : Number(left) - Number(right);
+      return libraryFileSort.direction === "asc" ? result : -result;
+    };
+    type FolderRow = {
+      path: string;
+      name: string;
+      parent: string;
+      size: number;
+      updatedAt: string;
+    };
+    const folderMap = new Map<string, FolderRow>();
+    for (const file of visibleLibraryFiles) {
+      const parts = String(file.relativePath || file.name).split("/").filter(Boolean);
+      let parent = "";
+      for (const segment of parts.slice(0, -1)) {
+        const folderPath = parent ? `${parent}/${segment}` : segment;
+        const existing = folderMap.get(folderPath);
+        folderMap.set(folderPath, {
+          path: folderPath,
+          name: segment,
+          parent,
+          size: (existing?.size || 0) + file.size,
+          updatedAt:
+            !existing || new Date(file.updatedAt) > new Date(existing.updatedAt)
+              ? file.updatedAt
+              : existing.updatedAt,
+        });
+        parent = folderPath;
+      }
+    }
+    const foldersByParent = new Map<string, FolderRow[]>();
+    for (const folder of folderMap.values()) {
+      foldersByParent.set(folder.parent, [
+        ...(foldersByParent.get(folder.parent) || []),
+        folder,
+      ]);
+    }
+    const filesByParent = new Map<string, LibraryFile[]>();
+    for (const file of visibleLibraryFiles) {
+      const pathValue = String(file.relativePath || file.name);
+      const parent = pathValue.includes("/")
+        ? pathValue.split("/").slice(0, -1).join("/")
+        : "";
+      filesByParent.set(parent, [...(filesByParent.get(parent) || []), file]);
+    }
+    const sortFolder = (left: { name: string; size: number; updatedAt: string }, right: { name: string; size: number; updatedAt: string }) =>
+      libraryFileSort.key === "name"
+        ? compareValues(left.name, right.name)
+        : libraryFileSort.key === "size"
+          ? compareValues(left.size, right.size)
+          : compareValues(new Date(left.updatedAt).getTime(), new Date(right.updatedAt).getTime());
+    const sortFile = (left: LibraryFile, right: LibraryFile) =>
+      libraryFileSort.key === "name"
+        ? compareValues(left.name, right.name)
+        : libraryFileSort.key === "size"
+          ? compareValues(left.size, right.size)
+          : compareValues(new Date(left.updatedAt).getTime(), new Date(right.updatedAt).getTime());
+    const rows: LibraryTreeRow[] = [];
+    const walk = (parent: string, depth: number) => {
+      for (const folder of [...(foldersByParent.get(parent) || [])].sort(sortFolder)) {
+        rows.push({ kind: "folder", ...folder, depth });
+        if (query || expandedLibraryFolders.has(folder.path)) walk(folder.path, depth + 1);
+      }
+      for (const file of [...(filesByParent.get(parent) || [])].sort(sortFile)) {
+        rows.push({ kind: "file", file, depth });
+      }
+    };
+    walk("", 0);
+    return rows;
+  }, [expandedLibraryFolders, fileSearch, libraryFileSort, visibleLibraryFiles]);
   const projectFiles = projectPage
-    ? state.files.filter((file) => (projectPage.fileIds ?? []).includes(file.id))
+    ? state.files.filter((file) => file.projectId === projectPage.id)
     : [];
+  const projectCollections = projectPage
+    ? state.libraryCollections.filter((collection) =>
+        (projectPage.libraryCollectionIds ?? []).includes(collection.id),
+      )
+    : [];
+
+  const changeLibraryFileSort = (key: LibraryFileSort["key"]) => {
+    setLibraryFileSort((current) => ({
+      key,
+      direction:
+        current.key === key
+          ? current.direction === "desc"
+            ? "asc"
+            : "desc"
+          : "desc",
+    }));
+  };
+
+  const saveLibraryCollection = async (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const editing = libraryCollectionEditor;
+    const response = await gatewayFetch(
+      editing && editing !== "new"
+        ? `/api/file-collections/${encodeURIComponent(editing.id)}`
+        : "/api/file-collections",
+      {
+        method: editing && editing !== "new" ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: trimmed }),
+      },
+    );
+    const payload = (await response.json().catch(() => ({}))) as {
+      collection?: LibraryCollection;
+      error?: string;
+    };
+    if (!response.ok || !payload.collection) {
+      showToast(payload.error || "文件集保存失败");
+      return;
+    }
+    setState((current) => ({
+      ...current,
+      libraryCollections:
+        editing && editing !== "new"
+          ? current.libraryCollections.map((collection) =>
+              collection.id === payload.collection!.id
+                ? payload.collection!
+                : collection,
+            )
+          : [payload.collection!, ...current.libraryCollections],
+    }));
+    setLibraryCollectionEditor(null);
+    if (!editing || editing === "new") {
+      setActiveLibraryCollectionId(payload.collection.id);
+    }
+  };
+
+  const deleteLibraryCollection = async (collection: LibraryCollection) => {
+    if (!window.confirm(`删除文件集“${collection.name}”及其中的全部文件？`)) {
+      return;
+    }
+    const response = await gatewayFetch(
+      `/api/file-collections/${encodeURIComponent(collection.id)}`,
+      { method: "DELETE" },
+    );
+    const payload = (await response.json().catch(() => ({}))) as {
+      error?: string;
+    };
+    if (!response.ok) {
+      showToast(payload.error || "文件集删除失败");
+      return;
+    }
+    setState((current) => ({
+      ...current,
+      libraryCollections: current.libraryCollections.filter(
+        (item) => item.id !== collection.id,
+      ),
+      files: current.files.filter((file) => file.collectionId !== collection.id),
+      projects: current.projects.map((project) => ({
+        ...project,
+        libraryCollectionIds: (project.libraryCollectionIds ?? []).filter(
+          (id) => id !== collection.id,
+        ),
+      })),
+      conversations: current.conversations.map((conversation) => ({
+        ...conversation,
+        libraryCollectionIds: (conversation.libraryCollectionIds ?? []).filter(
+          (id) => id !== collection.id,
+        ),
+      })),
+    }));
+    setSelectedLibraryCollectionIds((current) =>
+      current.filter((id) => id !== collection.id),
+    );
+    setActiveLibraryCollectionId("");
+    setLibraryCollectionMenuId("");
+    showToast("文件集已删除");
+  };
 
   const deleteLibraryFile = async (fileId: string) => {
     setState((current) => ({
@@ -6928,6 +7336,111 @@ export default function EasyWorkApp() {
         : [...current, skillId],
     );
   };
+
+  const toggleSelectedLibraryCollection = (collectionId: string) => {
+    setSelectedLibraryCollectionIds((current) => {
+      const next = current.includes(collectionId)
+        ? current.filter((id) => id !== collectionId)
+        : [...current, collectionId];
+      if (activeConversationId) {
+        setState((snapshot) => ({
+          ...snapshot,
+          conversations: snapshot.conversations.map((conversation) =>
+            conversation.id === activeConversationId
+              ? { ...conversation, libraryCollectionIds: next, updatedAt: now() }
+              : conversation,
+          ),
+        }));
+      }
+      return next;
+    });
+  };
+
+  function defaultAgentMenuOwner(): AgentMenuOwner {
+    if (view === "project") return "project";
+    return activeConversation ? "toolbar" : "new-work";
+  }
+
+  function agentMenuButtonFor(owner: AgentMenuOwner) {
+    if (owner === "project") return projectAgentButtonRef.current;
+    if (owner === "new-work") return newWorkAgentButtonRef.current;
+    return toolbarAgentButtonRef.current;
+  }
+
+  function openAgentMenuFor(
+    owner: AgentMenuOwner = defaultAgentMenuOwner(),
+    page: "root" | "config" | "models" = "root",
+    anchor?: HTMLElement | null,
+  ) {
+    const target = anchor || agentMenuButtonFor(owner);
+    if (target) {
+      const rect = target.getBoundingClientRect();
+      setAgentMenuAnchorRect({
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        left: rect.left,
+      });
+    } else {
+      setAgentMenuAnchorRect(null);
+    }
+    setAgentMenuOwner(owner);
+    setAgentMenuPage(page);
+    setAgentMenuOpen(true);
+  }
+
+  function toggleAgentMenuFor(owner: AgentMenuOwner, anchor: HTMLElement) {
+    if (agentMenuOpen && agentMenuOwner === owner) {
+      setAgentMenuOpen(false);
+      setAgentMenuPage("root");
+      return;
+    }
+    openAgentMenuFor(owner, "root", anchor);
+  }
+
+  function currentAgentMenuHeight() {
+    if (agentMenuPage === "config") return agentConfigMenuHeight;
+    if (agentMenuPage === "models") {
+      return Math.min(
+        390,
+        104 +
+          Math.max(
+            agentModelProviderId
+              ? providerModels.length
+              : agentModelProviders.length,
+            1,
+          ) *
+            44,
+      );
+    }
+    return Math.min(390, 54 + Math.max(agents.length, 1) * 58);
+  }
+
+  function agentMenuPortalStyle(): React.CSSProperties {
+    if (!agentMenuAnchorRect || typeof window === "undefined") return {};
+    const viewportGap = 14;
+    const menuWidth = Math.min(330, window.innerWidth - viewportGap * 2);
+    const menuHeight = currentAgentMenuHeight();
+    const left = Math.max(
+      viewportGap,
+      Math.min(
+        agentMenuAnchorRect.right - menuWidth,
+        window.innerWidth - menuWidth - viewportGap,
+      ),
+    );
+    const roomBelow = window.innerHeight - agentMenuAnchorRect.bottom - viewportGap;
+    const top =
+      roomBelow >= menuHeight + 8
+        ? agentMenuAnchorRect.bottom + 8
+        : Math.max(viewportGap, agentMenuAnchorRect.top - menuHeight - 8);
+    return {
+      position: "fixed",
+      zIndex: 160,
+      top,
+      left,
+      width: menuWidth,
+    };
+  }
 
   return (
     <div
@@ -7326,9 +7839,7 @@ export default function EasyWorkApp() {
               </span>
               <span>
                 <strong>管理员面板</strong>
-                <small>平台 API 与 SSH</small>
               </span>
-              <ChevronRight size={15} />
             </button>
           )}
           <button
@@ -7350,16 +7861,12 @@ export default function EasyWorkApp() {
               )}
             </span>
             <span>
-              <strong>{actor.displayName}</strong>
-              <small>
+              <strong>
                 {actor.authenticated
-                  ? webModelProviders.some((provider) => provider.configured)
-                    ? "模型 API 已配置"
-                    : "配置模型 API"
-                  : "登录或注册"}
-              </small>
+                  ? actor.username || actor.displayName
+                  : "未登录"}
+              </strong>
             </span>
-            <ChevronRight size={16} />
           </button>
         </div>
       </aside>
@@ -7457,8 +7964,10 @@ export default function EasyWorkApp() {
           <div className="topbar-actions" />
         </header>
 
-        {view === "chat" && (
+        {(view === "chat" ||
+          (agentMenuOpen && mode === "work" && connection.status === "connected")) && (
           <section
+            hidden={view !== "chat"}
             className={`conversation-surface${
               mode === "work" && connection.status === "connected"
                 ? " workspace-toolbar"
@@ -7523,64 +8032,50 @@ export default function EasyWorkApp() {
               </div>
 
               <div className="conversation-toolbar-right">
-                {!isNewConversation &&
-                  mode === "work" &&
-                  connection.status === "connected" && (
+                {mode === "work" && connection.status === "connected" && (
                   <div className="agent-selector">
-                    <button
-                      className={`agent-picker${activeAgentScanning ? " scanning" : ""}`}
-                      type="button"
-                      aria-expanded={agentMenuOpen}
-                      disabled={activeAgentScanning}
-                      onClick={() =>
-                        setAgentMenuOpen((current) => {
-                          if (!current) setAgentMenuPage("root");
-                          return !current;
-                        })
-                      }
-                    >
-                      {activeAgentScanning ? (
-                        <LoaderCircle className="spin" size={15} />
-                      ) : (
-                        <Bot size={15} />
-                      )}
-                      <span>
-                        {activeAgentScanning
-                          ? "扫描中"
-                          : activeAgent?.status === "ready"
-                          ? activeAgent.name
-                          : "选择 Agent"}
-                      </span>
-                      {!activeAgentScanning &&
-                        activeAgent?.status === "ready" && (
-                          <AgentContextRing usage={contextUsage?.agent ?? null} />
+                    {!isNewConversation && view === "chat" && (
+                      <button
+                        ref={toolbarAgentButtonRef}
+                        className={`agent-picker agent-menu-launcher${activeAgentScanning ? " scanning" : ""}`}
+                        type="button"
+                        aria-expanded={agentMenuOpen && agentMenuOwner === "toolbar"}
+                        disabled={activeAgentScanning}
+                        onClick={(event) =>
+                          toggleAgentMenuFor("toolbar", event.currentTarget)
+                        }
+                      >
+                        {activeAgentScanning ? (
+                          <LoaderCircle className="spin" size={15} />
+                        ) : (
+                          <Bot size={15} />
                         )}
-                      {!activeAgentScanning && <ChevronDown size={13} />}
-                    </button>
-                    {agentMenuOpen && (
+                        <span>
+                          {activeAgentScanning
+                            ? "扫描中"
+                            : activeAgent?.status === "ready"
+                            ? activeAgent.name
+                            : "选择 Agent"}
+                        </span>
+                        {!activeAgentScanning &&
+                          activeAgent?.status === "ready" && (
+                            <AgentContextRing usage={contextUsage?.agent ?? null} />
+                          )}
+                        {!activeAgentScanning && <ChevronDown size={13} />}
+                      </button>
+                    )}
+                    {agentMenuOpen && agentMenuAnchorRect && typeof document !== "undefined" && createPortal(
+                      <div
+                        className="easywork-app easywork-agent-menu-portal"
+                        style={agentMenuPortalStyle()}
+                      >
                       <div
                         className={`agent-dropdown show-${agentMenuPage}`}
                         style={
                           {
-                            "--agent-menu-height":
-                              agentMenuPage === "config"
-                                ? `${agentConfigMenuHeight}px`
-                                : agentMenuPage === "models"
-                                  ? `${Math.min(
-                                      390,
-                                      104 +
-                                        Math.max(
-                                          agentModelProviderId
-                                            ? providerModels.length
-                                            : agentModelProviders.length,
-                                          1,
-                                        ) *
-                                          44,
-                                    )}px`
-                                  : `${Math.min(
-                                      390,
-                                      54 + Math.max(agents.length, 1) * 58,
-                                    )}px`,
+                            "--agent-menu-height": `${currentAgentMenuHeight()}px`,
+                            position: "relative",
+                            inset: "auto",
                           } as React.CSSProperties
                         }
                       >
@@ -7981,6 +8476,8 @@ export default function EasyWorkApp() {
                           </div>
                         </div>
                       </div>
+                      </div>,
+                      document.body,
                     )}
                   </div>
                 )}
@@ -8303,7 +8800,8 @@ export default function EasyWorkApp() {
               )}
             </div>
 
-            <div className="composer-zone">
+            {!appLoading && (
+              <div className="composer-zone">
                 <UnifiedComposer
                   value={draft}
                   textareaRef={textareaRef}
@@ -8312,6 +8810,8 @@ export default function EasyWorkApp() {
                   allowSubmitWhileSending={canAppendToActiveRun}
                   skills={state.skills}
                   selectedSkills={selectedSkills}
+                  libraryCollections={state.libraryCollections}
+                  selectedLibraryCollectionIds={selectedLibraryCollectionIds}
                   model={activeWebModelProvider.model}
                   providers={webModelProviders}
                   activeProviderId={state.settings.activeProviderId}
@@ -8324,10 +8824,19 @@ export default function EasyWorkApp() {
                   onChange={setDraft}
                   onSubmit={() => void submitMessage()}
                   onStop={stopCurrentRun}
-                  onUpload={(files) =>
-                    void handleLibraryUpload(files, activeProject?.id)
-                  }
+                  onUpload={(files) => {
+                    const conversationId =
+                      activeConversation?.id ||
+                      draftConversationIdRef.current ||
+                      uid("chat");
+                    draftConversationIdRef.current = conversationId;
+                    void handleLibraryUpload(files, {
+                      conversationId,
+                      draftConversation: !activeConversation,
+                    });
+                  }}
                   onToggleSkill={toggleSelectedSkill}
+                  onToggleLibraryCollection={toggleSelectedLibraryCollection}
                   onDetectModels={(providerId) =>
                     void detectProviderModels(providerId)
                   }
@@ -8399,16 +8908,17 @@ export default function EasyWorkApp() {
                         </div>
                       ) : (
                         <button
-                          className="new-work-setup-action agent-stage"
+                          ref={newWorkAgentButtonRef}
+                          className="new-work-setup-action agent-stage agent-menu-launcher"
                           type="button"
-                          onClick={() => {
+                          aria-expanded={agentMenuOpen && agentMenuOwner === "new-work"}
+                          onClick={(event) => {
                             if (!activeAgent || activeAgent.status === "missing") {
-                              setAgentMenuPage("root");
+                              openAgentMenuFor("new-work", "root", event.currentTarget);
                             } else {
-                              setAgentConfigAgentId(activeAgent.id);
-                              setAgentMenuPage("config");
+                              openAgentSettings(activeAgent);
+                              openAgentMenuFor("new-work", "config", event.currentTarget);
                             }
-                            setAgentMenuOpen(true);
                           }}
                         >
                           <Settings2 size={16} />
@@ -8439,7 +8949,8 @@ export default function EasyWorkApp() {
               {isNewConversation && (
                 <p>EasyWork 可能会出错，请核对重要信息。</p>
               )}
-            </div>
+              </div>
+            )}
           </section>
         )}
 
@@ -8456,22 +8967,24 @@ export default function EasyWorkApp() {
 
             <div className="project-composer-area">
               <div
-                className="project-launch-mode"
+                className="new-conversation-mode-switch project-launch-mode"
                 role="group"
                 aria-label="选择新对话类型"
               >
                 <button
-                  className={mode === "chat" ? "active" : ""}
+                  className={`chat${mode === "chat" ? " active" : ""}`}
                   type="button"
-                  onClick={() => setMode("chat")}
+                  onClick={() => changeMode("chat")}
                 >
+                  <MessageCircle size={14} />
                   聊天
                 </button>
                 <button
-                  className={mode === "work" ? "active" : ""}
+                  className={`work${mode === "work" ? " active" : ""}`}
                   type="button"
-                  onClick={() => setMode("work")}
+                  onClick={() => changeMode("work")}
                 >
+                  <Terminal size={14} />
                   工作
                 </button>
               </div>
@@ -8481,6 +8994,8 @@ export default function EasyWorkApp() {
                 sending={sending}
                 skills={state.skills}
                 selectedSkills={selectedSkills}
+                libraryCollections={state.libraryCollections}
+                selectedLibraryCollectionIds={selectedLibraryCollectionIds}
                 model={activeWebModelProvider.model}
                 providers={webModelProviders}
                 activeProviderId={state.settings.activeProviderId}
@@ -8497,10 +9012,17 @@ export default function EasyWorkApp() {
                   })
                 }
                 onStop={stopCurrentRun}
-                onUpload={(files) =>
-                  void handleLibraryUpload(files, projectPage.id)
-                }
+                onUpload={(files) => {
+                  const conversationId =
+                    draftConversationIdRef.current || uid("chat");
+                  draftConversationIdRef.current = conversationId;
+                  void handleLibraryUpload(files, {
+                    conversationId,
+                    draftConversation: true,
+                  });
+                }}
                 onToggleSkill={toggleSelectedSkill}
+                onToggleLibraryCollection={toggleSelectedLibraryCollection}
                 onDetectModels={(providerId) =>
                   void detectProviderModels(providerId)
                 }
@@ -8511,6 +9033,75 @@ export default function EasyWorkApp() {
                   mode === "work" ? "工作" : "聊天"
                 }`}
               />
+              {mode === "work" && (
+                <div className="project-work-setup" aria-label="项目工作对话准备">
+                  <button
+                    className={`project-setup-step${connection.status === "connected" ? " ready" : ""}`}
+                    type="button"
+                    disabled={connection.status === "connecting"}
+                    onClick={openConversationServerManager}
+                  >
+                    {connection.status === "connecting" ? (
+                      <LoaderCircle className="spin" size={15} />
+                    ) : connection.status === "connected" ? (
+                      <Wifi size={15} />
+                    ) : (
+                      <KeyRound size={15} />
+                    )}
+                    <span>{
+                      connection.status === "connected"
+                        ? activeServerProfile?.host || connection.host || "远程服务器"
+                        : connection.status === "connecting"
+                          ? "正在连接"
+                          : "连接远程服务器"
+                    }</span>
+                  </button>
+                  {connection.status === "connected" && (
+                    <>
+                      <button
+                        ref={projectAgentButtonRef}
+                        className={`project-setup-step agent-menu-launcher${activeAgent?.status === "ready" && activeAgent.configured ? " ready" : ""}`}
+                        type="button"
+                        disabled={activeAgentScanning}
+                        aria-expanded={agentMenuOpen && agentMenuOwner === "project"}
+                        onClick={(event) => {
+                          if (!activeAgent || activeAgent.status === "missing") {
+                            openAgentMenuFor("project", "root", event.currentTarget);
+                          } else {
+                            openAgentSettings(activeAgent);
+                            openAgentMenuFor("project", "config", event.currentTarget);
+                          }
+                        }}
+                      >
+                        {activeAgentScanning ? (
+                          <LoaderCircle className="spin" size={15} />
+                        ) : (
+                          <Bot size={15} />
+                        )}
+                        <span>{
+                          activeAgentScanning
+                            ? "正在扫描 Agent"
+                            : activeAgent?.status === "ready" && activeAgent.configured
+                              ? activeAgent.name
+                              : "配置 Agent"
+                        }</span>
+                      </button>
+                      {activeAgent?.status === "ready" && activeAgent.configured && (
+                        <button
+                          className={`project-setup-step${activeWorkspace?.id ? " ready" : ""}`}
+                          type="button"
+                          onClick={() => void openWorkspacePicker()}
+                        >
+                          {activeWorkspace?.id ? <FolderOpen size={15} /> : <FolderPlus size={15} />}
+                          <span title={activeWorkspace?.path || ""}>
+                            {activeWorkspace?.path || "设置工作区"}
+                          </span>
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
             </div>
 
             <nav className="project-home-tabs" aria-label="项目内容">
@@ -8529,6 +9120,14 @@ export default function EasyWorkApp() {
               >
                 文件
                 <span>{projectFiles.length}</span>
+              </button>
+              <button
+                className={projectPageTab === "collections" ? "active" : ""}
+                type="button"
+                onClick={() => setProjectPageTab("collections")}
+              >
+                关联文件集
+                <span>{projectCollections.length}</span>
               </button>
             </nav>
 
@@ -8562,16 +9161,9 @@ export default function EasyWorkApp() {
                     </div>
                   )}
                 </div>
-              ) : (
+              ) : projectPageTab === "files" ? (
                 <div className="project-home-files">
                   <div className="project-home-file-actions">
-                    <button
-                      type="button"
-                      onClick={() => setProjectLibraryModalOpen(true)}
-                    >
-                      <Library size={15} />
-                      关联文件库
-                    </button>
                     <button
                       type="button"
                       onClick={() => projectFileInputRef.current?.click()}
@@ -8585,10 +9177,9 @@ export default function EasyWorkApp() {
                       multiple
                       type="file"
                       onChange={(event) =>
-                        void handleLibraryUpload(
-                          event.target.files,
-                          projectPage.id,
-                        )
+                        void handleLibraryUpload(event.target.files, {
+                          projectId: projectPage.id,
+                        })
                       }
                     />
                   </div>
@@ -8602,22 +9193,8 @@ export default function EasyWorkApp() {
                         </span>
                         <button
                           type="button"
-                          aria-label={`从项目移除 ${file.name}`}
-                          onClick={() =>
-                            setState((current) => ({
-                              ...current,
-                              projects: current.projects.map((project) =>
-                                project.id === projectPage.id
-                                  ? {
-                                      ...project,
-                                      fileIds: (project.fileIds ?? []).filter(
-                                        (fileId) => fileId !== file.id,
-                                      ),
-                                    }
-                                  : project,
-                              ),
-                            }))
-                          }
+                          aria-label={`删除项目文件 ${file.name}`}
+                          onClick={() => void deleteLibraryFile(file.id)}
                         >
                           <X size={14} />
                         </button>
@@ -8630,6 +9207,60 @@ export default function EasyWorkApp() {
                     )}
                   </div>
                 </div>
+              ) : (
+                <div className="project-home-files project-home-collections">
+                  <div className="project-home-file-actions">
+                    <button
+                      type="button"
+                      onClick={() => setProjectLibraryModalOpen(true)}
+                    >
+                      <Library size={15} />
+                      管理关联
+                    </button>
+                  </div>
+                  <div className="project-home-file-list">
+                    {projectCollections.map((collection) => {
+                      const fileCount = state.files.filter(
+                        (file) => file.collectionId === collection.id,
+                      ).length;
+                      return (
+                        <div className="project-home-file project-home-collection" key={collection.id}>
+                          <Folder size={17} />
+                          <span>
+                            <strong>{collection.name}</strong>
+                            <small>{fileCount} 个文件</small>
+                          </span>
+                          <button
+                            type="button"
+                            aria-label={`取消关联 ${collection.name}`}
+                            onClick={() =>
+                              setState((current) => ({
+                                ...current,
+                                projects: current.projects.map((project) =>
+                                  project.id === projectPage.id
+                                    ? {
+                                        ...project,
+                                        libraryCollectionIds: (
+                                          project.libraryCollectionIds ?? []
+                                        ).filter((id) => id !== collection.id),
+                                      }
+                                    : project,
+                                ),
+                              }))
+                            }
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      );
+                    })}
+                    {!projectCollections.length && (
+                      <div className="project-home-empty">
+                        <p>还没有关联文件集</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
               )}
             </div>
           </section>
@@ -8637,35 +9268,213 @@ export default function EasyWorkApp() {
 
         {view === "library" && (
           <section className="workspace-page library-page">
-            <div className="page-intro">
-              <div>
-                <h1>文件库</h1>
-                <p>上传资料，在聊天中检索并引用。</p>
+            <header
+              className={`library-header ${
+                activeLibraryCollection
+                  ? "library-collection-detail-header"
+                  : "library-collection-overview-header"
+              }`}
+            >
+              <div className="library-title-row">
+                {activeLibraryCollection ? (
+                  <button
+                    className="library-back-button"
+                    type="button"
+                    aria-label="返回文件集"
+                    onClick={() => {
+                      setActiveLibraryCollectionId("");
+                      setFileSearch("");
+                    }}
+                  >
+                    <ChevronLeft size={18} />
+                  </button>
+                ) : (
+                  <span className="library-title-icon"><Library size={19} /></span>
+                )}
+                <h1>{activeLibraryCollection?.name || "文件库"}</h1>
               </div>
-              <div className="page-actions">
+              <div className="library-header-actions">
                 <button
-                  className="primary-button"
+                  className="library-action-button library-upload-button"
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!state.settings.embedding.configured}
+                  onClick={() =>
+                    activeLibraryCollection
+                      ? fileInputRef.current?.click()
+                      : setLibraryCollectionEditor("new")
+                  }
                 >
-                  <Upload size={16} />
-                  上传文件
+                  {activeLibraryCollection ? <Upload size={16} /> : <Plus size={16} />}
+                  {activeLibraryCollection ? "添加文件" : "新建文件集"}
                 </button>
+                {activeLibraryCollection && (
+                  <>
+                    <button
+                      className="library-action-button library-folder-upload-button"
+                      type="button"
+                      onClick={() => libraryFolderInputRef.current?.click()}
+                    >
+                      <FolderPlus size={16} />
+                      添加文件夹
+                    </button>
+                    <div className="library-detail-menu-wrap">
+                      <button
+                        className="library-detail-menu-button"
+                        type="button"
+                        aria-label="文件集选项"
+                        onClick={() =>
+                          setLibraryCollectionMenuId((current) =>
+                            current === activeLibraryCollection.id
+                              ? ""
+                              : activeLibraryCollection.id,
+                          )
+                        }
+                      >
+                        <Ellipsis size={18} />
+                      </button>
+                      {libraryCollectionMenuId === activeLibraryCollection.id && (
+                        <div className="library-collection-menu" role="menu">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setLibraryCollectionEditor(activeLibraryCollection);
+                              setLibraryCollectionMenuId("");
+                            }}
+                          >
+                            <Pencil size={15} />重命名
+                          </button>
+                          <button
+                            className="danger"
+                            type="button"
+                            onClick={() => void deleteLibraryCollection(activeLibraryCollection)}
+                          >
+                            <Trash2 size={15} />删除文件集
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
                 <input
                   ref={fileInputRef}
                   hidden
                   multiple
                   type="file"
-                  onChange={(event) => void handleLibraryUpload(event.target.files)}
+                  onChange={(event) =>
+                    void handleLibraryUpload(event.target.files, {
+                      collectionId: activeLibraryCollectionId,
+                    })
+                  }
+                />
+                <input
+                  ref={libraryFolderInputRef}
+                  hidden
+                  multiple
+                  type="file"
+                  onChange={(event) =>
+                    void handleLibraryUpload(event.target.files, {
+                      collectionId: activeLibraryCollectionId,
+                    })
+                  }
                 />
               </div>
-            </div>
+            </header>
 
-            <div className="content-card file-table-card">
+            {!state.settings.embedding.configured ? (
+              <div className="library-unavailable" role="status">
+                <span><Database size={22} /></span>
+                <div>
+                  <h2>文件库暂不可用</h2>
+                </div>
+              </div>
+            ) : !activeLibraryCollection ? (
+              <div className="library-collection-browser">
+                <div className="library-overview-toolbar">
+                  <span>{state.libraryCollections.length} 个文件集</span>
+                  <label className="table-search">
+                    <Search size={15} />
+                    <input
+                      value={fileSearch}
+                      onChange={(event) => setFileSearch(event.target.value)}
+                      placeholder="搜索文件集"
+                    />
+                  </label>
+                </div>
+                <div className="library-collection-grid">
+                  {visibleLibraryCollections.map((collection) => {
+                    const files = state.files.filter(
+                      (file) => file.collectionId === collection.id,
+                    );
+                    return (
+                      <article
+                        className="library-collection-card"
+                        key={collection.id}
+                      >
+                        <button
+                          className="library-collection-open"
+                          type="button"
+                          onClick={() => {
+                            setActiveLibraryCollectionId(collection.id);
+                            setFileSearch("");
+                          }}
+                        >
+                          <span className="library-collection-icon">
+                            <Folder size={19} />
+                          </span>
+                          <span>
+                            <strong>{collection.name}</strong>
+                            <small>{files.length} 个文件</small>
+                          </span>
+                        </button>
+                        <button
+                          className="library-collection-more"
+                          type="button"
+                          aria-label={`打开 ${collection.name} 选项`}
+                          onClick={() =>
+                            setLibraryCollectionMenuId((current) =>
+                              current === collection.id ? "" : collection.id,
+                            )
+                          }
+                        >
+                          <Ellipsis size={17} />
+                        </button>
+                        {libraryCollectionMenuId === collection.id && (
+                          <div className="library-collection-menu" role="menu">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setLibraryCollectionEditor(collection);
+                                setLibraryCollectionMenuId("");
+                              }}
+                            >
+                              <Pencil size={15} />重命名
+                            </button>
+                            <button
+                              className="danger"
+                              type="button"
+                              onClick={() => void deleteLibraryCollection(collection)}
+                            >
+                              <Trash2 size={15} />删除文件集
+                            </button>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                  {!visibleLibraryCollections.length && (
+                    <div className="library-collection-empty">
+                      <FolderPlus size={23} />
+                      <p>{fileSearch ? "没有匹配的文件集" : "还没有文件集"}</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+            <div className="file-table-card">
               <div className="card-toolbar">
                 <div>
-                  <h2>全部文件</h2>
-                  <span>{state.files.length} 个文件 · {state.files.reduce((sum, file) => sum + file.chunks, 0)} 个文本块</span>
+                  <h2>文件</h2>
+                  <span>{visibleLibraryFiles.length} 个文件</span>
                 </div>
                 <label className="table-search">
                   <Search size={14} />
@@ -8678,65 +9487,125 @@ export default function EasyWorkApp() {
               </div>
               <div className="file-table">
                 <div className="file-table-head">
-                  <span>名称</span>
-                  <span>索引状态</span>
-                  <span>切块</span>
-                  <span>更新时间</span>
-                  <span />
-                </div>
-                {visibleLibraryFiles.map((file) => (
-                  <div className="file-table-row" key={file.id}>
-                    <span className="file-name-cell">
-                      <i>
-                        {file.name.endsWith(".docx") ? (
-                          <FileText size={17} />
-                        ) : file.name.endsWith(".csv") ? (
-                          <Database size={17} />
-                        ) : (
-                          <File size={17} />
-                        )}
-                      </i>
-                      <span>
-                        <strong>{file.name}</strong>
-                        <small>{formatBytes(file.size)}</small>
-                      </span>
-                    </span>
-                    <span>
-                      <span className={`index-status ${file.status}`}>
-                        {file.status === "ready"
-                          ? "可检索"
-                          : file.status === "indexing"
-                            ? "索引中"
-                            : file.status === "keyword-only"
-                              ? "仅关键词"
-                              : "失败"}
-                      </span>
-                    </span>
-                    <span>{file.chunks || "—"}</span>
-                    <span>{new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(new Date(file.updatedAt))}</span>
-                    <span className="row-actions">
-                      <button
-                        type="button"
-                        aria-label={`删除 ${file.name}`}
-                        onClick={() => void deleteLibraryFile(file.id)}
-                      >
-                        <Trash2 size={15} />
-                      </button>
-                    </span>
-                  </div>
-                ))}
-                {!visibleLibraryFiles.length && (
-                  <div className="data-empty-state">
-                    <p>{fileSearch ? "没有匹配的文件" : "还没有文件"}</p>
-                    {!fileSearch && (
-                      <button type="button" onClick={() => fileInputRef.current?.click()}>
-                        上传文件
-                      </button>
+                  <button type="button" onClick={() => changeLibraryFileSort("name")}>
+                    名称
+                    {libraryFileSort.key === "name" && (
+                      <ChevronDown className={libraryFileSort.direction} size={14} />
                     )}
+                  </button>
+                  <button type="button" onClick={() => changeLibraryFileSort("updatedAt")}>
+                    更新时间
+                    {libraryFileSort.key === "updatedAt" && (
+                      <ChevronDown className={libraryFileSort.direction} size={14} />
+                    )}
+                  </button>
+                  <button type="button" onClick={() => changeLibraryFileSort("size")}>
+                    文件大小
+                    {libraryFileSort.key === "size" && (
+                      <ChevronDown className={libraryFileSort.direction} size={14} />
+                    )}
+                  </button>
+                  <span>索引状态</span>
+                </div>
+                {libraryTreeRows.map((row) => {
+                  if (row.kind === "folder") {
+                    const expanded = fileSearch.trim() || expandedLibraryFolders.has(row.path);
+                    return (
+                      <button
+                        className="file-table-row folder-row"
+                        type="button"
+                        key={`folder-${row.path}`}
+                        onClick={() =>
+                          setExpandedLibraryFolders((current) => {
+                            const next = new Set(current);
+                            if (next.has(row.path)) next.delete(row.path);
+                            else next.add(row.path);
+                            return next;
+                          })
+                        }
+                      >
+                        <span
+                          className="file-name-cell"
+                          style={{ "--file-depth": row.depth } as React.CSSProperties}
+                        >
+                          <i>{expanded ? <FolderOpen size={18} /> : <Folder size={18} />}</i>
+                          <strong>{row.name}</strong>
+                        </span>
+                        <span>{new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric" }).format(new Date(row.updatedAt))}</span>
+                        <span>{formatBytes(row.size)}</span>
+                        <span className="folder-status">文件夹</span>
+                      </button>
+                    );
+                  }
+                  const file = row.file;
+                  return (
+                    <div className="file-table-row" key={file.id}>
+                      <span
+                        className="file-name-cell"
+                        style={{ "--file-depth": row.depth } as React.CSSProperties}
+                      >
+                        <i>
+                          {file.name.endsWith(".docx") ? (
+                            <FileText size={17} />
+                          ) : file.name.endsWith(".csv") ? (
+                            <Database size={17} />
+                          ) : (
+                            <File size={17} />
+                          )}
+                        </i>
+                        <span>
+                          <strong>{file.name}</strong>
+                          {file.relativePath && file.relativePath !== file.name && (
+                            <small>{file.relativePath}</small>
+                          )}
+                        </span>
+                      </span>
+                      <span>{new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric" }).format(new Date(file.updatedAt))}</span>
+                      <span>{formatBytes(file.size)}</span>
+                      <span className="file-index-cell">
+                        <span className={`index-status ${file.status}`}>
+                          {file.status === "ready"
+                            ? "可检索"
+                            : file.status === "indexing"
+                              ? "索引中"
+                              : file.status === "stale"
+                                ? "需重建"
+                                : "失败"}
+                        </span>
+                        {file.error && (
+                          <details className="file-index-error">
+                            <summary>查看原因</summary>
+                            <div>
+                              <p>{file.error}</p>
+                              {file.retryable !== false && (
+                                <button type="button" onClick={() => void retryLibraryFileIndex(file)}>
+                                  <RefreshCw size={13} />重新索引
+                                </button>
+                              )}
+                            </div>
+                          </details>
+                        )}
+                        <button
+                          className="file-row-delete"
+                          type="button"
+                          aria-label={`删除 ${file.name}`}
+                          onClick={() => void deleteLibraryFile(file.id)}
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </span>
+                    </div>
+                  );
+                })}
+                {!libraryTreeRows.length && (
+                  <div className="data-empty-state">
+                    <span className="data-empty-icon"><FileText size={21} /></span>
+                    <p>{fileSearch ? "没有匹配的文件" : "还没有文件"}</p>
                   </div>
                 )}
               </div>
             </div>
+            )}
           </section>
         )}
 
@@ -8745,11 +9614,10 @@ export default function EasyWorkApp() {
             <div className="page-intro">
               <div>
                 <h1>技能</h1>
-                <p>上传技能后，可在输入框下方按需选择。</p>
               </div>
               <div className="page-actions">
                 <button
-                  className="secondary-button"
+                  className="skill-action-button folder"
                   type="button"
                   onClick={() => skillFolderInputRef.current?.click()}
                 >
@@ -8757,7 +9625,7 @@ export default function EasyWorkApp() {
                   上传文件夹
                 </button>
                 <button
-                  className="primary-button"
+                  className="skill-action-button upload"
                   type="button"
                   onClick={() => skillInputRef.current?.click()}
                 >
@@ -9112,20 +9980,32 @@ export default function EasyWorkApp() {
       )}
       {projectLibraryModalOpen && projectPage && (
         <ProjectLibraryModal
+          collections={state.libraryCollections}
           files={state.files}
-          selectedIds={projectPage.fileIds ?? []}
+          selectedIds={projectPage.libraryCollectionIds ?? []}
           onClose={() => setProjectLibraryModalOpen(false)}
-          onSave={(fileIds) => {
+          onSave={(libraryCollectionIds) => {
             setState((current) => ({
               ...current,
               projects: current.projects.map((project) =>
                 project.id === projectPage.id
-                  ? { ...project, fileIds }
+                  ? { ...project, libraryCollectionIds }
                   : project,
               ),
             }));
             setProjectLibraryModalOpen(false);
           }}
+        />
+      )}
+      {libraryCollectionEditor && (
+        <LibraryCollectionEditorModal
+          collection={
+            libraryCollectionEditor === "new"
+              ? undefined
+              : libraryCollectionEditor
+          }
+          onClose={() => setLibraryCollectionEditor(null)}
+          onSave={(name) => void saveLibraryCollection(name)}
         />
       )}
       {profileModalOpen && (
@@ -9493,6 +10373,7 @@ function AdminPanel() {
   const [error, setError] = useState("");
   const [disconnecting, setDisconnecting] = useState("");
   const [showKeys, setShowKeys] = useState<Set<string>>(new Set());
+  const [loadingKey, setLoadingKey] = useState("");
   const [detectedModels, setDetectedModels] = useState<
     Partial<Record<"web" | "agent" | "embedding", string[]>>
   >({});
@@ -9513,7 +10394,6 @@ function AdminPanel() {
       chunkOverlap: 600,
       batchSize: 32,
       hybridEnabled: true,
-      rerankEnabled: false,
     },
   });
   const [sshDraft, setSshDraft] = useState({
@@ -9522,6 +10402,13 @@ function AdminPanel() {
     keepaliveCountMax: 3,
     connectTimeoutSeconds: 25,
     cleanupIntervalMinutes: 360,
+    allowedCidrs: [] as string[],
+    blockedCidrs: [] as string[],
+    allowedPorts: [] as number[],
+    maxConnectionsPerUser: 8,
+    maxTotalConnections: 128,
+    allowKeyAuth: true,
+    allowPasswordAuth: true,
   });
 
   const hydrateDrafts = useCallback((payload: AdminOverview) => {
@@ -9549,10 +10436,23 @@ function AdminPanel() {
         chunkOverlap: payload.settings.embedding.chunkOverlap,
         batchSize: payload.settings.embedding.batchSize,
         hybridEnabled: payload.settings.embedding.hybridEnabled,
-        rerankEnabled: payload.settings.embedding.rerankEnabled,
       },
     });
-    setSshDraft(payload.settings.ssh);
+    setSshDraft({
+      idleTtlMinutes: payload.settings.ssh.idleTtlMinutes ?? 43_200,
+      keepaliveIntervalSeconds:
+        payload.settings.ssh.keepaliveIntervalSeconds ?? 60,
+      keepaliveCountMax: payload.settings.ssh.keepaliveCountMax ?? 3,
+      connectTimeoutSeconds: payload.settings.ssh.connectTimeoutSeconds ?? 25,
+      cleanupIntervalMinutes: payload.settings.ssh.cleanupIntervalMinutes ?? 360,
+      allowedCidrs: payload.settings.ssh.allowedCidrs ?? [],
+      blockedCidrs: payload.settings.ssh.blockedCidrs ?? [],
+      allowedPorts: payload.settings.ssh.allowedPorts ?? [],
+      maxConnectionsPerUser: payload.settings.ssh.maxConnectionsPerUser ?? 8,
+      maxTotalConnections: payload.settings.ssh.maxTotalConnections ?? 128,
+      allowKeyAuth: payload.settings.ssh.allowKeyAuth !== false,
+      allowPasswordAuth: payload.settings.ssh.allowPasswordAuth !== false,
+    });
   }, []);
 
   const loadOverview = useCallback(
@@ -9569,7 +10469,36 @@ function AdminPanel() {
           throw new Error("error" in payload ? payload.error : "管理员数据读取失败");
         }
         setOverview(payload);
-        if (!quiet) hydrateDrafts(payload);
+        if (!quiet) {
+          hydrateDrafts(payload);
+          const configuredCategories = (["web", "agent", "embedding"] as const).filter(
+            (category) =>
+              category === "embedding"
+                ? payload.settings.embedding.apiKeyConfigured
+                : payload.settings.providers[category].apiKeyConfigured,
+          );
+          const storedKeys = await Promise.all(
+            configuredCategories.map(async (category) => {
+              const keyResponse = await gatewayFetch(
+                `/api/admin/providers/key?category=${encodeURIComponent(category)}`,
+                { cache: "no-store" },
+              );
+              const keyPayload = (await keyResponse.json().catch(() => ({}))) as {
+                apiKey?: string;
+              };
+              return [category, keyResponse.ok ? keyPayload.apiKey || "" : ""] as const;
+            }),
+          ).catch(() => [] as Array<readonly ["web" | "agent" | "embedding", string]>);
+          if (storedKeys.length) {
+            setApiDraft((current) => {
+              const next = structuredClone(current);
+              for (const [category, apiKey] of storedKeys) {
+                next[category].apiKey = apiKey;
+              }
+              return next;
+            });
+          }
+        }
         setError("");
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : "管理员数据读取失败");
@@ -9600,8 +10529,8 @@ function AdminPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           providers: {
-            web: { ...apiDraft.web, configured: true },
-            agent: { ...apiDraft.agent, configured: true },
+            web: { ...apiDraft.web, model: "", configured: true },
+            agent: { ...apiDraft.agent, model: "", configured: true },
           },
           embedding: {
             ...apiDraft.embedding,
@@ -9621,7 +10550,9 @@ function AdminPanel() {
         | { settings?: AdminOverview["settings"]; usage?: AdminUsage; error?: string }
         | AdminOverview;
       if (!response.ok || !payload.settings) {
-        throw new Error(payload.error || "平台 API 保存失败");
+        throw new Error(
+          ("error" in payload ? payload.error : "") || "平台 API 保存失败",
+        );
       }
       await loadOverview();
     } catch (caught) {
@@ -9730,13 +10661,44 @@ function AdminPanel() {
     }
   };
 
-  const toggleKey = (category: string) =>
-    setShowKeys((current) => {
-      const next = new Set(current);
-      if (next.has(category)) next.delete(category);
-      else next.add(category);
-      return next;
-    });
+  const toggleKey = async (category: "web" | "agent" | "embedding") => {
+    if (showKeys.has(category)) {
+      setShowKeys((current) => {
+        const next = new Set(current);
+        next.delete(category);
+        return next;
+      });
+      return;
+    }
+    const draft = category === "embedding" ? apiDraft.embedding : apiDraft[category];
+    const saved = category === "embedding"
+      ? overview?.settings.embedding
+      : overview?.settings.providers[category];
+    if (!draft.apiKey && saved?.apiKeyConfigured) {
+      setLoadingKey(category);
+      try {
+        const response = await gatewayFetch(
+          `/api/admin/providers/key?category=${encodeURIComponent(category)}`,
+          { cache: "no-store" },
+        );
+        const payload = (await response.json().catch(() => ({}))) as {
+          apiKey?: string;
+          error?: string;
+        };
+        if (!response.ok) throw new Error(payload.error || "API Key 读取失败");
+        setApiDraft((current) => ({
+          ...current,
+          [category]: { ...current[category], apiKey: payload.apiKey || "" },
+        }));
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "API Key 读取失败");
+        return;
+      } finally {
+        setLoadingKey("");
+      }
+    }
+    setShowKeys((current) => new Set(current).add(category));
+  };
 
   const usageTotal = (
     period: "daily" | "weekly" | "total",
@@ -9752,7 +10714,6 @@ function AdminPanel() {
   const providerCard = (
     category: "web" | "agent" | "embedding",
     title: string,
-    description: string,
     icon: React.ReactNode,
   ) => {
     const draft = category === "embedding" ? apiDraft.embedding : apiDraft[category];
@@ -9767,7 +10728,6 @@ function AdminPanel() {
           <span className="admin-api-icon">{icon}</span>
           <span>
             <strong>{title}</strong>
-            <small>{description}</small>
           </span>
           <span className={`admin-config-status${saved?.configured ? " ready" : ""}`}>
             <i />
@@ -9814,42 +10774,52 @@ function AdminPanel() {
                   }))
                 }
               />
-              <button type="button" onClick={() => toggleKey(category)}>
-                {showKeys.has(category) ? "隐藏" : "显示"}
-              </button>
-            </span>
-          </label>
-          <label className="admin-model-field">
-            <span>模型</span>
-            <span className="admin-model-control">
-              <select
-                value={draft.model}
-                onChange={(event) =>
-                  setApiDraft((current) => ({
-                    ...current,
-                    [category]: { ...current[category], model: event.target.value },
-                  }))
-                }
-              >
-                {!models.length && <option value="">请检测模型</option>}
-                {models.map((model) => (
-                  <option key={model} value={model}>{model}</option>
-                ))}
-              </select>
               <button
                 type="button"
-                disabled={detectingModel === category || !draft.baseUrl}
-                onClick={() => void detectAdminModels(category)}
+                disabled={loadingKey === category}
+                onClick={() => void toggleKey(category)}
               >
-                {detectingModel === category ? (
-                  <LoaderCircle className="spin" size={14} />
-                ) : (
-                  <RefreshCw size={14} />
-                )}
-                检测
+                {loadingKey === category
+                  ? "读取中"
+                  : showKeys.has(category)
+                    ? "隐藏"
+                    : "显示"}
               </button>
             </span>
           </label>
+          {category === "embedding" && (
+            <label className="admin-model-field">
+              <span>Embedding 模型</span>
+              <span className="admin-model-control">
+                <select
+                  value={draft.model}
+                  onChange={(event) =>
+                    setApiDraft((current) => ({
+                      ...current,
+                      embedding: { ...current.embedding, model: event.target.value },
+                    }))
+                  }
+                >
+                  {!models.length && <option value="">请先检测模型</option>}
+                  {models.map((model) => (
+                    <option key={model} value={model}>{model}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  disabled={detectingModel === "embedding" || !draft.baseUrl}
+                  onClick={() => void detectAdminModels("embedding")}
+                >
+                  {detectingModel === "embedding" ? (
+                    <LoaderCircle className="spin" size={14} />
+                  ) : (
+                    <RefreshCw size={14} />
+                  )}
+                  检测
+                </button>
+              </span>
+            </label>
+          )}
           {category === "embedding" && (
             <div className="admin-embedding-options">
               <label>
@@ -9919,19 +10889,6 @@ function AdminPanel() {
                 />
                 <span>混合检索</span>
               </label>
-              <label className="admin-check-option">
-                <input
-                  type="checkbox"
-                  checked={apiDraft.embedding.rerankEnabled}
-                  onChange={(event) =>
-                    setApiDraft((current) => ({
-                      ...current,
-                      embedding: { ...current.embedding, rerankEnabled: event.target.checked },
-                    }))
-                  }
-                />
-                <span>结果重排</span>
-              </label>
             </div>
           )}
         </div>
@@ -9951,11 +10908,7 @@ function AdminPanel() {
   return (
     <section className="workspace-page admin-page">
       <header className="admin-hero">
-        <div>
-          <span className="admin-eyebrow">EasyWork Control</span>
-          <h1>管理员面板</h1>
-          <p>统一管理模型入口、知识库索引与全站远程连接。</p>
-        </div>
+        <h1>管理员面板</h1>
         <div className="admin-hero-stats">
           <span><strong>{overview?.userCount ?? "—"}</strong><small>用户</small></span>
           <span><strong>{overview?.adminCount ?? "—"}</strong><small>管理员</small></span>
@@ -10004,10 +10957,7 @@ function AdminPanel() {
         <div className="admin-api-layout">
           <div className="admin-api-configs">
             <div className="admin-section-heading">
-              <div>
-                <span>模型与索引</span>
-                <h2>公共 API 配置</h2>
-              </div>
+              <h2>公共 API 配置</h2>
               <button
                 className="admin-save-button"
                 type="button"
@@ -10021,29 +10971,23 @@ function AdminPanel() {
             {providerCard(
               "web",
               "网页模型对话 API",
-              "面向所有用户的网页聊天与上下文整理",
               <MessageCircle size={18} />,
             )}
             {providerCard(
               "agent",
               "Agent 模型对话 API",
-              "用于 EasyWork 部署的 OpenCode、Claude Code 与 Codex",
               <Bot size={18} />,
             )}
             {providerCard(
               "embedding",
               "Embedding 模型 API",
-              "自动为全站文件库执行切块、向量化与混合检索",
               <Sparkles size={18} />,
             )}
           </div>
 
           <aside className="admin-usage-panel">
             <div className="admin-section-heading compact">
-              <div>
-                <span>Usage</span>
-                <h2>API 用量</h2>
-              </div>
+              <h2>API 用量</h2>
               <Activity size={18} />
             </div>
             <div className="admin-usage-metrics">
@@ -10104,7 +11048,6 @@ function AdminPanel() {
           <section className="admin-ssh-policy">
             <div className="admin-section-heading">
               <div>
-                <span>Worker pool</span>
                 <h2>连接策略</h2>
               </div>
               <button
@@ -10118,13 +11061,15 @@ function AdminPanel() {
               </button>
             </div>
             <div className="admin-policy-grid">
-              {[
+              {([
                 ["idleTtlMinutes", "空闲断开时间", "分钟", "用户一个月未操作时释放连接"],
                 ["keepaliveIntervalSeconds", "保活间隔", "秒", "主机发送 SSH keepalive 的频率"],
                 ["keepaliveCountMax", "保活失败次数", "次", "连续失败后允许连接自然中断"],
                 ["connectTimeoutSeconds", "连接超时", "秒", "SSH 握手最长等待时间"],
-                ["cleanupIntervalMinutes", "清理周期", "分钟", "后台检查空闲 worker 的频率"],
-              ].map(([field, label, unit, hint]) => (
+                ["cleanupIntervalMinutes", "清理周期", "分钟", "后台检查空闲连接的频率"],
+                ["maxConnectionsPerUser", "单用户连接上限", "条", "一个账号可同时维持的 SSH 连接"],
+                ["maxTotalConnections", "连接池上限", "条", "主机可同时维持的 SSH 连接总数"],
+              ] as const).map(([field, label, unit, hint]) => (
                 <label key={field}>
                   <span><strong>{label}</strong><small>{hint}</small></span>
                   <span className="admin-number-input">
@@ -10144,12 +11089,76 @@ function AdminPanel() {
                 </label>
               ))}
             </div>
+            <div className="admin-access-policy">
+              <div className="admin-access-fields">
+                <label>
+                  <span><strong>允许的目标网段</strong><small>留空表示不限制；每行一个 IPv4 或 IPv6 CIDR</small></span>
+                  <textarea
+                    value={sshDraft.allowedCidrs.join("\n")}
+                    placeholder={"10.0.0.0/8\n192.168.0.0/16"}
+                    onChange={(event) =>
+                      setSshDraft((current) => ({
+                        ...current,
+                        allowedCidrs: event.target.value.split(/\r?\n|,/).map((value) => value.trim()).filter(Boolean),
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span><strong>禁止的目标网段</strong><small>优先级高于允许列表</small></span>
+                  <textarea
+                    value={sshDraft.blockedCidrs.join("\n")}
+                    placeholder="例如 169.254.169.254/32"
+                    onChange={(event) =>
+                      setSshDraft((current) => ({
+                        ...current,
+                        blockedCidrs: event.target.value.split(/\r?\n|,/).map((value) => value.trim()).filter(Boolean),
+                      }))
+                    }
+                  />
+                </label>
+                <label className="admin-port-policy">
+                  <span><strong>允许的 SSH 端口</strong><small>留空表示不限制，用逗号分隔</small></span>
+                  <input
+                    value={sshDraft.allowedPorts.join(", ")}
+                    placeholder="22, 2222"
+                    onChange={(event) =>
+                      setSshDraft((current) => ({
+                        ...current,
+                        allowedPorts: event.target.value
+                          .split(/[\s,;]+/)
+                          .map(Number)
+                          .filter((value) => Number.isInteger(value) && value > 0),
+                      }))
+                    }
+                  />
+                </label>
+              </div>
+              <div className="admin-auth-policy" aria-label="允许的 SSH 登录方式">
+                <span>允许的登录方式</span>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={sshDraft.allowKeyAuth}
+                    onChange={(event) => setSshDraft((current) => ({ ...current, allowKeyAuth: event.target.checked }))}
+                  />
+                  SSH 密钥
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={sshDraft.allowPasswordAuth}
+                    onChange={(event) => setSshDraft((current) => ({ ...current, allowPasswordAuth: event.target.checked }))}
+                  />
+                  用户名与密码
+                </label>
+              </div>
+            </div>
           </section>
 
           <section className="admin-ssh-connections">
             <div className="admin-section-heading">
               <div>
-                <span>Live connections</span>
                 <h2>用户 SSH 连接</h2>
               </div>
               <button className="admin-refresh-button" type="button" onClick={() => void loadOverview()}>
@@ -10412,23 +11421,25 @@ function ProjectEditModal({
 }
 
 function ProjectLibraryModal({
+  collections,
   files,
   selectedIds,
   onClose,
   onSave,
 }: {
+  collections: LibraryCollection[];
   files: LibraryFile[];
   selectedIds: string[];
   onClose: () => void;
-  onSave: (fileIds: string[]) => void;
+  onSave: (collectionIds: string[]) => void;
 }) {
   const [selected, setSelected] = useState(() => new Set(selectedIds));
   const [query, setQuery] = useState("");
-  const visible = files.filter((file) =>
-    file.name.toLowerCase().includes(query.trim().toLowerCase()),
+  const visible = collections.filter((collection) =>
+    collection.name.toLowerCase().includes(query.trim().toLowerCase()),
   );
   return (
-    <Modal title="关联文件库" onClose={onClose}>
+    <Modal title="关联文件集" onClose={onClose}>
       <div className="project-library-dialog">
         <label className="project-library-search">
           <Search size={15} />
@@ -10436,32 +11447,35 @@ function ProjectLibraryModal({
             autoFocus
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索文件"
+            placeholder="搜索文件集"
           />
         </label>
         <div className="project-library-options">
-          {visible.map((file) => {
-            const checked = selected.has(file.id);
+          {visible.map((collection) => {
+            const checked = selected.has(collection.id);
+            const fileCount = files.filter(
+              (file) => file.collectionId === collection.id,
+            ).length;
             return (
               <button
                 className={checked ? "selected" : ""}
                 type="button"
-                key={file.id}
+                key={collection.id}
                 onClick={() =>
                   setSelected((current) => {
                     const next = new Set(current);
-                    if (next.has(file.id)) next.delete(file.id);
-                    else next.add(file.id);
+                    if (next.has(collection.id)) next.delete(collection.id);
+                    else next.add(collection.id);
                     return next;
                   })
                 }
               >
                 <span className="project-library-file-icon">
-                  <FileText size={16} />
+                  <Folder size={16} />
                 </span>
                 <span>
-                  <strong>{file.name}</strong>
-                  <small>{formatBytes(file.size)}</small>
+                  <strong>{collection.name}</strong>
+                  <small>{fileCount} 个文件</small>
                 </span>
                 <span className="project-library-check">
                   {checked && <Check size={14} />}
@@ -10471,7 +11485,7 @@ function ProjectLibraryModal({
           })}
           {!visible.length && (
             <div className="project-library-empty">
-              {files.length ? "没有匹配的文件" : "文件库还没有文件"}
+              {collections.length ? "没有匹配的文件集" : "文件库还没有文件集"}
             </div>
           )}
         </div>
@@ -10488,6 +11502,47 @@ function ProjectLibraryModal({
           </button>
         </div>
       </div>
+    </Modal>
+  );
+}
+
+function LibraryCollectionEditorModal({
+  collection,
+  onClose,
+  onSave,
+}: {
+  collection?: LibraryCollection;
+  onClose: () => void;
+  onSave: (name: string) => void;
+}) {
+  const [name, setName] = useState(collection?.name || "");
+  return (
+    <Modal title={collection ? "重命名文件集" : "新建文件集"} onClose={onClose}>
+      <form
+        className="modal-form library-collection-editor"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave(name);
+        }}
+      >
+        <label className="field">
+          <span>文件集名称</span>
+          <input
+            autoFocus
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="输入名称"
+          />
+        </label>
+        <div className="modal-actions">
+          <button className="secondary-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button" type="submit" disabled={!name.trim()}>
+            {collection ? "保存" : "创建"}
+          </button>
+        </div>
+      </form>
     </Modal>
   );
 }
@@ -10513,6 +11568,11 @@ function ProfileModal({
   onToast: (message: string) => void;
   onFirstDevice: () => void;
 }) {
+  const personalProviders = state.settings.providers.filter(
+    (item) =>
+      item.managedBy !== "platform" &&
+      (item.configured || item.id !== DEFAULT_PROVIDER_ID),
+  );
   const [username, setUsername] = useState(actor.username ?? "");
   const [password, setPassword] = useState("");
   const [name, setName] = useState(actor.authenticated ? actor.displayName : "");
@@ -10520,18 +11580,15 @@ function ProfileModal({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [providers, setProviders] = useState<ModelProvider[]>(
-    state.settings.providers.some((item) => item.managedBy !== "platform")
-      ? state.settings.providers.filter((item) => item.managedBy !== "platform")
-      : [defaultModelProvider()],
+    personalProviders,
   );
   const [selectedProviderId, setSelectedProviderId] = useState(
-    state.settings.providers.some(
+    personalProviders.some(
       (item) =>
-        item.id === state.settings.activeProviderId && item.managedBy !== "platform",
+        item.id === state.settings.activeProviderId,
     )
       ? state.settings.activeProviderId
-      : state.settings.providers.find((item) => item.managedBy !== "platform")?.id ||
-          DEFAULT_PROVIDER_ID,
+      : personalProviders[0]?.id || "",
   );
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
@@ -10705,7 +11762,9 @@ function ProfileModal({
       if (!response.ok) throw new Error(payload.error || "模型 API 保存失败");
       const responseProviders = payload.providers ?? providers;
       const nextProviders = responseProviders.filter(
-        (item) => item.managedBy !== "platform",
+        (item) =>
+          item.managedBy !== "platform" &&
+          (item.configured || item.id !== DEFAULT_PROVIDER_ID),
       );
       setProviders(nextProviders);
       onState((current) => ({
@@ -10738,8 +11797,13 @@ function ProfileModal({
       }
       onClose={onClose}
       wide={actor.authenticated}
+      hideTitle={actor.authenticated}
       className={`account-modal ${
         actor.authenticated ? "account-modal-authenticated" : "account-modal-entry"
+      } account-modal-${tab}${
+        actor.authenticated && tab === "api" && !providers.length
+          ? " account-modal-api-empty"
+          : ""
       }`}
     >
       <div className="account-tabs">
@@ -11008,6 +12072,12 @@ function ProfileModal({
               </div>
             </div>
           )}
+          {!provider && (
+            <div className="provider-empty-state">
+              <Database size={21} />
+              <strong>还没有个人 API</strong>
+            </div>
+          )}
         </div>
       )}
     </Modal>
@@ -11216,7 +12286,14 @@ function ServerManagerModal({
   };
 
   return (
-    <Modal title="远程连接" onClose={onClose} wide>
+    <Modal
+      title="远程连接"
+      onClose={onClose}
+      wide
+      className={`configuration-modal server-configuration-modal${
+        context === "manage" ? " manager-view" : " conversation-view"
+      }`}
+    >
       <div className={`server-manager${conversationScoped ? " compact" : ""}`}>
         {!conversationScoped && (
           <aside className="server-profile-list">

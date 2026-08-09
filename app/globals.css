@@ -424,14 +424,6 @@ textarea::placeholder {
   white-space: nowrap;
 }
 
-.profile-button small {
-  font-size: 10px;
-}
-
-.profile-button > svg {
-  color: #929990;
-}
-
 .topbar {
   z-index: 8;
   display: grid;
@@ -664,8 +656,8 @@ textarea::placeholder {
 .easywork-app.easywork-app .help-document .help-markdown {
   gap: 0.82rem;
   color: #494a43;
-  font-size: 20px;
-  line-height: 1.84;
+  font-size: 17px;
+  line-height: 1.72;
 }
 
 .easywork-app.easywork-app .help-document .help-markdown > :first-child {
@@ -678,7 +670,7 @@ textarea::placeholder {
   padding-bottom: 14px;
   color: #2f382f;
   font-family: Georgia, "Songti SC", "SimSun", serif;
-  font-size: 30px;
+  font-size: 27px;
   font-weight: 560;
   letter-spacing: -0.035em;
   line-height: 1.25;
@@ -701,8 +693,8 @@ textarea::placeholder {
   margin: 0.2rem 0 0.65rem;
   padding: 1px 0 1px 15px;
   color: #5c5d55;
-  font-size: 20px;
-  line-height: 1.85;
+  font-size: 17px;
+  line-height: 1.72;
 }
 
 .easywork-app.easywork-app .help-document .help-markdown > h2 {
@@ -711,7 +703,7 @@ textarea::placeholder {
   border-bottom: 1px solid rgb(99 91 70 / 13%);
   padding: 0 0 8px 15px;
   color: #343c32;
-  font-size: 25px;
+  font-size: 22px;
   font-weight: 720;
   letter-spacing: -0.015em;
 }
@@ -730,7 +722,7 @@ textarea::placeholder {
 .easywork-app.easywork-app .help-document .help-markdown > h3 {
   margin-top: 0.95rem;
   color: #3f4843;
-  font-size: 22px;
+  font-size: 19px;
   font-weight: 720;
 }
 
@@ -740,7 +732,7 @@ textarea::placeholder {
   gap: 8px;
   margin-top: 0.85rem;
   color: #48504b;
-  font-size: 21px;
+  font-size: 18px;
   font-weight: 720;
 }
 
@@ -818,16 +810,16 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-nav-button {
   display: grid;
-  width: calc(100% - 14px);
-  min-height: 48px;
+  width: 100%;
+  min-height: 42px;
   grid-template-columns: 30px minmax(0, 1fr) 18px;
   align-items: center;
   gap: 7px;
   border: 1px solid transparent;
-  border-radius: 12px;
-  margin: 0 7px 5px;
+  border-radius: 10px;
+  margin: 0 0 4px;
   background: transparent;
-  padding: 6px 8px;
+  padding: 5px 7px;
   color: var(--ink-soft);
   text-align: left;
 }
@@ -861,16 +853,8 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .admin-nav-button strong {
-  font-size: 13px;
-  font-weight: 660;
-}
-
-.easywork-app.easywork-app .admin-nav-button small {
-  overflow: hidden;
-  color: var(--ink-faint);
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 13.5px;
+  font-weight: 550;
 }
 
 .easywork-app.easywork-app .admin-page {
@@ -883,38 +867,21 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-hero {
   display: flex;
-  min-height: 112px;
-  align-items: flex-end;
+  min-height: 82px;
+  align-items: center;
   justify-content: space-between;
   gap: 28px;
   border-bottom: 1px solid var(--line);
-  padding: 0 2px 22px;
-}
-
-.easywork-app.easywork-app .admin-eyebrow,
-.easywork-app.easywork-app .admin-section-heading > div > span {
-  display: block;
-  margin-bottom: 5px;
-  color: #718062;
-  font-size: 10px;
-  font-weight: 760;
-  letter-spacing: 0.13em;
-  text-transform: uppercase;
+  padding: 0 2px 18px;
 }
 
 .easywork-app.easywork-app .admin-hero h1 {
   margin: 0;
   color: #30352d;
-  font-size: clamp(29px, 2.4vw, 38px);
+  font-size: clamp(26px, 2.1vw, 34px);
   font-weight: 690;
   letter-spacing: -0.045em;
   line-height: 1.08;
-}
-
-.easywork-app.easywork-app .admin-hero p {
-  margin: 8px 0 0;
-  color: var(--ink-faint);
-  font-size: 13px;
 }
 
 .easywork-app.easywork-app .admin-hero-stats {
@@ -929,12 +896,12 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-hero-stats > span {
   display: flex;
-  min-width: 91px;
+  min-width: 96px;
   flex-direction: column;
   align-items: center;
   gap: 1px;
   border-right: 1px solid var(--line-soft);
-  padding: 12px 15px 10px;
+  padding: 11px 15px 10px;
 }
 
 .easywork-app.easywork-app .admin-hero-stats > span:last-child {
@@ -950,7 +917,7 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-hero-stats small {
   color: var(--ink-faint);
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .easywork-app.easywork-app .admin-tabs {
@@ -966,14 +933,14 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-tabs button {
   display: inline-flex;
-  height: 34px;
+  height: 39px;
   align-items: center;
   gap: 7px;
   border-radius: 9px;
   background: transparent;
-  padding: 0 14px;
+  padding: 0 16px;
   color: var(--ink-faint);
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .easywork-app.easywork-app .admin-tabs button.active {
@@ -995,7 +962,7 @@ textarea::placeholder {
   background: rgb(161 60 50 / 5%);
   padding: 9px 13px;
   color: #8d443c;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .easywork-app.easywork-app .admin-alert button {
@@ -1018,7 +985,7 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-api-layout {
   display: grid;
-  grid-template-columns: minmax(570px, 1.55fr) minmax(290px, 0.72fr);
+  grid-template-columns: minmax(620px, 1.55fr) minmax(320px, 0.72fr);
   align-items: start;
   gap: clamp(22px, 3vw, 42px);
 }
@@ -1042,7 +1009,7 @@ textarea::placeholder {
 .easywork-app.easywork-app .admin-section-heading h2 {
   margin: 0;
   color: #353a32;
-  font-size: 19px;
+  font-size: 20px;
   font-weight: 680;
   letter-spacing: -0.025em;
 }
@@ -1057,16 +1024,16 @@ textarea::placeholder {
 .easywork-app.easywork-app .admin-model-control button,
 .easywork-app.easywork-app .admin-disconnect-button {
   display: inline-flex;
-  min-height: 32px;
+  min-height: 36px;
   align-items: center;
   justify-content: center;
   gap: 6px;
   border: 1px solid var(--line);
   border-radius: 9px;
   background: rgb(255 255 255 / 54%);
-  padding: 0 11px;
+  padding: 0 13px;
   color: var(--ink-soft);
-  font-size: 11px;
+  font-size: 13px;
   white-space: nowrap;
 }
 
@@ -1115,18 +1082,18 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-api-card > header {
   display: grid;
-  min-height: 66px;
-  grid-template-columns: 35px minmax(0, 1fr) auto;
+  min-height: 76px;
+  grid-template-columns: 40px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   border-bottom: 1px solid var(--line-soft);
-  padding: 10px 15px 10px 17px;
+  padding: 12px 17px 12px 19px;
 }
 
 .easywork-app.easywork-app .admin-api-icon {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 40px;
+  height: 40px;
   place-items: center;
   border-radius: 11px;
   background: color-mix(in srgb, var(--admin-accent) 11%, transparent);
@@ -1142,13 +1109,13 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-api-card > header strong {
   color: #343830;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 690;
 }
 
 .easywork-app.easywork-app .admin-api-card > header small {
   color: var(--ink-faint);
-  font-size: 10px;
+  font-size: 12.5px;
   line-height: 1.4;
 }
 
@@ -1157,7 +1124,7 @@ textarea::placeholder {
   align-items: center;
   gap: 5px;
   color: #8b8578;
-  font-size: 10px;
+  font-size: 12px;
   white-space: nowrap;
 }
 
@@ -1181,8 +1148,8 @@ textarea::placeholder {
 .easywork-app.easywork-app .admin-api-fields {
   display: grid;
   grid-template-columns: minmax(120px, 0.55fr) minmax(200px, 1.2fr);
-  gap: 11px 12px;
-  padding: 14px 15px 16px 17px;
+  gap: 13px 14px;
+  padding: 17px 17px 19px 19px;
 }
 
 .easywork-app.easywork-app .admin-api-fields > label,
@@ -1190,22 +1157,22 @@ textarea::placeholder {
   display: flex;
   min-width: 0;
   flex-direction: column;
-  gap: 5px;
+  gap: 7px;
   color: var(--ink-faint);
-  font-size: 10px;
+  font-size: 12.5px;
 }
 
 .easywork-app.easywork-app .admin-api-fields input,
 .easywork-app.easywork-app .admin-api-fields select,
 .easywork-app.easywork-app .admin-policy-grid input {
   width: 100%;
-  height: 36px;
+  height: 42px;
   border: 1px solid rgb(78 73 60 / 15%);
   border-radius: 9px;
   background: rgb(255 254 249 / 72%);
-  padding: 0 10px;
+  padding: 0 12px;
   color: var(--ink);
-  font-size: 11px;
+  font-size: 14px;
 }
 
 .easywork-app.easywork-app .admin-api-url {
@@ -1224,19 +1191,19 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .admin-secret-input input {
-  padding-right: 49px;
+  padding-right: 58px;
 }
 
 .easywork-app.easywork-app .admin-secret-input button {
   position: absolute;
-  top: 4px;
+  top: 5px;
   right: 4px;
-  height: 28px;
+  height: 32px;
   border-radius: 7px;
   background: transparent;
-  padding: 0 7px;
+  padding: 0 9px;
   color: var(--ink-faint);
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .easywork-app.easywork-app .admin-model-control select {
@@ -1245,7 +1212,7 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .admin-model-control button {
-  height: 36px;
+  height: 42px;
   flex: 0 0 auto;
 }
 
@@ -1278,7 +1245,7 @@ textarea::placeholder {
   border: 1px solid var(--line);
   border-radius: 17px;
   background: rgb(248 244 233 / 68%);
-  padding: 16px;
+  padding: 18px;
 }
 
 .easywork-app.easywork-app .admin-usage-metrics {
@@ -1297,20 +1264,20 @@ textarea::placeholder {
   min-width: 0;
   flex-direction: column;
   background: rgb(255 253 247 / 88%);
-  padding: 10px;
+  padding: 12px;
 }
 
 .easywork-app.easywork-app .admin-usage-metrics span,
 .easywork-app.easywork-app .admin-usage-metrics small {
   color: var(--ink-faint);
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .easywork-app.easywork-app .admin-usage-metrics strong {
   overflow: hidden;
   margin: 3px 0 1px;
   color: #3e4938;
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 690;
   text-overflow: ellipsis;
 }
@@ -1333,7 +1300,7 @@ textarea::placeholder {
   align-items: center;
   gap: 4px;
   color: var(--ink-faint);
-  font-size: 8px;
+  font-size: 10.5px;
 }
 
 .easywork-app.easywork-app .admin-chart-legend span::before {
@@ -1396,7 +1363,7 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-chart-day small {
   color: #948e80;
-  font-size: 7px;
+  font-size: 9px;
   writing-mode: vertical-rl;
 }
 
@@ -1405,7 +1372,7 @@ textarea::placeholder {
   width: 100%;
   place-items: center;
   color: var(--ink-faint);
-  font-size: 10px;
+  font-size: 12.5px;
 }
 
 .easywork-app.easywork-app .admin-usage-breakdown {
@@ -1421,7 +1388,7 @@ textarea::placeholder {
   gap: 7px;
   border-bottom: 1px solid var(--line-soft);
   padding: 8px 1px;
-  font-size: 10px;
+  font-size: 12.5px;
 }
 
 .easywork-app.easywork-app .admin-usage-breakdown > div:last-child {
@@ -1451,7 +1418,7 @@ textarea::placeholder {
 .easywork-app.easywork-app .admin-usage-breakdown small {
   grid-column: 2 / -1;
   color: var(--ink-faint);
-  font-size: 8px;
+  font-size: 10.5px;
 }
 
 .easywork-app.easywork-app .admin-ssh-layout {
@@ -1468,13 +1435,13 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-policy-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(150px, 1fr));
-  gap: 1px;
-  border: 1px solid var(--line-soft);
-  border-radius: 13px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  border: 0;
+  border-radius: 0;
   margin-top: 12px;
-  background: var(--line-soft);
-  overflow: hidden;
+  background: transparent;
+  overflow: visible;
 }
 
 .easywork-app.easywork-app .admin-policy-grid > label {
@@ -1482,9 +1449,11 @@ textarea::placeholder {
   min-width: 0;
   flex-direction: column;
   justify-content: space-between;
-  gap: 13px;
-  background: rgb(255 253 247 / 90%);
-  padding: 13px;
+  gap: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: rgb(255 253 247 / 76%);
+  padding: 15px;
 }
 
 .easywork-app.easywork-app .admin-policy-grid > label > span:first-child {
@@ -1494,12 +1463,12 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .admin-policy-grid strong {
-  font-size: 11px;
+  font-size: 13.5px;
 }
 
 .easywork-app.easywork-app .admin-policy-grid small {
   color: var(--ink-faint);
-  font-size: 8px;
+  font-size: 11px;
   line-height: 1.5;
 }
 
@@ -1516,7 +1485,7 @@ textarea::placeholder {
   top: 50%;
   right: 9px;
   color: var(--ink-faint);
-  font-size: 8px;
+  font-size: 11px;
   font-style: normal;
   transform: translateY(-50%);
 }
@@ -1538,19 +1507,19 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .admin-connection-head {
-  min-height: 36px;
+  min-height: 42px;
   background: rgb(232 227 213 / 48%);
   color: var(--ink-faint);
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 680;
 }
 
 .easywork-app.easywork-app .admin-connection-row {
-  min-height: 66px;
+  min-height: 72px;
   border-top: 1px solid var(--line-soft);
   background: rgb(255 253 247 / 55%);
   color: var(--ink-soft);
-  font-size: 10px;
+  font-size: 13px;
 }
 
 .easywork-app.easywork-app .admin-connection-row:hover {
@@ -1568,14 +1537,14 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-user-cell > i {
   display: grid;
-  width: 27px;
-  height: 27px;
+  width: 32px;
+  height: 32px;
   flex: 0 0 auto;
   place-items: center;
   border-radius: 50%;
   background: #e4e8dd;
   color: #536344;
-  font-size: 10px;
+  font-size: 12px;
   font-style: normal;
   font-weight: 720;
 }
@@ -1594,7 +1563,7 @@ textarea::placeholder {
   overflow: hidden;
   max-width: 100%;
   color: var(--ink);
-  font-size: 10px;
+  font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1605,7 +1574,7 @@ textarea::placeholder {
   overflow: hidden;
   max-width: 100%;
   color: var(--ink-faint);
-  font-size: 8px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1634,12 +1603,12 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .admin-count-cell strong {
   color: var(--ink);
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .easywork-app.easywork-app .admin-time-cell {
   color: var(--ink-faint);
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .easywork-app.easywork-app .admin-disconnect-button {
@@ -1653,7 +1622,91 @@ textarea::placeholder {
   min-height: 150px;
   place-items: center;
   color: var(--ink-faint);
+  font-size: 13px;
+}
+
+.easywork-app.easywork-app .admin-access-policy {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.easywork-app.easywork-app .admin-access-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.easywork-app.easywork-app .admin-access-fields > label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.easywork-app.easywork-app .admin-access-fields > label > span {
+  display: grid;
+  gap: 3px;
+}
+
+.easywork-app.easywork-app .admin-access-fields strong,
+.easywork-app.easywork-app .admin-auth-policy > span {
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.easywork-app.easywork-app .admin-access-fields small {
+  color: var(--ink-faint);
   font-size: 11px;
+  font-weight: 450;
+}
+
+.easywork-app.easywork-app .admin-access-fields textarea,
+.easywork-app.easywork-app .admin-access-fields input {
+  width: 100%;
+  border: 1px solid rgb(78 73 60 / 15%);
+  border-radius: 10px;
+  background: rgb(255 254 249 / 72%);
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.easywork-app.easywork-app .admin-access-fields textarea {
+  min-height: 82px;
+}
+
+.easywork-app.easywork-app .admin-port-policy {
+  grid-column: 1 / -1;
+}
+
+.easywork-app.easywork-app .admin-auth-policy {
+  display: flex;
+  min-width: 190px;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: rgb(255 253 247 / 68%);
+  padding: 13px 14px;
+}
+
+.easywork-app.easywork-app .admin-auth-policy label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.easywork-app.easywork-app .admin-auth-policy input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--green);
 }
 
 .easywork-app.easywork-app .help-loading-state {
@@ -1829,11 +1882,6 @@ textarea::placeholder {
   color: #9a642f;
 }
 
-.index-status.keyword-only {
-  background: #eceae4;
-  color: #777e76;
-}
-
 .index-status.error {
   background: #f8e5e2;
   color: var(--red);
@@ -1901,6 +1949,27 @@ textarea::placeholder {
 
 .skill-card h2 {
   font-family: Georgia, "Songti SC", serif;
+}
+
+.easywork-app.easywork-app .skill-card .source-badge {
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 11.5px !important;
+}
+
+.easywork-app.easywork-app .skill-card-top > button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-faint);
+}
+
+.easywork-app.easywork-app .skill-card-top > button:hover {
+  background: rgb(161 60 50 / 7%);
+  color: var(--red);
 }
 
 .skill-card > p {
@@ -3227,8 +3296,21 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .account-modal-authenticated {
-  width: min(760px, calc(100vw - 32px));
-  height: min(570px, calc(100dvh - 40px));
+  width: min(740px, calc(100vw - 32px));
+  height: auto;
+}
+
+.easywork-app.easywork-app .account-modal-profile {
+  width: min(620px, calc(100vw - 32px));
+}
+
+.easywork-app.easywork-app .account-modal-api {
+  width: min(780px, calc(100vw - 32px));
+  height: min(560px, calc(100dvh - 40px));
+}
+
+.easywork-app.easywork-app .account-modal-api-empty {
+  height: min(390px, calc(100dvh - 40px));
 }
 
 .easywork-app.easywork-app .account-modal-entry {
@@ -3238,8 +3320,8 @@ textarea::placeholder {
 .easywork-app.easywork-app .account-modal .account-tabs {
   flex: 0 0 auto;
   justify-content: flex-start;
-  gap: 20px;
-  margin: 8px 24px 0;
+  gap: 24px;
+  margin: 7px 26px 0;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -3247,13 +3329,13 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .account-modal .account-tabs button {
-  min-height: 38px;
+  min-height: 41px;
   border: 0;
   border-radius: 0;
   background: transparent;
   padding: 0;
   color: #777064;
-  font-size: 13px !important;
+  font-size: 14.5px !important;
   box-shadow: none;
 }
 
@@ -3270,6 +3352,12 @@ textarea::placeholder {
   font-weight: 680;
 }
 
+.easywork-app.easywork-app .account-modal .account-tabs button:focus-visible {
+  border-radius: 5px;
+  outline: 2px solid rgb(83 99 63 / 26%);
+  outline-offset: 3px;
+}
+
 .easywork-app.easywork-app .account-modal-authenticated .profile-form,
 .easywork-app.easywork-app .account-modal-authenticated .provider-manager {
   min-height: 0;
@@ -3279,11 +3367,24 @@ textarea::placeholder {
 .easywork-app.easywork-app .account-modal-authenticated .profile-form {
   width: 100%;
   justify-content: flex-start;
-  padding: 27px 28px 24px;
+  padding: 26px 28px 28px;
 }
 
 .easywork-app.easywork-app .account-modal-authenticated .provider-manager {
   border-top: 0;
+}
+
+.easywork-app.easywork-app .account-modal .profile-form .field > span,
+.easywork-app.easywork-app .account-modal .provider-form .field > span {
+  font-size: 14px !important;
+}
+
+.easywork-app.easywork-app .account-modal .profile-form .field input,
+.easywork-app.easywork-app .account-modal .provider-form .field input {
+  min-height: 46px;
+  border-color: rgb(79 73 59 / 16%);
+  background: rgb(255 254 250 / 78%);
+  font-size: 14.5px !important;
 }
 
 /* A draft conversation is a centered launch surface; existing chats keep the toolbar layout. */
@@ -3560,6 +3661,7 @@ textarea::placeholder {
   align-items: center;
   gap: 8px;
   border-radius: 9px;
+  background: transparent;
   padding: 0 9px;
   color: #686257;
   font-size: 12.5px !important;
@@ -3669,8 +3771,8 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .provider-manager {
   display: grid;
-  min-height: 430px;
-  grid-template-columns: 184px minmax(0, 1fr);
+  min-height: 450px;
+  grid-template-columns: 204px minmax(0, 1fr);
   border-top: 1px solid rgb(79 73 59 / 8%);
 }
 
@@ -3680,14 +3782,14 @@ textarea::placeholder {
   flex-direction: column;
   border-right: 1px solid rgb(79 73 59 / 9%);
   background: rgb(241 235 220 / 28%);
-  padding: 10px 8px;
+  padding: 12px 10px;
 }
 
 .easywork-app.easywork-app .provider-tab-list {
   display: grid;
   min-height: 0;
   align-content: start;
-  gap: 3px;
+  gap: 4px;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -3696,14 +3798,14 @@ textarea::placeholder {
   display: flex;
   width: 100%;
   min-width: 0;
-  min-height: 39px;
+  min-height: 44px;
   align-items: center;
   justify-content: space-between;
   gap: 6px;
   border-radius: 9px;
-  padding: 0 9px;
+  padding: 0 11px;
   color: #686258;
-  font-size: 13px !important;
+  font-size: 14px !important;
   text-align: left;
 }
 
@@ -3726,13 +3828,13 @@ textarea::placeholder {
 .easywork-app.easywork-app .provider-tab-list > button > small {
   flex: 0 0 auto;
   color: #738265;
-  font-size: 10px !important;
+  font-size: 11.5px !important;
 }
 
 .easywork-app.easywork-app .provider-add-button {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 38px;
+  height: 38px;
   flex: 0 0 auto;
   place-items: center;
   margin-top: 5px;
@@ -3747,7 +3849,32 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .provider-form {
   align-content: start;
-  padding: 23px 26px 20px;
+  padding: 25px 28px 22px;
+}
+
+.easywork-app.easywork-app .provider-empty-state {
+  display: flex;
+  min-height: 280px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 7px;
+  color: var(--ink-faint);
+  text-align: center;
+}
+
+.easywork-app.easywork-app .provider-empty-state svg {
+  margin-bottom: 3px;
+  color: #758268;
+}
+
+.easywork-app.easywork-app .provider-empty-state strong {
+  color: var(--ink-soft);
+  font-size: 15px !important;
+}
+
+.easywork-app.easywork-app .provider-empty-state span {
+  font-size: 13px !important;
 }
 
 @media (max-width: 700px) {
@@ -3834,7 +3961,7 @@ textarea::placeholder {
   min-width: 0;
   overflow: hidden;
   color: #898277;
-  font-size: 12px !important;
+  font-size: 13px !important;
   font-weight: 430;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3855,7 +3982,7 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .workspace-kind-selector select {
-  height: 34px;
+  height: 38px;
   min-width: 126px;
   appearance: none;
   border: 1px solid rgb(79 73 59 / 14%);
@@ -3863,7 +3990,7 @@ textarea::placeholder {
   background: rgb(255 253 248 / 68%);
   padding: 0 29px 0 10px;
   color: #555148;
-  font-size: 13px !important;
+  font-size: 14px !important;
   outline: none;
 }
 
@@ -3876,13 +4003,13 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .modal-card.modal-wide:has(.remote-directory-picker),
 .easywork-app.easywork-app .modal-card.modal-wide:has(.workspace-virtual-picker) {
-  width: min(900px, calc(100vw - 32px));
+  width: min(860px, calc(100vw - 32px));
   overflow: hidden;
 }
 
 .easywork-app.easywork-app .remote-directory-picker {
   display: grid;
-  height: min(590px, calc(100dvh - 104px));
+  height: min(560px, calc(100dvh - 104px));
   min-height: 430px;
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
@@ -3917,7 +4044,7 @@ textarea::placeholder {
   overflow: hidden;
   color: #4d4a42;
   font-family: inherit;
-  font-size: 13px !important;
+  font-size: 14.5px !important;
   font-weight: 590;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3932,8 +4059,8 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .remote-directory-filter {
   display: flex;
-  width: 198px;
-  height: 34px;
+  width: 220px;
+  height: 38px;
   align-items: center;
   gap: 6px;
   border: 1px solid rgb(79 73 59 / 13%);
@@ -3953,14 +4080,14 @@ textarea::placeholder {
   border: 0;
   background: transparent;
   color: #504c44;
-  font-size: 13px !important;
+  font-size: 14px !important;
   outline: 0;
 }
 
 .easywork-app.easywork-app .remote-directory-actions > button {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 38px;
+  height: 38px;
   place-items: center;
   border: 1px solid rgb(79 73 59 / 13%);
   border-radius: 9px;
@@ -3991,14 +4118,14 @@ textarea::placeholder {
 .easywork-app.easywork-app .remote-directory-list > button {
   display: grid;
   width: 100%;
-  min-height: 42px;
+  min-height: 46px;
   grid-template-columns: 22px minmax(0, 1fr) 18px;
   align-items: center;
   gap: 8px;
   border-radius: 8px;
   padding: 0 9px;
   color: #4d4a42;
-  font-size: 13px !important;
+  font-size: 14px !important;
   text-align: left;
 }
 
@@ -4023,7 +4150,7 @@ textarea::placeholder {
   justify-content: center;
   gap: 7px;
   color: #8a8378;
-  font-size: 13px !important;
+  font-size: 14px !important;
 }
 
 .easywork-app.easywork-app .remote-directory-picker > footer {
@@ -4071,14 +4198,14 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .workspace-virtual-address small {
   color: #888074;
-  font-size: 12px !important;
+  font-size: 13px !important;
 }
 
 .easywork-app.easywork-app .workspace-virtual-address code {
   overflow: hidden;
   color: #49463e;
   font-family: inherit;
-  font-size: 13.5px !important;
+  font-size: 14.5px !important;
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4087,7 +4214,7 @@ textarea::placeholder {
 .easywork-app.easywork-app .workspace-virtual-picker > p {
   margin: 0;
   color: #716b60;
-  font-size: 13px !important;
+  font-size: 14px !important;
   line-height: 1.7;
 }
 
@@ -4356,7 +4483,7 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .agent-context-usage-row > strong {
   color: #746e64;
-  font-size: 13px !important;
+  font-size: 14px !important;
   font-variant-numeric: tabular-nums;
   font-weight: 560;
   line-height: 1;
@@ -4376,13 +4503,13 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .agent-context-limit-control input {
   width: 100%;
-  height: 34px;
+  height: 38px;
   border: 1px solid rgb(79 73 59 / 14%);
   border-radius: 8px;
   background: rgb(255 253 248 / 64%);
   padding: 0 34px 0 9px;
   color: var(--ink-soft);
-  font-size: 13px !important;
+  font-size: 14px !important;
   outline: none;
 }
 
@@ -4397,8 +4524,8 @@ textarea::placeholder {
   top: 3px;
   right: 3px;
   display: grid;
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   place-items: center;
   border-radius: 6px;
   color: #5b7350;
@@ -4410,7 +4537,7 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .agent-context-compress {
   display: inline-flex;
-  height: 34px;
+  height: 38px;
   align-items: center;
   gap: 5px;
   border: 1px solid rgb(79 73 59 / 14%);
@@ -4418,7 +4545,7 @@ textarea::placeholder {
   background: rgb(255 253 248 / 64%);
   padding: 0 9px;
   color: #5d6256;
-  font-size: 13px !important;
+  font-size: 14px !important;
   white-space: nowrap;
 }
 
@@ -4442,7 +4569,7 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .agent-config-panel,
 .easywork-app.easywork-app .agent-config-panel :is(button, label, select, input, strong) {
-  font-size: 13px !important;
+  font-size: 14px !important;
 }
 
 .easywork-app.easywork-app .agent-menu-option.danger:hover:not(:disabled) {
@@ -4722,8 +4849,12 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .context-dialog {
   display: grid;
-  gap: 12px;
-  padding: 19px 20px 18px;
+  gap: 14px;
+  padding: 20px 22px 21px;
+}
+
+.easywork-app.easywork-app .modal-card.modal-wide:has(.web-context-dialog) {
+  width: min(680px, calc(100vw - 32px));
 }
 
 .easywork-app.easywork-app .context-usage-hero,
@@ -4772,7 +4903,7 @@ textarea::placeholder {
 .easywork-app.easywork-app .context-usage-heading small,
 .easywork-app.easywork-app .context-dialog-section header small {
   color: var(--ink-faint);
-  font-size: 11.5px;
+  font-size: 12.5px;
 }
 
 .easywork-app.easywork-app .context-usage-heading strong {
@@ -4830,7 +4961,7 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .context-dialog-section > header strong {
   color: #4f4b43;
-  font-size: 13.5px;
+  font-size: 15px;
   font-weight: 640;
 }
 
@@ -4851,9 +4982,9 @@ textarea::placeholder {
   border: 1px solid rgb(80 74 61 / 9%);
   border-radius: 10px;
   background: rgb(247 245 239 / 56%);
-  padding: 9px 10px;
+  padding: 10px 11px;
   color: #716b61;
-  font-size: 12.5px;
+  font-size: 13.5px;
 }
 
 .easywork-app.easywork-app .context-breakdown :is(dt, dd) {
@@ -4863,7 +4994,7 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .context-breakdown dt {
   color: #918a7e;
-  font-size: 10.5px;
+  font-size: 12px;
 }
 
 .easywork-app.easywork-app .context-breakdown dd {
@@ -4882,7 +5013,7 @@ textarea::placeholder {
   display: grid;
   gap: 7px;
   color: #5e594f;
-  font-size: 12px;
+  font-size: 13.5px;
 }
 
 .easywork-app.easywork-app .context-setting-field > span {
@@ -4891,17 +5022,18 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .context-setting-field > small {
   color: #918a7e;
-  font-size: 10.5px;
+  font-size: 12px;
   line-height: 1.5;
 }
 
 .easywork-app.easywork-app .context-setting-field input {
   width: 100%;
-  height: 38px;
+  height: 43px;
   border: 1px solid rgb(82 75 62 / 15%);
   border-radius: 10px;
   background: rgb(255 255 252 / 66%);
-  padding: 0 11px;
+  padding: 0 12px;
+  font-size: 14px;
   color: var(--ink);
   font-variant-numeric: tabular-nums;
   outline: none;
@@ -4921,16 +5053,16 @@ textarea::placeholder {
 
 .easywork-app.easywork-app .context-dialog-actions button {
   display: inline-flex;
-  min-height: 36px;
+  min-height: 40px;
   align-items: center;
   justify-content: center;
   gap: 6px;
   border: 1px solid rgb(82 75 62 / 16%);
   border-radius: 10px;
   background: rgb(255 253 248 / 72%);
-  padding: 0 12px;
+  padding: 0 14px;
   color: #5c574d;
-  font-size: 12.5px;
+  font-size: 14px;
 }
 
 .easywork-app.easywork-app .context-dialog-actions button.primary {
@@ -6310,6 +6442,7 @@ textarea::placeholder {
   height: 30px;
   place-items: center;
   border-radius: 8px;
+  background: transparent;
   color: var(--ink-faint);
 }
 
@@ -6333,6 +6466,7 @@ textarea::placeholder {
   align-items: center;
   gap: 7px;
   border-radius: 9px;
+  background: transparent;
   padding: 0 9px;
   color: var(--ink-soft);
   font-size: 13px !important;
@@ -6487,14 +6621,14 @@ textarea::placeholder {
 .agent-menu-option {
   display: grid;
   width: 100%;
-  min-height: 43px;
+  min-height: 46px;
   align-items: center;
   gap: 8px;
   border-radius: 9px;
   background: transparent;
   padding: 0 9px;
   color: var(--ink-soft);
-  font-size: 13px !important;
+  font-size: 14px !important;
   text-align: left;
 }
 
@@ -6518,18 +6652,18 @@ textarea::placeholder {
 .agent-native-setting {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(112px, 1.25fr);
-  min-height: 48px;
+  min-height: 52px;
   align-items: center;
   gap: 9px;
   padding: 4px 9px;
   color: var(--ink-faint);
-  font-size: 11.5px;
+  font-size: 13.5px;
 }
 
 .agent-native-setting select {
   width: 100%;
   min-width: 0;
-  height: 32px;
+  height: 37px;
   border: 1px solid rgb(79 73 59 / 14%);
   border-radius: 8px;
   background: rgb(255 253 247 / 58%);
@@ -6547,7 +6681,7 @@ textarea::placeholder {
 .agent-model-panel > p {
   margin: 9px 9px 5px;
   color: var(--ink-faint);
-  font-size: 11.5px !important;
+  font-size: 13px !important;
 }
 
 .agent-model-progress {
@@ -6560,7 +6694,7 @@ textarea::placeholder {
   background: rgb(83 99 63 / 8%);
   padding: 0 9px;
   color: var(--green-deep);
-  font-size: 12px !important;
+  font-size: 13.5px !important;
 }
 
 .agent-model-progress.error {
@@ -6578,14 +6712,14 @@ textarea::placeholder {
 
 .agent-model-list > button {
   display: grid;
-  min-height: 38px;
+  min-height: 43px;
   grid-template-columns: minmax(0, 1fr) 18px;
   align-items: center;
   gap: 7px;
   border-radius: 9px;
   padding: 0 9px;
   color: var(--ink-soft);
-  font-size: 13px !important;
+  font-size: 14px !important;
   text-align: left;
 }
 
@@ -6613,7 +6747,7 @@ textarea::placeholder {
   gap: 7px;
   padding: 8px;
   color: var(--ink-faint);
-  font-size: 12px !important;
+  font-size: 13px !important;
   text-align: center;
 }
 
@@ -7554,23 +7688,25 @@ textarea::placeholder {
 
 .profile-wrap {
   border-color: var(--line);
-  padding: 8px;
+  padding: 8px 10px;
 }
 
 .profile-button {
-  min-height: 52px;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  min-height: 42px;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 7px;
   border-radius: 10px;
-  padding: 5px 8px;
+  padding: 5px 7px;
+}
+
+.profile-button .profile-avatar {
+  width: 28px;
+  height: 28px;
 }
 
 .profile-button strong {
-  font-size: 14px !important;
+  font-size: 13.5px !important;
   font-weight: 550;
-}
-
-.profile-button small {
-  color: #777;
 }
 
 .topbar {
@@ -7765,9 +7901,9 @@ textarea::placeholder {
 }
 
 .workspace-page {
-  width: min(1040px, 100%);
+  width: min(1160px, 100%);
   margin: 0 auto;
-  padding: 36px 34px 60px;
+  padding: 38px 36px 64px;
 }
 
 .page-intro {
@@ -7783,7 +7919,8 @@ textarea::placeholder {
 .page-intro h1 {
   margin: 0 0 6px;
   color: #171717;
-  font-size: 24px !important;
+  font-family: inherit;
+  font-size: 27px !important;
   font-weight: 600;
   letter-spacing: -0.02em;
 }
@@ -7792,7 +7929,8 @@ textarea::placeholder {
   max-width: none;
   margin: 0;
   color: #6f6f6f;
-  line-height: 1.6;
+  font-size: 14.5px !important;
+  line-height: 1.55;
 }
 
 .page-actions {
@@ -7802,34 +7940,37 @@ textarea::placeholder {
 .primary-button,
 .secondary-button,
 .text-danger-button {
-  min-height: 40px;
+  min-height: 42px;
   gap: 7px;
   border-radius: 9px;
-  padding: 0 14px;
+  padding: 0 15px;
+  font-size: 14px !important;
   font-weight: 550;
 }
 
 .primary-button {
-  border: 1px solid #171717;
-  background: #171717;
-  color: #fff;
+  border: 1px solid rgb(83 99 63 / 16%);
+  background: rgb(101 119 84 / 10%);
+  color: #44513b;
 }
 
 .primary-button:not(:disabled):hover {
-  border-color: #000;
-  background: #000;
+  border-color: rgb(83 99 63 / 26%);
+  background: rgb(101 119 84 / 16%);
+  color: #34422d;
   transform: none;
 }
 
 .secondary-button {
-  border: 1px solid #d9d9d9;
-  background: #fff;
-  color: #2f2f2f;
+  border: 1px solid rgb(95 86 70 / 14%);
+  background: rgb(247 244 236 / 72%);
+  color: #595349;
 }
 
 .secondary-button:not(:disabled):hover {
-  border-color: #bdbdbd;
-  background: #f7f7f7;
+  border-color: rgb(95 86 70 / 23%);
+  background: rgb(241 237 226 / 88%);
+  color: #454038;
 }
 
 .text-danger-button {
@@ -7846,60 +7987,138 @@ textarea::placeholder {
 }
 
 .file-table-card {
+  border: 1px solid rgb(79 73 59 / 13%);
+  border-radius: 16px;
+  background: rgb(255 254 250 / 72%);
   overflow: hidden;
 }
 
+.easywork-app.easywork-app .library-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 24px;
+}
+
+.easywork-app.easywork-app .library-title-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 11px;
+}
+
+.easywork-app.easywork-app .library-title-icon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 12px;
+  background: rgb(83 99 63 / 10%);
+  color: var(--green-deep);
+}
+
+.easywork-app.easywork-app .library-title-row h1 {
+  margin: 0;
+  color: #292c27;
+  font-size: 27px !important;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+}
+
+.easywork-app.easywork-app .library-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.easywork-app.easywork-app .library-unavailable {
+  display: flex;
+  min-height: 170px;
+  align-items: center;
+  gap: 16px;
+  border: 1px solid rgb(149 105 47 / 14%);
+  border-radius: 16px;
+  background: linear-gradient(105deg, rgb(235 223 198 / 38%), rgb(255 254 250 / 56%));
+  padding: 28px 30px;
+}
+
+.easywork-app.easywork-app .library-unavailable > span {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 14px;
+  background: rgb(149 105 47 / 10%);
+  color: #8d673c;
+}
+
+.easywork-app.easywork-app .library-unavailable h2 {
+  margin: 0 0 5px;
+  font-size: 18px !important;
+}
+
+.easywork-app.easywork-app .library-unavailable p {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 14px !important;
+}
+
 .card-toolbar {
-  min-height: 66px;
+  min-height: 72px;
   border-color: #e8e8e8;
-  padding: 13px 16px;
+  padding: 14px 18px;
 }
 
 .card-toolbar h2 {
   margin: 0;
-  font-size: 17px !important;
+  font-size: 18px !important;
   font-weight: 600;
 }
 
 .card-toolbar > div > span {
   color: #777;
+  font-size: 13px !important;
 }
 
 .table-search {
-  min-height: 36px;
+  min-height: 40px;
   border-color: #dedede;
   border-radius: 9px;
   background: #fff;
-  padding: 0 10px;
+  padding: 0 12px;
 }
 
 .table-search input {
-  font-size: 14px !important;
+  font-size: 14.5px !important;
 }
 
 .file-table-head,
 .file-table-row {
   grid-template-columns: minmax(250px, 1.7fr) minmax(100px, 0.75fr) 70px 100px 38px;
   gap: 14px;
-  padding: 0 16px;
+  padding: 0 18px;
 }
 
 .file-table-head {
-  min-height: 40px;
-  background: #fafafa;
+  min-height: 43px;
+  background: rgb(239 235 224 / 45%);
   color: #777;
-  font-weight: 550;
+  font-size: 12.5px !important;
+  font-weight: 620;
   letter-spacing: 0;
   text-transform: none;
 }
 
 .file-table-row {
-  min-height: 62px;
+  min-height: 68px;
   border-color: #ededed;
 }
 
 .file-table-row:hover {
-  background: #fafafa;
+  background: rgb(242 238 227 / 42%);
 }
 
 .file-name-cell {
@@ -7907,29 +8126,51 @@ textarea::placeholder {
 }
 
 .file-name-cell strong {
-  font-size: 14px !important;
+  font-size: 15px !important;
   font-weight: 550;
 }
 
 .file-name-cell small {
   color: #7b7b7b;
+  font-size: 12px !important;
+}
+
+.easywork-app.easywork-app .file-table-row > span:not(.file-name-cell) {
+  font-size: 13px !important;
+}
+
+.easywork-app.easywork-app .file-index-error {
+  display: block;
+  max-width: 180px;
+  overflow: hidden;
+  margin-top: 4px;
+  color: #9b4d45;
+  font-size: 11.5px !important;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .index-status,
 .source-badge {
   border-radius: 999px;
   padding: 3px 8px;
+  font-size: 11.5px !important;
   font-weight: 550;
+}
+
+.easywork-app.easywork-app .index-status.stale {
+  background: rgb(149 105 47 / 10%);
+  color: #8c6436;
 }
 
 .skill-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
+  gap: 16px;
 }
 
 .skill-card {
-  min-height: 198px;
-  padding: 16px;
+  min-height: 214px;
+  padding: 18px;
 }
 
 .skill-card:hover {
@@ -7939,35 +8180,46 @@ textarea::placeholder {
 }
 
 .skill-card-icon {
-  width: 36px;
-  height: 36px;
-  border-radius: 9px;
-  background: #f0f0f0;
-  color: #303030;
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  background: rgb(83 99 63 / 9%);
+  color: var(--green-deep);
 }
 
 .skill-card h2 {
-  margin: 18px 0 7px;
-  font-size: 17px !important;
-  font-weight: 600;
+  margin: 19px 0 8px;
+  font-size: 18px !important;
+  font-family: inherit;
+  font-weight: 650;
 }
 
 .skill-card > p {
   color: #666;
-  line-height: 1.65;
+  font-size: 14px !important;
+  line-height: 1.6;
 }
 
 .skill-card-foot {
   margin-top: 18px;
   padding-top: 12px;
   color: #777;
+  font-size: 13px !important;
 }
 
 .skill-upload-card {
-  min-height: 198px;
+  min-height: 214px;
   gap: 8px;
   border-style: dashed;
   color: #5f5f5f;
+}
+
+.easywork-app.easywork-app .skill-upload-card strong {
+  font-size: 15px !important;
+}
+
+.easywork-app.easywork-app .skill-upload-card small {
+  font-size: 12.5px !important;
 }
 
 .skill-upload-card:hover {
@@ -8662,11 +8914,16 @@ textarea::placeholder {
   background: linear-gradient(to bottom, transparent, var(--paper) 25%, var(--paper));
 }
 
-.easywork-app.easywork-app .primary-button,
 .easywork-app.easywork-app .send-button {
   border-color: var(--green-deep);
   background: var(--green-deep);
   color: #fffdf7;
+}
+
+.easywork-app.easywork-app .primary-button {
+  border-color: rgb(83 99 63 / 16%);
+  background: rgb(101 119 84 / 10%);
+  color: #44513b;
 }
 
 .easywork-app.easywork-app .message-list {
@@ -9010,6 +9267,19 @@ textarea::placeholder {
   box-shadow: 0 18px 50px rgb(55 46 30 / 16%);
 }
 
+.easywork-app.easywork-agent-menu-portal {
+  display: block;
+  height: auto;
+  overflow: visible;
+  background: transparent;
+  pointer-events: none;
+}
+
+.easywork-app.easywork-agent-menu-portal .agent-dropdown {
+  width: 100%;
+  pointer-events: auto;
+}
+
 .agent-dropdown-list {
   display: grid;
   max-height: 290px;
@@ -9033,7 +9303,7 @@ textarea::placeholder {
 .agent-dropdown-row > button:first-child {
   display: grid;
   min-width: 0;
-  min-height: 52px;
+  min-height: 58px;
   grid-template-columns: 28px minmax(0, 1fr) 18px;
   align-items: center;
   gap: 8px;
@@ -9066,7 +9336,7 @@ textarea::placeholder {
 .agent-dropdown-row strong {
   overflow: hidden;
   color: var(--ink);
-  font-size: 13.5px !important;
+  font-size: 14px !important;
   font-weight: 620;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -9075,7 +9345,7 @@ textarea::placeholder {
 .agent-dropdown-row small {
   overflow: hidden;
   color: var(--ink-faint);
-  font-size: 11px !important;
+  font-size: 12px !important;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -9104,14 +9374,14 @@ textarea::placeholder {
 
 .agent-dropdown-actions button {
   display: inline-flex;
-  min-height: 36px;
+  min-height: 40px;
   align-items: center;
   justify-content: center;
   gap: 7px;
   border-radius: 8px;
   background: transparent;
   color: var(--ink-soft);
-  font-size: 12.5px !important;
+  font-size: 13.5px !important;
 }
 
 .agent-dropdown-actions button:hover {
@@ -9601,8 +9871,8 @@ textarea::placeholder {
 
 .agent-config-editor {
   display: grid;
-  gap: 12px;
-  padding: 16px 18px 18px;
+  gap: 14px;
+  padding: 18px 20px 20px;
 }
 
 .agent-config-path {
@@ -9611,6 +9881,7 @@ textarea::placeholder {
   align-items: center;
   gap: 8px;
   color: var(--ink-faint);
+  font-size: 13.5px !important;
 }
 
 .agent-config-path code {
@@ -9621,7 +9892,7 @@ textarea::placeholder {
 
 .agent-config-editor textarea {
   width: 100%;
-  min-height: 420px;
+  min-height: 440px;
   resize: vertical;
   border: 1px solid rgb(79 73 59 / 16%);
   border-radius: 11px;
@@ -9630,7 +9901,7 @@ textarea::placeholder {
   padding: 15px;
   color: #dfe9da;
   font-family: var(--font-mono, monospace);
-  font-size: 13px !important;
+  font-size: 14px !important;
   line-height: 1.65;
   tab-size: 2;
 }
@@ -9642,7 +9913,7 @@ textarea::placeholder {
 
 .remote-file-manager {
   display: grid;
-  min-height: 520px;
+  min-height: 540px;
   grid-template-rows: auto minmax(0, 1fr);
 }
 
@@ -9653,7 +9924,7 @@ textarea::placeholder {
   justify-content: space-between;
   gap: 12px;
   border-bottom: 1px solid var(--line);
-  padding: 10px 14px;
+  padding: 12px 16px;
 }
 
 .remote-file-location,
@@ -9667,20 +9938,20 @@ textarea::placeholder {
 .remote-file-location button,
 .remote-file-actions button {
   display: inline-flex;
-  min-height: 32px;
+  min-height: 38px;
   align-items: center;
   justify-content: center;
   gap: 6px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fffdf8;
-  padding: 0 9px;
+  padding: 0 11px;
   color: var(--ink-soft);
-  font-size: 12px !important;
+  font-size: 13.5px !important;
 }
 
 .remote-file-location button {
-  width: 32px;
+  width: 38px;
   padding: 0;
 }
 
@@ -9689,6 +9960,7 @@ textarea::placeholder {
   overflow: hidden;
   padding: 0 5px;
   color: var(--ink-faint);
+  font-size: 13px !important;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -9716,14 +9988,14 @@ textarea::placeholder {
   border-bottom: 1px solid var(--line);
   background: var(--paper);
   color: var(--ink-faint);
-  font-size: 11px !important;
+  font-size: 12.5px !important;
 }
 
 .remote-file-row {
-  min-height: 44px;
+  min-height: 48px;
   border-bottom: 1px solid rgb(79 73 59 / 7%);
   color: var(--ink-faint);
-  font-size: 12px !important;
+  font-size: 13px !important;
 }
 
 .remote-file-row:hover {
@@ -9748,7 +10020,7 @@ textarea::placeholder {
 
 .remote-file-name span {
   overflow: hidden;
-  font-size: 13px !important;
+  font-size: 14px !important;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -9780,7 +10052,7 @@ textarea::placeholder {
   justify-content: center;
   gap: 8px;
   color: var(--ink-faint);
-  font-size: 13px !important;
+  font-size: 14px !important;
 }
 
 .remote-file-loading {
@@ -9909,7 +10181,7 @@ textarea::placeholder {
 .project-library-options strong {
   overflow: hidden;
   color: #47433a;
-  font-size: 12.5px !important;
+  font-size: 14px !important;
   font-weight: 560;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -9917,18 +10189,18 @@ textarea::placeholder {
 
 .project-library-options small {
   color: #918a7c;
-  font-size: 10.5px !important;
+  font-size: 12px !important;
 }
 
 .project-library-dialog {
   display: grid;
-  gap: 14px;
-  padding: 18px 20px 20px;
+  gap: 16px;
+  padding: 20px 22px 22px;
 }
 
 .project-library-search {
   display: flex;
-  min-height: 40px;
+  min-height: 44px;
   align-items: center;
   gap: 9px;
   border: 1px solid rgb(79 73 59 / 14%);
@@ -9960,7 +10232,7 @@ textarea::placeholder {
 
 .project-library-options > button {
   display: grid;
-  min-height: 52px;
+  min-height: 58px;
   grid-template-columns: 34px minmax(0, 1fr) 26px;
   align-items: center;
   gap: 9px;
@@ -9995,17 +10267,25 @@ textarea::placeholder {
   min-height: 150px;
   place-items: center;
   color: #8d8679;
-  font-size: 13px !important;
+  font-size: 14px !important;
 }
 
 .easywork-app.easywork-app .modal-card.modal-wide {
-  width: min(980px, calc(100vw - 36px));
+  width: min(920px, calc(100vw - 36px));
   max-height: min(840px, calc(100dvh - 36px));
 }
 
+.easywork-app.easywork-app .modal-card.account-modal-profile {
+  width: min(620px, calc(100vw - 32px));
+}
+
+.easywork-app.easywork-app .modal-card.account-modal-api {
+  width: min(780px, calc(100vw - 32px));
+}
+
 .easywork-app.easywork-app .server-manager {
-  min-height: 610px;
-  grid-template-columns: 248px minmax(0, 1fr);
+  min-height: 540px;
+  grid-template-columns: 224px minmax(0, 1fr);
 }
 
 .easywork-app.easywork-app .server-profile-list {
@@ -10013,13 +10293,27 @@ textarea::placeholder {
   background:
     linear-gradient(180deg, rgb(255 253 248 / 40%), transparent 34%),
     #f1ebdd;
-  padding: 12px 10px;
+  padding: 14px 11px;
+}
+
+.easywork-app.easywork-app .server-profile-list-heading {
+  min-height: 38px;
+  font-size: 13.5px !important;
 }
 
 .easywork-app.easywork-app .server-profile-list > button:not(.demo-server-button) {
-  min-height: 58px;
+  min-height: 62px;
   border-radius: 10px;
   padding: 6px 8px;
+}
+
+.easywork-app.easywork-app .server-profile-list strong {
+  font-size: 14px !important;
+}
+
+.easywork-app.easywork-app .server-profile-list small,
+.easywork-app.easywork-app .server-profile-empty {
+  font-size: 12px !important;
 }
 
 .easywork-app.easywork-app .server-profile-list > button:hover {
@@ -10037,27 +10331,41 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .server-form {
-  max-width: 680px;
-  gap: 12px;
-  padding: 17px 30px 19px;
+  max-width: 660px;
+  gap: 14px;
+  padding: 20px 28px 22px;
+}
+
+.easywork-app.easywork-app .server-form .field {
+  gap: 7px;
+  font-size: 13.5px !important;
+}
+
+.easywork-app.easywork-app .server-form .field input,
+.easywork-app.easywork-app .server-form .field select,
+.easywork-app.easywork-app .server-form .field textarea {
+  min-height: 46px;
+  border-color: rgb(79 73 59 / 15%);
+  background: rgb(255 254 250 / 78%);
+  font-size: 14.5px !important;
 }
 
 .ssh-authentication-panel {
   display: grid;
   min-width: 0;
-  gap: 10px;
+  gap: 12px;
   margin: 0;
   border: 1px solid rgb(79 73 59 / 11%);
   border-radius: 14px;
   background: rgb(246 241 230 / 62%);
-  padding: 8px 12px 12px;
+  padding: 10px 14px 14px;
 }
 
 .ssh-authentication-panel > legend {
   margin-left: -2px;
   padding: 0 6px;
   color: #655f54;
-  font-size: 13px !important;
+  font-size: 14px !important;
   font-weight: 620;
 }
 
@@ -10076,7 +10384,7 @@ textarea::placeholder {
 
 .auth-method-switch button {
   display: inline-flex;
-  min-height: 36px;
+  min-height: 40px;
   align-items: center;
   justify-content: center;
   gap: 7px;
@@ -10084,7 +10392,7 @@ textarea::placeholder {
   border-radius: 8px;
   background: transparent;
   color: #777064;
-  font-size: 13px !important;
+  font-size: 14px !important;
 }
 
 .auth-method-switch button.active {
@@ -10117,7 +10425,7 @@ textarea::placeholder {
 }
 
 .nested-field > span {
-  font-size: 12px !important;
+  font-size: 13.5px !important;
 }
 
 @media (max-width: 820px) {
@@ -10364,8 +10672,62 @@ textarea::placeholder {
 }
 
 .easywork-app.easywork-app .profile-wrap {
+  display: grid;
+  gap: 3px;
   border-top-color: var(--line);
   background: transparent;
+  padding: 8px 10px;
+}
+
+.easywork-app.easywork-app .profile-wrap .admin-nav-button,
+.easywork-app.easywork-app .profile-wrap .profile-button {
+  width: 100%;
+  min-height: 44px;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  padding: 5px 7px;
+  color: var(--ink-soft);
+  box-shadow: none;
+  text-align: left;
+}
+
+.easywork-app.easywork-app .profile-wrap .admin-nav-button {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 16px;
+}
+
+.easywork-app.easywork-app .profile-wrap .profile-button {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+}
+
+.easywork-app.easywork-app .profile-wrap .admin-nav-button:hover,
+.easywork-app.easywork-app .profile-wrap .profile-button:hover {
+  background: rgb(83 99 63 / 7%);
+  color: var(--ink);
+}
+
+.easywork-app.easywork-app .profile-wrap .admin-nav-button.active {
+  background: rgb(83 99 63 / 11%);
+  box-shadow: none;
+}
+
+.easywork-app.easywork-app .profile-wrap .admin-nav-button strong,
+.easywork-app.easywork-app .profile-wrap .profile-button strong {
+  font-size: 13.5px !important;
+  font-weight: 560;
+}
+
+.easywork-app.easywork-app .profile-wrap .admin-nav-icon,
+.easywork-app.easywork-app .profile-wrap .profile-avatar {
+  width: 30px;
+  height: 30px;
+  border: 0;
+  background: rgb(83 99 63 / 9%);
+  color: var(--green-deep);
 }
 
 .rail-edge-toggle,
@@ -12377,6 +12739,288 @@ textarea::placeholder {
   max-height: 370px;
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
+/* File collections and composer collection selection. */
+.easywork-app.easywork-app .library-back-button,
+.easywork-app.easywork-app .library-detail-menu-button {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgb(79 73 59 / 10%);
+  border-radius: 11px;
+  background: rgb(255 254 249 / 62%);
+  color: #585349;
+}
+
+.easywork-app.easywork-app .library-back-button:hover,
+.easywork-app.easywork-app .library-detail-menu-button:hover {
+  border-color: rgb(83 99 63 / 20%);
+  background: rgb(83 99 63 / 8%);
+  color: #405039;
+}
+
+.easywork-app.easywork-app .library-detail-menu-wrap,
+.easywork-app.easywork-app .library-collection-card {
+  position: relative;
+}
+
+.easywork-app.easywork-app .library-collection-browser {
+  overflow: hidden;
+  border: 1px solid rgb(79 73 59 / 10%);
+  border-radius: 18px;
+  background: rgb(255 254 249 / 50%);
+}
+
+.easywork-app.easywork-app .library-collection-editor {
+  gap: 18px;
+  padding: 22px 24px 24px;
+}
+
+.easywork-app.easywork-app .library-collection-editor .field > span {
+  color: #5c584f;
+  font-size: 13.5px !important;
+  font-weight: 620;
+}
+
+.easywork-app.easywork-app .library-collection-editor .field input {
+  min-height: 46px;
+  border-color: rgb(79 73 59 / 16%);
+  border-radius: 11px;
+  background: rgb(255 254 250 / 82%);
+  font-size: 14.5px !important;
+}
+
+.easywork-app.easywork-app .library-collection-editor .modal-actions button {
+  min-height: 40px;
+  border: 1px solid rgb(82 96 69 / 14%);
+  border-radius: 10px;
+  background: rgb(101 119 84 / 7%);
+  color: #4b5941;
+  box-shadow: none;
+  font-size: 14px !important;
+}
+
+.easywork-app.easywork-app .library-collection-editor .modal-actions button:disabled {
+  background: rgb(79 73 59 / 4%);
+  color: #a39d91;
+}
+
+.easywork-app.easywork-app .library-overview-toolbar {
+  display: flex;
+  min-height: 66px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid rgb(79 73 59 / 8%);
+  padding: 10px 16px 10px 19px;
+}
+
+.easywork-app.easywork-app .library-overview-toolbar > span {
+  color: #6c675d;
+  font-size: 13.5px;
+  font-weight: 560;
+}
+
+.easywork-app.easywork-app .library-collection-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  padding: 8px 12px 14px;
+}
+
+.easywork-app.easywork-app .library-collection-card {
+  min-width: 0;
+  border-bottom: 1px solid rgb(79 73 59 / 7%);
+}
+
+.easywork-app.easywork-app .library-collection-card:nth-child(odd) {
+  border-right: 1px solid rgb(79 73 59 / 7%);
+}
+
+.easywork-app.easywork-app .library-collection-open {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: 84px;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 48px 14px 12px;
+  color: var(--ink);
+  text-align: left;
+}
+
+.easywork-app.easywork-app .library-collection-open:hover {
+  background: rgb(83 99 63 / 5%);
+}
+
+.easywork-app.easywork-app .library-collection-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 11px;
+  background: rgb(92 111 72 / 10%);
+  color: #506342;
+}
+
+.easywork-app.easywork-app .library-collection-open > span:last-child {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.easywork-app.easywork-app .library-collection-open strong {
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.easywork-app.easywork-app .library-collection-open small {
+  color: #847f75;
+  font-size: 12px;
+}
+
+.easywork-app.easywork-app .library-collection-more {
+  position: absolute;
+  z-index: 2;
+  top: 26px;
+  right: 11px;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  color: #817b70;
+}
+
+.easywork-app.easywork-app .library-collection-more:hover {
+  background: rgb(79 73 59 / 7%);
+  color: #4e493f;
+}
+
+.easywork-app.easywork-app .library-collection-menu {
+  position: absolute;
+  z-index: 24;
+  top: calc(100% + 6px);
+  right: 0;
+  display: grid;
+  width: 174px;
+  border: 1px solid rgb(79 73 59 / 14%);
+  border-radius: 12px;
+  background: #fbf7ec;
+  box-shadow: 0 16px 36px rgb(55 46 30 / 14%);
+  padding: 6px;
+}
+
+.easywork-app.easywork-app .library-collection-card .library-collection-menu {
+  top: 58px;
+  right: 9px;
+}
+
+.easywork-app.easywork-app .library-collection-menu > button {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 9px;
+  border-radius: 8px;
+  padding: 0 10px;
+  color: #4f4a41;
+  font-size: 13.5px;
+  text-align: left;
+}
+
+.easywork-app.easywork-app .library-collection-menu > button:hover {
+  background: rgb(79 73 59 / 7%);
+}
+
+.easywork-app.easywork-app .library-collection-menu > button.danger {
+  color: #a4483f;
+}
+
+.easywork-app.easywork-app .library-collection-empty {
+  display: grid;
+  min-height: 230px;
+  grid-column: 1 / -1;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  color: #8a857b;
+}
+
+.easywork-app.easywork-app .library-collection-empty p {
+  margin: 0;
+  font-size: 14px;
+}
+
+.easywork-app.easywork-app .library-collection-empty button {
+  color: #536344;
+  font-size: 13.5px;
+  font-weight: 620;
+}
+
+.easywork-app.easywork-app .library-collection-editor {
+  min-width: min(440px, calc(100vw - 42px));
+}
+
+.easywork-app.easywork-app .project-home-collection {
+  background: rgb(83 99 63 / 4%);
+}
+
+.easywork-app.easywork-app .composer-menu-popover.show-root {
+  height: 151px;
+}
+
+.easywork-app.easywork-app .composer-menu-popover.show-collections {
+  height: var(--composer-collection-height);
+}
+
+.easywork-app.easywork-app .composer-menu-track {
+  width: 300%;
+}
+
+.easywork-app.easywork-app .composer-menu-panel {
+  width: 33.3333%;
+  flex-basis: 33.3333%;
+}
+
+.easywork-app.easywork-app .composer-menu-popover.show-skills .composer-menu-track {
+  transform: translateX(-33.3333%);
+}
+
+.easywork-app.easywork-app .composer-menu-popover.show-collections .composer-menu-track {
+  transform: translateX(-66.6667%);
+}
+
+.easywork-app.easywork-app .composer-collection-list {
+  max-height: 253px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-top: 3px;
+}
+
+.easywork-app.easywork-app .modal-header.title-hidden {
+  position: absolute;
+  z-index: 4;
+  top: 10px;
+  right: 11px;
+  width: auto;
+  min-height: 0;
+  border: 0;
+  padding: 0;
+}
+
+.easywork-app.easywork-app .modal-header.title-hidden .modal-header-actions {
+  margin: 0;
+}
+
+.easywork-app.easywork-app .account-modal .account-tabs {
+  padding-right: 54px;
+}
+
 /* Responsive layout. */
 .easywork-app.easywork-app,
 .easywork-app.easywork-app .main-column,
@@ -12560,24 +13204,72 @@ textarea::placeholder {
     padding-right: 20px;
     padding-left: 20px;
   }
+
+  .easywork-app.easywork-app .library-collection-overview-header {
+    min-height: 40px;
+    justify-content: flex-end;
+  }
+
+  .easywork-app.easywork-app
+    .library-collection-overview-header
+    .library-title-row {
+    display: none;
+  }
 }
 
 @media (max-width: 720px) {
+  .easywork-app.easywork-app .library-header {
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 17px;
+  }
+
+  .easywork-app.easywork-app .library-title-row h1 {
+    font-size: 23px !important;
+  }
+
+  .easywork-app.easywork-app .library-title-icon,
+  .easywork-app.easywork-app .library-back-button,
+  .easywork-app.easywork-app .library-detail-menu-button {
+    width: 36px;
+    height: 36px;
+  }
+
+  .easywork-app.easywork-app .library-collection-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .easywork-app.easywork-app .library-collection-card:nth-child(odd) {
+    border-right: 0;
+  }
+
+  .easywork-app.easywork-app .library-collection-open {
+    min-height: 72px;
+  }
+
   .easywork-app.easywork-app .help-document .help-markdown {
-    font-size: 20px;
-    line-height: 1.82;
+    font-size: 17px;
+    line-height: 1.72;
   }
 
   .easywork-app.easywork-app .help-document .help-markdown > h1 {
-    font-size: 26px;
+    font-size: 25px;
   }
 
   .easywork-app.easywork-app .help-document .help-markdown > h1 + p {
-    font-size: 20px;
+    font-size: 17px;
   }
 
   .easywork-app.easywork-app .help-document .help-markdown > h2 {
-    font-size: 24px;
+    font-size: 21px;
+  }
+
+  .easywork-app.easywork-app .help-document .help-markdown > h3 {
+    font-size: 19px;
+  }
+
+  .easywork-app.easywork-app .help-document .help-markdown > h4 {
+    font-size: 18px;
   }
 
   .easywork-app.easywork-app .admin-page {
@@ -13067,6 +13759,26 @@ textarea::placeholder {
 }
 
 @media (max-width: 520px) {
+  .easywork-app.easywork-app .library-header {
+    flex-wrap: wrap;
+  }
+
+  .easywork-app.easywork-app .library-header-actions {
+    margin-left: auto;
+  }
+
+  .easywork-app.easywork-app .library-overview-toolbar,
+  .easywork-app.easywork-app .card-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .easywork-app.easywork-app .library-overview-toolbar .table-search,
+  .easywork-app.easywork-app .card-toolbar .table-search {
+    width: 100%;
+  }
+
   .easywork-app.easywork-app .workspace-page {
     padding: 18px 13px 42px;
   }
@@ -13197,5 +13909,1056 @@ textarea::placeholder {
   .easywork-app.easywork-app .modal-card.modal-wide {
     max-height: 100dvh;
     border-radius: 14px 14px 0 0;
+  }
+}
+
+/* 2026 surface pass: components keep a shared rhythm without inheriting a
+   single global button color. Each surface owns its controls and hierarchy. */
+.easywork-app.easywork-app .modal-card.configuration-modal,
+.easywork-app.easywork-app .modal-card.account-modal-authenticated {
+  width: min(860px, calc(100vw - 32px));
+  height: min(600px, calc(100dvh - 40px));
+  min-height: 0;
+  max-height: calc(100dvh - 40px);
+}
+
+.easywork-app.easywork-app
+  .modal-card.modal-wide.configuration-modal.server-configuration-modal,
+.easywork-app.easywork-app
+  .modal-card.modal-wide.configuration-modal.context-config-modal {
+  width: min(860px, calc(100vw - 32px));
+  height: min(600px, calc(100dvh - 40px));
+  min-height: 0;
+  max-height: calc(100dvh - 40px);
+}
+
+.easywork-app.easywork-app .modal-card.configuration-modal .modal-header h2,
+.easywork-app.easywork-app .modal-card.account-modal .modal-header h2,
+.easywork-app.easywork-app .modal-card:has(.library-collection-editor) .modal-header h2,
+.easywork-app.easywork-app .modal-card:has(.project-library-dialog) .modal-header h2 {
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang SC", "Microsoft YaHei UI", sans-serif;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated :is(.profile-form, .provider-manager) {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .profile-form {
+  display: grid;
+  width: min(650px, 100%);
+  max-width: 650px;
+  grid-template-columns: 170px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  align-content: stretch;
+  align-self: stretch;
+  gap: 24px 28px;
+  margin-inline: auto;
+  padding: 36px 34px 30px;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .profile-form .avatar-editor {
+  grid-row: 1;
+  align-self: start;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .profile-form > .field {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: start;
+  margin-top: 24px;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .profile-form .modal-actions {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  align-self: end;
+  margin-top: 0;
+  border-top: 1px solid rgb(79 73 59 / 8%);
+  padding-top: 18px;
+}
+
+.easywork-app.easywork-app .account-modal .account-tabs button:focus-visible {
+  outline: 0;
+  box-shadow: inset 0 -2px rgb(83 99 63 / 35%);
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .profile-form .primary-button,
+.easywork-app.easywork-app .account-modal-authenticated .profile-form .secondary-button,
+.easywork-app.easywork-app .account-modal-authenticated .provider-form .primary-button,
+.easywork-app.easywork-app .account-modal-authenticated .provider-form .secondary-button {
+  min-height: 40px;
+  border: 1px solid rgb(88 102 72 / 18%);
+  border-radius: 11px;
+  background: rgb(101 119 82 / 9%);
+  color: #425038;
+  box-shadow: none;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated :is(.profile-form, .provider-form)
+  :is(.primary-button, .secondary-button):hover {
+  border-color: rgb(88 102 72 / 27%);
+  background: rgb(101 119 82 / 15%);
+  color: #35422e;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-manager {
+  min-height: 0;
+  grid-template-columns: 180px minmax(0, 1fr);
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-form {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 26px 30px 28px;
+}
+
+.easywork-app.easywork-app .server-configuration-modal .server-manager,
+.easywork-app.easywork-app .server-configuration-modal .server-manager.compact {
+  min-height: 0;
+  height: 100%;
+}
+
+.easywork-app.easywork-app .server-configuration-modal .server-connection-body {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.easywork-app.easywork-app .server-configuration-modal
+  :is(.primary-button, .secondary-button, .demo-server-button, .server-conversation-action) {
+  border: 1px solid rgb(78 92 66 / 16%);
+  border-radius: 10px;
+  background: rgb(94 111 77 / 8%);
+  color: #46543d;
+  box-shadow: none;
+}
+
+.easywork-app.easywork-app .server-configuration-modal
+  :is(.primary-button, .secondary-button, .demo-server-button, .server-conversation-action):not(:disabled):hover {
+  border-color: rgb(78 92 66 / 25%);
+  background: rgb(94 111 77 / 14%);
+  color: #33412d;
+}
+
+.easywork-app.easywork-app .server-configuration-modal .quick-disconnect-button,
+.easywork-app.easywork-app .server-configuration-modal .server-conversation-action.disconnect {
+  border-color: rgb(170 76 66 / 18%);
+  background: rgb(170 76 66 / 7%);
+  color: #a34940;
+}
+
+.easywork-app.easywork-app .context-config-modal .context-dialog {
+  height: calc(100% - 64px);
+  min-height: 0;
+  grid-template-columns: minmax(0, 1.12fr) minmax(260px, 0.88fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  overflow: auto;
+  padding: 20px 22px 22px;
+}
+
+.easywork-app.easywork-app .context-config-modal .context-usage-hero {
+  grid-column: 1 / -1;
+}
+
+.easywork-app.easywork-app .context-config-modal .context-dialog-section {
+  align-content: start;
+  height: 100%;
+  box-shadow: none;
+}
+
+.easywork-app.easywork-app .context-config-modal .context-breakdown-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+}
+
+.easywork-app.easywork-app .context-config-modal .context-breakdown > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 0;
+  border-bottom: 1px solid rgb(80 74 61 / 8%);
+  border-radius: 0;
+  background: transparent;
+  padding: 9px 2px;
+}
+
+.easywork-app.easywork-app .context-config-modal .context-dialog-actions {
+  grid-column: 1 / -1;
+}
+
+.easywork-app.easywork-app .context-config-modal .context-dialog-actions button {
+  border-color: rgb(87 101 73 / 17%);
+  background: rgb(97 115 79 / 8%);
+  color: #46543c;
+}
+
+.easywork-app.easywork-app .context-config-modal .context-dialog-actions button.primary {
+  border-color: rgb(99 83 126 / 18%);
+  background: rgb(113 91 145 / 10%);
+  color: #5d4679;
+}
+
+.easywork-app.easywork-app .library-page {
+  overflow: visible;
+}
+
+.easywork-app.easywork-app .library-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.easywork-app.easywork-app .library-action-button,
+.easywork-app.easywork-app .library-detail-menu-button {
+  display: inline-flex;
+  height: 40px;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgb(81 97 67 / 15%);
+  border-radius: 11px;
+  background: rgb(102 121 84 / 8%);
+  padding: 0 13px;
+  color: #47553d;
+  font-size: 14px;
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.easywork-app.easywork-app .library-detail-menu-button {
+  width: 40px;
+  padding: 0;
+}
+
+.easywork-app.easywork-app .library-action-button:hover,
+.easywork-app.easywork-app .library-detail-menu-button:hover {
+  border-color: rgb(81 97 67 / 25%);
+  background: rgb(102 121 84 / 14%);
+  color: #35432e;
+}
+
+.easywork-app.easywork-app :is(
+  .library-action-button,
+  .library-detail-menu-button,
+  .library-collection-more,
+  .library-collection-open,
+  .file-table-head button
+):focus {
+  outline: 0;
+}
+
+.easywork-app.easywork-app :is(
+  .library-action-button,
+  .library-detail-menu-button,
+  .library-collection-more,
+  .library-collection-open,
+  .file-table-head button
+):focus-visible {
+  box-shadow: 0 0 0 3px rgb(89 107 73 / 14%);
+}
+
+.easywork-app.easywork-app .library-folder-upload-button {
+  border-color: rgb(103 91 128 / 14%);
+  background: rgb(112 93 145 / 7%);
+  color: #625174;
+}
+
+.easywork-app.easywork-app .library-collection-browser {
+  overflow: visible;
+  border-radius: 17px;
+  background: rgb(255 254 250 / 38%);
+}
+
+.easywork-app.easywork-app .library-collection-grid {
+  border-radius: 0 0 17px 17px;
+}
+
+.easywork-app.easywork-app .library-collection-card:has(.library-collection-menu) {
+  z-index: 30;
+}
+
+.easywork-app.easywork-app .library-collection-open:hover {
+  background: rgb(102 121 84 / 3.5%);
+}
+
+.easywork-app.easywork-app .library-collection-open {
+  background: transparent;
+}
+
+.easywork-app.easywork-app .library-collection-menu {
+  z-index: 80;
+  border-color: rgb(81 75 63 / 13%);
+  background: rgb(250 247 238 / 98%);
+  box-shadow: 0 18px 42px rgb(58 49 35 / 15%);
+}
+
+.easywork-app.easywork-app .library-collection-menu > button {
+  background: transparent;
+}
+
+.easywork-app.easywork-app .library-collection-menu > button:hover {
+  background: rgb(97 111 82 / 8%);
+}
+
+.easywork-app.easywork-app .library-collection-empty button,
+.easywork-app.easywork-app .file-empty-actions button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid rgb(82 96 69 / 14%);
+  border-radius: 10px;
+  background: rgb(101 119 84 / 7%);
+  padding: 0 12px;
+  color: #4c5b42;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.easywork-app.easywork-app .file-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.easywork-app.easywork-app .file-table-card {
+  overflow: visible;
+  background: rgb(255 254 250 / 48%);
+}
+
+.easywork-app.easywork-app .file-table-head,
+.easywork-app.easywork-app .file-table-row {
+  grid-template-columns: minmax(260px, 1.8fr) minmax(120px, 0.75fr) minmax(92px, 0.55fr) minmax(150px, 0.9fr);
+  gap: 18px;
+}
+
+.easywork-app.easywork-app .file-table-head {
+  min-height: 46px;
+  border-top: 1px solid rgb(79 73 59 / 8%);
+  border-bottom: 1px solid rgb(79 73 59 / 9%);
+  background: transparent;
+  color: #716c63;
+  font-size: 13px !important;
+}
+
+.easywork-app.easywork-app .file-table-head > :is(button, span) {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 620;
+  text-align: left;
+}
+
+.easywork-app.easywork-app .file-table-head button svg.asc {
+  transform: rotate(180deg);
+}
+
+.easywork-app.easywork-app .file-table-row {
+  position: relative;
+  min-height: 62px;
+  border-color: rgb(79 73 59 / 8%);
+  background: transparent;
+  color: #575249;
+  text-align: left;
+}
+
+.easywork-app.easywork-app button.file-table-row {
+  width: 100%;
+}
+
+.easywork-app.easywork-app .file-table-row:hover {
+  background: rgb(101 119 84 / 3.5%);
+}
+
+.easywork-app.easywork-app .file-name-cell {
+  padding-left: calc(var(--file-depth, 0) * 21px);
+}
+
+.easywork-app.easywork-app .folder-row .file-name-cell strong {
+  font-weight: 620;
+}
+
+.easywork-app.easywork-app .folder-status {
+  color: #817b70;
+  font-size: 12.5px;
+}
+
+.easywork-app.easywork-app .file-index-cell {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding-right: 34px;
+}
+
+.easywork-app.easywork-app .file-row-delete {
+  position: absolute;
+  right: 0;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  background: transparent;
+  color: #9a9388;
+  opacity: 0;
+}
+
+.easywork-app.easywork-app .file-table-row:hover .file-row-delete,
+.easywork-app.easywork-app .file-row-delete:focus-visible {
+  opacity: 1;
+}
+
+.easywork-app.easywork-app .file-index-error {
+  position: relative;
+  display: block;
+  max-width: none;
+  overflow: visible;
+  margin: 0;
+  color: #984c44;
+  font-size: 12px !important;
+  white-space: normal;
+}
+
+.easywork-app.easywork-app .file-index-error summary {
+  cursor: pointer;
+  color: #9a5148;
+  list-style: none;
+}
+
+.easywork-app.easywork-app .file-index-error > div {
+  position: absolute;
+  z-index: 35;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(330px, calc(100vw - 40px));
+  border: 1px solid rgb(157 73 64 / 15%);
+  border-radius: 11px;
+  background: rgb(253 247 240 / 98%);
+  box-shadow: 0 15px 34px rgb(66 48 36 / 14%);
+  padding: 12px;
+}
+
+.easywork-app.easywork-app .file-index-error p {
+  margin: 0 0 10px;
+  line-height: 1.5;
+}
+
+.easywork-app.easywork-app .file-index-error button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #7f443e;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.easywork-app.easywork-app .project-home-tabs {
+  gap: 3px;
+}
+
+.easywork-app.easywork-app .project-home-tabs button {
+  border-radius: 9px;
+  padding-inline: 12px;
+}
+
+.easywork-app.easywork-app .project-home-tabs button.active {
+  background: rgb(95 112 78 / 9%);
+}
+
+.easywork-app.easywork-app .project-home-collection {
+  background: transparent;
+}
+
+.easywork-app.easywork-app .project-home-file-actions button,
+.easywork-app.easywork-app .project-setup-step {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgb(83 98 70 / 14%);
+  border-radius: 10px;
+  background: rgb(101 119 84 / 7%);
+  padding: 0 12px;
+  color: #4d5b42;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.easywork-app.easywork-app .project-setup-step.ready {
+  background: transparent;
+  color: #516247;
+}
+
+.easywork-app.easywork-app .project-work-setup {
+  display: flex;
+  min-height: 46px;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  margin-top: 8px;
+  overscroll-behavior-x: contain;
+}
+
+.easywork-app.easywork-app .project-work-setup .project-setup-step {
+  min-width: 0;
+  max-width: 34%;
+  flex: 0 1 auto;
+}
+
+.easywork-app.easywork-app .project-work-setup .project-setup-step span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.easywork-app.easywork-app .project-composer-area .project-launch-mode {
+  top: -44px;
+  right: 0;
+  width: 150px;
+  height: 34px;
+  border: 1px solid rgb(79 73 59 / 9%);
+  border-radius: 999px;
+  background: rgb(79 73 59 / 4%);
+}
+
+.easywork-app.easywork-app .project-composer-area .project-launch-mode button {
+  min-height: 28px;
+  gap: 5px;
+  border-radius: 999px;
+  font-size: 12.5px !important;
+}
+
+.easywork-app.easywork-app .new-conversation .empty-chat.loading {
+  position: fixed;
+  inset: 0;
+  width: auto;
+  height: auto;
+  justify-content: center;
+  padding: 0;
+  pointer-events: none;
+}
+
+.easywork-app.easywork-app .new-conversation .empty-chat.loading .workspace-loading-indicator {
+  transform: translateY(0);
+}
+
+.easywork-app.easywork-app :is(
+  .new-chat-button,
+  .sidebar-nav-item,
+  .profile-wrap .admin-nav-button,
+  .profile-wrap .profile-button,
+  .model-selector-button
+):focus {
+  outline: 0;
+}
+
+.easywork-app.easywork-app :is(
+  .new-chat-button,
+  .sidebar-nav-item,
+  .profile-wrap .admin-nav-button,
+  .profile-wrap .profile-button,
+  .model-selector-button
+):focus-visible {
+  box-shadow: inset 0 0 0 2px rgb(83 99 63 / 16%);
+}
+
+@media (max-width: 760px) {
+  .easywork-app.easywork-app .modal-card.configuration-modal,
+  .easywork-app.easywork-app .modal-card.account-modal-authenticated {
+    width: calc(100vw - 16px);
+    height: min(720px, calc(100dvh - 16px));
+    max-height: calc(100dvh - 16px);
+  }
+
+  .easywork-app.easywork-app .context-config-modal .context-dialog {
+    display: flex;
+    overflow-y: auto;
+    flex-direction: column;
+  }
+
+  .easywork-app.easywork-app .file-table-head,
+  .easywork-app.easywork-app .file-table-row {
+    grid-template-columns: minmax(180px, 1.5fr) 110px 84px minmax(130px, 0.8fr);
+    min-width: 650px;
+  }
+
+  .easywork-app.easywork-app .file-table {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+
+  .easywork-app.easywork-app .project-work-setup .project-setup-step {
+    max-width: 72%;
+  }
+}
+
+@media (max-width: 520px) {
+  .easywork-app.easywork-app .modal-card.account-modal-authenticated {
+    height: min(620px, calc(100dvh - max(8px, env(safe-area-inset-top))));
+  }
+
+  .easywork-app.easywork-app .library-header-actions {
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .easywork-app.easywork-app .library-action-button {
+    flex: 0 0 auto;
+  }
+
+  .easywork-app.easywork-app .account-modal-authenticated .provider-manager {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .easywork-app.easywork-app .account-modal-authenticated .provider-tabs {
+    max-height: 132px;
+  }
+
+  .easywork-app.easywork-app .account-modal-authenticated .profile-form {
+    display: grid;
+    width: 100%;
+    max-width: none;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    align-content: stretch;
+    gap: 18px;
+    padding: 24px 20px;
+  }
+
+  .easywork-app.easywork-app .account-modal-authenticated .profile-form .avatar-editor {
+    grid-row: 1;
+    align-self: flex-start;
+    flex-direction: row;
+  }
+
+  .easywork-app.easywork-app .account-modal-authenticated .profile-form > .field {
+    width: 100%;
+    grid-column: 1;
+    grid-row: 2;
+    align-self: stretch;
+    margin-top: 0;
+  }
+
+  .easywork-app.easywork-app .account-modal-authenticated .profile-form .modal-actions {
+    width: 100%;
+    grid-column: 1;
+    grid-row: 4;
+    flex-wrap: nowrap;
+    gap: 12px;
+  }
+
+  .easywork-app.easywork-app .account-modal-authenticated .profile-form .modal-actions > button {
+    width: auto;
+    min-width: 0;
+    flex: 0 0 auto;
+  }
+}
+
+/* Skills, account, help and administrator surfaces use local controls rather
+   than inheriting the generic primary/secondary button treatment. */
+.easywork-app.easywork-app .profile-wrap .admin-nav-button,
+.easywork-app.easywork-app .profile-wrap .profile-button {
+  grid-template-columns: 30px minmax(0, 1fr);
+  min-height: 42px;
+  padding: 4px 7px;
+  color: #4f5049;
+}
+
+.easywork-app.easywork-app .profile-wrap .admin-nav-button.active {
+  background: transparent;
+  color: #34422e;
+}
+
+.easywork-app.easywork-app .profile-wrap .admin-nav-button.active .admin-nav-icon {
+  background: rgb(83 99 63 / 14%);
+}
+
+.easywork-app.easywork-app .profile-wrap :is(.admin-nav-button, .profile-button):hover {
+  background: rgb(79 73 59 / 5.5%);
+}
+
+.easywork-app.easywork-app .profile-wrap :is(.admin-nav-button, .profile-button) strong {
+  font-size: 14px !important;
+  font-weight: 560;
+  letter-spacing: -0.005em;
+}
+
+.easywork-app.easywork-app .skills-page .page-intro,
+.easywork-app.easywork-app .skills-page .skill-grid {
+  width: min(1080px, 100%);
+  max-width: none;
+}
+
+.easywork-app.easywork-app .skills-page .page-intro {
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.easywork-app.easywork-app .skills-page .page-intro h1 {
+  font-size: 26px !important;
+  font-weight: 650;
+}
+
+.easywork-app.easywork-app .skills-page .page-actions {
+  gap: 7px;
+}
+
+.easywork-app.easywork-app .skill-action-button {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgb(81 77 66 / 14%);
+  border-radius: 10px;
+  background: rgb(255 254 250 / 52%);
+  padding: 0 14px;
+  color: #575248;
+  font-size: 14px;
+  font-weight: 590;
+  box-shadow: 0 5px 14px rgb(65 55 40 / 4%);
+}
+
+.easywork-app.easywork-app .skill-action-button.upload {
+  border-color: rgb(82 99 68 / 18%);
+  background: rgb(100 119 82 / 8%);
+  color: #46543d;
+}
+
+.easywork-app.easywork-app .skill-action-button:hover {
+  border-color: rgb(81 77 66 / 23%);
+  background: rgb(247 243 233 / 80%);
+  color: #373a33;
+}
+
+.easywork-app.easywork-app .skill-action-button.upload:hover {
+  border-color: rgb(82 99 68 / 27%);
+  background: rgb(100 119 82 / 14%);
+  color: #35442e;
+}
+
+.easywork-app.easywork-app .skills-page .skill-grid {
+  gap: 14px;
+}
+
+.easywork-app.easywork-app .skills-page :is(.skill-card, .skill-upload-card) {
+  min-height: 204px;
+  border-color: rgb(79 73 59 / 12%);
+  background: rgb(255 254 250 / 48%);
+}
+
+.easywork-app.easywork-app .skills-page .skill-card {
+  padding: 19px;
+}
+
+.easywork-app.easywork-app .skills-page .skill-card h2 {
+  margin: 17px 0 7px;
+  color: #30332e;
+  font-size: 18px !important;
+  font-weight: 640;
+}
+
+.easywork-app.easywork-app .skills-page .skill-card > p {
+  color: #615e56;
+  font-size: 14.5px !important;
+  line-height: 1.62;
+}
+
+.easywork-app.easywork-app .skills-page .skill-card-foot {
+  color: #777268;
+  font-size: 13.5px !important;
+}
+
+.easywork-app.easywork-app .skills-page .skill-upload-card {
+  border-style: solid;
+  background: rgb(245 241 230 / 38%);
+}
+
+.easywork-app.easywork-app .skills-page .skill-upload-card > span {
+  color: #627153;
+}
+
+.easywork-app.easywork-app .skills-page .skill-upload-card strong {
+  color: #464b42;
+  font-size: 15.5px !important;
+  font-weight: 620;
+}
+
+.easywork-app.easywork-app .skills-page .skill-upload-card small {
+  color: #7b766d;
+  font-size: 13px !important;
+}
+
+.easywork-app.easywork-app .skills-page .skill-upload-card:hover {
+  border-color: rgb(82 99 68 / 20%);
+  background: rgb(100 119 82 / 7%);
+}
+
+.easywork-app.easywork-app .help-document {
+  width: min(880px, 100%);
+}
+
+.easywork-app.easywork-app .help-document .help-markdown {
+  color: #44463f;
+  font-size: 17px;
+  line-height: 1.76;
+}
+
+.easywork-app.easywork-app .help-document .help-markdown > h2 {
+  font-size: 21px;
+}
+
+.easywork-app.easywork-app .help-document .help-markdown > h3 {
+  font-size: 18.5px;
+}
+
+.easywork-app.easywork-app .admin-page {
+  padding-top: 26px;
+}
+
+.easywork-app.easywork-app .admin-hero {
+  min-height: 70px;
+  padding-bottom: 15px;
+}
+
+.easywork-app.easywork-app .admin-hero h1 {
+  font-size: clamp(25px, 1.8vw, 30px);
+  font-weight: 670;
+}
+
+.easywork-app.easywork-app .admin-tabs {
+  gap: 18px;
+  border: 0;
+  border-bottom: 1px solid rgb(79 73 59 / 12%);
+  border-radius: 0;
+  margin: 16px 0 23px;
+  background: transparent;
+  padding: 0;
+}
+
+.easywork-app.easywork-app .admin-tabs button {
+  position: relative;
+  height: 42px;
+  border-radius: 0;
+  padding: 0 2px;
+  color: #716d65;
+  font-size: 14.5px;
+}
+
+.easywork-app.easywork-app .admin-tabs button.active {
+  background: transparent;
+  box-shadow: none;
+  color: #39472f;
+}
+
+.easywork-app.easywork-app .admin-tabs button.active::after {
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: #6b7e58;
+  content: "";
+}
+
+.easywork-app.easywork-app .admin-section-heading h2 {
+  font-size: 19px;
+  font-weight: 660;
+}
+
+.easywork-app.easywork-app .admin-save-button,
+.easywork-app.easywork-app .admin-refresh-button,
+.easywork-app.easywork-app .admin-model-control button,
+.easywork-app.easywork-app .admin-disconnect-button {
+  min-height: 38px;
+  border-color: rgb(81 77 66 / 15%);
+  border-radius: 10px;
+  background: rgb(255 254 250 / 52%);
+  color: #575248;
+  font-size: 13.5px;
+  font-weight: 580;
+}
+
+.easywork-app.easywork-app .admin-save-button {
+  border-color: rgb(82 99 68 / 19%);
+  background: rgb(100 119 82 / 9%);
+  color: #43513a;
+}
+
+.easywork-app.easywork-app .admin-save-button:not(:disabled):hover {
+  border-color: rgb(82 99 68 / 28%);
+  background: rgb(100 119 82 / 15%);
+  color: #33422c;
+}
+
+.easywork-app.easywork-app .admin-api-card {
+  border-color: rgb(79 73 59 / 12%);
+  background: rgb(255 254 250 / 42%);
+}
+
+.easywork-app.easywork-app .admin-api-card > header {
+  min-height: 62px;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  gap: 11px;
+  padding-block: 10px;
+}
+
+.easywork-app.easywork-app .admin-api-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+}
+
+.easywork-app.easywork-app .admin-api-card > header strong {
+  font-size: 15.5px;
+}
+
+.easywork-app.easywork-app .admin-config-status {
+  font-size: 12.5px;
+}
+
+.easywork-app.easywork-app .admin-api-fields > label,
+.easywork-app.easywork-app .admin-embedding-options > label {
+  color: #666158;
+  font-size: 13px;
+}
+
+.easywork-app.easywork-app .admin-api-fields input,
+.easywork-app.easywork-app .admin-api-fields select,
+.easywork-app.easywork-app .admin-policy-grid input,
+.easywork-app.easywork-app .account-modal .provider-form .field input {
+  border-color: rgb(79 73 59 / 15%);
+  background: rgb(255 254 250 / 72%);
+  font-size: 14.5px !important;
+}
+
+.easywork-app.easywork-app .admin-secret-input button,
+.easywork-app.easywork-app .account-modal .api-key-control > button {
+  border: 0;
+  background: transparent;
+  color: #686359;
+  font-size: 12.5px !important;
+  font-weight: 590;
+}
+
+.easywork-app.easywork-app .admin-secret-input button:hover:not(:disabled),
+.easywork-app.easywork-app .account-modal .api-key-control > button:hover:not(:disabled) {
+  background: rgb(79 73 59 / 6%);
+  color: #3f443c;
+}
+
+.easywork-app.easywork-app .admin-usage-panel,
+.easywork-app.easywork-app .admin-ssh-policy,
+.easywork-app.easywork-app .admin-ssh-connections {
+  border-color: rgb(79 73 59 / 12%);
+  background: rgb(255 254 250 / 38%);
+}
+
+.easywork-app.easywork-app .admin-usage-metrics span,
+.easywork-app.easywork-app .admin-usage-metrics small,
+.easywork-app.easywork-app .admin-chart-legend span,
+.easywork-app.easywork-app .admin-usage-breakdown small {
+  font-size: 12.5px;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-tabs {
+  background: rgb(241 235 220 / 20%);
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-tab-list > button {
+  min-height: 42px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  font-size: 14px !important;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-tab-list > button.active {
+  border-color: rgb(82 99 68 / 13%);
+  background: rgb(100 119 82 / 8%);
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-form {
+  gap: 18px;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-form .field > span {
+  color: #555148;
+  font-size: 14px !important;
+  font-weight: 590;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-form .modal-actions {
+  margin-top: 2px;
+}
+
+.easywork-app.easywork-app .account-modal-authenticated .provider-form .primary-button {
+  min-height: 40px;
+  border-color: rgb(82 99 68 / 18%);
+  background: rgb(100 119 82 / 9%);
+  color: #43513a;
+}
+
+@media (max-width: 760px) {
+  .easywork-app.easywork-app .skills-page .page-intro {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .easywork-app.easywork-app .skills-page .page-actions {
+    flex-wrap: wrap;
+  }
+
+  .easywork-app.easywork-app .skills-page .skill-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .easywork-app.easywork-app .admin-hero {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 520px) {
+  .easywork-app.easywork-app .skills-page .skill-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .easywork-app.easywork-app .skill-action-button {
+    flex: 1 1 auto;
+  }
+
+  .easywork-app.easywork-app .help-document .help-markdown {
+    font-size: 16px;
+  }
+
+  .easywork-app.easywork-app .admin-hero-stats {
+    width: 100%;
+  }
+
+  .easywork-app.easywork-app .admin-hero-stats > span {
+    min-width: 0;
+    flex: 1;
   }
 }

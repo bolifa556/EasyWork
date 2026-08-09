@@ -1772,12 +1772,11 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
         ],
         activeProviderId: "provider-default",
         embedding: {
-          baseUrl: "https://api.openai.com/v1",
-          model: "text-embedding-3-small",
-          dimensions: "1536",
+          baseUrl: "",
+          model: "",
+          dimensions: "",
           configured: false,
           hybridEnabled: true,
-          rerankEnabled: false,
         },
       },
     };
@@ -2050,6 +2049,19 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
     assert.equal(adjustedContext.web.limit, 80_000);
     assert.equal(adjustedContext.web.automaticCompressionThreshold, 0.82);
 
+    const unavailableEmbeddingCollectionResponse = await fetch(
+      `${base}/api/file-collections`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookies },
+        body: JSON.stringify({ name: "集群资料" }),
+      },
+    );
+    assert.equal(unavailableEmbeddingCollectionResponse.status, 200);
+    const unavailableEmbeddingCollection = (
+      await unavailableEmbeddingCollectionResponse.json()
+    ).collection;
+
     const fileResponse = await fetch(`${base}/api/files`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: cookies },
@@ -2058,15 +2070,14 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
         name: "cluster-notes.txt",
         type: "text/plain",
         size: 54,
+        collectionId: unavailableEmbeddingCollection.id,
         contentBase64: Buffer.from(
           "登录节点有 128 GiB 内存。训练任务需要通过调度器提交。",
         ).toString("base64"),
       }),
     });
-    assert.equal(fileResponse.status, 200);
-    const indexed = await fileResponse.json();
-    assert.equal(indexed.status, "keyword-only");
-    assert.ok(indexed.chunks >= 1);
+    assert.equal(fileResponse.status, 503);
+    assert.match((await fileResponse.json()).error, /Embedding 尚未配置/);
 
     const chatResponse = await fetch(`${base}/api/chat/stream`, {
       method: "POST",
@@ -2085,10 +2096,9 @@ test("gateway persists identity, indexes files, and opens a demo work session", 
       .map((line) => JSON.parse(line));
     const chatDone = chatEvents.find((event) => event.type === "done");
     assert.equal(chatDone.demo, true);
-    assert.ok(
-      chatEvents
-        .find((event) => event.type === "meta")
-        .sources.includes("cluster-notes.txt"),
+    assert.deepEqual(
+      chatEvents.find((event) => event.type === "meta").sources,
+      [],
     );
 
     const events = [];
@@ -3264,6 +3274,9 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
   process.env.EASYWORK_DATA_DIR = path.join(temporaryRoot, "data");
   process.env.EASYWORK_SKILL_DIR = path.join(temporaryRoot, "skill");
 
+  const providerRequests = [];
+  let failNextEmbedding = false;
+  let failImageExtraction = false;
   const providerServer = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -3280,8 +3293,64 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
       );
       return;
     }
+    if (req.method === "POST" && req.url === "/v1/embeddings") {
+      if (failNextEmbedding) {
+        failNextEmbedding = false;
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "temporary embedding failure" } }));
+        return;
+      }
+      const parsedBody = JSON.parse(requestBody || "{}");
+      const inputs = Array.isArray(parsedBody.input)
+        ? parsedBody.input
+        : [parsedBody.input];
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          data: inputs.map((input, index) => {
+            const text = String(input || "");
+            return {
+              index,
+              embedding: [
+                Math.max(text.length, 1),
+                [...text].filter((character) => /[\u4e00-\u9fff]/.test(character)).length + 1,
+                (text.match(/服务器|集群|节点/g) || []).length + 1,
+                (text.match(/文件|知识|资料/g) || []).length + 1,
+              ],
+            };
+          }),
+        }),
+      );
+      return;
+    }
     if (req.method === "POST" && req.url === "/v1/responses") {
       const parsedBody = JSON.parse(requestBody || "{}");
+      providerRequests.push({ path: req.url, body: parsedBody });
+      const imageExtractionRequest = requestBody.includes("data:image/");
+      if (imageExtractionRequest && failImageExtraction) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "temporary image extraction failure" } }));
+        return;
+      }
+      if (imageExtractionRequest) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            output: [
+              {
+                type: "message",
+                content: [
+                  {
+                    type: "output_text",
+                    text: "图片识别文字：GPU 节点状态正常。",
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+        return;
+      }
       if (parsedBody.stream) {
         const completeText = "我是 **EasyWork Chat 助手**，很高兴见到你。";
         res.writeHead(200, {
@@ -3328,6 +3397,28 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
     }
     if (req.method === "POST" && req.url === "/v1/chat/completions") {
       const parsedBody = JSON.parse(requestBody || "{}");
+      providerRequests.push({ path: req.url, body: parsedBody });
+      const imageExtractionRequest = requestBody.includes("data:image/");
+      if (imageExtractionRequest && failImageExtraction) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "temporary image extraction failure" } }));
+        return;
+      }
+      if (imageExtractionRequest) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: "图片识别文字：GPU 节点状态正常。",
+                },
+              },
+            ],
+          }),
+        );
+        return;
+      }
       if (parsedBody.stream) {
         res.writeHead(200, {
           "Content-Type": "text/event-stream",
@@ -3699,7 +3790,6 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
           chunkOverlap: 120,
           batchSize: 16,
           hybridEnabled: true,
-          rerankEnabled: true,
         },
         webApiKey: "platform-web-secret",
         agentApiKey: "platform-agent-secret",
@@ -3769,6 +3859,698 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
     assert.equal(secondRegistration.status, 200);
     const secondAccount = await secondRegistration.json();
     assert.equal(secondAccount.actor.isAdmin, false);
+
+    const adminCollectionResponse = await fetch(`${base}/api/file-collections`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "管理员资料" }),
+    });
+    assert.equal(adminCollectionResponse.status, 200);
+    const adminCollection = (await adminCollectionResponse.json()).collection;
+
+    const excludedCollectionResponse = await fetch(`${base}/api/file-collections`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "未关联资料" }),
+    });
+    assert.equal(excludedCollectionResponse.status, 200);
+    const excludedCollection = (await excludedCollectionResponse.json()).collection;
+
+    const ordinaryCollectionResponse = await fetch(`${base}/api/file-collections`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${secondAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "普通用户资料" }),
+    });
+    assert.equal(ordinaryCollectionResponse.status, 200);
+    const ordinaryCollection = (await ordinaryCollectionResponse.json()).collection;
+
+    const adminLibraryUpload = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "admin-library-file",
+        name: "same-name.txt",
+        relativePath: "资料/same-name.txt",
+        type: "text/plain",
+        collectionId: adminCollection.id,
+        contentBase64: Buffer.from("管理员自己的集群资料。", "utf8").toString("base64"),
+      }),
+    });
+    assert.equal(adminLibraryUpload.status, 200);
+    const excludedLibraryUpload = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "excluded-library-file",
+        name: "excluded.txt",
+        relativePath: "private/excluded.txt",
+        type: "text/plain",
+        collectionId: excludedCollection.id,
+        contentBase64: Buffer.from(
+          "未关联文件集中的绝密资料，不应进入当前对话。",
+          "utf8",
+        ).toString("base64"),
+      }),
+    });
+    assert.equal(excludedLibraryUpload.status, 200);
+    const ordinaryLibraryUpload = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${secondAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "ordinary-library-file",
+        name: "same-name.txt",
+        relativePath: "archive/same-name.txt",
+        type: "text/plain",
+        collectionId: ordinaryCollection.id,
+        contentBase64: Buffer.from("普通用户自己的文件资料。", "utf8").toString("base64"),
+      }),
+    });
+    assert.equal(ordinaryLibraryUpload.status, 200);
+
+    const adminStateBeforeStaleSave = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+    }).then((response) => response.json());
+    const staleStateSave = await fetch(`${base}/api/state`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        state: {
+          ...adminStateBeforeStaleSave.state,
+          files: [],
+          libraryCollections: [],
+        },
+      }),
+    });
+    assert.equal(staleStateSave.status, 200);
+    const adminStateAfterStaleSave = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+    }).then((response) => response.json());
+    assert.equal(adminStateAfterStaleSave.state.files.length, 2);
+    assert.equal(adminStateAfterStaleSave.state.libraryCollections.length, 2);
+
+    const groundedChatResponse = await fetch(`${base}/api/chat/stream`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        conversationId: "collection-grounded-chat",
+        userMessageId: "collection-grounded-user",
+        assistantMessageId: "collection-grounded-assistant",
+        prompt: "管理员的集群资料是什么？",
+        firstTurn: false,
+        libraryCollectionIds: [adminCollection.id],
+      }),
+    });
+    assert.equal(groundedChatResponse.status, 200);
+    const groundedChatEvents = (await groundedChatResponse.text())
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      groundedChatEvents.find((event) => event.type === "meta")?.sources,
+      ["same-name.txt"],
+    );
+    const groundedProviderRequest = JSON.stringify(providerRequests.at(-1)?.body || {});
+    assert.match(groundedProviderRequest, /管理员自己的集群资料/);
+    assert.doesNotMatch(groundedProviderRequest, /未关联文件集中的绝密资料/);
+
+    const conversationFileResponse = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "conversation-library-file",
+        name: "conversation-note.txt",
+        relativePath: "notes/2026/conversation-note.txt",
+        type: "text/plain",
+        conversationId: "collection-grounded-chat",
+        contentBase64: Buffer.from(
+          "这份资料只属于当前对话，暗号是 conversation-scope-only。",
+          "utf8",
+        ).toString("base64"),
+      }),
+    });
+    assert.equal(conversationFileResponse.status, 200);
+    const conversationFile = await conversationFileResponse.json();
+    assert.equal(conversationFile.source, "conversation");
+    assert.equal(conversationFile.conversationId, "collection-grounded-chat");
+    assert.equal(conversationFile.relativePath, "notes/2026/conversation-note.txt");
+
+    const forbiddenConversationFile = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${secondAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "foreign-conversation-file",
+        name: "foreign.txt",
+        type: "text/plain",
+        conversationId: "collection-grounded-chat",
+        contentBase64: Buffer.from("不能跨用户保存", "utf8").toString("base64"),
+      }),
+    });
+    assert.equal(forbiddenConversationFile.status, 404);
+
+    const invalidRelativePath = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "invalid-relative-file",
+        name: "escape.txt",
+        relativePath: "../escape.txt",
+        type: "text/plain",
+        collectionId: excludedCollection.id,
+        contentBase64: Buffer.from("path traversal", "utf8").toString("base64"),
+      }),
+    });
+    assert.equal(invalidRelativePath.status, 400);
+
+    const ambiguousFileScope = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "ambiguous-scope-file",
+        name: "ambiguous.txt",
+        collectionId: adminCollection.id,
+        conversationId: "collection-grounded-chat",
+        contentBase64: Buffer.from("ambiguous", "utf8").toString("base64"),
+      }),
+    });
+    assert.equal(ambiguousFileScope.status, 400);
+
+    const conversationGroundedResponse = await fetch(`${base}/api/chat/stream`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        conversationId: "collection-grounded-chat",
+        userMessageId: "conversation-file-user",
+        assistantMessageId: "conversation-file-assistant",
+        prompt: "当前对话的暗号是什么？",
+        firstTurn: false,
+      }),
+    });
+    assert.equal(conversationGroundedResponse.status, 200);
+    const conversationGroundedEvents = (await conversationGroundedResponse.text())
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      conversationGroundedEvents.find((event) => event.type === "meta")?.sources,
+      ["conversation-note.txt"],
+    );
+    assert.match(
+      JSON.stringify(providerRequests.at(-1)?.body || {}),
+      /conversation-scope-only/,
+    );
+
+    const missingConversationFile = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "missing-conversation-file",
+        name: "missing.txt",
+        type: "text/plain",
+        conversationId: "conversation-that-does-not-exist",
+        draftConversation: false,
+        contentBase64: Buffer.from("不能写入不存在的正式对话", "utf8").toString(
+          "base64",
+        ),
+      }),
+    });
+    assert.equal(missingConversationFile.status, 404);
+
+    const draftConversationUpload = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "draft-conversation-file",
+        name: "draft-note.txt",
+        relativePath: "drafts/first-turn/draft-note.txt",
+        type: "text/plain",
+        conversationId: "draft-conversation",
+        draftConversation: true,
+        contentBase64: Buffer.from(
+          "草稿对话首轮附件暗号是 draft-scope-only。",
+          "utf8",
+        ).toString("base64"),
+      }),
+    });
+    assert.equal(draftConversationUpload.status, 200);
+    const draftConversationFile = await draftConversationUpload.json();
+    assert.equal(draftConversationFile.source, "conversation");
+    assert.equal(draftConversationFile.conversationId, "draft-conversation");
+    assert.equal(
+      draftConversationFile.relativePath,
+      "drafts/first-turn/draft-note.txt",
+    );
+
+    const draftConversationChat = await fetch(`${base}/api/chat/stream`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        conversationId: "draft-conversation",
+        userMessageId: "draft-conversation-user",
+        assistantMessageId: "draft-conversation-assistant",
+        prompt: "首轮附件的暗号是什么？",
+        firstTurn: true,
+      }),
+    });
+    assert.equal(draftConversationChat.status, 200);
+    const draftConversationEvents = (await draftConversationChat.text())
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      draftConversationEvents.find((event) => event.type === "meta")?.sources,
+      ["draft-note.txt"],
+    );
+    assert.match(
+      JSON.stringify(providerRequests.at(-1)?.body || {}),
+      /draft-scope-only/,
+    );
+
+    failNextEmbedding = true;
+    const failedUploadResponse = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "retry-library-file",
+        name: "retry.txt",
+        relativePath: "failed/retry.txt",
+        type: "text/plain",
+        collectionId: excludedCollection.id,
+        contentBase64: Buffer.from("索引失败后必须能够重试。", "utf8").toString("base64"),
+      }),
+    });
+    assert.equal(failedUploadResponse.status, 502);
+    const failedUpload = await failedUploadResponse.json();
+    assert.equal(failedUpload.status, "error");
+    assert.equal(failedUpload.failedStage, "embedding");
+    assert.equal(failedUpload.retryable, true);
+    assert.match(failedUpload.error, /Embedding API 返回 503/);
+
+    const failedState = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+    }).then((response) => response.json());
+    assert.equal(
+      failedState.state.files.find((file) => file.id === "retry-library-file")
+        ?.status,
+      "error",
+    );
+
+    const reindexResponse = await fetch(
+      `${base}/api/files/retry-library-file/reindex`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+      },
+    );
+    assert.equal(reindexResponse.status, 200);
+    const reindexed = await reindexResponse.json();
+    assert.equal(reindexed.status, "ready");
+    assert.equal(reindexed.error, undefined);
+
+    const providerRequestsBeforeImage = providerRequests.length;
+    const imageUploadResponse = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "image-library-file",
+        name: "status.png",
+        relativePath: "images/cluster/status.png",
+        type: "image/png",
+        collectionId: excludedCollection.id,
+        contentBase64: Buffer.from("fake-png-image-content", "utf8").toString(
+          "base64",
+        ),
+      }),
+    });
+    assert.equal(imageUploadResponse.status, 200);
+    const indexedImage = await imageUploadResponse.json();
+    assert.equal(indexedImage.status, "ready");
+    assert.equal(indexedImage.relativePath, "images/cluster/status.png");
+    assert.ok(
+      providerRequests
+        .slice(providerRequestsBeforeImage)
+        .some((request) => JSON.stringify(request.body).includes("data:image/png;base64")),
+    );
+
+    failImageExtraction = true;
+    const failedImageUploadResponse = await fetch(`${base}/api/files`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminAccount.deviceToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        id: "image-extraction-failed-file",
+        name: "failed.png",
+        relativePath: "images/failed/failed.png",
+        type: "image/png",
+        collectionId: excludedCollection.id,
+        contentBase64: Buffer.from("fake-failed-image-content", "utf8").toString(
+          "base64",
+        ),
+      }),
+    });
+    failImageExtraction = false;
+    assert.equal(failedImageUploadResponse.status, 502);
+    const failedImageUpload = await failedImageUploadResponse.json();
+    assert.equal(failedImageUpload.status, "error");
+    assert.equal(failedImageUpload.failedStage, "extracting");
+    assert.equal(failedImageUpload.retryable, true);
+    assert.match(failedImageUpload.error, /图片解析接口返回 503/);
+
+    const failedImageState = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+    }).then((response) => response.json());
+    const persistedImageFailure = failedImageState.state.files.find(
+      (file) => file.id === "image-extraction-failed-file",
+    );
+    assert.deepEqual(
+      Object.fromEntries(
+        ["status", "failedStage", "retryable"].map((key) => [
+          key,
+          persistedImageFailure?.[key],
+        ]),
+      ),
+      {
+        status: "error",
+        failedStage: "extracting",
+        retryable: true,
+      },
+    );
+    assert.match(persistedImageFailure?.error || "", /图片解析接口返回 503/);
+    assert.equal(
+      failedImageState.state.files.some(
+        (file) => file.id === "missing-conversation-file",
+      ),
+      false,
+    );
+
+    const reindexImageResponse = await fetch(
+      `${base}/api/files/image-extraction-failed-file/reindex`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+      },
+    );
+    assert.equal(reindexImageResponse.status, 200);
+    const reindexedImage = await reindexImageResponse.json();
+    assert.equal(reindexedImage.status, "ready");
+    assert.equal(reindexedImage.failedStage, undefined);
+
+    const concurrentUploads = await Promise.all(
+      ["a", "b"].map((suffix) =>
+        fetch(`${base}/api/files`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${adminAccount.deviceToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            id: `concurrent-library-${suffix}`,
+            name: `${suffix}.txt`,
+            relativePath: `concurrent/${suffix}.txt`,
+            type: "text/plain",
+            collectionId: excludedCollection.id,
+            contentBase64: Buffer.from(
+              `并发索引文件 ${suffix}`,
+              "utf8",
+            ).toString("base64"),
+          }),
+        }),
+      ),
+    );
+    assert.deepEqual(
+      concurrentUploads.map((response) => response.status),
+      [200, 200],
+    );
+
+    const scopedLibraryRoot = path.join(
+      process.env.EASYWORK_DATA_DIR,
+      "users",
+      adminAccount.actor.id,
+      "library",
+    );
+    assert.match(
+      await readFile(
+        path.join(
+          scopedLibraryRoot,
+          "originals",
+          "conversation-library-file",
+          "notes",
+          "2026",
+          "conversation-note.txt",
+        ),
+        "utf8",
+      ),
+      /conversation-scope-only/,
+    );
+    assert.match(
+      await readFile(
+        path.join(
+          scopedLibraryRoot,
+          "originals",
+          "retry-library-file",
+          "failed",
+          "retry.txt",
+        ),
+        "utf8",
+      ),
+      /能够重试/,
+    );
+    const concurrentIndex = JSON.parse(
+      await readFile(path.join(scopedLibraryRoot, "vector-index.json"), "utf8"),
+    );
+    assert.ok(concurrentIndex.files["concurrent-library-a"]);
+    assert.ok(concurrentIndex.files["concurrent-library-b"]);
+    assert.equal(
+      concurrentIndex.files["conversation-library-file"].relativePath,
+      "notes/2026/conversation-note.txt",
+    );
+    assert.equal(
+      concurrentIndex.files["draft-conversation-file"].relativePath,
+      "drafts/first-turn/draft-note.txt",
+    );
+    assert.equal(
+      concurrentIndex.files["image-library-file"].relativePath,
+      "images/cluster/status.png",
+    );
+    assert.match(
+      concurrentIndex.files["image-library-file"].chunks[0].text,
+      /图片识别文字：GPU 节点状态正常/,
+    );
+    assert.match(
+      concurrentIndex.files["image-extraction-failed-file"].chunks[0].text,
+      /图片识别文字：GPU 节点状态正常/,
+    );
+
+    const deleteConversationFile = await fetch(
+      `${base}/api/files/conversation-library-file`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+      },
+    );
+    assert.equal(deleteConversationFile.status, 200);
+    await assert.rejects(
+      readFile(
+        path.join(
+          scopedLibraryRoot,
+          "originals",
+          "conversation-library-file",
+          "notes",
+          "2026",
+          "conversation-note.txt",
+        ),
+        "utf8",
+      ),
+      (error) => error?.code === "ENOENT",
+    );
+
+    const deleteDraftConversationFile = await fetch(
+      `${base}/api/files/draft-conversation-file`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+      },
+    );
+    assert.equal(deleteDraftConversationFile.status, 200);
+    await assert.rejects(
+      readFile(
+        path.join(
+          scopedLibraryRoot,
+          "originals",
+          "draft-conversation-file",
+          "drafts",
+          "first-turn",
+          "draft-note.txt",
+        ),
+        "utf8",
+      ),
+      (error) => error?.code === "ENOENT",
+    );
+
+    const deleteExcludedCollection = await fetch(
+      `${base}/api/file-collections/${excludedCollection.id}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+      },
+    );
+    assert.equal(deleteExcludedCollection.status, 200);
+    assert.equal((await deleteExcludedCollection.json()).deletedFiles, 6);
+    await assert.rejects(
+      readFile(
+        path.join(
+          scopedLibraryRoot,
+          "originals",
+          "retry-library-file",
+          "failed",
+          "retry.txt",
+        ),
+        "utf8",
+      ),
+      (error) => error?.code === "ENOENT",
+    );
+
+    const adminLibraryRoot = path.join(
+      process.env.EASYWORK_DATA_DIR,
+      "users",
+      adminAccount.actor.id,
+      "library",
+    );
+    const ordinaryLibraryRoot = path.join(
+      process.env.EASYWORK_DATA_DIR,
+      "users",
+      secondAccount.actor.id,
+      "library",
+    );
+    const adminIndexSource = await readFile(
+      path.join(adminLibraryRoot, "vector-index.json"),
+      "utf8",
+    );
+    const ordinaryIndexSource = await readFile(
+      path.join(ordinaryLibraryRoot, "vector-index.json"),
+      "utf8",
+    );
+    assert.match(adminIndexSource, /管理员自己的集群资料/);
+    assert.doesNotMatch(adminIndexSource, /普通用户自己的文件资料/);
+    assert.match(ordinaryIndexSource, /普通用户自己的文件资料/);
+    assert.doesNotMatch(ordinaryIndexSource, /管理员自己的集群资料/);
+    assert.equal(JSON.parse(adminIndexSource).version, 3);
+    assert.equal(JSON.parse(ordinaryIndexSource).version, 3);
+    assert.match(
+      await readFile(
+        path.join(
+          adminLibraryRoot,
+          "originals",
+          "admin-library-file",
+          "资料",
+          "same-name.txt",
+        ),
+        "utf8",
+      ),
+      /管理员自己的集群资料/,
+    );
+    assert.match(
+      await readFile(
+        path.join(
+          ordinaryLibraryRoot,
+          "originals",
+          "ordinary-library-file",
+          "archive",
+          "same-name.txt",
+        ),
+        "utf8",
+      ),
+      /普通用户自己的文件资料/,
+    );
+
+    const adminLibraryState = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${adminAccount.deviceToken}` },
+    }).then((response) => response.json());
+    const ordinaryLibraryState = await fetch(`${base}/api/bootstrap`, {
+      headers: { Authorization: `Bearer ${secondAccount.deviceToken}` },
+    }).then((response) => response.json());
+    assert.deepEqual(
+      adminLibraryState.state.files.map((file) => file.id),
+      ["admin-library-file"],
+    );
+    assert.deepEqual(
+      adminLibraryState.state.libraryCollections.map((collection) => collection.id),
+      [adminCollection.id],
+    );
+    assert.deepEqual(
+      ordinaryLibraryState.state.files.map((file) => file.id),
+      ["ordinary-library-file"],
+    );
+    assert.deepEqual(
+      ordinaryLibraryState.state.libraryCollections.map(
+        (collection) => collection.id,
+      ),
+      [ordinaryCollection.id],
+    );
+    assert.equal(
+      adminLibraryState.state.files[0].collectionId,
+      adminCollection.id,
+    );
+    assert.equal(
+      ordinaryLibraryState.state.files[0].collectionId,
+      ordinaryCollection.id,
+    );
+
     const forbiddenOverview = await fetch(`${base}/api/admin/overview`, {
       headers: { Authorization: `Bearer ${secondAccount.deviceToken}` },
     });
@@ -3798,6 +4580,8 @@ test("gateway detects models, auto-selects a compatible chat protocol, and permi
     assert.doesNotMatch(platformSecretsSource, /platform-(?:web|agent|embedding)-secret/);
 
   } finally {
+    server.closeAllConnections?.();
+    providerServer.closeAllConnections?.();
     await Promise.all([
       new Promise((resolve) => server.close(resolve)),
       new Promise((resolve) => providerServer.close(resolve)),

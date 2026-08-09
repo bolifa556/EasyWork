@@ -3,6 +3,7 @@ import https from "node:https";
 import net from "node:net";
 import crypto from "node:crypto";
 import path from "node:path";
+import { lookup as dnsLookup } from "node:dns/promises";
 import {
   access,
   chmod,
@@ -82,6 +83,7 @@ const EASYWORK_OPENCODE_PROVIDER_ID = "easywork";
 const DEFAULT_PROVIDER_ID = "provider-default";
 const DEFAULT_AGENT_CONTEXT_LIMIT = 200_000;
 const DEFAULT_AGENT_OUTPUT_LIMIT = 32_768;
+const LIBRARY_INDEX_VERSION = 3;
 const BUILTIN_SKILLS = {
   skill_cluster: path.join(SKILL_ROOT, "built-in", "cluster-ops"),
   skill_paper: path.join(SKILL_ROOT, "built-in", "paper-reading"),
@@ -144,7 +146,6 @@ const DEFAULT_PLATFORM_SETTINGS = Object.freeze({
     chunkOverlap: 600,
     batchSize: 32,
     hybridEnabled: true,
-    rerankEnabled: false,
   },
   ssh: {
     idleTtlMinutes: 30 * 24 * 60,
@@ -152,6 +153,13 @@ const DEFAULT_PLATFORM_SETTINGS = Object.freeze({
     keepaliveCountMax: 3,
     connectTimeoutSeconds: 25,
     cleanupIntervalMinutes: 6 * 60,
+    allowedCidrs: [],
+    blockedCidrs: [],
+    allowedPorts: [],
+    maxConnectionsPerUser: 8,
+    maxTotalConnections: 128,
+    allowKeyAuth: true,
+    allowPasswordAuth: true,
   },
 });
 
@@ -254,6 +262,44 @@ function safeRelativePath(value) {
     .filter(Boolean)
     .filter((part) => part !== "." && part !== "..")
     .map((part) => safeSegment(part));
+  return parts.join("/");
+}
+
+function validatedLibraryRelativePath(value, fallback = "upload.bin") {
+  const source = String(value || fallback)
+    .normalize("NFKC")
+    .replaceAll("\\", "/");
+  if (
+    !source ||
+    source.length > 1_024 ||
+    source.startsWith("/") ||
+    /^[a-z]:(?:\/|$)/i.test(source) ||
+    source.includes("\0")
+  ) {
+    const error = new Error("文件相对路径无效");
+    error.statusCode = 400;
+    throw error;
+  }
+  const parts = source.split("/");
+  const windowsReservedName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+  if (
+    !parts.length ||
+    parts.some(
+      (part) =>
+        !part ||
+        part === "." ||
+        part === ".." ||
+        part !== part.trim() ||
+        part.length > 180 ||
+        /[\u0000-\u001f<>:"|?*]/u.test(part) ||
+        /[. ]$/u.test(part) ||
+        windowsReservedName.test(part),
+    )
+  ) {
+    const error = new Error("文件相对路径无效");
+    error.statusCode = 400;
+    throw error;
+  }
   return parts.join("/");
 }
 
@@ -595,6 +641,34 @@ function clampNumber(value, fallback, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, parsed));
 }
 
+function normalizeStringList(value, limit = 128) {
+  const source = Array.isArray(value)
+    ? value
+    : String(value || "").split(/[\n,;]+/);
+  return [...new Set(source.map((item) => String(item).trim()).filter(Boolean))].slice(
+    0,
+    limit,
+  );
+}
+
+function normalizeCidrList(value) {
+  return normalizeStringList(value).filter((entry) => {
+    const [address, prefixText] = entry.split("/");
+    const family = net.isIP(address);
+    if (!family) return false;
+    if (prefixText === undefined) return true;
+    const prefix = Number(prefixText);
+    return Number.isInteger(prefix) && prefix >= 0 && prefix <= (family === 4 ? 32 : 128);
+  });
+}
+
+function normalizePortList(value) {
+  return normalizeStringList(value)
+    .map(Number)
+    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535)
+    .slice(0, 128);
+}
+
 function normalizePlatformProvider(value = {}, audience = "web") {
   const id = audience === "agent"
     ? PLATFORM_AGENT_PROVIDER_ID
@@ -655,7 +729,6 @@ function normalizePlatformSettings(value = {}) {
         clampNumber(embedding.batchSize, defaults.embedding.batchSize, 1, 128),
       ),
       hybridEnabled: embedding.hybridEnabled !== false,
-      rerankEnabled: Boolean(embedding.rerankEnabled),
     },
     ssh: {
       idleTtlMinutes: Math.round(
@@ -698,6 +771,27 @@ function normalizePlatformSettings(value = {}) {
           24 * 60,
         ),
       ),
+      allowedCidrs: normalizeCidrList(ssh.allowedCidrs),
+      blockedCidrs: normalizeCidrList(ssh.blockedCidrs),
+      allowedPorts: normalizePortList(ssh.allowedPorts),
+      maxConnectionsPerUser: Math.round(
+        clampNumber(
+          ssh.maxConnectionsPerUser,
+          defaults.ssh.maxConnectionsPerUser,
+          1,
+          128,
+        ),
+      ),
+      maxTotalConnections: Math.round(
+        clampNumber(
+          ssh.maxTotalConnections,
+          defaults.ssh.maxTotalConnections,
+          1,
+          4096,
+        ),
+      ),
+      allowKeyAuth: ssh.allowKeyAuth !== false,
+      allowPasswordAuth: ssh.allowPasswordAuth !== false,
     },
   };
 }
@@ -1278,8 +1372,8 @@ function actorCredentialPath(actor, name) {
   );
 }
 
-function actorAttachmentPath(actor, ...segments) {
-  return path.join(actorDirectory(actor), "attachments", ...segments);
+function actorLibraryPath(actor, ...segments) {
+  return path.join(actorDirectory(actor), "library", ...segments);
 }
 
 async function readCheckpointDocument(actor) {
@@ -1989,12 +2083,13 @@ async function updateSecrets(actor, patch) {
 }
 
 async function getState(actor) {
-  const [settings, projects, conversations, skills, files] = await Promise.all([
+  const [settings, projects, conversations, skills, files, libraryCollections] = await Promise.all([
     readJson(actorStatePath(actor, "settings"), {}),
     readJson(actorStatePath(actor, "projects"), []),
     readJson(path.join(actorDirectory(actor), "conversations", "index.json"), []),
     readJson(actorStatePath(actor, "skills"), []),
-    readJson(actorAttachmentPath(actor, "files.json"), []),
+    readJson(actorLibraryPath(actor, "files.json"), []),
+    readJson(actorLibraryPath(actor, "collections.json"), []),
   ]);
   return {
     settings: normalizeProviderSettings(settings),
@@ -2002,6 +2097,7 @@ async function getState(actor) {
     conversations,
     skills,
     files,
+    libraryCollections,
   };
 }
 
@@ -2079,7 +2175,11 @@ async function saveState(actor, state) {
       safeState.conversations || [],
     ),
     writeJson(actorStatePath(actor, "skills"), safeState.skills || []),
-    writeJson(actorAttachmentPath(actor, "files.json"), safeState.files || []),
+    writeJson(actorLibraryPath(actor, "files.json"), safeState.files || []),
+    writeJson(
+      actorLibraryPath(actor, "collections.json"),
+      safeState.libraryCollections || [],
+    ),
   ]);
   delete safeState.memories;
   delete safeState.memorySummary;
@@ -2232,6 +2332,40 @@ async function stateForClient(actor) {
   state.settings.activeProviderId = activeProvider.id;
   const embeddingAccess = await platformEmbeddingAccess();
   state.settings.embedding = embeddingAccess.config;
+  const libraryIndex = await readLibraryIndex(actor);
+  const currentLibraryFingerprint = embeddingAccess.config.configured
+    ? embeddingFingerprint(embeddingAccess.config)
+    : "";
+  state.files = (Array.isArray(state.files) ? state.files : []).map((file) => {
+    const indexed = libraryIndex.files?.[safeSegment(file.id)];
+    if (file.status === "indexing" || file.status === "error") {
+      return {
+        ...file,
+        chunks: Number(file.chunks || 0),
+        relativePath: file.relativePath || indexed?.relativePath || file.name,
+      };
+    }
+    if (!indexed) {
+      return {
+        ...file,
+        chunks: 0,
+        status: "error",
+        error: "该文件没有可用的向量索引，请重新上传",
+      };
+    }
+    const stale = indexed.embeddingFingerprint !== currentLibraryFingerprint;
+    return {
+      ...file,
+      size: Number(file.size || indexed.size || 0),
+      type: file.type || indexed.type || "application/octet-stream",
+      relativePath: file.relativePath || indexed.relativePath || file.name,
+      chunks: indexed.chunks?.length || 0,
+      status: stale ? "stale" : "ready",
+      embeddingModel: indexed.embeddingModel,
+      indexedAt: indexed.indexedAt,
+      error: stale ? "Embedding 或分块配置已变化，请重新上传" : undefined,
+    };
+  });
   if (Array.isArray(state?.settings?.servers)) {
     state.settings.servers = state.settings.servers.map((profile) => ({
       ...profile,
@@ -2332,7 +2466,77 @@ async function parseJsonBody(req) {
   }
 }
 
-async function extractText(buffer, filename, mime = "") {
+async function extractImageText(actor, buffer, filename, mime) {
+  const state = await getState(actor);
+  const { provider, apiKey } = await effectiveProviderAccess(
+    actor,
+    state.settings,
+    state.settings?.activeProviderId,
+  );
+  if (!provider?.configured || !apiKey) {
+    const error = new Error("图片解析需要可用的网页对话模型 API");
+    error.statusCode = 503;
+    throw error;
+  }
+  const imageUrl = `data:${mime || "image/png"};base64,${buffer.toString("base64")}`;
+  const prompt = `请提取图片“${filename}”中的文字、表格信息与关键视觉内容。保持事实准确，按便于检索的纯文本输出，不要添加寒暄。`;
+  const protocols =
+    provider.protocol === "responses" || provider.protocol === "chat-completions"
+      ? [provider.protocol]
+      : ["responses", "chat-completions"];
+  let lastError;
+  for (const protocol of protocols) {
+    const endpoint = protocol === "responses" ? "responses" : "chat/completions";
+    const body =
+      protocol === "responses"
+        ? {
+            model: provider.model,
+            input: [{
+              role: "user",
+              content: [
+                { type: "input_text", text: prompt },
+                { type: "input_image", image_url: imageUrl },
+              ],
+            }],
+          }
+        : {
+            model: provider.model,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                { type: "image_url", image_url: { url: imageUrl } },
+              ],
+            }],
+          };
+    const response = await fetch(apiUrl(provider.baseUrl, endpoint), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (response.ok) {
+      const payload = await response.json();
+      const text = extractModelText(payload).trim();
+      if (text) return text;
+      lastError = new Error("图片模型未返回可索引文本");
+      continue;
+    }
+    const diagnostic = (await response.text()).slice(0, 240);
+    lastError = new Error(
+      `图片解析接口返回 ${response.status}${diagnostic ? `：${diagnostic}` : ""}`,
+    );
+    if ([401, 403, 429].includes(response.status)) break;
+  }
+  lastError ||= new Error("图片解析失败");
+  lastError.statusCode = 502;
+  throw lastError;
+}
+
+async function extractText(buffer, filename, mime = "", actor) {
   const extension = path.extname(filename).toLowerCase();
   if (
     mime.startsWith("text/") ||
@@ -2354,6 +2558,12 @@ async function extractText(buffer, filename, mime = "") {
     } finally {
       await parser.destroy();
     }
+  }
+  if (
+    mime.startsWith("image/") ||
+    [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"].includes(extension)
+  ) {
+    return extractImageText(actor, buffer, filename, mime);
   }
   return "";
 }
@@ -2495,23 +2705,106 @@ async function callEmbedding(config, apiKey, inputs) {
     signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) {
-    throw new Error(`Embedding API 返回 ${response.status}`);
+    const diagnostic = (await response.text()).slice(0, 240);
+    const error = new Error(
+      `Embedding API 返回 ${response.status}${diagnostic ? `：${diagnostic}` : ""}`,
+    );
+    error.statusCode = 502;
+    throw error;
   }
   const result = await response.json();
-  return Array.isArray(result.data) ? result.data.map((item) => item.embedding) : [];
+  const data = Array.isArray(result.data) ? [...result.data] : [];
+  data.sort((left, right) => Number(left?.index || 0) - Number(right?.index || 0));
+  const vectors = data.map((item) => item?.embedding);
+  if (
+    vectors.length !== list.length ||
+    vectors.some(
+      (vector) =>
+        !Array.isArray(vector) ||
+        !vector.length ||
+        vector.some((value) => !Number.isFinite(Number(value))),
+    )
+  ) {
+    const error = new Error("Embedding API 返回了无效向量");
+    error.statusCode = 502;
+    throw error;
+  }
+  const returnedDimensions = vectors[0].length;
+  if (vectors.some((vector) => vector.length !== returnedDimensions)) {
+    const error = new Error("Embedding API 返回的向量维度不一致");
+    error.statusCode = 502;
+    throw error;
+  }
+  return vectors;
 }
 
-async function indexLibraryFile(actor, item, buffer) {
-  const text = await extractText(buffer, item.name, item.type);
+function embeddingFingerprint(embedding) {
+  return crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        baseUrl: String(embedding.baseUrl || "").replace(/\/+$/, ""),
+        model: embedding.model,
+        dimensions: embedding.dimensions || "auto",
+        chunkStrategy: embedding.chunkStrategy,
+        chunkSize: embedding.chunkSize,
+        chunkOverlap: embedding.chunkOverlap,
+      }),
+    )
+    .digest("hex");
+}
+
+function emptyLibraryIndex() {
+  return { version: LIBRARY_INDEX_VERSION, files: {} };
+}
+
+async function readLibraryIndex(actor) {
+  const stored = await readJson(
+    actorLibraryPath(actor, "vector-index.json"),
+    emptyLibraryIndex(),
+  );
+  return stored?.version === LIBRARY_INDEX_VERSION && stored?.files
+    ? stored
+    : emptyLibraryIndex();
+}
+
+async function buildLibraryIndexEntry(actor, item, buffer) {
   const { config: embedding, apiKey } = await platformEmbeddingAccess();
+  if (!embedding.configured || !apiKey) {
+    const error = new Error("文件库暂不可用：Embedding 尚未配置");
+    error.statusCode = 503;
+    error.failedStage = "embedding";
+    throw error;
+  }
+  let text;
+  try {
+    text = await extractText(buffer, item.name, item.type, actor);
+  } catch (caught) {
+    if (caught && typeof caught === "object" && !caught.failedStage) {
+      caught.failedStage = "extracting";
+    }
+    throw caught;
+  }
+  if (!String(text || "").trim()) {
+    const error = new Error("无法从该文件中提取可索引的文本");
+    error.statusCode = 422;
+    error.failedStage = "extracting";
+    throw error;
+  }
   const textChunks = chunksFromText(
     text,
     embedding.chunkSize,
     embedding.chunkOverlap,
     embedding.chunkStrategy,
   );
-  let vectors = [];
-  if (embedding.configured && apiKey && textChunks.length) {
+  if (!textChunks.length) {
+    const error = new Error("文件内容为空，无法建立索引");
+    error.statusCode = 422;
+    error.failedStage = "chunking";
+    throw error;
+  }
+  const vectors = [];
+  try {
     for (let offset = 0; offset < textChunks.length; offset += embedding.batchSize) {
       const batch = textChunks.slice(offset, offset + embedding.batchSize);
       vectors.push(...(await callEmbedding(embedding, apiKey, batch)));
@@ -2519,25 +2812,170 @@ async function indexLibraryFile(actor, item, buffer) {
         inputTokens: estimateContextTokens(batch.join("\n")),
       }).catch(() => undefined);
     }
+  } catch (caught) {
+    if (caught && typeof caught === "object" && !caught.failedStage) {
+      caught.failedStage = "embedding";
+    }
+    throw caught;
   }
-  const indexPath = actorAttachmentPath(actor, "library-index.json");
-  const index = await readJson(indexPath, { version: 1, files: {} });
-  index.files[item.id] = {
+  const indexedAt = isoNow();
+  return {
     id: item.id,
     name: item.name,
     type: item.type,
-    updatedAt: isoNow(),
+    size: Number(item.size || buffer.length),
+    relativePath: item.relativePath,
+    collectionId: item.collectionId || undefined,
+    projectId: item.projectId || undefined,
+    conversationId: item.conversationId || undefined,
+    source: item.source,
+    sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
+    updatedAt: indexedAt,
+    indexedAt,
+    embeddingModel: embedding.model,
+    embeddingDimensions: vectors[0]?.length || 0,
+    embeddingFingerprint: embeddingFingerprint(embedding),
+    chunkStrategy: embedding.chunkStrategy,
+    chunkSize: embedding.chunkSize,
+    chunkOverlap: embedding.chunkOverlap,
     chunks: textChunks.map((chunk, indexValue) => ({
       id: `${item.id}:${indexValue}`,
       text: chunk,
-      vector: vectors[indexValue] || undefined,
+      vector: vectors[indexValue],
     })),
   };
-  await writeJson(indexPath, index);
+}
+
+async function indexLibraryFile(actor, item, buffer) {
+  const entry = await buildLibraryIndexEntry(actor, item, buffer);
+  await enqueueActorMutation(actorMutationQueues, actor, async () => {
+    const state = await getState(actor);
+    if (!(state.files || []).some((file) => file.id === item.id)) {
+      const error = new Error("文件已被删除，索引结果未保存");
+      error.statusCode = 409;
+      error.failedStage = "indexing";
+      throw error;
+    }
+    const indexPath = actorLibraryPath(actor, "vector-index.json");
+    const index = await readLibraryIndex(actor);
+    index.files[item.id] = entry;
+    await writeJson(indexPath, index);
+  });
   return {
-    chunks: textChunks.length,
-    status: vectors.length ? "ready" : "keyword-only",
+    chunks: entry.chunks.length,
+    status: "ready",
+    indexedAt: entry.indexedAt,
+    embeddingModel: entry.embeddingModel,
   };
+}
+
+async function removeLibraryFileStorage(actor, id) {
+  const safeId = safeSegment(id);
+  await enqueueActorMutation(actorMutationQueues, actor, async () => {
+    await rm(actorLibraryPath(actor, "originals", safeId), {
+      recursive: true,
+      force: true,
+    });
+    const indexPath = actorLibraryPath(actor, "vector-index.json");
+    const index = await readLibraryIndex(actor);
+    delete index.files?.[safeId];
+    await writeJson(indexPath, index);
+  });
+}
+
+function libraryOriginalLocation(actor, file) {
+  const id = safeSegment(file.id);
+  const relativePath = validatedLibraryRelativePath(
+    file.relativePath || file.name,
+    file.name || "upload.bin",
+  );
+  const root = path.resolve(actorLibraryPath(actor, "originals", id));
+  const target = path.resolve(root, ...relativePath.split("/"));
+  if (!target.startsWith(`${root}${path.sep}`)) {
+    const error = new Error("文件相对路径无效");
+    error.statusCode = 400;
+    throw error;
+  }
+  return { root, target, relativePath };
+}
+
+function libraryIndexFailureMetadata(metadata, caught, fallbackStage = "indexing") {
+  const error = caught instanceof Error ? caught.message : "文件索引失败";
+  const statusCode = Number(caught?.statusCode || 500);
+  return {
+    ...metadata,
+    status: "error",
+    chunks: 0,
+    error,
+    failedStage: String(caught?.failedStage || fallbackStage),
+    retryable: statusCode >= 500 || String(caught?.failedStage || "") === "embedding",
+    updatedAt: isoNow(),
+  };
+}
+
+async function storeLibraryFileMetadata(actor, metadata, { create = false } = {}) {
+  let stored = null;
+  await updateState(actor, (state) => {
+    const files = Array.isArray(state.files) ? state.files : [];
+    if (create) {
+      state.files = [metadata, ...files.filter((file) => file.id !== metadata.id)];
+      stored = metadata;
+    } else {
+      state.files = files.map((file) => {
+        if (file.id !== metadata.id) return file;
+        stored = { ...file, ...metadata };
+        return stored;
+      });
+    }
+    if (stored?.collectionId) {
+      state.libraryCollections = (state.libraryCollections || []).map(
+        (collection) =>
+          collection.id === stored.collectionId
+            ? { ...collection, updatedAt: stored.updatedAt }
+            : collection,
+      );
+    }
+    return state;
+  });
+  return stored;
+}
+
+async function removeLibraryIndexEntry(actor, id) {
+  const safeId = safeSegment(id);
+  await enqueueActorMutation(actorMutationQueues, actor, async () => {
+    const indexPath = actorLibraryPath(actor, "vector-index.json");
+    const index = await readLibraryIndex(actor);
+    delete index.files?.[safeId];
+    await writeJson(indexPath, index);
+  });
+}
+
+async function runLibraryIndexing(actor, metadata, buffer) {
+  try {
+    const result = await indexLibraryFile(actor, metadata, buffer);
+    const ready = {
+      ...metadata,
+      status: "ready",
+      chunks: result.chunks,
+      embeddingModel: result.embeddingModel,
+      indexedAt: result.indexedAt,
+      updatedAt: result.indexedAt,
+      error: undefined,
+      failedStage: undefined,
+      retryable: undefined,
+    };
+    return {
+      metadata: (await storeLibraryFileMetadata(actor, ready)) || ready,
+      statusCode: 200,
+    };
+  } catch (caught) {
+    await removeLibraryIndexEntry(actor, metadata.id).catch(() => undefined);
+    const failed = libraryIndexFailureMetadata(metadata, caught);
+    return {
+      metadata: (await storeLibraryFileMetadata(actor, failed)) || failed,
+      statusCode: Number(caught?.statusCode || 500),
+    };
+  }
 }
 
 function tokenize(value) {
@@ -2566,14 +3004,47 @@ function cosine(left, right) {
   return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
 }
 
-async function retrieveKnowledge(actor, query, state, limit = 6) {
-  const index = await readJson(actorAttachmentPath(actor, "library-index.json"), {
-    files: {},
-  });
+async function retrieveKnowledge(
+  actor,
+  query,
+  state,
+  limit = 6,
+  projectId = "",
+  collectionIds = [],
+  conversationId = "",
+) {
+  const index = await readLibraryIndex(actor);
+  const { config: embedding, apiKey } = await platformEmbeddingAccess();
+  if (!embedding.configured || !apiKey) return [];
+  const currentFingerprint = embeddingFingerprint(embedding);
+  const project = projectId
+    ? (state.projects || []).find((item) => item.id === projectId)
+    : null;
+  const selectedCollectionIds = new Set([
+    ...(Array.isArray(collectionIds) ? collectionIds : []),
+    ...(Array.isArray(project?.libraryCollectionIds)
+      ? project.libraryCollectionIds
+      : []),
+  ]);
+  const allowedFileIds = new Set(
+    (state.files || [])
+      .filter(
+        (file) =>
+          file.status === "ready" &&
+          ((file.collectionId && selectedCollectionIds.has(file.collectionId)) ||
+            (projectId && file.projectId === projectId) ||
+            (conversationId && file.conversationId === conversationId)),
+      )
+      .map((file) => file.id),
+  );
+  if (!allowedFileIds.size) return [];
   const terms = tokenize(query);
   const rows = [];
   for (const file of Object.values(index.files || {})) {
+    if (file.embeddingFingerprint !== currentFingerprint) continue;
+    if (!allowedFileIds.has(file.id)) continue;
     for (const chunk of file.chunks || []) {
+      if (!Array.isArray(chunk.vector) || !chunk.vector.length) continue;
       const tokens = tokenize(chunk.text);
       rows.push({
         file: file.name,
@@ -2615,27 +3086,19 @@ async function retrieveKnowledge(actor, query, state, limit = 6) {
       return score + inverseDocumentFrequency * ((frequency * (k1 + 1)) / normalization);
     }, 0);
   }
-  const { config: embedding, apiKey } = await platformEmbeddingAccess();
-  if (
-    embedding.hybridEnabled &&
-    embedding.configured &&
-    apiKey &&
-    rows.some((row) => row.chunk.vector)
-  ) {
-    try {
-      const [queryVector] = await callEmbedding(embedding, apiKey, query);
-      await recordPlatformUsage("embedding", {
-        inputTokens: estimateContextTokens(query),
-      }).catch(() => undefined);
-      for (const row of rows) row.semanticScore = cosine(queryVector, row.chunk.vector);
-    } catch {
-      // Keyword retrieval remains available when the embedding endpoint is temporarily down.
-    }
-  }
+  if (!rows.length) return [];
+  const [queryVector] = await callEmbedding(embedding, apiKey, query);
+  await recordPlatformUsage("embedding", {
+    inputTokens: estimateContextTokens(query),
+  }).catch(() => undefined);
+  for (const row of rows) row.semanticScore = cosine(queryVector, row.chunk.vector);
   const keywordRanking = [...rows].sort((a, b) => b.keywordScore - a.keywordScore);
   const semanticRanking = [...rows].sort((a, b) => b.semanticScore - a.semanticScore);
   const rrf = new Map();
-  for (const ranking of [keywordRanking, semanticRanking]) {
+  const rankings = embedding.hybridEnabled
+    ? [semanticRanking, keywordRanking]
+    : [semanticRanking];
+  for (const ranking of rankings) {
     ranking.forEach((row, indexValue) => {
       const key = row.chunk.id;
       rrf.set(key, (rrf.get(key) || 0) + 1 / (60 + indexValue + 1));
@@ -2643,21 +3106,9 @@ async function retrieveKnowledge(actor, query, state, limit = 6) {
   }
   const ranked = rows
     .map((row) => ({ ...row, score: rrf.get(row.chunk.id) || 0 }))
-    .filter((row) => row.keywordScore > 0 || row.semanticScore > 0.15)
+    .filter((row) => row.semanticScore > 0.12)
     .sort((a, b) => b.score - a.score)
     .slice(0, Math.max(limit, 20));
-  if (embedding.rerankEnabled) {
-    const normalizedQuery = String(query).toLowerCase().replace(/\s+/g, " ").trim();
-    for (const row of ranked) {
-      const normalizedText = String(row.chunk.text).toLowerCase();
-      const exactBoost = normalizedQuery && normalizedText.includes(normalizedQuery) ? 0.08 : 0;
-      row.score +=
-        exactBoost +
-        Math.min(row.keywordScore / 100, 0.05) +
-        Math.max(row.semanticScore, 0) * 0.04;
-    }
-    ranked.sort((a, b) => b.score - a.score);
-  }
   return ranked.slice(0, limit);
 }
 
@@ -3172,6 +3623,7 @@ async function buildContext({
   prompt,
   skillIds,
   projectId,
+  libraryCollectionIds = [],
   memoryMode,
   conversationId,
   currentUserMessageId,
@@ -3225,7 +3677,22 @@ async function buildContext({
     conversationId,
     currentUserMessageId,
   );
-  const knowledge = await retrieveKnowledge(actor, prompt, state).catch(() => []);
+  const knowledge = await retrieveKnowledge(
+    actor,
+    prompt,
+    state,
+    6,
+    projectId,
+    libraryCollectionIds,
+    conversationId,
+  ).catch((caught) => {
+    console.warn(
+      `[EasyWork Library] retrieval skipped: ${
+        caught instanceof Error ? caught.message : "unknown error"
+      }`,
+    );
+    return [];
+  });
   const knowledgeText = (
     await Promise.all(
       knowledge.map((item, indexValue) =>
@@ -3698,6 +4165,9 @@ async function persistChatTurnStart(actor, body, fallbackTitle) {
         title: fallbackTitle || "新对话",
         mode: "chat",
         projectId: body.projectId ? String(body.projectId) : undefined,
+        libraryCollectionIds: Array.isArray(body.libraryCollectionIds)
+          ? body.libraryCollectionIds.map(String)
+          : [],
         messages: [],
         updatedAt: createdAt,
       };
@@ -3707,6 +4177,9 @@ async function persistChatTurnStart(actor, body, fallbackTitle) {
     conversation.projectId ||= body.projectId
       ? String(body.projectId)
       : undefined;
+    conversation.libraryCollectionIds = Array.isArray(body.libraryCollectionIds)
+      ? body.libraryCollectionIds.map(String)
+      : conversation.libraryCollectionIds || [];
     conversation.updatedAt = createdAt;
     conversation.messages = Array.isArray(conversation.messages)
       ? conversation.messages
@@ -3722,6 +4195,9 @@ async function persistChatTurnStart(actor, body, fallbackTitle) {
         createdAt,
         mode: "chat",
         selectedSkills: Array.isArray(body.skillIds) ? body.skillIds : [],
+        selectedLibraryCollectionIds: Array.isArray(body.libraryCollectionIds)
+          ? body.libraryCollectionIds.map(String)
+          : [],
       });
     }
     if (
@@ -4250,6 +4726,28 @@ async function handleHttp(req, res) {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/api/admin/providers/key") {
+      const actor = await resolveActor(req, res);
+      await requireAdmin(actor);
+      const category = ["web", "agent", "embedding"].includes(
+        url.searchParams.get("category"),
+      )
+        ? url.searchParams.get("category")
+        : "web";
+      const secrets = await readPlatformSecrets();
+      res.setHeader("Cache-Control", "no-store");
+      sendJson(res, 200, {
+        category,
+        apiKey:
+          category === "embedding"
+            ? secrets.embeddingApiKey
+            : category === "agent"
+              ? secrets.agentApiKey
+              : secrets.webApiKey,
+      });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/admin/ssh/disconnect") {
       const actor = await resolveActor(req, res);
       await requireAdmin(actor);
@@ -4521,6 +5019,11 @@ async function handleHttp(req, res) {
           nextState.conversations,
           tombstones,
         );
+        // File collections and indexed files are mutated through their own
+        // endpoints. A stale browser tab must not erase an upload or restore
+        // metadata for a file that was deleted elsewhere.
+        nextState.libraryCollections = storedState?.libraryCollections || [];
+        nextState.files = storedState?.files || [];
         return nextState;
       });
       const worker = sshWorkerPool.get(sshWorkerKey(actor));
@@ -5962,45 +6465,279 @@ async function handleHttp(req, res) {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/file-collections") {
+      const actor = await resolveActor(req, res);
+      const body = await parseJsonBody(req);
+      const name = String(body.name || "").trim().slice(0, 80);
+      if (!name) {
+        sendJson(res, 400, { error: "文件集名称不能为空" });
+        return;
+      }
+      let collection;
+      await updateState(actor, (state) => {
+        state.libraryCollections = Array.isArray(state.libraryCollections)
+          ? state.libraryCollections
+          : [];
+        if (
+          state.libraryCollections.some(
+            (item) => String(item.name || "").toLowerCase() === name.toLowerCase(),
+          )
+        ) {
+          const error = new Error("已有同名文件集");
+          error.statusCode = 409;
+          throw error;
+        }
+        collection = {
+          id: safeSegment(randomId("collection-")),
+          name,
+          createdAt: isoNow(),
+          updatedAt: isoNow(),
+        };
+        state.libraryCollections.unshift(collection);
+        return state;
+      });
+      sendJson(res, 200, { collection });
+      return;
+    }
+
+    if (
+      req.method === "PUT" &&
+      url.pathname.startsWith("/api/file-collections/")
+    ) {
+      const actor = await resolveActor(req, res);
+      const id = safeSegment(
+        decodeURIComponent(url.pathname.slice("/api/file-collections/".length)),
+      );
+      const body = await parseJsonBody(req);
+      const name = String(body.name || "").trim().slice(0, 80);
+      if (!name) {
+        sendJson(res, 400, { error: "文件集名称不能为空" });
+        return;
+      }
+      let collection;
+      await updateState(actor, (state) => {
+        const collections = Array.isArray(state.libraryCollections)
+          ? state.libraryCollections
+          : [];
+        if (
+          collections.some(
+            (item) =>
+              item.id !== id &&
+              String(item.name || "").toLowerCase() === name.toLowerCase(),
+          )
+        ) {
+          const error = new Error("已有同名文件集");
+          error.statusCode = 409;
+          throw error;
+        }
+        const current = collections.find((item) => item.id === id);
+        if (!current) {
+          const error = new Error("文件集不存在");
+          error.statusCode = 404;
+          throw error;
+        }
+        collection = { ...current, name, updatedAt: isoNow() };
+        state.libraryCollections = collections.map((item) =>
+          item.id === id ? collection : item,
+        );
+        return state;
+      });
+      sendJson(res, 200, { collection });
+      return;
+    }
+
+    if (
+      req.method === "DELETE" &&
+      url.pathname.startsWith("/api/file-collections/")
+    ) {
+      const actor = await resolveActor(req, res);
+      const id = safeSegment(
+        decodeURIComponent(url.pathname.slice("/api/file-collections/".length)),
+      );
+      const state = await getState(actor);
+      const collection = (state.libraryCollections || []).find(
+        (item) => item.id === id,
+      );
+      if (!collection) {
+        sendJson(res, 404, { error: "文件集不存在" });
+        return;
+      }
+      const fileIds = (state.files || [])
+        .filter((file) => file.collectionId === id)
+        .map((file) => file.id);
+      for (const fileId of fileIds) {
+        await removeLibraryFileStorage(actor, fileId);
+      }
+      await updateState(actor, (current) => {
+        current.libraryCollections = (current.libraryCollections || []).filter(
+          (item) => item.id !== id,
+        );
+        current.files = (current.files || []).filter(
+          (file) => file.collectionId !== id,
+        );
+        current.projects = (current.projects || []).map((project) => ({
+          ...project,
+          libraryCollectionIds: (project.libraryCollectionIds || []).filter(
+            (collectionId) => collectionId !== id,
+          ),
+        }));
+        current.conversations = (current.conversations || []).map(
+          (conversation) => ({
+            ...conversation,
+            libraryCollectionIds: (
+              conversation.libraryCollectionIds || []
+            ).filter((collectionId) => collectionId !== id),
+          }),
+        );
+        return current;
+      });
+      sendJson(res, 200, { ok: true, deletedFiles: fileIds.length });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/files") {
       const actor = await resolveActor(req, res);
       const body = await parseJsonBody(req);
       const id = safeSegment(body.id || randomId("file_"));
-      const name = safeSegment(body.name || "upload.bin");
       const buffer = Buffer.from(String(body.contentBase64 || ""), "base64");
+      const collectionId = safeSegment(body.collectionId || "", "");
+      const projectId = safeSegment(body.projectId || "", "");
+      const conversationId = safeSegment(body.conversationId || "", "");
       if (!buffer.length) {
         sendJson(res, 400, { error: "文件为空" });
         return;
       }
-      const fileDir = actorAttachmentPath(actor, "library");
-      await mkdir(fileDir, { recursive: true });
-      await writeFile(path.join(fileDir, `${id}-${name}`), buffer);
-      const result = await indexLibraryFile(
-        actor,
-        { id, name: String(body.name || name), type: String(body.type || "") },
-        buffer,
+      const scopeIds = [collectionId, projectId, conversationId].filter(Boolean);
+      if (scopeIds.length !== 1) {
+        sendJson(res, 400, { error: "文件必须且只能属于一个文件集、项目或对话" });
+        return;
+      }
+      const state = await getState(actor);
+      if ((state.files || []).some((file) => file.id === id)) {
+        sendJson(res, 409, { error: "文件标识已存在" });
+        return;
+      }
+      if (
+        collectionId &&
+        !(state.libraryCollections || []).some(
+          (collection) => collection.id === collectionId,
+        )
+      ) {
+        sendJson(res, 404, { error: "文件集不存在" });
+        return;
+      }
+      if (
+        projectId &&
+        !(state.projects || []).some((project) => project.id === projectId)
+      ) {
+        sendJson(res, 404, { error: "项目不存在" });
+        return;
+      }
+      if (
+        conversationId &&
+        !body.draftConversation &&
+        !(state.conversations || []).some(
+          (conversation) => conversation.id === conversationId,
+        )
+      ) {
+        sendJson(res, 404, { error: "对话不存在" });
+        return;
+      }
+      const relativePath = validatedLibraryRelativePath(
+        body.relativePath || body.name,
+        body.name || "upload.bin",
       );
-      sendJson(res, 200, result);
+      const name = path.posix.basename(relativePath);
+      const source = collectionId
+        ? "collection"
+        : projectId
+          ? "project"
+          : "conversation";
+      const metadata = {
+        id,
+        name,
+        relativePath,
+        size: buffer.length,
+        type: String(body.type || "application/octet-stream"),
+        status: "indexing",
+        chunks: 0,
+        collectionId: collectionId || undefined,
+        projectId: projectId || undefined,
+        conversationId: conversationId || undefined,
+        source,
+        updatedAt: isoNow(),
+      };
+      const location = libraryOriginalLocation(actor, metadata);
+      await mkdir(path.dirname(location.target), { recursive: true });
+      await writeFile(location.target, buffer);
+      await storeLibraryFileMetadata(actor, metadata, { create: true });
+      const indexed = await runLibraryIndexing(actor, metadata, buffer);
+      sendJson(res, indexed.statusCode, indexed.metadata);
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      /^\/api\/files\/[^/]+\/reindex$/.test(url.pathname)
+    ) {
+      const actor = await resolveActor(req, res);
+      const id = safeSegment(
+        decodeURIComponent(
+          url.pathname.slice("/api/files/".length, -"/reindex".length),
+        ),
+      );
+      const state = await getState(actor);
+      const current = (state.files || []).find((file) => file.id === id);
+      if (!current) {
+        sendJson(res, 404, { error: "文件不存在" });
+        return;
+      }
+      const indexing = {
+        ...current,
+        status: "indexing",
+        chunks: 0,
+        updatedAt: isoNow(),
+        error: undefined,
+        failedStage: undefined,
+        retryable: undefined,
+      };
+      await storeLibraryFileMetadata(actor, indexing);
+      let buffer;
+      try {
+        const location = libraryOriginalLocation(actor, indexing);
+        buffer = await readFile(location.target);
+      } catch (caught) {
+        if (caught && typeof caught === "object") {
+          caught.failedStage = "reading";
+          caught.statusCode = 422;
+        }
+        const failed = libraryIndexFailureMetadata(indexing, caught, "reading");
+        const stored = (await storeLibraryFileMetadata(actor, failed)) || failed;
+        sendJson(res, 422, stored);
+        return;
+      }
+      const indexed = await runLibraryIndexing(actor, indexing, buffer);
+      sendJson(res, indexed.statusCode, indexed.metadata);
       return;
     }
 
     if (req.method === "DELETE" && url.pathname.startsWith("/api/files/")) {
       const actor = await resolveActor(req, res);
       const id = safeSegment(decodeURIComponent(url.pathname.slice("/api/files/".length)));
-      const fileDir = actorAttachmentPath(actor, "library");
-      const entries = await readdir(fileDir).catch(() => []);
-      for (const entry of entries) {
-        if (entry === id || entry.startsWith(`${id}-`)) {
-          const target = path.resolve(fileDir, entry);
-          if (target.startsWith(path.resolve(fileDir) + path.sep)) {
-            await rm(target, { force: true });
-          }
+      await removeLibraryFileStorage(actor, id);
+      await updateState(actor, (state) => {
+        const removed = (state.files || []).find((file) => file.id === id);
+        state.files = (state.files || []).filter((file) => file.id !== id);
+        if (removed?.collectionId) {
+          state.libraryCollections = (state.libraryCollections || []).map(
+            (collection) =>
+              collection.id === removed.collectionId
+                ? { ...collection, updatedAt: isoNow() }
+                : collection,
+          );
         }
-      }
-      const indexPath = actorAttachmentPath(actor, "library-index.json");
-      const index = await readJson(indexPath, { version: 1, files: {} });
-      delete index.files?.[id];
-      await writeJson(indexPath, index);
+        return state;
+      });
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -6071,6 +6808,9 @@ async function handleHttp(req, res) {
         prompt: String(body.prompt || ""),
         skillIds: Array.isArray(body.skillIds) ? body.skillIds : [],
         projectId: body.projectId ? String(body.projectId) : undefined,
+        libraryCollectionIds: Array.isArray(body.libraryCollectionIds)
+          ? body.libraryCollectionIds.map(String)
+          : [],
         memoryMode:
           body.memoryMode === "project-only" ? "project-only" : "project-and-global",
         conversationId: String(body.conversationId || ""),
@@ -6163,6 +6903,10 @@ function createWorkerTask(session, payload) {
     serverIdentity: session.serverIdentity,
     agentId: String(payload.agentId || "opencode"),
     projectId: payload.projectId ? String(payload.projectId) : undefined,
+    libraryCollectionIds: Array.isArray(payload.libraryCollectionIds)
+      ? payload.libraryCollectionIds.map(String)
+      : [],
+    skills: Array.isArray(payload.skills) ? payload.skills.map(String) : [],
     memoryMode:
       payload.memoryMode === "project-only"
         ? "project-only"
@@ -6358,6 +7102,7 @@ async function ensureWorkerTaskConversation(actor, task) {
         title: task.title || "新对话",
         mode: "work",
         projectId: task.projectId,
+        libraryCollectionIds: task.libraryCollectionIds,
         messages: [],
         updatedAt: task.updatedAt,
         work: {
@@ -6376,6 +7121,7 @@ async function ensureWorkerTaskConversation(actor, task) {
     conversation.mode = "work";
     conversation.updatedAt = task.updatedAt;
     conversation.projectId ||= task.projectId;
+    conversation.libraryCollectionIds = task.libraryCollectionIds || [];
     conversation.work = {
       ...(conversation.work || {}),
       agentId: task.agentId,
@@ -6400,6 +7146,8 @@ async function ensureWorkerTaskConversation(actor, task) {
         content: task.prompt,
         createdAt: task.startedAt,
         mode: "work",
+        selectedSkills: task.skills || [],
+        selectedLibraryCollectionIds: task.libraryCollectionIds || [],
         runId: task.runId,
         workspaceId: task.workspaceId,
         workspaceName: task.workspaceName,
@@ -12728,6 +13476,9 @@ async function runRemoteWork(socket, session, actor, payload) {
     prompt: String(payload.prompt || ""),
     skillIds: Array.isArray(payload.skills) ? payload.skills : [],
     projectId: payload.projectId ? String(payload.projectId) : undefined,
+    libraryCollectionIds: Array.isArray(payload.libraryCollectionIds)
+      ? payload.libraryCollectionIds.map(String)
+      : [],
     memoryMode:
       payload.memoryMode === "project-only"
         ? "project-only"
@@ -13652,6 +14403,61 @@ async function closeSshSession(session) {
   scheduleSshWorkerPersist(session.worker, 0);
 }
 
+function cidrBlockList(entries = []) {
+  const blockList = new net.BlockList();
+  for (const entry of entries) {
+    const [address, prefixText] = String(entry).split("/");
+    const version = net.isIP(address);
+    if (!version) continue;
+    const family = version === 4 ? "ipv4" : "ipv6";
+    const prefix = prefixText === undefined ? (version === 4 ? 32 : 128) : Number(prefixText);
+    blockList.addSubnet(address, prefix, family);
+  }
+  return blockList;
+}
+
+async function permittedSshTarget(host, port, policy) {
+  if (policy.allowedPorts?.length && !policy.allowedPorts.includes(port)) {
+    const error = new Error(`平台策略不允许连接 SSH 端口 ${port}`);
+    error.statusCode = 403;
+    throw error;
+  }
+  const addresses = net.isIP(host)
+    ? [{ address: host, family: net.isIP(host) }]
+    : await dnsLookup(host, { all: true, verbatim: true }).catch((caught) => {
+        const error = new Error(
+          `无法解析服务器地址：${caught instanceof Error ? caught.message : host}`,
+        );
+        error.statusCode = 502;
+        throw error;
+      });
+  const allowed = cidrBlockList(policy.allowedCidrs);
+  const blocked = cidrBlockList(policy.blockedCidrs);
+  const permitted = addresses.filter(({ address, family }) => {
+    const type = Number(family) === 6 ? "ipv6" : "ipv4";
+    if (blocked.check(address, type)) return false;
+    return !policy.allowedCidrs?.length || allowed.check(address, type);
+  });
+  if (!permitted.length) {
+    const error = new Error("该服务器地址不在平台允许的 SSH 网段内");
+    error.statusCode = 403;
+    throw error;
+  }
+  return permitted[0].address;
+}
+
+function activeSshConnectionCounts(worker) {
+  const active = (session) => ["connecting", "connected"].includes(session.status);
+  return {
+    user: [...worker.sessions.values()].filter(active).length,
+    total: [...sshWorkerPool.values()].reduce(
+      (sum, candidate) =>
+        sum + [...candidate.sessions.values()].filter(active).length,
+      0,
+    ),
+  };
+}
+
 async function connectSsh(socket, session, actor, payload) {
   if (
     session.status === "connected" &&
@@ -13756,6 +14562,28 @@ async function connectSsh(socket, session, actor, payload) {
   const client = new SshClient();
   const sshPolicy =
     runtimePlatformSettings?.ssh || DEFAULT_PLATFORM_SETTINGS.ssh;
+  if (authMethod === "key" && !sshPolicy.allowKeyAuth) {
+    const error = new Error("平台策略已禁用 SSH 密钥登录");
+    error.statusCode = 403;
+    throw error;
+  }
+  if (authMethod === "password" && !sshPolicy.allowPasswordAuth) {
+    const error = new Error("平台策略已禁用 SSH 密码登录");
+    error.statusCode = 403;
+    throw error;
+  }
+  const counts = activeSshConnectionCounts(session.worker);
+  if (counts.user >= sshPolicy.maxConnectionsPerUser) {
+    const error = new Error("该用户的 SSH 连接数已达到平台上限");
+    error.statusCode = 429;
+    throw error;
+  }
+  if (counts.total >= sshPolicy.maxTotalConnections) {
+    const error = new Error("平台 SSH 连接池已满，请稍后重试");
+    error.statusCode = 503;
+    throw error;
+  }
+  const targetAddress = await permittedSshTarget(host, port, sshPolicy);
   attachProviderRelayHandler(session, client);
   session.demo = false;
   session.status = "connecting";
@@ -13851,7 +14679,7 @@ async function connectSsh(socket, session, actor, payload) {
           }
         })
         .connect({
-          host,
+          host: targetAddress,
           port,
           username,
           privateKey: authMethod === "key" ? privateKey : undefined,

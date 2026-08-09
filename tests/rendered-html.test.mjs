@@ -31,6 +31,7 @@ test("server-renders the EasyWork shell with an in-workspace loading state", asy
   assert.match(html, /EasyWork/);
   assert.match(html, /class="workspace-loading-indicator"/);
   assert.match(html, /正在加载/);
+  assert.doesNotMatch(html, /class="unified-composer/);
   assert.match(html, /\u65b0\u804a\u5929/);
   assert.doesNotMatch(html, /CHAT · COMPUTE · CREATE|CONVERSATION MAP/);
   assert.doesNotMatch(html, /class="right-rail"/);
@@ -264,6 +265,12 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.doesNotMatch(app, /const EMPTY_CONVERSATION_ID/);
   assert.match(app, /Embedding 模型 API/);
   assert.match(app, /管理员面板/);
+  assert.doesNotMatch(app, /平台 API 与 SSH/);
+  assert.match(
+    app,
+    /provider\.audience !== "agent" && provider\.configured/,
+  );
+  assert.match(app, /actor\.username \|\| actor\.displayName/);
   assert.match(app, /X-EasyWork-Device-Id/);
   assert.match(app, /conversationScrollPositionsRef/);
   assert.match(app, /project-only/);
@@ -288,19 +295,27 @@ test("includes the two-mode product architecture and removes starter artifacts",
   assert.match(css, /\.help-document \.help-markdown > h4 \+ p/);
   assert.match(
     css,
-    /\.help-document \.help-markdown\s*\{[\s\S]*?font-size:\s*20px/,
+    /\.help-document \.help-markdown\s*\{[\s\S]*?font-size:\s*17px/,
   );
   assert.match(
     css,
-    /\.help-document \.help-markdown > h2\s*\{[\s\S]*?font-size:\s*25px/,
+    /\.help-document \.help-markdown > h1\s*\{[\s\S]*?font-size:\s*27px/,
   );
   assert.match(
     css,
-    /\.help-document \.help-markdown > h3\s*\{[\s\S]*?font-size:\s*22px/,
+    /\.help-document \.help-markdown > h2\s*\{[\s\S]*?font-size:\s*22px/,
   );
   assert.match(
     css,
-    /\.help-document \.help-markdown > h4\s*\{[\s\S]*?font-size:\s*21px/,
+    /\.help-document \.help-markdown > h3\s*\{[\s\S]*?font-size:\s*19px/,
+  );
+  assert.match(
+    css,
+    /\.help-document \.help-markdown > h4\s*\{[\s\S]*?font-size:\s*18px/,
+  );
+  assert.match(
+    css,
+    /\.composer-model-list > button\s*\{[\s\S]*?background:\s*transparent/,
   );
   assert.doesNotMatch(css, /\.easywork-app\.easywork-app \*\s*\{[\s\S]*?font-size/);
   assert.match(css, /\.help-keyword, \.help-emphasis\)\.tone-agent/);
