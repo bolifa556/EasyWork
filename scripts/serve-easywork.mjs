@@ -6,13 +6,28 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createGatewayServer } from "../gateway/core/server.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const node = process.execPath;
-const vinextRunner = path.join(root, "scripts", "run-vinext.mjs");
-const publicPort = Number(process.env.EASYWORK_WEB_PORT || 3000);
-const internalPort = Number(process.env.EASYWORK_WEB_INTERNAL_PORT || publicPort + 1);
-const gatewayPort = Number(process.env.EASYWORK_GATEWAY_PORT || 8789);
+const vinextCli = path.join(root, "node_modules", "vinext", "dist", "cli.js");
+const publicPort = Number(process.env.EASYWORK_WEB_PORT || 8001);
+const internalPort = Number(process.env.EASYWORK_WEB_INTERNAL_PORT || 8002);
 const clientRoot = path.join(root, "dist", "client");
+const dataRoot = path.resolve(process.env.EASYWORK_DATA_ROOT || path.join(root, "data"));
+const allowedOrigins = String(process.env.EASYWORK_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+const secrets = ["SESSION_SECRET", "MASTER_SECRET", "CURSOR_SECRET", "ARTIFACT_SECRET"]
+  .every((name) => process.env[`EASYWORK_${name}`])
+  ? {
+      sessionSecret: process.env.EASYWORK_SESSION_SECRET,
+      masterSecret: process.env.EASYWORK_MASTER_SECRET,
+      cursorSecret: process.env.EASYWORK_CURSOR_SECRET,
+      artifactSecret: process.env.EASYWORK_ARTIFACT_SECRET,
+    }
+  : undefined;
 
 const contentTypes = new Map([
   [".css", "text/css; charset=utf-8"],
@@ -30,37 +45,32 @@ const contentTypes = new Map([
   [".woff2", "font/woff2"],
 ]);
 
+// Vinext remains an isolated renderer. The current process owns the only
+// public listener and the complete EasyWork business runtime.
 const frontend = spawn(
   node,
-  [vinextRunner, "start", "--hostname", "127.0.0.1", "--port", String(internalPort)],
+  [vinextCli, "start", "--hostname", "127.0.0.1", "--port", String(internalPort)],
   { cwd: root, env: process.env, stdio: "inherit", shell: false },
 );
 
-function targetFor(url = "/") {
-  return url.startsWith("/api/") || url === "/api" || url.startsWith("/easywork-ws")
-    ? { port: gatewayPort, service: "gateway" }
-    : { port: internalPort, service: "web" };
-}
-
-function proxyHttp(request, response) {
-  const target = targetFor(request.url);
+function proxyFrontend(request, response) {
   const headers = {
     ...request.headers,
-    host: `127.0.0.1:${target.port}`,
+    host: `127.0.0.1:${internalPort}`,
     "x-forwarded-host": request.headers.host || "",
-    "x-forwarded-proto": "http",
+    "x-forwarded-proto": String(request.headers["x-forwarded-proto"] || "http"),
   };
   const upstream = http.request(
     {
       host: "127.0.0.1",
-      port: target.port,
+      port: internalPort,
       method: request.method,
       path: request.url,
       headers,
     },
     (upstreamResponse) => {
       const responseHeaders = { ...upstreamResponse.headers };
-      if (target.service === "web" && !String(request.url || "").startsWith("/assets/")) {
+      if (!String(request.url || "").startsWith("/assets/")) {
         responseHeaders["cache-control"] = "no-cache, max-age=0, must-revalidate";
       }
       response.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
@@ -74,10 +84,7 @@ function proxyHttp(request, response) {
     }
     response.writeHead(502, { "content-type": "application/json; charset=utf-8" });
     response.end(JSON.stringify({
-      error: {
-        code: target.service === "gateway" ? "GATEWAY_UNAVAILABLE" : "WEB_UNAVAILABLE",
-        message: target.service === "gateway" ? "EasyWork 网关暂时不可用" : "EasyWork 页面暂时不可用",
-      },
+      error: { code: "WEB_UNAVAILABLE", message: "EasyWork 页面暂时不可用" },
     }));
   });
   request.pipe(upstream);
@@ -100,9 +107,6 @@ async function serveBuiltAsset(request, response) {
   response.writeHead(200, {
     "content-type": contentTypes.get(extension) || "application/octet-stream",
     "content-length": info.size,
-    // Production assets use content hashes and can be immutable. Every other
-    // response must be revalidated so an obsolete app shell cannot keep
-    // referencing bundles removed by the latest clean build.
     "cache-control": pathname.startsWith("/assets/")
       ? "public, max-age=31536000, immutable"
       : "no-cache, max-age=0, must-revalidate",
@@ -112,40 +116,7 @@ async function serveBuiltAsset(request, response) {
   return true;
 }
 
-function proxyUpgrade(request, browserSocket, head) {
-  const target = targetFor(request.url);
-  if (target.service !== "gateway") {
-    browserSocket.destroy();
-    return;
-  }
-  browserSocket.pause();
-  const gatewaySocket = net.connect({ host: "127.0.0.1", port: target.port });
-  const close = () => {
-    if (!browserSocket.destroyed) browserSocket.destroy();
-    if (!gatewaySocket.destroyed) gatewaySocket.destroy();
-  };
-  gatewaySocket.once("connect", () => {
-    const forwardedHeaders = [];
-    for (let index = 0; index < request.rawHeaders.length; index += 2) {
-      const name = request.rawHeaders[index];
-      const value = request.rawHeaders[index + 1];
-      if (name.toLowerCase() === "host") continue;
-      forwardedHeaders.push(`${name}: ${value}`);
-    }
-    forwardedHeaders.push(`Host: 127.0.0.1:${target.port}`);
-    gatewaySocket.write(
-      `${request.method || "GET"} ${request.url || "/easywork-ws"} HTTP/${request.httpVersion}\r\n${forwardedHeaders.join("\r\n")}\r\n\r\n`,
-    );
-    if (head.length) gatewaySocket.write(head);
-    browserSocket.pipe(gatewaySocket);
-    gatewaySocket.pipe(browserSocket);
-    browserSocket.resume();
-  });
-  browserSocket.once("error", close);
-  gatewaySocket.once("error", close);
-}
-
-function waitForFrontend({ attempts = 80, intervalMs = 125 } = {}) {
+function waitForFrontend({ attempts = 120, intervalMs = 125 } = {}) {
   return new Promise((resolve, reject) => {
     let remaining = attempts;
     const tryConnect = () => {
@@ -157,7 +128,7 @@ function waitForFrontend({ attempts = 80, intervalMs = 125 } = {}) {
       socket.once("error", () => {
         socket.destroy();
         remaining -= 1;
-        if (remaining <= 0) reject(new Error("EasyWork production server did not start"));
+        if (remaining <= 0) reject(new Error("EasyWork renderer did not start"));
         else setTimeout(tryConnect, intervalMs);
       });
     };
@@ -165,39 +136,35 @@ function waitForFrontend({ attempts = 80, intervalMs = 125 } = {}) {
   });
 }
 
-const server = http.createServer(async (request, response) => {
-  try {
-    if (await serveBuiltAsset(request, response)) return;
-    proxyHttp(request, response);
-  } catch (error) {
-    if (!response.headersSent) response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-    response.end("EasyWork 静态资源读取失败");
-    console.error(error);
-  }
-});
-server.on("upgrade", proxyUpgrade);
-
+let gateway;
 let shuttingDown = false;
-function shutdown(exitCode = 0) {
+async function shutdown(exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
-  server.close(() => process.exit(exitCode));
-  frontend.kill();
-  setTimeout(() => process.exit(exitCode), 2_000).unref();
+  if (!frontend.killed) frontend.kill();
+  if (gateway) await gateway.close().catch(() => undefined);
+  process.exit(exitCode);
 }
 
 frontend.once("exit", (code, signal) => {
-  if (!shuttingDown) shutdown(signal ? 1 : (code ?? 1));
+  if (!shuttingDown) void shutdown(signal ? 1 : (code ?? 1));
 });
-process.once("SIGINT", () => shutdown(0));
-process.once("SIGTERM", () => shutdown(0));
+process.once("SIGINT", () => void shutdown(0));
+process.once("SIGTERM", () => void shutdown(0));
 
 try {
   await waitForFrontend();
-  server.listen(publicPort, "0.0.0.0", () => {
-    console.log(`[easywork] Web and same-origin gateway available at http://0.0.0.0:${publicPort}`);
+  gateway = await createGatewayServer({
+    runtimeOptions: { dataRoot, allowedOrigins, secrets },
+    allowedOrigins,
+    fallbackRequestHandler: async (request, response) => {
+      if (await serveBuiltAsset(request, response)) return;
+      proxyFrontend(request, response);
+    },
   });
+  const address = await gateway.start({ host: "0.0.0.0", port: publicPort });
+  console.log(`[easywork] Unified web, API and WebSocket entry at http://${address.host}:${address.port}`);
 } catch (error) {
   console.error(error);
-  shutdown(1);
+  await shutdown(1);
 }

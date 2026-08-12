@@ -107,13 +107,21 @@ export async function createGatewayServer(options = {}) {
     const id = requestId(request);
     let cors = {};
     try {
+      const url = new URL(request.url || "/", "http://easywork.local");
+      const isGatewayRequest = url.pathname === "/health"
+        || url.pathname === "/healthz"
+        || url.pathname === "/api"
+        || url.pathname.startsWith("/api/");
+      if (!isGatewayRequest && typeof options.fallbackRequestHandler === "function") {
+        await options.fallbackRequestHandler(request, response);
+        return;
+      }
       cors = corsHeaders(request, allowedOrigins);
       if (request.method === "OPTIONS") {
         response.writeHead(204, { ...cors, "cache-control": "no-store", "x-request-id": id });
         response.end();
         return;
       }
-      const url = new URL(request.url || "/", "http://easywork.local");
       if (request.method === "GET" && ["/health", "/healthz", "/api/health"].includes(url.pathname)) {
         const result = apiSuccess({ status: "ok", service: "easywork", occurredAt: new Date().toISOString() }, { requestId: id });
         writeJson(response, { ...result, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-request-id": id } }, cors);

@@ -23,7 +23,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const protocol =
     requestHeaders.get("x-forwarded-proto") ??
     (isLoopbackHost || isIpAddressHost ? "http" : "https");
-  const origin = `${protocol}://${host ?? "localhost:3000"}`;
+  const origin = `${protocol}://${host ?? "localhost:8001"}`;
   const imageUrl = new URL("/og.png", origin).toString();
   const title = "EasyWork — 对话连接算力";
   const description =

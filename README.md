@@ -8,18 +8,15 @@ EasyWork 是面向个人与算力平台的对话工作台。聊天模式直接�
 
 ```powershell
 npm install
-npm run gateway
+npm run build
+npm start
 ```
 
-另开一个终端：
+打开 `http://127.0.0.1:8001`。网页、`/api` 和 `/easywork-ws` 共用这一个对外端口；内部服务不需要单独访问。独立部署时可通过 `NEXT_PUBLIC_EASYWORK_GATEWAY_URL` 指向受保护的 HTTPS/WSS 网关。
 
-```powershell
-npm run dev
-```
+Windows 可使用 `frp\start.cmd` 启动主服务、内部网页渲染器和可选的 FRP 映射。主服务是唯一公开入口；FRP 只映射 `8001 → 8001`，不参与 SSH 认证和远端会话。
 
-打开 `http://127.0.0.1:3000`。开发服务器把同源 `/api` 和实时连接转发到本地网关；独立部署时可通过 `NEXT_PUBLIC_EASYWORK_GATEWAY_URL` 指向受保护的 HTTPS/WSS 网关。
-
-Windows 可使用 `frp\start.cmd` 启动网页、网关和可选的 FRP 映射。FRP 只负责把网页暴露给其他设备，不参与 SSH 认证和远端会话。
+开发时可分别运行 `npm run gateway` 与 `npm run dev`；开发服务器同样使用 `8001`，并把 API 与实时连接转发到开发网关。
 
 ## 运行模型
 

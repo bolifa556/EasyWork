@@ -15,6 +15,7 @@ const localBindingConfig = {
 
 export default defineConfig(async () => {
   const gatewayPort = Number(process.env.EASYWORK_GATEWAY_PORT || 8789);
+  const publicPort = Number(process.env.EASYWORK_WEB_PORT || 8001);
   const gatewayTarget = `http://127.0.0.1:${gatewayPort}`;
   const installWebsocketTunnel = (server: {
     httpServer: import("node:http").Server | null;
@@ -87,6 +88,8 @@ export default defineConfig(async () => {
   return {
     server: {
       host: "0.0.0.0",
+      port: publicPort,
+      strictPort: true,
       hmr: false,
       proxy: {
         "/api": {

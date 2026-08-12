@@ -285,6 +285,37 @@ test("Realtime 首消息鉴权、帮助 ETag 与 CORS OPTIONS 由独立入口处
   assert.equal(authenticated.actor.username, "socket-user");
 });
 
+test("统一入口在同一监听器处理 API、WebSocket 并把页面请求交给渲染回退", async (t) => {
+  const { dataRoot, helpFile } = await temporaryRuntimeRoot(t);
+  const fallbackRequests = [];
+  const gateway = await createGatewayServer({
+    runtimeOptions: { dataRoot, helpFile, webModelFactory: fakeModelFactory },
+    fallbackRequestHandler(request, response) {
+      fallbackRequests.push(request.url);
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end("<main>EasyWork renderer</main>");
+    },
+  });
+  t.after(() => gateway.close());
+  const address = await gateway.start({ host: "127.0.0.1", port: 0 });
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const page = await fetch(`${baseUrl}/help`);
+  assert.equal(page.status, 200);
+  assert.equal(await page.text(), "<main>EasyWork renderer</main>");
+  assert.deepEqual(fallbackRequests, ["/help"]);
+
+  const health = await requestJson(baseUrl, "/api/health");
+  assert.equal(health.response.status, 200);
+  assert.equal(health.payload.data.service, "easywork");
+  assert.deepEqual(fallbackRequests, ["/help"]);
+
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/easywork-ws`);
+  t.after(() => socket.close());
+  await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+  assert.equal(socket.readyState, WebSocket.OPEN);
+});
+
 test("首轮标题生成失败不影响主回复并保留首问截断标题", async (t) => {
   const { dataRoot, helpFile } = await temporaryRuntimeRoot(t);
   const active = await startGateway({ dataRoot, helpFile, webModelFactory: titleFailureModelFactory });
