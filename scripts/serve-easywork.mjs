@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { cp, mkdir, readdir, rm, stat } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -10,10 +10,12 @@ import { createGatewayServer } from "../gateway/core/server.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const node = process.execPath;
-const vinextCli = path.join(root, "node_modules", "vinext", "dist", "cli.js");
+const rendererEntry = path.join(root, "scripts", "start-renderer.mjs");
 const publicPort = Number(process.env.EASYWORK_WEB_PORT || 8001);
 const internalPort = Number(process.env.EASYWORK_WEB_INTERNAL_PORT || 8002);
-const clientRoot = path.join(root, "dist", "client");
+const buildRoot = path.resolve(
+  process.env.EASYWORK_BUILD_ROOT || path.join(root, ".cache", "runtime-build", "dist"),
+);
 const dataRoot = path.resolve(process.env.EASYWORK_DATA_ROOT || path.join(root, "data"));
 const allowedOrigins = String(process.env.EASYWORK_ALLOWED_ORIGINS || "")
   .split(",")
@@ -45,12 +47,57 @@ const contentTypes = new Map([
   [".woff2", "font/woff2"],
 ]);
 
+function assertPort(value, name) {
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(`${name} must be an integer between 1 and 65535`);
+  }
+}
+
+assertPort(publicPort, "EASYWORK_WEB_PORT");
+assertPort(internalPort, "EASYWORK_WEB_INTERNAL_PORT");
+if (publicPort === internalPort) {
+  throw new Error("EasyWork public and renderer ports must be different");
+}
+
+async function publishBuildSnapshot() {
+  const sourceRoot = path.join(root, "dist");
+  if (buildRoot === sourceRoot) return sourceRoot;
+
+  const parent = path.dirname(buildRoot);
+  const snapshotRoot = path.join(parent, `dist-${Date.now()}-${process.pid}`);
+  await mkdir(parent, { recursive: true });
+  const previousEntries = await readdir(parent, { withFileTypes: true });
+  await Promise.all(previousEntries.map(async (entry) => {
+    if (!entry.isDirectory()) return;
+    if (!/^dist(?:-\d+-\d+|\.(?:staging|previous)-\d+)$/.test(entry.name)) return;
+    await rm(path.join(parent, entry.name), { recursive: true, force: true }).catch(() => undefined);
+  }));
+  await rm(snapshotRoot, { recursive: true, force: true });
+  await cp(sourceRoot, snapshotRoot, { recursive: true, force: true });
+  return snapshotRoot;
+}
+
+const publishedBuildRoot = await publishBuildSnapshot();
+const clientRoot = path.join(publishedBuildRoot, "client");
+
 // Vinext remains an isolated renderer. The current process owns the only
-// public listener and the complete EasyWork business runtime.
+// public listener and the complete EasyWork business runtime. It reads a
+// published build snapshot so a later build can never mix new HTML with old
+// hashed client assets in a running process.
 const frontend = spawn(
   node,
-  [vinextCli, "start", "--hostname", "127.0.0.1", "--port", String(internalPort)],
-  { cwd: root, env: process.env, stdio: "inherit", shell: false },
+  [rendererEntry],
+  {
+    cwd: root,
+    env: {
+      ...process.env,
+      EASYWORK_BUILD_ROOT: publishedBuildRoot,
+      EASYWORK_RENDERER_HOST: "127.0.0.1",
+      EASYWORK_RENDERER_PORT: String(internalPort),
+    },
+    stdio: "inherit",
+    shell: false,
+  },
 );
 
 function proxyFrontend(request, response) {
