@@ -1,20 +1,16 @@
 # EasyWork 提示词目录
 
-应用运行时使用的模型提示词和 Agent 协议均保存在这里。后端只负责读取模板、填入上下文和解析协议标记，不在源码中维护回答风格。
+应用运行时使用的模型提示词均保存在这里。后端读取模板并通过结构化事件与 Context Hub 投递，不在正文中解析私有标记。
 
 ## 分类
 
-- `chat-system.md`：Chat 模式系统规则。
-- `work-system.md`：Work 模式系统规则与远程安全边界。
-- `context/`：记忆、历史、技能、知识库和用户请求的上下文装配模板。
 - `memory/`：对话压缩和可复用记忆候选提取。
-- `model/`：模型 API 的系统消息与连通性检测提示。
 - `tasks/`：标题生成等独立模型任务。
-- `web/`：网页模型向远程 Agent 交接当前任务的模板。
-- `agents/`：网页与远程 Agent 之间的公共协议、各 Agent 原生计划提示，以及本轮工作区和版本范围说明。
+- `web/chat-system.md`：Chat 模式 Web Agent 的工具边界与工作方式。
+- `web/work-system.md`：Work 模式网页 Agent 的最小上下文装配边界。
+- `agents/common.md`：所有远程 Agent 共用的执行、上下文与版本边界。
+- `agents/{opencode,codex,claude-code}.md`：各 Agent 的原生计划与能力补充。
 
-## 前端协议
-
-`agents/protocol.md` 中的 `[[EASYWORK_PROGRESS]]` 和 `[[EASYWORK_FINAL]]` 只用于前端区分 Agent 中途文本与最终正文。它们不规定正文必须采用何种开头、章节或写作结构。
+EasyWork 只读取 `web/`、`memory/`、`tasks/` 和上述 `agents/` 提示词。Context Hub 使用结构化实体装配上下文，不再读取旧的文本拼接模板。Work 模式由网页 Agent 只装配上下文，远程 Agent 自主规划、执行并生成最终正文。
 
 网页模型的思考只显示模型 API 明确返回的 reasoning/thinking 内容；EasyWork 不根据正文虚构思考过程。

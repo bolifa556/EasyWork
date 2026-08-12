@@ -1,0 +1,240 @@
+.dialogPanel {
+  width: min(680px, calc(100vw - 32px));
+  height: auto;
+  min-height: 0;
+  max-height: calc(100dvh - 40px);
+}
+
+.layout {
+  display: grid;
+  min-height: 0;
+  gap: 14px;
+}
+
+.overview,
+.composition,
+.settings {
+  min-width: 0;
+  border: 1px solid rgb(80 74 61 / 13%);
+  border-radius: 16px;
+  background: rgb(255 254 250 / 56%);
+  box-shadow: 0 6px 22px rgb(63 54 38 / 3.5%);
+}
+
+.overview {
+  display: grid;
+  gap: 12px;
+  padding: 17px 18px 15px;
+  background:
+    radial-gradient(circle at 88% 8%, rgb(111 128 96 / 8%), transparent 40%),
+    rgb(255 254 250 / 65%);
+}
+
+.usageHeading {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+}
+
+.usageIcon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 12px;
+  background: rgb(83 99 63 / 9%);
+  color: var(--ew-green-deep);
+}
+
+.usageHeading > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.usageHeading small,
+.settings header small {
+  color: var(--ew-ink-muted);
+  font-size: 12.5px;
+}
+
+.usageHeading strong {
+  overflow: hidden;
+  color: var(--ew-ink);
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usageHeading em {
+  color: var(--ew-green-deep);
+  font-size: 13px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+
+.progress {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(83 99 63 / 10%);
+}
+
+.progress > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7c936c, #9fad91);
+  transition: width 240ms ease;
+}
+
+.composition,
+.settings {
+  display: grid;
+  gap: 12px;
+  padding: 15px 16px;
+  box-shadow: none;
+}
+
+.composition > header,
+.settings > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings > header > div {
+  display: grid;
+  gap: 3px;
+}
+
+.composition > header strong,
+.settings > header strong {
+  color: #4f4b43;
+  font-size: 15px;
+  font-weight: 640;
+}
+
+.parts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.parts > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 10px 11px;
+  border: 1px solid rgb(80 74 61 / 9%);
+  border-radius: 10px;
+  background: rgb(247 245 239 / 56%);
+}
+
+.parts :is(dt, dd) { min-width: 0; margin: 0; }
+.parts dt { color: #918a7e; font-size: 12px; }
+.parts dd { color: #565148; font-size: 13px; font-variant-numeric: tabular-nums; font-weight: 590; }
+.emptyParts { color: var(--ew-ink-muted); font-size: 13px; }
+
+.settingsGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.settingsGrid label {
+  display: grid;
+  gap: 7px;
+  color: var(--ew-ink-soft);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.numberField {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  padding: 0 11px;
+  border: 1px solid var(--ew-line);
+  border-radius: 10px;
+  background: rgb(255 253 248 / 72%);
+}
+
+.numberField:focus-within {
+  border-color: rgb(83 99 63 / 34%);
+  box-shadow: 0 0 0 3px rgb(83 99 63 / 6%);
+}
+
+.numberField input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ew-ink);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.saveButton,
+.compactButton {
+  min-height: 40px;
+  border-color: rgb(87 101 73 / 17%);
+  background: rgb(97 115 79 / 8%);
+  color: #46543c;
+  box-shadow: none;
+}
+
+.saveButton:hover:not(:disabled) {
+  border-color: rgb(87 101 73 / 26%);
+  background: rgb(97 115 79 / 13%);
+  color: #35442e;
+}
+
+.compactButton {
+  border-color: rgb(99 83 126 / 18%);
+  background: rgb(113 91 145 / 10%);
+  color: #5d4679;
+}
+
+.compactButton:hover:not(:disabled) {
+  border-color: rgb(99 83 126 / 27%);
+  background: rgb(113 91 145 / 16%);
+  color: #503b69;
+}
+
+.unavailable {
+  display: grid;
+  min-height: 220px;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  color: var(--ew-ink-muted);
+  text-align: center;
+}
+
+.unavailable strong { color: var(--ew-ink); font-size: .98rem; }
+.unavailable span { max-width: 430px; font-size: .82rem; line-height: 1.55; }
+
+@media (max-width: 680px) {
+  .dialogPanel { width: 100%; max-height: 88dvh; }
+  .parts,
+  .settingsGrid { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress > i { transition: none; }
+}

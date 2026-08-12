@@ -1,0 +1,23 @@
+.layout { display: grid; gap: 16px; min-height: 260px; }
+.identity { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 14px; border: 1px solid rgba(65,64,54,.11); border-radius: 14px; background: rgba(246,243,235,.55); }
+.identity div { display: grid; gap: 2px; min-width: 0; }
+.identity strong { color: var(--ew-ink); font-size: .98rem; }
+.identity div span { color: var(--ew-ink-muted); font-size: .79rem; }
+.source { flex: none; color: var(--ew-green); font-size: .78rem; font-weight: 650; }
+.fields { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+.fields label { display: grid; gap: 7px; color: var(--ew-ink-soft); font-size: .83rem; font-weight: 600; }
+.fields input,.fields select { width: 100%; min-height: 42px; padding: 0 12px; border: 1px solid var(--ew-line); border-radius: 11px; outline: none; background: rgba(255,255,255,.52); color: var(--ew-ink); font: inherit; font-weight: 500; }
+.fields input:focus,.fields select:focus { border-color: rgba(77,105,59,.48); box-shadow: 0 0 0 3px rgba(77,105,59,.08); }
+.fields input:disabled,.fields select:disabled { opacity: .68; }
+.wide { grid-column: 1/-1; }
+.fieldLabel { display: block; margin-bottom: 7px; color: var(--ew-ink-soft); font-size: .83rem; font-weight: 600; }
+.modelSteps { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(0,1fr); align-items: end; gap: 9px; }
+.modelSteps > svg { margin-bottom: 12px; color: var(--ew-ink-muted); }
+.modelSteps label span { color: var(--ew-ink-muted); font-size: .75rem; font-weight: 560; }
+.readonly,.unavailable { display: grid; justify-items: center; gap: 7px; padding: 35px 18px; color: var(--ew-ink-muted); text-align: center; }
+.readonly strong,.unavailable strong { color: var(--ew-ink-soft); font-size: .94rem; }
+.readonly span,.unavailable span { font-size: .82rem; }
+.actions { display: flex; justify-content: flex-end; padding-top: 3px; }
+.spin { animation: spin 800ms linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (max-width: 620px) { .fields { grid-template-columns: 1fr; }.wide { grid-column: auto; }.modelSteps { grid-template-columns: 1fr; }.modelSteps > svg { display: none; } }

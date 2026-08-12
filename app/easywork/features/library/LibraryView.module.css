@@ -1,0 +1,2 @@
+.unavailable { display: grid; width: 100%; height: 100%; place-content: center; justify-items: center; gap: 11px; color: var(--ew-ink-muted); text-align: center; }
+.unavailable strong { color: var(--ew-ink-soft); font-family: var(--ew-display); font-size: 1.05rem; font-weight: 630; }

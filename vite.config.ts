@@ -16,59 +16,60 @@ const localBindingConfig = {
 export default defineConfig(async () => {
   const gatewayPort = Number(process.env.EASYWORK_GATEWAY_PORT || 8789);
   const gatewayTarget = `http://127.0.0.1:${gatewayPort}`;
+  const installWebsocketTunnel = (server: {
+    httpServer: import("node:http").Server | null;
+  }) => {
+    return () => {
+      const httpServer = server.httpServer;
+      if (!httpServer) return;
+      const existingUpgradeListeners = httpServer.rawListeners("upgrade");
+      httpServer.removeAllListeners("upgrade");
+      httpServer.on("upgrade", (request, browserSocket, head) => {
+        const requestUrl = new URL(
+          request.url || "/",
+          `http://${request.headers.host || "localhost"}`,
+        );
+        if (requestUrl.pathname !== "/easywork-ws") {
+          for (const listener of existingUpgradeListeners) {
+            listener.call(httpServer, request, browserSocket, head);
+          }
+          return;
+        }
+
+        browserSocket.pause();
+        const gatewaySocket = net.connect({
+          host: "127.0.0.1",
+          port: gatewayPort,
+        });
+        const closeTunnel = () => {
+          if (!browserSocket.destroyed) browserSocket.destroy();
+          if (!gatewaySocket.destroyed) gatewaySocket.destroy();
+        };
+        gatewaySocket.once("connect", () => {
+          const headers = request.rawHeaders
+            .reduce<string[]>((lines, value, index, raw) => {
+              if (index % 2 === 0) lines.push(`${value}: ${raw[index + 1]}`);
+              return lines;
+            }, [])
+            .join("\r\n");
+          gatewaySocket.write(
+            `${request.method || "GET"} ${request.url || "/easywork-ws"} HTTP/${
+              request.httpVersion
+            }\r\n${headers}\r\n\r\n`,
+          );
+          if (head.length) gatewaySocket.write(head);
+          browserSocket.pipe(gatewaySocket);
+          gatewaySocket.pipe(browserSocket);
+          browserSocket.resume();
+        });
+        browserSocket.once("error", closeTunnel);
+        gatewaySocket.once("error", closeTunnel);
+      });
+    };
+  };
   const websocketTunnel = {
     name: "easywork-websocket-tunnel",
-    configureServer(server: {
-      httpServer: import("node:http").Server | null;
-    }) {
-      return () => {
-        const httpServer = server.httpServer;
-        if (!httpServer) return;
-        const existingUpgradeListeners = httpServer.rawListeners("upgrade");
-        httpServer.removeAllListeners("upgrade");
-        httpServer.on("upgrade", (request, browserSocket, head) => {
-          const requestUrl = new URL(
-            request.url || "/",
-            `http://${request.headers.host || "localhost"}`,
-          );
-          if (requestUrl.pathname !== "/easywork-ws") {
-            for (const listener of existingUpgradeListeners) {
-              listener.call(httpServer, request, browserSocket, head);
-            }
-            return;
-          }
-
-          browserSocket.pause();
-          const gatewaySocket = net.connect({
-            host: "127.0.0.1",
-            port: gatewayPort,
-          });
-          const closeTunnel = () => {
-            if (!browserSocket.destroyed) browserSocket.destroy();
-            if (!gatewaySocket.destroyed) gatewaySocket.destroy();
-          };
-          gatewaySocket.once("connect", () => {
-            const headers = request.rawHeaders
-              .reduce<string[]>((lines, value, index, raw) => {
-                if (index % 2 === 0) lines.push(`${value}: ${raw[index + 1]}`);
-                return lines;
-              }, [])
-              .join("\r\n");
-            gatewaySocket.write(
-              `${request.method || "GET"} ${request.url || "/easywork-ws"} HTTP/${
-                request.httpVersion
-              }\r\n${headers}\r\n\r\n`,
-            );
-            if (head.length) gatewaySocket.write(head);
-            browserSocket.pipe(gatewaySocket);
-            gatewaySocket.pipe(browserSocket);
-            browserSocket.resume();
-          });
-          browserSocket.once("error", closeTunnel);
-          gatewaySocket.once("error", closeTunnel);
-        });
-      };
-    },
+    configureServer: installWebsocketTunnel,
   };
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.

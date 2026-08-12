@@ -1,0 +1,16 @@
+.state {
+  display: grid;
+  width: min(440px, calc(100% - 36px));
+  margin: auto;
+  place-items: center;
+  align-content: center;
+  gap: 9px;
+  padding: 34px;
+  color: var(--ew-ink-soft);
+  text-align: center;
+}
+
+.state h2 { margin: 5px 0 0; color: var(--ew-ink); font-family: var(--ew-display); font-size: 1.08rem; }
+.state p { margin: 0; color: var(--ew-ink-muted); font-size: .9rem; line-height: 1.55; }
+.state button { display: inline-flex; min-height: 36px; align-items: center; gap: 7px; margin-top: 8px; padding: 7px 12px; border: 1px solid var(--ew-line-strong); border-radius: 10px; background: rgba(255,254,250,.62); color: var(--ew-ink-soft); cursor: pointer; }
+.state button:hover { border-color: rgba(82,107,67,.34); color: var(--ew-green-deep); }

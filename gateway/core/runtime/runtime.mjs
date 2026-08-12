@@ -1,0 +1,984 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { AuthDeviceService } from "../auth/service.mjs";
+import { createActorContext } from "../actor.mjs";
+import { AuditService } from "../audit/service.mjs";
+import { HostAgentArtifactCatalog } from "../agent-runtime/index.mjs";
+import { invariant } from "../errors.mjs";
+import { canTransitionTask, transitionTask } from "../entities/task.mjs";
+import { createApi } from "../http/api.mjs";
+import { commandId, expectedRevision } from "../http/router.mjs";
+import { defaultActorMutationQueue } from "../mutation-queue.mjs";
+import {
+  OpenAICompatibleModelDetector,
+  PlatformConfigurationService,
+  ProviderService,
+  ProviderUsageService,
+} from "../platform/service.mjs";
+import { PLATFORM_PROVIDER_IDS } from "../platform/contract.mjs";
+import { MemoryPreviewSessionStore } from "../previews/index.mjs";
+import { taskTopic } from "../orchestrator/contract.mjs";
+import { FileTaskStore } from "../orchestrator/persistence.mjs";
+import { RealtimeSocketServer } from "../realtime-socket.mjs";
+import { SshCredentialVault, SshServerRegistry, Ssh2TransportFactory, SshWorkerPool } from "../ssh/index.mjs";
+import { OpenAIChatModel } from "../web-agent/openai-model.mjs";
+import { DynamicSshPolicy, PromptRepository } from "./adapters.mjs";
+import { loadOrCreateRuntimeSecrets } from "./secrets.mjs";
+import { ActorServiceContainer } from "./services.mjs";
+import { createDefaultRemoteBackend, RoutingAgentTransport } from "./remote.mjs";
+
+const runtimeDirectory = path.dirname(fileURLToPath(import.meta.url));
+const defaultRepositoryRoot = path.resolve(runtimeDirectory, "../../..");
+const actorKey = (actor) => `${actor.actorType}:${actor.actorId}`;
+const clone = (value) => value === undefined ? undefined : structuredClone(value);
+
+export function composeResourceList(snapshot, query = {}) {
+  invariant(snapshot?.data && Array.isArray(snapshot.data.bindings) && Array.isArray(snapshot.data.versions) && Array.isArray(snapshot.data.blobs), "RESOURCE_STORE_INVALID", "资源索引结构无效", { status: 500, expose: false });
+  const bindings = snapshot.data.bindings.filter((entry) => (!query.ownerType || entry.ownerType === query.ownerType) && (!query.ownerId || entry.ownerId === query.ownerId));
+  const byVersion = new Map(snapshot.data.versions.map((entry) => [entry.id, entry]));
+  const byBlob = new Map(snapshot.data.blobs.map((entry) => [entry.id, entry]));
+  return bindings.map((binding) => {
+    const version = byVersion.get(binding.resourceVersionId);
+    invariant(version, "RESOURCE_VERSION_MISSING", "资源绑定引用了不存在的版本", { status: 500, expose: false });
+    const blob = byBlob.get(version.blobId);
+    invariant(blob, "RESOURCE_BLOB_MISSING", "资源版本引用了不存在的 Blob", { status: 500, expose: false });
+    return {
+      binding: clone(binding),
+      version: clone(version),
+      blob: clone(blob),
+      size: blob.size,
+    };
+  });
+}
+
+function requiredObject(value, operation) {
+  invariant(value && typeof value === "object" && !Array.isArray(value), "REQUEST_BODY_REQUIRED", `${operation} 请求体不能为空`, { status: 400 });
+  return value;
+}
+
+function strictBody(value, allowed, operation) {
+  const body = requiredObject(value, operation);
+  invariant(Object.keys(body).every((key) => allowed.includes(key)), "REQUEST_BODY_SCHEMA_INVALID", `${operation} 请求体不符合 EasyWork 协议`, {
+    status: 400,
+    details: { allowed },
+  });
+  return body;
+}
+
+function strictQuery(query, allowed, operation) {
+  invariant(Object.keys(query || {}).every((key) => allowed.includes(key)), "QUERY_SCHEMA_INVALID", `${operation} 查询参数不符合 EasyWork 协议`, {
+    status: 400,
+    details: { allowed },
+  });
+  return query || {};
+}
+
+function parseCsv(value) {
+  if (!value) return undefined;
+  return [...new Set(String(value).split(",").map((entry) => entry.trim()).filter(Boolean))];
+}
+
+function parseRangeHeader(value, size) {
+  if (!value) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(value).trim());
+  invariant(match && (match[1] || match[2]), "ARTIFACT_RANGE_INVALID", "Range 请求无效", { status: 416, details: { size } });
+  let start;
+  let endExclusive;
+  if (!match[1]) {
+    const suffix = Number(match[2]);
+    invariant(Number.isSafeInteger(suffix) && suffix > 0, "ARTIFACT_RANGE_INVALID", "Range 请求无效", { status: 416, details: { size } });
+    start = Math.max(0, size - suffix);
+    endExclusive = size;
+  } else {
+    start = Number(match[1]);
+    endExclusive = match[2] ? Number(match[2]) + 1 : size;
+  }
+  invariant(Number.isSafeInteger(start) && Number.isSafeInteger(endExclusive) && start >= 0 && start < size && endExclusive > start && endExclusive <= size, "ARTIFACT_RANGE_INVALID", "Range 请求超出 Artifact 大小", {
+    status: 416,
+    details: { size },
+  });
+  return { start, endExclusive };
+}
+
+function parsePreviewRangeHeader(value, size) {
+  if (!value) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(value).trim());
+  invariant(match && (match[1] || match[2]), "PREVIEW_RANGE_INVALID", "Range 请求无效", { status: 416, details: { size } });
+  invariant(size > 0, "PREVIEW_RANGE_INVALID", "空文件不接受 Range", { status: 416, details: { size } });
+  let start;
+  let endExclusive;
+  if (!match[1]) {
+    const suffix = Number(match[2]);
+    invariant(Number.isSafeInteger(suffix) && suffix > 0, "PREVIEW_RANGE_INVALID", "Range 请求无效", { status: 416, details: { size } });
+    start = Math.max(0, size - suffix);
+    endExclusive = size;
+  } else {
+    start = Number(match[1]);
+    endExclusive = match[2] ? Number(match[2]) + 1 : size;
+  }
+  invariant(Number.isSafeInteger(start) && Number.isSafeInteger(endExclusive) && start >= 0 && start < size && endExclusive > start && endExclusive <= size, "PREVIEW_RANGE_INVALID", "Range 请求超出 Preview 大小", {
+    status: 416,
+    details: { size },
+  });
+  return { start, endExclusive };
+}
+
+export class EasyWorkRuntime {
+  static async create(options = {}) {
+    const dataRoot = path.resolve(String(options.dataRoot || ""));
+    invariant(path.isAbsolute(dataRoot) && path.basename(dataRoot).toLowerCase() === "data", "RUNTIME_DATA_ROOT_INVALID", "Gateway dataRoot 必须指向 data 目录", { status: 500, expose: false });
+    await fs.mkdir(dataRoot, { recursive: true });
+    const secrets = await loadOrCreateRuntimeSecrets(dataRoot, options.secrets || {});
+    const runtime = new EasyWorkRuntime({ ...options, dataRoot, secrets });
+    await runtime.#initialize();
+    return runtime;
+  }
+
+  constructor(options) {
+    this.dataRoot = options.dataRoot;
+    this.secrets = options.secrets;
+    this.clock = options.clock || (() => new Date());
+    this.queue = options.queue || defaultActorMutationQueue;
+    this.fetchImpl = options.fetchImpl || globalThis.fetch;
+    this.allowedOrigins = Object.freeze([...(options.allowedOrigins || [])].map(String));
+    this.contextSourcesFactory = options.contextSourcesFactory || null;
+    this.visionExtractor = options.visionExtractor || null;
+    this.remoteBackendFactory = options.remoteBackendFactory || null;
+    this.agentTransportFactory = options.agentTransportFactory || null;
+    this.agentDeploymentFactory = options.agentDeploymentFactory || null;
+    this.agentCatalog = options.agentCatalog || null;
+    this.agentAppRoot = path.resolve(options.agentAppRoot || path.join(defaultRepositoryRoot, "agent-app"));
+    this.apiProxyFactory = options.apiProxyFactory || null;
+    this.sshTransportFactory = options.sshTransportFactory || null;
+    this.webModelFactory = options.webModelFactory || null;
+    this.previewHostSourceFactory = options.previewHostSourceFactory || null;
+    this.previewRemoteSourceFactory = options.previewRemoteSourceFactory || null;
+    this.previewLimits = Object.freeze({ ...(options.previewLimits || {}) });
+    this.remoteFileLimits = Object.freeze({ ...(options.remoteFileLimits || {}) });
+    this.previewStore = options.previewStore || new MemoryPreviewSessionStore();
+    this.containerIdleTtlMs = Number(options.containerIdleTtlMs ?? 15 * 60_000);
+    this.containerMaintenanceMs = Number(options.containerMaintenanceMs ?? 60_000);
+    this.guestTtlMs = Number(options.guestTtlMs ?? 30 * 24 * 60 * 60_000);
+    this.guestMaintenanceMs = Number(options.guestMaintenanceMs ?? 6 * 60 * 60_000);
+    invariant(Number.isSafeInteger(this.guestTtlMs) && this.guestTtlMs > 0 && Number.isSafeInteger(this.guestMaintenanceMs) && this.guestMaintenanceMs > 0, "GUEST_MAINTENANCE_INVALID", "访客清理周期无效", { status: 500, expose: false });
+    this.promptRoot = path.resolve(options.promptRoot || path.join(defaultRepositoryRoot, "prompts"));
+    this.authOptions = Object.freeze({ ...(options.authOptions || {}) });
+    this.helpFile = path.resolve(options.helpFile || path.join(defaultRepositoryRoot, "help", "help.md"));
+    this.containers = new Map();
+    this.registries = new Map();
+    this.closing = false;
+  }
+
+  async #initialize() {
+    this.auth = new AuthDeviceService({ ...this.authOptions, dataRoot: this.dataRoot, sessionSecret: this.secrets.sessionSecret, clock: this.clock });
+    this.platform = new PlatformConfigurationService({ dataRoot: this.dataRoot, masterSecret: this.secrets.masterSecret, clock: this.clock, queue: this.queue });
+    this.providers = new ProviderService({
+      dataRoot: this.dataRoot,
+      masterSecret: this.secrets.masterSecret,
+      platform: this.platform,
+      detector: new OpenAICompatibleModelDetector({ fetchImpl: this.fetchImpl }),
+      clock: this.clock,
+      queue: this.queue,
+    });
+    this.providerUsage = new ProviderUsageService({ dataRoot: this.dataRoot, providerService: this.providers, clock: this.clock, queue: this.queue });
+    this.prompts = new PromptRepository({ promptRoot: this.promptRoot });
+    this.agentCatalog ||= new HostAgentArtifactCatalog({ root: this.agentAppRoot });
+    this.remoteBackendFactory ||= (input) => createDefaultRemoteBackend({
+      ...input,
+      catalog: this.agentCatalog,
+      apiProxyFactory: this.apiProxyFactory,
+    });
+    this.agentTransportFactory ||= async ({ container }) => new RoutingAgentTransport(
+      async (serverId) => (await container.remoteBackend(serverId)).agentTransport,
+      async ({ providerId, modelId }) => {
+        const agentProviderId = providerId === PLATFORM_PROVIDER_IDS.web ? PLATFORM_PROVIDER_IDS.agent : providerId;
+        const access = await this.providers.resolve(container.actor, {
+          providerId: agentProviderId,
+          purpose: "agent",
+          modelId,
+          requireModel: true,
+        });
+        return Object.freeze({
+          providerId: access.provider.id,
+          model: access.model,
+          baseUrl: access.credential.baseUrl,
+          apiKey: access.credential.apiKey,
+          protocol: access.credential.protocol,
+        });
+      },
+    );
+    this.agentDeploymentFactory ||= async ({ container, serverId }) => (
+      await container.remoteBackend(serverId)
+    ).agentDeployment;
+    this.sshPolicy = new DynamicSshPolicy({ platform: this.platform });
+    const sshRuntime = await this.platform.sshRuntimeConfiguration();
+    this.sshPool = new SshWorkerPool({
+      registryFactory: (actor) => this.registryForActor(actor),
+      transportFactory: this.sshTransportFactory || new Ssh2TransportFactory({ readyTimeoutMs: sshRuntime.transport.connectTimeoutMs }),
+      clock: () => this.clock().getTime(),
+      ...sshRuntime.workerPool,
+      ...sshRuntime.limits,
+      limitsProvider: async () => (await this.platform.sshRuntimeConfiguration()).limits,
+    });
+    this.sshPool.start();
+    this.containerTimer = setInterval(() => this.releaseIdleContainers().catch(() => undefined), this.containerMaintenanceMs);
+    this.containerTimer.unref?.();
+    this.guestTimer = setInterval(() => this.cleanupInactiveGuests().catch(() => undefined), this.guestMaintenanceMs);
+    this.guestTimer.unref?.();
+    this.actorRecoveryPromise = this.#recoverActorsAfterRestart().catch(() => []);
+  }
+
+  async #recoverActorsAfterRestart() {
+    const terminal = new Set(["completed", "failed", "cancelled"]);
+    const candidates = [];
+    for (const [directory, actorType] of [["users", "user"], ["guests", "guest"]]) {
+      const root = path.join(this.dataRoot, directory);
+      let actorIds = [];
+      try { actorIds = await fs.readdir(root); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+      for (const actorId of actorIds.sort()) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(actorId)) continue;
+        let hasPendingTask = false;
+        let hasRunningWebInteraction = false;
+        try {
+          const envelope = JSON.parse(await fs.readFile(path.join(root, actorId, "tasks", "index.json"), "utf8"));
+          hasPendingTask = Object.values(envelope?.data?.tasks || {}).some((task) => task?.status && !terminal.has(task.status));
+        } catch (error) {
+          if (error?.code !== "ENOENT") continue;
+        }
+        try {
+          const envelope = JSON.parse(await fs.readFile(path.join(root, actorId, "runtime", "web-interactions", "state.json"), "utf8"));
+          hasRunningWebInteraction = Object.values(envelope?.data?.runs || {}).some((run) => run?.status === "running");
+        } catch (error) {
+          if (error?.code !== "ENOENT" && !hasPendingTask) continue;
+        }
+        if (!hasPendingTask && !hasRunningWebInteraction) continue;
+        candidates.push(createActorContext({
+          actorType,
+          actorId,
+          ...(actorType === "user" ? { userId: actorId } : {}),
+          deviceId: "gateway-recovery",
+          sessionId: "gateway-recovery",
+          roles: [],
+        }));
+      }
+    }
+    return Promise.all(candidates.map(async (actor) => {
+      try {
+        await this.servicesForActor(actor);
+        return { actorId: actor.actorId, status: "fulfilled" };
+      } catch (error) {
+        await this.#settleUnrecoverableActorTasks(actor).catch(() => undefined);
+        return { actorId: actor.actorId, status: "rejected", code: String(error?.code || "ACTOR_RECOVERY_FAILED") };
+      }
+    }));
+  }
+
+  async #settleUnrecoverableActorTasks(actor) {
+    const taskStore = new FileTaskStore({ dataRoot: this.dataRoot, actor, queue: this.queue, clock: this.clock });
+    const tasks = await taskStore.scanTasks();
+    const now = this.clock().toISOString();
+    for (const summary of tasks) {
+      let task = await taskStore.getTask(summary.id);
+      if (task && canTransitionTask(task.status, "failed")) {
+        const next = transitionTask(task, "failed", {
+          expectedRevision: task.revision,
+          activeCommandId: task.activeCommandId,
+          failure: {
+            code: "TASK_RECOVERY_RUNTIME_UNAVAILABLE",
+            message: "Gateway 重启后无法初始化该用户的恢复运行时，Task 已安全收口",
+            retryable: false,
+          },
+          clock: this.clock,
+        });
+        await taskStore.saveTask(next, { expectedRevision: task.revision });
+        task = next;
+      }
+      for (const command of await taskStore.listCommands(summary.id)) {
+        if (!["accepted", "running"].includes(command.status)) continue;
+        await taskStore.updateCommand(summary.id, command.commandId, {
+          status: "failed",
+          failure: {
+            code: "TASK_COMMAND_GATEWAY_RESTARTED",
+            message: `Gateway 重启前的 ${command.type} command 未能返回确定结果，Task 当前状态为 ${task?.status || "unknown"}`,
+            retryable: false,
+          },
+          updatedAt: now,
+        });
+      }
+    }
+  }
+
+  registryForActor(actor) {
+    const key = actorKey(actor);
+    if (!this.registries.has(key)) {
+      const vault = new SshCredentialVault({ dataRoot: this.dataRoot, actor, masterSecret: this.secrets.masterSecret, queue: this.queue });
+      this.registries.set(key, new SshServerRegistry({
+        dataRoot: this.dataRoot,
+        actor,
+        vault,
+        queue: this.queue,
+        clock: this.clock,
+        networkPolicy: this.sshPolicy,
+      }));
+    }
+    return this.registries.get(key);
+  }
+
+  async servicesForActor(actor) {
+    invariant(!this.closing, "RUNTIME_CLOSING", "Gateway 正在关闭", { status: 503, retryable: true });
+    const key = actorKey(actor);
+    let entry = this.containers.get(key);
+    if (!entry) {
+      const promise = ActorServiceContainer.create(this, actor);
+      entry = { promise, lastAccess: Date.now() };
+      this.containers.set(key, entry);
+      promise.catch(() => {
+        if (this.containers.get(key) === entry) this.containers.delete(key);
+      });
+    }
+    entry.lastAccess = Date.now();
+    return entry.promise;
+  }
+
+  async releaseActor(actor, { force = false } = {}) {
+    const key = actorKey(actor);
+    const entry = this.containers.get(key);
+    if (!entry) return false;
+    const container = await entry.promise.catch(() => null);
+    if (!force && container?.interactions?.runs?.size) return false;
+    this.containers.delete(key);
+    await container?.close?.();
+    return true;
+  }
+
+  async releaseIdleContainers() {
+    const threshold = Date.now() - this.containerIdleTtlMs;
+    const entries = [...this.containers.entries()];
+    await Promise.all(entries.map(async ([, entry]) => {
+      const container = await entry.promise.catch(() => null);
+      await container?.previews?.expireDue?.().catch(() => undefined);
+    }));
+    await Promise.all(entries
+      .filter(([, entry]) => entry.lastAccess < threshold)
+      .map(async ([key, entry]) => {
+        const container = await entry.promise.catch(() => null);
+        if (!container || container.interactions.runs.size || (await container.taskStore.listTasks({ statuses: ["queued", "preparing", "delivering_context", "running", "interrupting", "recovering", "finalizing"], limit: 1 })).length) return;
+        if (this.containers.get(key) === entry) this.containers.delete(key);
+        await container.close();
+      }));
+    await this.cleanupPendingGuests();
+  }
+
+  async createWebModel({ actor, providerId, modelId, mode, runId }) {
+    if (this.webModelFactory) return this.webModelFactory({ actor, providerId, modelId, mode, runId, runtime: this });
+    const access = await this.providers.resolve(actor, { providerId, purpose: "web", modelId, requireModel: true });
+    const underlying = new OpenAIChatModel({
+      baseUrl: access.credential.baseUrl,
+      apiKey: access.credential.apiKey,
+      model: access.model,
+      protocol: access.credential.protocol,
+      fetchImpl: this.fetchImpl,
+    });
+    let completionIndex = 0;
+    return {
+      complete: async (input) => {
+        const usageRunId = `${runId}:${completionIndex++}`;
+        const startedAt = Date.now();
+        try {
+          const result = await underlying.complete(input);
+          await this.#recordModelUsage(actor, providerId, usageRunId, result.usage, Date.now() - startedAt, false);
+          return result;
+        } catch (error) {
+          await this.#recordModelUsage(actor, providerId, usageRunId, null, Date.now() - startedAt, true).catch(() => undefined);
+          throw error;
+        }
+      },
+    };
+  }
+
+  async completeAuxiliary({ actor, providerId, modelId, mode = "chat", runId, system, input, maxOutputTokens = 8_192 }) {
+    const model = await this.createWebModel({ actor, providerId, modelId, mode, runId });
+    const result = await model.complete({
+      messages: [
+        { role: "system", content: String(system || "") },
+        { role: "user", content: typeof input === "string" ? input : JSON.stringify(input) },
+      ],
+      tools: [],
+      limits: { maxInputTokens: 160_000, maxOutputTokens },
+      signal: undefined,
+      onDelta: undefined,
+    });
+    return String(result?.content || "");
+  }
+
+  async #recordModelUsage(actor, providerId, runId, usage, latencyMs, failed) {
+    const inputTokens = Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0);
+    const outputTokens = Number(usage?.completion_tokens ?? usage?.output_tokens ?? 0);
+    await this.providerUsage.record(actor, {
+      providerId,
+      purpose: "web",
+      metrics: {
+        requests: 1,
+        inputTokens: Number.isSafeInteger(inputTokens) && inputTokens >= 0 ? inputTokens : 0,
+        outputTokens: Number.isSafeInteger(outputTokens) && outputTokens >= 0 ? outputTokens : 0,
+        embeddingTokens: 0,
+        errors: failed ? 1 : 0,
+        latencyMs: Math.max(0, Math.round(latencyMs)),
+      },
+      commandId: `usage_${crypto.createHash("sha256").update(runId).digest("hex").slice(0, 32)}`,
+    });
+  }
+
+  createApi() {
+    return createApi({
+      auth: this.auth,
+      servicesForActor: (actor) => this.servicesForActor(actor),
+      allowedOrigins: this.allowedOrigins,
+      bootstrap: (request) => request.services.bootstrap(request.session),
+      logout: (request) => this.logoutSession(request),
+      auditSession: async ({ action, result, request }) => {
+        // Authentication must never wait for the Actor service container. That
+        // container restores SSH workers and detached Agent tasks, and a slow
+        // or unavailable remote server must not prevent a user from logging in.
+        const audit = new AuditService({
+          dataRoot: this.dataRoot,
+          actor: result.actor,
+          cursorSecret: this.secrets.cursorSecret,
+          queue: this.queue,
+          clock: this.clock,
+        });
+        await audit.append({
+          action,
+          status: "success",
+          target: { actorType: result.actor.actorType, actorId: result.actor.actorId },
+          requestId: request.requestId,
+          metadata: { deviceId: result.actor.deviceId },
+        });
+      },
+      extend: (router) => this.#extendApi(router),
+    });
+  }
+
+  async logoutSession(request) {
+    const actor = request.session.actor;
+    const result = await this.auth.logout(request.token);
+    if (actor.actorType !== "guest") return { ...result, guestCleanup: "not-applicable" };
+    const cleanup = await this.#deleteGuestWhenIdle(actor);
+    if (!cleanup.deleted) await this.auth.markGuestCleanupPending(actor.actorId);
+    return { ...result, guestCleanup: cleanup.deleted ? "deleted" : "deferred" };
+  }
+
+  async #guestHasProtectedState(actor, { preserveAnySshTask = false } = {}) {
+    if (this.sshPool.snapshot().some((entry) => entry.actorType === "guest" && entry.actorId === actor.actorId)) return true;
+    if (!this.sshPool.canReleaseActor(actor)) return true;
+    const entry = this.containers.get(actorKey(actor));
+    if (entry) {
+      const container = await entry.promise.catch(() => null);
+      if (!container) return true;
+      if (container.interactions.runs.size || container.taskRuntime.activeKeys().length) return true;
+      let active;
+      try {
+        active = await container.taskStore.listTasks(preserveAnySshTask
+          ? { limit: 1 }
+          : {
+            statuses: ["queued", "preparing", "delivering_context", "running", "waiting_approval", "waiting_append", "interrupting", "interrupted", "recovering", "finalizing"],
+            limit: 1,
+          });
+      } catch {
+        return true;
+      }
+      if (active.length) return true;
+    } else {
+      const tasksPath = path.join(this.dataRoot, "guests", actor.actorId, "tasks", "index.json");
+      try {
+        const envelope = JSON.parse(await fs.readFile(tasksPath, "utf8"));
+        if (preserveAnySshTask && Object.keys(envelope?.data?.tasks || {}).length > 0) return true;
+        const activeStatuses = new Set(["queued", "preparing", "delivering_context", "running", "waiting_approval", "waiting_append", "interrupting", "interrupted", "recovering", "finalizing"]);
+        if (Object.values(envelope?.data?.tasks || {}).some((task) => activeStatuses.has(task?.status))) return true;
+      } catch (error) {
+        if (error?.code !== "ENOENT") return true;
+      }
+    }
+    const serversPath = path.join(this.dataRoot, "guests", actor.actorId, "state", "servers.json");
+    try {
+      const envelope = JSON.parse(await fs.readFile(serversPath, "utf8"));
+      if (preserveAnySshTask && Object.keys(envelope?.data?.profiles || {}).length > 0) return true;
+      if (Object.values(envelope?.data?.connections || {}).some((connection) => connection?.desiredConnection || ["connected", "connecting"].includes(connection?.status))) return true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") return true;
+    }
+    return false;
+  }
+
+  async #deleteGuestWhenIdle(actor, inactiveBefore = null) {
+    if (await this.#guestHasProtectedState(actor, { preserveAnySshTask: Boolean(inactiveBefore) })) return { deleted: false, reason: "protected-runtime" };
+    await this.releaseActor(actor, { force: true });
+    if (!await this.sshPool.releaseActor(actor)) return { deleted: false, reason: "ssh-active" };
+    this.registries.delete(actorKey(actor));
+    try {
+      return await this.auth.deleteGuestActor(actor.actorId, inactiveBefore ? { inactiveBefore } : {});
+    } catch (error) {
+      if (["GUEST_SESSION_ACTIVE", "GUEST_RECENTLY_ACTIVE"].includes(error?.code)) return { deleted: false, reason: error.code };
+      throw error;
+    }
+  }
+
+  async cleanupInactiveGuests() {
+    const inactiveBefore = new Date(this.clock().getTime() - this.guestTtlMs);
+    const candidates = await this.auth.listInactiveGuests({ inactiveBefore });
+    const results = [];
+    for (const candidate of candidates) {
+      const actor = createActorContext({
+        actorType: "guest",
+        actorId: candidate.actorId,
+        deviceId: "maintenance",
+        sessionId: "maintenance",
+        roles: [],
+      });
+      results.push({ actorId: candidate.actorId, ...(await this.#deleteGuestWhenIdle(actor, inactiveBefore)) });
+    }
+    return results;
+  }
+
+  async cleanupPendingGuests() {
+    const candidates = await this.auth.listPendingGuestCleanup();
+    const results = [];
+    for (const candidate of candidates) {
+      const actor = createActorContext({ actorType: "guest", actorId: candidate.actorId, deviceId: "maintenance", sessionId: "maintenance", roles: [] });
+      results.push({ actorId: candidate.actorId, ...(await this.#deleteGuestWhenIdle(actor)) });
+    }
+    return results;
+  }
+
+  createRealtimeServer() {
+    return new RealtimeSocketServer({
+      auth: this.auth,
+      brokerForActor: async (actor) => (await this.servicesForActor(actor)).broker,
+      authorizeTopic: async ({ actor, topic }) => {
+        const services = await this.servicesForActor(actor);
+        if (topic.startsWith("conversation:")) {
+          await services.baseConversations.getConversation(topic.slice("conversation:".length));
+          return true;
+        }
+        if (topic.startsWith("task:")) {
+          const tasks = await services.taskStore.listTasks({ limit: 1000 });
+          const visible = tasks.some((task) => task.id === topic.slice("task:".length));
+          invariant(visible, "REALTIME_TOPIC_FORBIDDEN", "无权订阅该 Task", { status: 403 });
+          return true;
+        }
+        if (topic.startsWith("terminal:")) {
+          const visible = [...services.remoteBundles.values()].some((entry) => entry.backend?.terminal?.ownsTopic?.(topic));
+          invariant(visible, "REALTIME_TOPIC_FORBIDDEN", "无权订阅该终端会话", { status: 403 });
+          return true;
+        }
+        invariant(false, "REALTIME_TOPIC_FORBIDDEN", "无权订阅该 topic", { status: 403 });
+      },
+    });
+  }
+
+  #extendApi(router) {
+    router.route("GET", "/api/admin/ssh-connections", (request) => this.adminSshConnections(request.session.actor), { admin: true });
+    router.route("POST", "/api/admin/ssh-connections/:actorId/:serverId/disconnect", (request) => this.adminDisconnectSsh(request.session.actor, {
+      actorId: request.params.actorId,
+      serverId: request.params.serverId,
+      commandId: commandId(request),
+    }), { admin: true });
+
+    router.route("POST", "/api/conversations/:id/respond", (request) => request.services.interactions.respond({
+      ...requiredObject(request.body, "对话响应"),
+      conversationId: request.params.id,
+      commandId: commandId(request),
+    }));
+    router.route("GET", "/api/conversations/:id/runs/:runId", async (request) => {
+      await request.services.conversations.getConversation(request.params.id);
+      return request.services.interactions.status(request.params.runId);
+    });
+    router.route("GET", "/api/conversations/:id/events", async (request) => {
+      await request.services.conversations.getConversation(request.params.id);
+      return request.services.broker.replay(`conversation:${request.params.id}`, {
+        afterSequence: request.query.after ? Number(request.query.after) : 0,
+        limit: request.query.limit ? Number(request.query.limit) : 2_000,
+      });
+    });
+    router.route("GET", "/api/conversations/:id/context", (request) => request.services.conversationContext.get(request.params.id));
+    router.route("PATCH", "/api/conversations/:id/context", (request) => request.services.conversationContext.update(request.params.id, {
+      ...requiredObject(request.body, "网页对话上下文配置"),
+      expectedRevision: expectedRevision(request),
+    }));
+    router.route("POST", "/api/conversations/:id/context/compact", (request) => request.services.conversationContext.compact(request.params.id));
+
+    router.route("GET", "/api/providers/manage", (request) => request.services.providers.inspectUserProviders(request.session.actor));
+    router.route("POST", "/api/skills/:skillId/activate", (request) => request.services.skills.activateVersion({
+      skillId: request.params.skillId,
+      version: requiredObject(request.body, "激活 Skill 版本").version,
+      expectedRevision: expectedRevision(request),
+      commandId: commandId(request),
+    }));
+    router.route("GET", "/api/skills/deployments", async (request) => {
+      const servers = await request.services.servers.list();
+      const connected = servers.filter((entry) => entry.connection.status === "connected" && entry.profile.serverIdentity);
+      const inspected = await Promise.all(connected.map(async (entry) => {
+        const backend = await request.services.remoteBackend(entry.profile.id);
+        invariant(typeof backend.skillDeployment?.inspect === "function", "REMOTE_SKILL_DEPLOYMENT_UNAVAILABLE", "远端 backend 未提供 Skill 部署状态", { status: 503 });
+        return backend.skillDeployment.inspect();
+      }));
+      const names = new Map(connected.map((entry) => [entry.profile.id, entry.profile.name || entry.profile.host]));
+      return { items: inspected.flatMap((entry) => entry.items.map((item) => ({
+        ...item,
+        serverId: entry.serverId,
+        serverName: names.get(entry.serverId) || entry.serverId,
+        serverIdentity: entry.serverIdentity,
+        status: item.status === "failed" ? "failed" : "ready",
+      }))) };
+    });
+    router.route("GET", "/api/resources", async (request) => {
+      const query = strictQuery(request.query, ["ownerType", "ownerId", "cursor", "limit"], "资源列表");
+      const inspected = await request.services.resources.inspect();
+      const items = composeResourceList(inspected, query);
+      return { items, revision: inspected.revision, nextCursor: null };
+    });
+
+    router.route("GET", "/api/artifacts", (request) => request.services.artifacts.list({
+      ...strictQuery(request.query, ["cursor", "limit", "taskId", "conversationId", "projectId", "workspaceId", "lifecycle"], "Artifact 列表"),
+      limit: request.query.limit ? Number(request.query.limit) : undefined,
+      lifecycle: parseCsv(request.query.lifecycle),
+    }));
+    router.route("GET", "/api/artifacts/:id", (request) => request.services.artifacts.get({ artifactId: request.params.id }));
+    router.route("POST", "/api/artifacts/:id/download", (request) => request.services.artifacts.issueDownload({
+      artifactId: request.params.id,
+      ttlMs: request.body?.ttlMs,
+    }));
+    router.route("POST", "/api/artifacts/:id/save-as-resource", (request) => request.services.artifacts.promoteToProject({
+      artifactId: request.params.id,
+      projectId: requiredObject(request.body, "保存 Artifact 到项目").projectId,
+      expectedRevision: expectedRevision(request),
+      commandId: commandId(request),
+    }));
+
+    router.route("POST", "/api/previews", (request) => request.services.createPreview(requiredObject(request.body, "创建 Preview")));
+    router.route("GET", "/api/previews/:id", (request) => request.services.previews.get({ previewId: request.params.id }));
+    router.route("HEAD", "/api/previews/:id", (request) => request.services.previews.head({ previewId: request.params.id }));
+    router.route("PATCH", "/api/previews/:id", (request) => request.services.previews.renew({
+      previewId: request.params.id,
+      expectedRevision: expectedRevision(request),
+      ttlMs: requiredObject(request.body, "续期 Preview").ttlMs,
+    }));
+    router.route("DELETE", "/api/previews/:id", (request) => request.services.previews.close({
+      previewId: request.params.id,
+      expectedRevision: expectedRevision(request),
+    }));
+
+    router.route("GET", "/api/help", () => this.helpDocument());
+
+    router.route("GET", "/api/servers/:id/capabilities", async (request) => ({ data: await request.services.serverCapabilities.get(request.params.id) }));
+    router.route("POST", "/api/servers/:id/capabilities/refresh", async (request) => ({ data: await request.services.serverCapabilities.get(request.params.id, { refresh: true }) }));
+
+    router.route("GET", "/api/servers/:id/workspaces", async (request) => {
+      const server = await request.services.servers.get(request.params.id);
+      invariant(server.profile.serverIdentity, "SSH_SERVER_IDENTITY_REQUIRED", "请先确认主机指纹并连接服务器", { status: 409 });
+      return (await request.services.workspaceFor(request.params.id, server.profile.serverIdentity)).list({ serverIdentity: server.profile.serverIdentity });
+    });
+    router.route("POST", "/api/servers/:id/workspaces/virtual", async (request) => {
+      const server = await request.services.servers.get(request.params.id);
+      return (await request.services.workspaceFor(request.params.id, server.profile.serverIdentity)).createVirtual({
+        ...requiredObject(request.body, "创建虚拟工作区"), serverIdentity: server.profile.serverIdentity, commandId: commandId(request),
+      });
+    });
+    router.route("POST", "/api/servers/:id/workspaces/assess", async (request) => {
+      const server = await request.services.servers.get(request.params.id);
+      return (await request.services.workspaceFor(request.params.id, server.profile.serverIdentity)).assessUserWorkspace({ ...requiredObject(request.body, "评估工作区"), serverIdentity: server.profile.serverIdentity });
+    });
+    router.route("POST", "/api/servers/:id/workspaces/user", async (request) => {
+      const server = await request.services.servers.get(request.params.id);
+      return (await request.services.workspaceFor(request.params.id, server.profile.serverIdentity)).registerUserWorkspace({
+        ...requiredObject(request.body, "注册工作区"), serverIdentity: server.profile.serverIdentity, commandId: commandId(request),
+      });
+    });
+    router.route("GET", "/api/servers/:id/workspace-bindings", async (request) => {
+      const server = await request.services.servers.get(request.params.id);
+      return (await request.services.workspaceFor(request.params.id, server.profile.serverIdentity)).listBindings({
+        conversationId: request.query.conversationId,
+        branchId: request.query.branchId || undefined,
+      });
+    });
+    router.route("POST", "/api/servers/:id/workspace-bindings", async (request) => {
+      const body = requiredObject(request.body, "绑定工作区");
+      await request.services.baseConversations.getConversation(body.conversationId);
+      await request.services.servers.bindConversation(request.params.id, body.conversationId);
+      const server = await request.services.servers.get(request.params.id);
+      return (await request.services.workspaceFor(request.params.id, server.profile.serverIdentity)).ensureAgentBinding({
+        ...body, commandId: commandId(request),
+      });
+    });
+    router.route("GET", "/api/servers/:id/workspace-route", async (request) => {
+      const server = await request.services.servers.get(request.params.id);
+      return (await request.services.workspaceFor(request.params.id, server.profile.serverIdentity)).getRoute({
+        conversationId: request.query.conversationId,
+        branchId: request.query.branchId || undefined,
+      });
+    });
+    router.route("POST", "/api/servers/:id/workspace-switch/describe", async (request) => (await request.services.workspaceFor(request.params.id, (await request.services.servers.get(request.params.id)).profile.serverIdentity)).describeSwitch(requiredObject(request.body, "描述工作区切换")));
+    router.route("POST", "/api/servers/:id/workspace-switch", async (request) => (await request.services.workspaceFor(request.params.id, (await request.services.servers.get(request.params.id)).profile.serverIdentity)).switchBinding({ ...requiredObject(request.body, "切换工作区"), commandId: commandId(request) }));
+    router.route("POST", "/api/servers/:id/dynamic-writes/describe", async (request) => (await request.services.workspaceFor(request.params.id, (await request.services.servers.get(request.params.id)).profile.serverIdentity)).describeDynamicWrite({
+      ...requiredObject(request.body, "描述动态写入"),
+      serverIdentity: (await request.services.servers.get(request.params.id)).profile.serverIdentity,
+    }));
+    router.route("POST", "/api/servers/:id/dynamic-writes/confirm", async (request) => (await request.services.workspaceFor(request.params.id, (await request.services.servers.get(request.params.id)).profile.serverIdentity)).confirmDynamicWrite({
+      ...requiredObject(request.body, "确认动态写入"),
+      serverIdentity: (await request.services.servers.get(request.params.id)).profile.serverIdentity,
+      commandId: commandId(request),
+    }));
+
+    router.route("GET", "/api/servers/:id/agents", async (request) => {
+      const deployment = await request.services.agentDeploymentFor(request.params.id);
+      const agentIds = parseCsv(request.query.agentIds) || ["opencode", "codex", "claude-code"];
+      return { items: await Promise.all(agentIds.map(async (agentId) => {
+        const status = await deployment.status(agentId);
+        const adapter = request.services.agentAdapters[String(agentId)] || null;
+        return {
+          ...status,
+          runtimeCapabilities: adapter ? structuredClone(adapter.capabilities) : null,
+        };
+      })) };
+    });
+    router.route("GET", "/api/servers/:id/directories", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.remoteControl?.listHomeDirectories === "function", "REMOTE_DIRECTORY_BROWSER_UNAVAILABLE", "当前服务器不支持目录选择", { status: 503 });
+      return backend.remoteControl.listHomeDirectories(request.query.path || null);
+    });
+    router.route("POST", "/api/servers/:id/agents/:agentId/register", async (request) => {
+      const body = requiredObject(request.body, "手动添加 Agent");
+      return (await request.services.agentDeploymentFor(request.params.id)).registerUserDeployment(request.params.agentId, { root: body.root });
+    });
+    for (const [route, method] of [["install", "install"], ["update", "install"], ["uninstall", "uninstall"]]) {
+      router.route("POST", `/api/servers/:id/agents/:agentId/${route}`, async (request) => (await request.services.agentDeploymentFor(request.params.id))[method](request.params.agentId, requiredObject(request.body || {}, `Agent ${route}`)));
+    }
+    router.route("GET", "/api/servers/:id/agents/:agentId/config", async (request) => {
+      const query = strictQuery(request.query, ["source"], "Agent 配置");
+      invariant(query.source == null || ["managed", "user"].includes(query.source), "AGENT_CONFIG_SOURCE_INVALID", "Agent 配置来源无效", { status: 400 });
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.agentConfiguration?.inspect === "function", "AGENT_CONFIG_UNAVAILABLE", "远端 backend 未提供 Agent 配置能力", { status: 503 });
+      return backend.agentConfiguration.inspect(request.params.agentId, { source: query.source || null });
+    });
+    router.route("PATCH", "/api/servers/:id/agents/:agentId/config", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.agentConfiguration?.update === "function", "AGENT_CONFIG_WRITE_UNAVAILABLE", "远端 backend 未提供 Agent 配置写入能力", { status: 503 });
+      const body = requiredObject(request.body, "更新 Agent 配置");
+      return backend.agentConfiguration.update(request.params.agentId, {
+        source: body.source,
+        expectedRevision: expectedRevision(request),
+        values: body.values,
+      });
+    });
+    router.route("GET", "/api/servers/:id/agents/:agentId/context", (request) => request.services.agentOperation(request.params.id, request.params.agentId, "contextUsage", {
+      bindingId: request.query.bindingId,
+      source: request.query.source,
+      workspacePath: request.query.workspacePath,
+    }));
+    router.route("POST", "/api/servers/:id/agents/:agentId/compact", (request) => request.services.agentOperation(request.params.id, request.params.agentId, "compact", requiredObject(request.body, "压缩 Agent 上下文")));
+
+    router.route("GET", "/api/tasks/:id/events", async (request) => {
+      await request.services.orchestrator.getTask(request.params.id);
+      return request.services.broker.replay(taskTopic(request.params.id), {
+        afterSequence: request.query.after ? Number(request.query.after) : 0,
+        limit: request.query.limit ? Number(request.query.limit) : 2_000,
+      });
+    });
+
+    router.route("GET", "/api/servers/:id/workspaces/:workspaceId/files", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.remoteFiles?.list === "function", "REMOTE_FILES_UNAVAILABLE", "远端 backend 未提供文件浏览", { status: 503 });
+      strictQuery(request.query, ["path"], "浏览远端文件");
+      return backend.remoteFiles.list({ workspaceId: request.params.workspaceId, path: request.query.path || "" });
+    });
+    router.route("POST", "/api/servers/:id/workspaces/:workspaceId/directories", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.remoteFiles?.mkdir === "function", "REMOTE_DIRECTORY_CREATE_UNAVAILABLE", "远端 backend 未提供新建目录", { status: 503 });
+      const body = strictBody(request.body, ["path"], "新建远端目录");
+      return backend.remoteFiles.mkdir({ workspaceId: request.params.workspaceId, path: body.path });
+    });
+    router.route("PATCH", "/api/servers/:id/workspaces/:workspaceId/entries", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.remoteFiles?.rename === "function", "REMOTE_FILE_RENAME_UNAVAILABLE", "远端 backend 未提供重命名", { status: 503 });
+      const body = strictBody(request.body, ["path", "destination"], "重命名远端文件");
+      return backend.remoteFiles.rename({ workspaceId: request.params.workspaceId, path: body.path, destination: body.destination });
+    });
+    router.route("DELETE", "/api/servers/:id/workspaces/:workspaceId/entries", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.remoteFiles?.delete === "function", "REMOTE_FILE_DELETE_UNAVAILABLE", "远端 backend 未提供删除", { status: 503 });
+      const body = strictBody(request.body, ["path", "recursive", "confirmation"], "删除远端文件");
+      return backend.remoteFiles.delete({ workspaceId: request.params.workspaceId, path: body.path, recursive: body.recursive === true, confirmation: body.confirmation });
+    });
+    router.route("POST", "/api/servers/:id/terminal", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.terminal?.create === "function", "REMOTE_TERMINAL_UNAVAILABLE", "远端 backend 未提供终端会话", { status: 503 });
+      return backend.terminal.create({ ...requiredObject(request.body, "创建终端"), commandId: commandId(request) });
+    });
+    router.route("POST", "/api/servers/:id/terminal/:sessionId/input", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.terminal?.input === "function", "REMOTE_TERMINAL_INPUT_UNAVAILABLE", "远端 backend 未提供终端输入", { status: 503 });
+      return backend.terminal.input(request.params.sessionId, { ...requiredObject(request.body, "终端输入"), commandId: commandId(request) });
+    });
+    router.route("GET", "/api/servers/:id/terminal/:sessionId", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.terminal?.inspect === "function", "REMOTE_TERMINAL_UNAVAILABLE", "远端 backend 未提供终端会话", { status: 503 });
+      return backend.terminal.inspect(request.params.sessionId);
+    });
+    router.route("POST", "/api/servers/:id/terminal/:sessionId/resize", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.terminal?.resize === "function", "REMOTE_TERMINAL_RESIZE_UNAVAILABLE", "远端 backend 未提供终端尺寸调整", { status: 503 });
+      return backend.terminal.resize(request.params.sessionId, { ...requiredObject(request.body, "调整终端大小"), commandId: commandId(request) });
+    });
+    router.route("POST", "/api/servers/:id/terminal/:sessionId/detach", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.terminal?.detach === "function", "REMOTE_TERMINAL_DETACH_UNAVAILABLE", "远端 backend 未提供终端分离", { status: 503 });
+      return backend.terminal.detach(request.params.sessionId);
+    });
+    router.route("POST", "/api/servers/:id/terminal/:sessionId/resume", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.terminal?.resume === "function", "REMOTE_TERMINAL_RESUME_UNAVAILABLE", "远端 backend 未提供终端恢复", { status: 503 });
+      return backend.terminal.resume(request.params.sessionId);
+    });
+    router.route("DELETE", "/api/servers/:id/terminal/:sessionId", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.terminal?.close === "function", "REMOTE_TERMINAL_CLOSE_UNAVAILABLE", "远端 backend 未提供终端关闭", { status: 503 });
+      return backend.terminal.close(request.params.sessionId);
+    });
+    for (const operation of ["status", "diff", "commit", "rewind"]) {
+      router.route(["commit", "rewind"].includes(operation) ? "POST" : "GET", `/api/servers/:id/versioning/${operation}`, async (request) => {
+        const backend = await request.services.remoteBackend(request.params.id);
+        invariant(typeof backend.versionControl?.[operation] === "function", "VERSION_CONTROL_UNAVAILABLE", `远端 backend 未提供版本${operation}`, { status: 503 });
+        return backend.versionControl[operation](["commit", "rewind"].includes(operation) ? { ...requiredObject(request.body, `版本${operation}`), commandId: commandId(request) } : request.query);
+      });
+    }
+    router.route("GET", "/api/servers/:id/workspaces/:workspaceId/git/status", async (request) => {
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.versionControl?.status === "function", "VERSION_CONTROL_UNAVAILABLE", "远端 backend 未提供隔离版本状态", { status: 503 });
+      return backend.versionControl.status({ workspaceId: request.params.workspaceId });
+    });
+
+    router.route("GET", "/api/servers/:id/scheduler/capabilities", async (request) => (await request.services.schedulerFor(request.params.id)).getCapabilities());
+    router.route("GET", "/api/servers/:id/scheduler/partitions", async (request) => (await request.services.schedulerFor(request.params.id)).accessiblePartitions());
+    router.route("GET", "/api/servers/:id/scheduler/resources", async (request) => (await request.services.schedulerFor(request.params.id)).resourceSummary({ partitions: parseCsv(request.query.partitions) }));
+    router.route("GET", "/api/servers/:id/scheduler/jobs", async (request) => (await request.services.schedulerFor(request.params.id)).userJobs());
+    router.route("GET", "/api/servers/:id/scheduler/jobs/:jobId/output", async (request) => {
+      const output = await (await request.services.schedulerFor(request.params.id)).jobOutput({ jobId: request.params.jobId, stream: request.query.stream, offset: request.query.offset && Number(request.query.offset), maxBytes: request.query.maxBytes && Number(request.query.maxBytes) });
+      return { ...output, bytesBase64: output.bytes.toString("base64"), bytes: undefined };
+    });
+    router.route("POST", "/api/servers/:id/scheduler/jobs", async (request) => (await request.services.schedulerFor(request.params.id)).submit({ ...requiredObject(request.body, "提交作业"), commandId: commandId(request) }));
+    router.route("POST", "/api/servers/:id/scheduler/jobs/:jobId/cancel", async (request) => (await request.services.schedulerFor(request.params.id)).cancelJob({ jobId: request.params.jobId, commandId: commandId(request) }));
+  }
+
+  async helpDocument() {
+    const [content, stat] = await Promise.all([fs.readFile(this.helpFile, "utf8"), fs.stat(this.helpFile)]);
+    return {
+      content,
+      mediaType: "text/markdown; charset=utf-8",
+      etag: `"${crypto.createHash("sha256").update(content).digest("base64url")}"`,
+      lastModified: stat.mtime.toUTCString(),
+    };
+  }
+
+  async adminSshConnections(adminActor) {
+    invariant(adminActor?.roles?.includes("admin"), "ADMIN_REQUIRED", "需要管理员权限", { status: 403 });
+    const users = await this.auth.listUsersForAdmin(adminActor);
+    const live = new Set(this.sshPool.snapshot().map((entry) => `${entry.actorId}:${entry.serverId}`));
+    const groups = await Promise.all(users.map(async (user) => {
+      const actor = createActorContext({
+        actorType: "user",
+        actorId: user.userId,
+        deviceId: "admin-inspection",
+        sessionId: "admin-inspection",
+        roles: [],
+      });
+      const servers = await this.registryForActor(actor).list();
+      return servers.map(({ profile, connection, conversationIds }) => {
+        const isLive = live.has(`${user.userId}:${profile.id}`);
+        const status = connection.status === "connected" && !isLive ? "disconnected" : connection.status;
+        return {
+          actorId: user.userId,
+          username: user.username,
+          serverId: profile.id,
+          serverName: profile.name,
+          host: profile.host,
+          status,
+          lastActiveAt: connection.lastActiveAt,
+          conversationCount: conversationIds.length,
+        };
+      });
+    }));
+    return {
+      items: groups.flat().sort((left, right) => String(right.lastActiveAt || "").localeCompare(String(left.lastActiveAt || "")) || left.username.localeCompare(right.username, "zh-CN")),
+    };
+  }
+
+  async adminDisconnectSsh(adminActor, input) {
+    invariant(adminActor?.roles?.includes("admin"), "ADMIN_REQUIRED", "需要管理员权限", { status: 403 });
+    invariant(typeof input?.commandId === "string" && input.commandId, "IDEMPOTENCY_KEY_REQUIRED", "写操作必须提供 Idempotency-Key", { status: 428 });
+    const users = await this.auth.listUsersForAdmin(adminActor);
+    const user = users.find((entry) => entry.userId === input.actorId);
+    invariant(user, "ADMIN_SSH_ACTOR_NOT_FOUND", "用户不存在", { status: 404 });
+    const actor = createActorContext({
+      actorType: "user",
+      actorId: user.userId,
+      deviceId: "admin-inspection",
+      sessionId: "admin-inspection",
+      roles: [],
+    });
+    const registry = this.registryForActor(actor);
+    const before = await registry.get(input.serverId);
+    const connection = await this.sshPool.workerFor(actor).disconnect(input.serverId);
+    return {
+      commandId: input.commandId,
+      disconnected: true,
+      item: {
+        actorId: user.userId,
+        username: user.username,
+        serverId: before.profile.id,
+        serverName: before.profile.name,
+        host: before.profile.host,
+        status: connection.status,
+        lastActiveAt: connection.lastActiveAt,
+        conversationCount: before.conversationIds.length,
+      },
+    };
+  }
+
+  async openArtifactDownload({ actor, artifactId, downloadToken, rangeHeader }) {
+    const services = await this.servicesForActor(actor);
+    const artifact = await services.artifacts.get({ artifactId });
+    const range = parseRangeHeader(rangeHeader, artifact.versions.find((entry) => entry.id === artifact.activeVersionId)?.size ?? artifact.size);
+    return services.artifacts.openDownload({ downloadToken, range });
+  }
+
+  async previewHead({ actor, previewId }) {
+    const services = await this.servicesForActor(actor);
+    return services.previews.head({ previewId });
+  }
+
+  async openPreviewContent({ actor, previewId, rangeHeader }) {
+    const services = await this.servicesForActor(actor);
+    const head = services.previews.head({ previewId });
+    const range = parsePreviewRangeHeader(rangeHeader, head.contentLength);
+    return services.previews.openContent({ previewId, range });
+  }
+
+  async close() {
+    if (this.closing) return;
+    this.closing = true;
+    if (this.containerTimer) clearInterval(this.containerTimer);
+    if (this.guestTimer) clearInterval(this.guestTimer);
+    await this.actorRecoveryPromise?.catch(() => undefined);
+    await Promise.allSettled([...this.containers.values()].map(async (entry) => (await entry.promise).close()));
+    this.containers.clear();
+    await this.sshPool.stop();
+    this.registries.clear();
+  }
+}
+
+export async function createEasyWorkRuntime(options) {
+  return EasyWorkRuntime.create(options);
+}

@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { headers } from "next/headers";
 import "katex/dist/katex.min.css";
-import "./globals.css";
+import "./easywork/styles/base.css";
 
 export const viewport: Viewport = {
   width: "device-width",

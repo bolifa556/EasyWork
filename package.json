@@ -1,6 +1,5 @@
 {
   "name": "easywork",
-  "version": "0.1.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -8,19 +7,18 @@
   "scripts": {
     "dev": "node scripts/run-vinext.mjs dev",
     "build": "node scripts/run-vinext.mjs build",
-    "start": "node scripts/run-vinext.mjs start",
-    "gateway": "node gateway/server.mjs",
+    "start": "node scripts/serve-easywork.mjs",
+    "gateway": "node gateway/core/server.mjs",
     "frp": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File frp/start.ps1",
     "sync:setup": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File sync/install.ps1",
-    "test:gateway": "node --test tests/gateway.test.mjs",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/gateway.test.mjs tests/remote-runtime.test.mjs tests/memory.test.mjs tests/memory-version-conflicts.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .cache --ignore-pattern outputs --ignore-pattern work",
-    "db:generate": "drizzle-kit generate"
+    "test:gateway": "node --test --test-reporter=spec tests/*.test.mjs",
+    "test": "npm run build && npm run test:gateway",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .cache --ignore-pattern outputs --ignore-pattern work"
   },
   "dependencies": {
-    "adm-zip": "0.6.0",
-    "drizzle-orm": "0.45.2",
-    "jsonc-parser": "3.3.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/xterm": "^6.0.0",
     "katex": "^0.18.1",
     "lucide-react": "1.27.0",
     "mammoth": "1.12.0",
@@ -45,7 +43,6 @@
     "@types/ws": "8.18.1",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
-    "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",
     "react-server-dom-webpack": "19.2.6",

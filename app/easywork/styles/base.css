@@ -1,0 +1,79 @@
+:root {
+  color-scheme: light;
+  --ew-canvas: #fbfaf6;
+  --ew-surface: rgba(255, 254, 250, 0.9);
+  --ew-surface-solid: #fffefa;
+  --ew-sidebar: #f2eddf;
+  --ew-sidebar-deep: #ebe3d1;
+  --ew-ink: #262820;
+  --ew-ink-soft: #5f6258;
+  --ew-ink-muted: #85877e;
+  --ew-line: rgba(52, 56, 46, 0.13);
+  --ew-line-strong: rgba(52, 56, 46, 0.22);
+  --ew-green: #526b43;
+  --ew-green-deep: #3f5634;
+  --ew-green-soft: #e8efe1;
+  --ew-purple: #755a98;
+  --ew-purple-soft: #eee8f5;
+  --ew-blue: #426f8a;
+  --ew-blue-soft: #e4eff4;
+  --ew-amber: #9b6a2f;
+  --ew-amber-soft: #f5ebda;
+  --ew-red: #ad443d;
+  --ew-red-soft: #f8e9e6;
+  --ew-shadow-sm: 0 8px 24px rgba(49, 44, 32, 0.07);
+  --ew-shadow-lg: 0 24px 70px rgba(43, 38, 28, 0.14);
+  --ew-radius-sm: 10px;
+  --ew-radius-md: 16px;
+  --ew-radius-lg: 24px;
+  --ew-sidebar-width: 252px;
+  --ew-rail-width: 326px;
+  --ew-header-height: 58px;
+  --ew-font: Inter, "SF Pro Text", "Segoe UI Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --ew-display: "SF Pro Display", "Segoe UI Variable Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --ew-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+  background: var(--ew-canvas);
+  color: var(--ew-ink);
+  font-family: var(--ew-font);
+  font-size: 16px;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+body { overflow: hidden; }
+
+button,
+input,
+textarea,
+select { font: inherit; }
+
+button { color: inherit; }
+
+a { color: inherit; }
+
+::selection { background: rgba(117, 90, 152, 0.2); }
+
+:focus-visible {
+  outline: 2px solid rgba(82, 107, 67, 0.58);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
