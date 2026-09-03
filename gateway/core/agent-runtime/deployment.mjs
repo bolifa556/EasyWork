@@ -47,6 +47,7 @@ done
 trap - EXIT HUP INT TERM
 rm -rf "$stage"
 `;
+const STATUS_CACHE_TTL_MS = 5 * 60_000;
 
 function json(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
@@ -115,6 +116,11 @@ export class AgentDeploymentService {
     this.catalog = catalog;
     this.executor = executor;
     this.clock = clock;
+    this.statusCache = new Map();
+    this.statusPending = new Map();
+    this.runtimeCache = new Map();
+    this.runtimePending = new Map();
+    this.pathsCache = new Map();
   }
 
   async detectPlatform() {
@@ -125,12 +131,23 @@ export class AgentDeploymentService {
   }
 
   async #paths(agentId) {
-    const paths = remoteAgentPaths(await this.executor.home(), agentId);
-    const guarded = [paths.easyworkRoot, `${paths.easyworkRoot}/agents`, paths.managedRoot, paths.managedReleases, `${paths.easyworkRoot}/runtime`, paths.runtimeReleases, paths.registryRoot];
-    const command = `for target in ${guarded.map(shellQuote).join(" ")}; do [ ! -L "$target" ] || exit 73; done; mkdir -p ${shellQuote(paths.easyworkRoot)}; chmod 0700 ${shellQuote(paths.easyworkRoot)}`;
-    const result = await this.executor.exec(command, { maxOutputBytes: 16 * 1024 });
-    invariant(result.code === 0, "AGENT_EASYWORK_ROOT_UNSAFE", "远端 ~/.easywork 路径包含符号链接，已拒绝写入", { status: 409 });
-    return paths;
+    const key = String(agentId);
+    if (this.pathsCache.has(key)) return this.pathsCache.get(key);
+    const pending = (async () => {
+      const paths = remoteAgentPaths(await this.executor.home(), agentId);
+      const guarded = [paths.easyworkRoot, `${paths.easyworkRoot}/agents`, paths.managedRoot, paths.managedReleases, `${paths.easyworkRoot}/runtime`, paths.runtimeReleases, paths.registryRoot];
+      const command = `for target in ${guarded.map(shellQuote).join(" ")}; do [ ! -L "$target" ] || exit 73; done; mkdir -p ${shellQuote(paths.easyworkRoot)}; chmod 0700 ${shellQuote(paths.easyworkRoot)}`;
+      const result = await this.executor.exec(command, { maxOutputBytes: 16 * 1024 });
+      invariant(result.code === 0, "AGENT_EASYWORK_ROOT_UNSAFE", "远端 ~/.easywork 路径包含符号链接，已拒绝写入", { status: 409 });
+      return paths;
+    })();
+    this.pathsCache.set(key, pending);
+    try {
+      return await pending;
+    } catch (error) {
+      if (this.pathsCache.get(key) === pending) this.pathsCache.delete(key);
+      throw error;
+    }
   }
 
   async #readJson(remotePath) {
@@ -144,10 +161,28 @@ export class AgentDeploymentService {
   }
 
   async status(agentId, { source = null } = {}) {
+    const cacheKey = `${agentId}:${source || "auto"}`;
+    const now = new Date(this.clock()).valueOf();
+    const cached = this.statusCache.get(cacheKey);
+    if (cached && now - cached.checkedAt < STATUS_CACHE_TTL_MS) return structuredClone(cached.value);
+    if (this.statusPending.has(cacheKey)) return structuredClone(await this.statusPending.get(cacheKey));
+    const pending = this.#inspectStatus(agentId, source).then((value) => {
+      const entry = { checkedAt: now, value };
+      this.statusCache.set(cacheKey, entry);
+      if (!source && value.source) this.statusCache.set(`${agentId}:${value.source}`, entry);
+      return value;
+    }).finally(() => this.statusPending.delete(cacheKey));
+    this.statusPending.set(cacheKey, pending);
+    return structuredClone(await pending);
+  }
+
+  async #inspectStatus(agentId, source) {
     const definition = runtimeAgentDefinition(agentId);
     const paths = await this.#paths(agentId);
-    const managed = await this.#readJson(paths.managedState);
-    const user = await this.#readJson(registryPath(paths, agentId));
+    const [managed, user] = await Promise.all([
+      this.#readJson(paths.managedState),
+      this.#readJson(registryPath(paths, agentId)),
+    ]);
     const selected = source === "managed" ? managed : source === "user" ? user : managed || user;
     if (!selected) {
       return Object.freeze({
@@ -186,6 +221,13 @@ export class AgentDeploymentService {
     });
   }
 
+  #invalidateStatus(agentId) {
+    const prefix = `${agentId}:`;
+    for (const key of this.statusCache.keys()) if (key.startsWith(prefix)) this.statusCache.delete(key);
+    for (const key of this.statusPending.keys()) if (key.startsWith(prefix)) this.statusPending.delete(key);
+    for (const key of this.runtimeCache.keys()) if (key.startsWith(prefix)) this.runtimeCache.delete(key);
+  }
+
   async checkUpdate(agentId, { platform = null } = {}) {
     const current = await this.status(agentId, { source: "managed" });
     invariant(current.installed, "AGENT_NOT_INSTALLED", `${current.displayName} 未安装`, { status: 409 });
@@ -200,14 +242,14 @@ export class AgentDeploymentService {
     });
   }
 
-  async install(agentId, { platform = null } = {}) {
+  async install(agentId, { platform = null, force = false } = {}) {
     runtimeAgentDefinition(agentId);
     const detectedPlatform = platform || await this.detectPlatform();
     const artifact = await this.catalog.resolve(agentId, detectedPlatform, { verify: true });
     const paths = await this.#paths(agentId);
     const previous = await this.#readJson(paths.managedState);
     const descriptor = createInstallDescriptor({ artifact, paths, action: previous ? "update" : "install" });
-    if (previous?.sha256 === descriptor.sha256 && previous?.binaryPath === descriptor.binaryPath) {
+    if (!force && previous?.sha256 === descriptor.sha256 && previous?.binaryPath === descriptor.binaryPath) {
       return Object.freeze({ action: "none", changed: false, descriptor, state: previous });
     }
     const scriptHash = crypto.createHash("sha256").update(DEPLOY_SCRIPT).digest("hex");
@@ -242,6 +284,7 @@ export class AgentDeploymentService {
       installedAt: this.clock().toISOString(),
     };
     await this.executor.writeAtomic(paths.managedState, json(state));
+    this.#invalidateStatus(agentId);
     return Object.freeze({ action: previous ? "update" : "install", changed: true, descriptor, state });
   }
 
@@ -258,6 +301,7 @@ export class AgentDeploymentService {
       result = await this.executor.exec(`test -x ${shellQuote(resolvedBinary)} && ${shellQuote(resolvedBinary)} --version`, { maxOutputBytes: 64 * 1024 });
     }
     invariant(result.code === 0, "AGENT_USER_BINARY_INVALID", `所选目录中没有可执行的 ${definition.binary}`, { status: 409 });
+    const reportedVersion = String(result.stdout || result.stderr || "").trim().split(/\r?\n/)[0].slice(0, 256);
     const state = {
       schemaVersion: AGENT_RUNTIME_SCHEMA_VERSION,
       agentId,
@@ -265,10 +309,11 @@ export class AgentDeploymentService {
       managed: false,
       root: selectedRoot,
       binaryPath: resolvedBinary,
-      version: String(result.stdout || result.stderr || "unknown").trim().split(/\r?\n/)[0].slice(0, 256),
+      version: reportedVersion || "unknown",
       selectedAt: this.clock().toISOString(),
     };
     await this.executor.writeAtomic(registryPath(paths, agentId), json(state));
+    this.#invalidateStatus(agentId);
     return Object.freeze(state);
   }
 
@@ -301,16 +346,54 @@ export class AgentDeploymentService {
       : `rm -f -- ${shellQuote(registryPath(paths, agentId))}`;
     const result = await this.executor.exec(command, { maxOutputBytes: 64 * 1024 });
     invariant(result.code === 0, "AGENT_UNINSTALL_FAILED", "Agent 卸载失败", { status: 502 });
+    this.#invalidateStatus(agentId);
     return Object.freeze({ action: "uninstall", changed: true, descriptor });
   }
 
   async resolveRuntime(agentId, { source = null } = {}) {
-    const status = await this.status(agentId, { source });
-    invariant(status.installed, "AGENT_NOT_INSTALLED", `${status.displayName} 未安装`, {
-      status: 409,
-      details: { agentId },
-    });
-    return status;
+    const key = `${agentId}:${source || "auto"}`;
+    const now = new Date(this.clock()).valueOf();
+    const cached = this.runtimeCache.get(key);
+    if (cached && now - cached.checkedAt < STATUS_CACHE_TTL_MS) return structuredClone(cached.value);
+    if (this.runtimePending.has(key)) return structuredClone(await this.runtimePending.get(key));
+
+    const pending = (async () => {
+      let status = await this.status(agentId, { source });
+      invariant(status.installed, "AGENT_NOT_INSTALLED", `${status.displayName} 未安装`, {
+        status: 409,
+        details: { agentId },
+      });
+
+      // Managed runtimes are not a compatibility surface. A binding always runs
+      // the exact artifact declared by this EasyWork build; an older deployment
+      // is replaced before a native session can be opened.
+      if (status.source === "managed") {
+        const platform = status.platform || await this.detectPlatform();
+        const [artifact, state] = await Promise.all([
+          this.catalog.resolve(agentId, platform, { verify: false }),
+          this.#readJson((await this.#paths(agentId)).managedState),
+        ]);
+        const current = status.status === "ready"
+          && state?.version === artifact.version
+          && state?.sha256 === artifact.sha256
+          && state?.binaryPath === status.binaryPath;
+        if (!current) {
+          await this.install(agentId, { platform, force: status.status !== "ready" });
+          status = await this.status(agentId, { source: "managed" });
+        }
+      }
+
+      invariant(status.status === "ready", "AGENT_RUNTIME_NOT_READY", `${status.displayName} 运行时不可用`, {
+        status: 409,
+        details: { agentId },
+      });
+      return status;
+    })().then((value) => {
+      this.runtimeCache.set(key, { checkedAt: now, value });
+      return value;
+    }).finally(() => this.runtimePending.delete(key));
+    this.runtimePending.set(key, pending);
+    return structuredClone(await pending);
   }
 }
 

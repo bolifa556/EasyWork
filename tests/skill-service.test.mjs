@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { createActorContext } from "../gateway/core/actor.mjs";
 import { actorDataRoot } from "../gateway/core/paths.mjs";
+import { isAutomaticSkillApplicable } from "../gateway/core/skills/applicability.mjs";
 import { SkillService } from "../gateway/core/skills/index.mjs";
 
 function actor(actorType = "user", actorId = "skill_owner") {
@@ -33,6 +34,27 @@ function serviceOptions(dataRoot, currentActor, overrides = {}) {
     ...overrides,
   };
 }
+
+test("自动 Skill 发现同时匹配明确平台标识和当前调度器", () => {
+  const slurmSkill = {
+    name: "本科生算力平台使用规范",
+    description: "适用于 USTC 登录节点、Slurm 队列和 GPU 作业。",
+  };
+  assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, serverName: "reta服务器", scheduler: "none" }), false);
+  assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, server: { name: "scnet-gpu", host: "qdeshell.hpccube.com" }, scheduler: "slurm" }), false);
+  assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, serverName: "107.ustc.edu.cn", scheduler: "unknown" }), true);
+  assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, serverName: "ordinary-server", scheduler: "unknown" }), false);
+  assert.equal(isAutomaticSkillApplicable({
+    skill: { name: "通用 Slurm 基线", description: "为 Slurm CPU 作业生成 README、JSON 结果并检查 UTC 时间。" },
+    server: { name: "scnet-gpu", host: "qdeshell.hpccube.com" },
+    scheduler: "slurm",
+  }), true);
+  assert.equal(isAutomaticSkillApplicable({
+    skill: { name: "服务器健康检查", description: "检查磁盘、内存和系统负载。" },
+    serverName: "reta服务器",
+    scheduler: "none",
+  }), true);
+});
 
 function skillInput(overrides = {}) {
   return {
@@ -78,7 +100,49 @@ test("上传 Skill 会在 Actor skills 目录保存不可变版本，并登记�
       assert.equal(descriptor.sha256, uploaded.version.sha256);
       assert.equal(descriptor.files.length, 2);
       assert.match(packageRoot, currentActor.actorType === "user" ? /[\\/]users[\\/]same_skill[\\/]/ : /[\\/]guests[\\/]same_skill[\\/]/);
+      const catalog = await service.listInstalledKnowledge();
+      assert.equal(Object.hasOwn(catalog.items[0], "applicability"), false);
+      assert.deepEqual(catalog.items.map((entry) => ({ skillId: entry.skillId, knowledge: entry.knowledge })), [{
+        skillId: "shell-helper",
+        knowledge: { key: "skill:shell-helper", version: `semantic-v1:1.0.0:${uploaded.version.sha256}` },
+      }]);
     }
+  });
+});
+
+test("内部 Skill 目录只在用户显式配置后携带 applicability", async () => {
+  await fixture(async (dataRoot) => {
+    const service = new SkillService(serviceOptions(dataRoot, actor()));
+    await service.uploadVersion(skillInput());
+    await service.updateApplicability("shell-helper", { serverKind: "standard", allowServers: [], denyServers: [] });
+    const catalog = await service.listInstalledKnowledge();
+    assert.deepEqual(catalog.items[0].applicability, { mode: "all", serverKind: "standard", allowServers: [], denyServers: [], forceEnabled: false });
+    for (const mode of ["work", "all"]) {
+      await service.updateApplicability("shell-helper", { mode, serverKind: "compute", forceEnabled: true });
+      const reloaded = new SkillService(serviceOptions(dataRoot, actor()));
+      assert.deepEqual((await reloaded.listInstalledKnowledge()).items[0].applicability, {
+        mode, serverKind: "compute", allowServers: [], denyServers: [], forceEnabled: true,
+      });
+    }
+  });
+});
+
+test("同时安装多个 Skill 时，初始范围与安装在同一写队列内且后续安装不覆盖个人配置", async () => {
+  await fixture(async (dataRoot) => {
+    const service = new SkillService(serviceOptions(dataRoot, actor()));
+    const [first, second] = await Promise.all([
+      service.installPackage({ ...skillInput({ skillId: "scope-a" }), applicability: { mode: "work", allowServers: ["server-a"] } }),
+      service.installPackage({ ...skillInput({ skillId: "scope-b" }), applicability: { mode: "all", denyServers: ["server-b"], forceEnabled: true } }),
+    ]);
+    assert.equal(first.duplicate, false);
+    assert.equal(second.duplicate, false);
+    await service.updateApplicability("scope-a", { mode: "chat" });
+    await service.installPackage({ ...skillInput({ skillId: "scope-a", version: "2.0.0" }), applicability: { mode: "work", forceEnabled: true } });
+    const items = (await service.listInstalled()).items;
+    assert.equal(items.find((item) => item.skillId === "scope-a").applicability.mode, "chat");
+    assert.deepEqual(items.find((item) => item.skillId === "scope-b").applicability.denyServers, ["server-b"]);
+    await assert.rejects(() => service.installPackage({ ...skillInput({ skillId: "invalid-scope" }), applicability: { mode: "chat", forceEnabled: true } }));
+    assert.equal((await service.listInstalled()).items.some((item) => item.skillId === "invalid-scope"), false);
   });
 });
 
@@ -228,6 +292,28 @@ test("Task pin 固定 version 与 sha256；被固定版本拒绝删除，释放 
     assert.deepEqual(state.data, { registries: [], versions: [], taskPins: [] });
     await assert.rejects(() => access(path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages", "shell-helper", "1.0.0")));
     assert.equal(deleted.revision, state.revision);
+  });
+});
+
+test("卸载技能会直接移除全部版本和 Task 固定记录", async () => {
+  await fixture(async (dataRoot) => {
+    const currentActor = actor();
+    const service = new SkillService(serviceOptions(dataRoot, currentActor));
+    const first = await service.uploadVersion(skillInput());
+    const second = await service.uploadVersion(skillInput({
+      version: "2.0.0",
+      expectedRevision: first.revision,
+      files: [
+        { path: "scripts/main.mjs", content: "export default async () => 'second';\n" },
+        { path: "README.md", content: "# Shell Helper second release\n" },
+      ],
+    }));
+    const pinned = await service.pinTask({ taskId: "task_a", skills: [{ skillId: "shell-helper", version: "1.0.0" }], expectedRevision: second.revision });
+    const uninstalled = await service.uninstall({ skillId: "shell-helper", expectedRevision: pinned.revision });
+    assert.equal(uninstalled.removedVersions, 2);
+    assert.equal(uninstalled.removedTaskPins, 1);
+    assert.deepEqual((await service.inspect()).data, { registries: [], versions: [], taskPins: [] });
+    await assert.rejects(() => access(path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages", "shell-helper")));
   });
 });
 

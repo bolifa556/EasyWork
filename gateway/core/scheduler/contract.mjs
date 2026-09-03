@@ -138,7 +138,7 @@ export function createAvailableFeature() {
 export function validateSchedulerAdapter(adapter) {
   invariant(adapter && typeof adapter === "object", "SCHEDULER_ADAPTER_INVALID", "Scheduler adapter 无效", { status: 500, expose: false });
   invariant(SCHEDULER_TYPES.includes(adapter.type) && typeof adapter.inspectCapabilities === "function", "SCHEDULER_ADAPTER_INVALID", "Scheduler adapter 契约不完整", { status: 500, expose: false });
-  for (const method of ["accessiblePartitions", "resourceSummary", "userJobs", "inspectJob", "jobOutput", "submit", "cancelJob"]) {
+  for (const method of ["accessiblePartitions", "resourceSummary", "userJobs", "jobHistory", "inspectJob", "jobOutput", "submit", "cancelJob"]) {
     invariant(typeof adapter[method] === "function", "SCHEDULER_ADAPTER_INVALID", `Scheduler adapter 缺少 ${method}`, { status: 500, expose: false });
   }
   return adapter;

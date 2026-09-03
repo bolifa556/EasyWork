@@ -15,14 +15,48 @@ class ActorSshWorker {
     this.reserveConnection = reserveConnection;
     this.sessions = new Map();
     this.connecting = new Map();
+    this.connectingWithTwoFactor = new Map();
   }
 
   async connect(serverId, options = {}) {
     const existing = this.sessions.get(serverId);
-    if (existing?.session && await existing.session.isAlive?.() !== false) return existing.summary;
-    if (this.connecting.has(serverId)) return this.connecting.get(serverId);
-    const promise = this.#connect(serverId, options).finally(() => this.connecting.delete(serverId));
+    if (existing?.session && await existing.session.isAlive?.() !== false) {
+      const current = await this.registry.get(serverId);
+      if (current.connection.status === "connected" && !current.connection.lastError) return structuredClone(existing.summary);
+      const summary = await this.registry.setConnection(serverId, {
+        ...current.connection,
+        status: "connected",
+        desiredConnection: true,
+        disconnectedAt: null,
+        lastError: null,
+      });
+      existing.summary = summary;
+      return structuredClone(summary);
+    }
+    if (this.connecting.has(serverId)) {
+      const active = this.connecting.get(serverId);
+      const activeUsedTwoFactor = Boolean(this.connectingWithTwoFactor.get(serverId));
+      try {
+        return await active;
+      } catch (error) {
+        // Gateway startup may still be restoring a desired connection without
+        // an interactive code when the user submits a fresh 2FA value.  The
+        // user's request must retry with that code instead of inheriting the
+        // background attempt's authentication failure.
+        if (String(options.twoFactorCode || "").trim() && !activeUsedTwoFactor) {
+          return this.connect(serverId, options);
+        }
+        throw error;
+      }
+    }
+    const promise = this.#connect(serverId, options).finally(() => {
+      if (this.connecting.get(serverId) === promise) {
+        this.connecting.delete(serverId);
+        this.connectingWithTwoFactor.delete(serverId);
+      }
+    });
     this.connecting.set(serverId, promise);
+    this.connectingWithTwoFactor.set(serverId, Boolean(String(options.twoFactorCode || "").trim()));
     return promise;
   }
 
@@ -66,14 +100,14 @@ class ActorSshWorker {
           lastError: null,
         });
         this.sessions.set(serverId, { session, profile: identifiedProfile, summary });
-        session.onClose?.((error) => this.#unexpectedClose(serverId, error));
+        session.onClose?.((error) => this.#unexpectedClose(serverId, session, error));
         return structuredClone(summary);
       } catch (error) {
         await session?.close?.().catch(() => undefined);
         const confirmationRequired = error?.code === "SSH_HOST_KEY_CONFIRMATION_REQUIRED";
         await this.registry.setConnection(serverId, {
           status: confirmationRequired ? "disconnected" : "failed",
-          desiredConnection: false,
+          desiredConnection: confirmationRequired ? false : Boolean(options.preserveIntentOnFailure),
           connectedAt: null,
           disconnectedAt: currentIso(this.clock),
           lastError: confirmationRequired ? null : { code: error?.code || "SSH_CONNECTION_FAILED", message: error?.message || "SSH 连接失败" },
@@ -85,15 +119,18 @@ class ActorSshWorker {
     }
   }
 
-  async #unexpectedClose(serverId, error) {
-    if (!this.sessions.has(serverId)) return;
+  async #unexpectedClose(serverId, session, error) {
+    const runtime = this.sessions.get(serverId);
+    // A delayed close event from a replaced session must never tear down the
+    // newer live session or temporarily publish a failed connection state.
+    if (!runtime || runtime.session !== session) return;
     this.sessions.delete(serverId);
     const current = await this.registry.get(serverId).catch(() => null);
     if (!current) return;
     await this.registry.setConnection(serverId, {
       ...current.connection,
       status: error ? "failed" : "disconnected",
-      desiredConnection: false,
+      desiredConnection: true,
       disconnectedAt: currentIso(this.clock),
       lastError: error ? { code: error.code || "SSH_CONNECTION_LOST", message: error.message || "SSH 连接已中断" } : null,
     });
@@ -126,18 +163,19 @@ class ActorSshWorker {
 
   async withSession(serverId, operation) {
     invariant(typeof operation === "function", "SSH_SESSION_OPERATION_REQUIRED", "SSH session 操作无效", { status: 500, expose: false });
-    const runtime = this.sessions.get(serverId);
-    invariant(runtime, "SSH_NOT_CONNECTED", "SSH 尚未连接", { status: 409 });
-    invariant(await runtime.session.isAlive?.() !== false, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
-    try {
-      return await operation(runtime.session, structuredClone(runtime.profile));
-    } finally {
-      const current = await this.registry.get(serverId).catch(() => null);
-      if (current && this.sessions.get(serverId) === runtime) {
-        const summary = await this.registry.setConnection(serverId, { ...current.connection, lastActiveAt: currentIso(this.clock), lastError: null }).catch(() => null);
-        if (summary) runtime.summary = summary;
-      }
+    let runtime = this.sessions.get(serverId);
+    if (runtime && await runtime.session.isAlive?.() === false) {
+      await this.#unexpectedClose(serverId, runtime.session, Object.assign(new Error("SSH 连接已关闭"), { code: "SSH_CONNECTION_CLOSED" }));
+      runtime = null;
     }
+    if (!runtime) {
+      const current = await this.registry.get(serverId);
+      invariant(current.connection.desiredConnection, "SSH_NOT_CONNECTED", "SSH 尚未连接", { status: 409 });
+      await this.connect(serverId, { preserveIntentOnFailure: true });
+      runtime = this.sessions.get(serverId);
+    }
+    invariant(runtime, "SSH_NOT_CONNECTED", "SSH 尚未连接", { status: 409 });
+    return operation(runtime.session, structuredClone(runtime.profile));
   }
 
   async touch(serverId) {
@@ -155,20 +193,47 @@ class ActorSshWorker {
 
   async restore() {
     const profiles = await this.registry.list();
-    const results = [];
-    for (const item of profiles.filter((entry) => entry.connection.desiredConnection)) {
-      try {
-        results.push({ serverId: item.profile.id, status: "connected", connection: await this.connect(item.profile.id) });
-      } catch (error) {
-        results.push({ serverId: item.profile.id, status: "failed", error: { code: error?.code || "SSH_RESTORE_FAILED", message: error?.message || "SSH 恢复失败" } });
-      }
-    }
-    return results;
+    return Promise.all(profiles.filter((entry) => entry.connection.desiredConnection || entry.connection.status !== "disconnected").map(async (item) => ({
+      serverId: item.profile.id,
+      status: "disconnected",
+      connection: await this.registry.setConnection(item.profile.id, {
+        ...item.connection,
+        status: "disconnected",
+        desiredConnection: false,
+        disconnectedAt: currentIso(this.clock),
+        lastError: null,
+      }),
+    })));
   }
 
   async maintain() {
     const now = currentMs(this.clock);
     const results = [];
+    const desiredWithoutSession = (await this.registry.list()).filter((entry) => (
+      entry.connection.desiredConnection
+      && !this.sessions.has(entry.profile.id)
+      && !this.connecting.has(entry.profile.id)
+    ));
+    const reconnectResults = await Promise.all(desiredWithoutSession.map(async (entry) => {
+      const lastActive = Date.parse(entry.connection.lastActiveAt || entry.connection.connectedAt || 0);
+      if (Number.isFinite(lastActive) && now - lastActive >= this.inactiveTtlMs) {
+        await this.registry.setConnection(entry.profile.id, {
+          ...entry.connection,
+          status: "disconnected",
+          desiredConnection: false,
+          disconnectedAt: currentIso(this.clock),
+          lastError: null,
+        });
+        return { serverId: entry.profile.id, action: "expired" };
+      }
+      try {
+        await this.connect(entry.profile.id, { preserveIntentOnFailure: true });
+        return { serverId: entry.profile.id, action: "reconnected" };
+      } catch {
+        return { serverId: entry.profile.id, action: "reconnect-failed" };
+      }
+    }));
+    results.push(...reconnectResults);
     for (const [serverId, runtime] of [...this.sessions.entries()]) {
       const state = await this.registry.get(serverId);
       const lastActive = Date.parse(state.connection.lastActiveAt || state.connection.connectedAt || 0);
@@ -185,7 +250,7 @@ class ActorSshWorker {
           runtime.summary = summary;
           results.push({ serverId, action: "kept-alive" });
         } catch (error) {
-          await this.#unexpectedClose(serverId, error);
+          await this.#unexpectedClose(serverId, runtime.session, error);
           results.push({ serverId, action: "lost" });
         }
       }
@@ -195,6 +260,10 @@ class ActorSshWorker {
 
   async close() {
     for (const [serverId] of [...this.sessions]) await this.disconnect(serverId);
+    const disconnected = new Set(this.sessions.keys());
+    for (const entry of await this.registry.list()) {
+      if (!disconnected.has(entry.profile.id) && entry.connection.desiredConnection) await this.disconnect(entry.profile.id);
+    }
   }
 
   snapshot() {
@@ -219,7 +288,7 @@ class ActorSshWorker {
       await this.registry.setConnection(serverId, {
         ...current.connection,
         status: "disconnected",
-        desiredConnection: true,
+        desiredConnection: false,
         disconnectedAt: currentIso(this.clock),
         lastError: null,
       });
@@ -307,6 +376,15 @@ export class SshWorkerPool {
     if (!worker) return true;
     if (!worker.isIdle()) return false;
     this.workers.delete(key);
+    return true;
+  }
+
+  async forceReleaseActor(actor) {
+    const key = actorKey(actor);
+    const worker = this.workers.get(key) || this.workerFor(actor);
+    await worker.close();
+    this.workers.delete(key);
+    for (const reservation of [...this.reservations]) if (reservation.startsWith(`${key}:`)) this.reservations.delete(reservation);
     return true;
   }
 

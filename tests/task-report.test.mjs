@@ -26,6 +26,8 @@ function taskInput() {
     actorId: actor.actorId,
     conversationId: "conversation-report",
     branchId: "branch-report",
+    sourceMessageId: "message-report",
+    conversationRunId: "run-report",
     goal: "inspect and change a file",
     route: {
       serverId: "server-report",
@@ -81,6 +83,8 @@ test("TaskReport 从 canonical Agent events 归并最终文本、证据、文件
     await appendAgent("job_status", "updated", { operation: "slurm", jobId: "30789", message: "running" });
     await appendAgent("artifact", "completed", { artifactId: "artifact-report", name: "report.txt" });
     await appendAgent("usage", "updated", { inputTokens: 120, outputTokens: 30, totalTokens: 150 });
+    await appendAgent("message", "completed", { role: "assistant", text: "Task finished with evidence.", delta: false }, { itemId: "claude-assistant:0" });
+    await appendAgent("message", "completed", { role: "assistant", text: "Task finished with evidence.", delta: false }, { itemId: "claude-content-block:0" });
     await appendAgent("final", "completed", { text: "Task finished with evidence." });
 
     const reports = new TaskReportService({

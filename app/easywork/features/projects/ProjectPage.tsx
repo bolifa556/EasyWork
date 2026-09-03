@@ -47,6 +47,7 @@ function formatSize(bytes: number) {
 
 function ResourceStatusLabel({ status }: { status: ResourceStatus }) {
   if (status === "ready") return <span className={`${styles.fileStatus} ${styles.ready}`}><CheckCircle2 size={14} />已就绪</span>;
+  if (status === "readable") return <span className={`${styles.fileStatus} ${styles.readable}`}><FileText size={14} />可直接读取</span>;
   if (status === "error") return <span className={`${styles.fileStatus} ${styles.failed}`}><TriangleAlert size={14} />索引失败</span>;
   const label = status === "pending" ? "等待索引" : status === "extracting" ? "正在解析" : "正在索引";
   return <span className={`${styles.fileStatus} ${styles.processing}`}><LoaderCircle size={14} />{label}</span>;
@@ -138,11 +139,11 @@ function FilesTab({ files, busyAction, onUpload, onRetry }: {
           {visible.map((file) => (
             <div key={file.id} className={`${styles.projectFileRow} ${file.status === "error" ? styles.fileError : ""}`}>
               <span className={styles.projectFileName}><FileText size={17} /><span><strong>{file.name}</strong>{file.relativePath && file.relativePath !== file.name ? <small>{file.relativePath}</small> : null}</span></span>
-              <time>{formatDate(file.updatedAt)}</time>
-              <span>{formatSize(file.size)}</span>
+              <time className={styles.projectFileTime}>{formatDate(file.updatedAt)}</time>
+              <span className={styles.projectFileSize}>{formatSize(file.size)}</span>
               <span className={styles.fileStatusCell}>
                 <ResourceStatusLabel status={file.status} />
-                {file.status === "error" ? <Button compact variant="ghost" icon={<RotateCcw size={14} />} disabled={busyAction === `retry:${file.id}`} onClick={() => onRetry(file.id)}>重试</Button> : null}
+                {["error", "readable"].includes(file.status) ? <Button compact variant="ghost" icon={<RotateCcw size={14} />} disabled={busyAction === `retry:${file.id}`} onClick={() => onRetry(file.id)}>{file.status === "readable" ? "向量化" : "重试"}</Button> : null}
               </span>
               {file.status === "error" && file.error ? <span className={styles.fileErrorReason}>{file.error}</span> : null}
             </div>

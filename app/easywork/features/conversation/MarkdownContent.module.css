@@ -1,76 +1,143 @@
 .markdown {
   display: grid;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
-  gap: .8em;
+  grid-template-columns: minmax(0, 1fr);
+  gap: .68em;
   overflow-wrap: anywhere;
   color: #3d3a32;
+  font-family: var(--ew-font);
   font-size: 17px;
   line-height: 1.72;
   white-space: normal;
 }
-.markdown > * { margin: 0; }
-.markdown p { font-size: inherit; line-height: inherit; white-space: pre-wrap; }
+.markdown > * { min-width: 0; max-width: 100%; margin: 0; }
+.markdown p { min-width:0; max-width:100%; overflow-wrap:anywhere; font-size:inherit; line-height:inherit; white-space:pre-wrap; word-break:break-word; }
 .markdown h1,.markdown h2,.markdown h3,.markdown h4 { margin: 0; color: #171717; font-weight: 650; line-height: 1.35; }
 .markdown h1 { font-size: 21px; }
 .markdown h2 { font-size: 20px; line-height: 1.42; }
 .markdown h3 { font-size: 18px; line-height: 1.45; }
 .markdown h4 { font-size: 17px; line-height: 1.48; }
-.markdown ul,.markdown ol { display: grid; gap: .35em; margin: 0; padding-left: 1.45em; }
-.markdown li { padding-left: .15em; font-size: inherit; line-height: inherit; }
+.markdown ul,.markdown ol { box-sizing:border-box; display:grid; width:100%; min-width:0; max-width:100%; grid-template-columns:minmax(0,1fr); gap:.35em; margin:0; padding-left:1.45em; }
+.markdown li { box-sizing:border-box; min-width:0; max-width:100%; padding-left:.15em; overflow-wrap:anywhere; font-size:inherit; line-height:inherit; word-break:break-word; }
+.markdown li > * { min-width:0; max-width:100%; }
 .markdown li > p { margin: 0; }
 .markdown li > p + :is(ul,ol) { margin-top: .18em; }
 .markdown li::marker { color: #536342; font-weight: 640; }
 .markdown a { color: #245f43; text-decoration: underline; text-underline-offset: 2px; }
-.markdown :where(strong,b,em,i,a,del) { font-size: inherit; line-height: inherit; }
+.markdown :where(strong,b,em,i,a,del) { font-family: inherit; font-size: inherit; line-height: inherit; }
+.markdown strong,.markdown b { color: #2f2d27; font-weight: 700; }
 .inlineField {
-  display: inline-block;
-  margin: 0 .06em;
-  border: 1px solid transparent;
-  border-radius: 5px;
-  padding: .06em .38em .1em;
-  font-family: var(--ew-mono);
-  font-size: .9em;
-  font-weight: 620;
-  line-height: 1.4;
-  vertical-align: .04em;
+  display: inline;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 600;
+  line-height: inherit;
+  vertical-align: baseline;
 }
-.tone0 { border-color: rgb(74 111 130 / 16%); background: rgb(82 128 151 / 9%); color: #3f7089; }
-.tone1 { border-color: rgb(118 91 151 / 15%); background: rgb(125 91 160 / 8%); color: #755697; }
-.tone2 { border-color: rgb(79 126 91 / 16%); background: rgb(83 137 97 / 9%); color: #4b7956; }
-.tone3 { border-color: rgb(177 117 48 / 16%); background: rgb(190 130 57 / 9%); color: #946522; }
-.tone4 { border-color: rgb(55 129 125 / 15%); background: rgb(61 142 136 / 8%); color: #357a75; }
+.tone0 { color: #3f7089; }
+.tone1 { color: #755697; }
+.tone2 { color: #4b7956; }
+.tone3 { color: #946522; }
+.tone4 { color: #357a75; }
 .quoteBlock { position: relative; border-left: 3px solid #c8d7cc; padding: .12em 38px .12em 12px; color: #5f6762; white-space: pre-wrap; }
+.skillSummaryRow { min-width: 0; border-left-color: #9dbba4; padding-top: .12em; padding-bottom: .12em; white-space: normal; }
+.skillSummaryRow > p { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skillSummaryRow > p > strong:first-child { margin-right: .62em; color: #343a32; font-weight: 650; white-space: nowrap; }
 .markdown hr { width: 100%; border: 0; border-top: 1px solid #e5e5e5; }
-.tableWrap { position: relative; max-width: 100%; overflow-x: auto; overscroll-behavior: contain; border: 1px solid #e4e4e4; border-radius: 10px; }
+.markdown > hr:last-child { display:none; }
+.tableWrap { position: relative; max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; overscroll-behavior-y: auto; border: 1px solid #e4e4e4; border-radius: 10px; }
 .markdown table { width: 100%; min-width: 360px; border-collapse: collapse; font-size: 16px; line-height: 1.55; }
 .markdown th,.markdown td { border-bottom: 1px solid #e8e8e8; padding: 8px 10px; font-size: inherit; line-height: inherit; text-align: left; vertical-align: top; }
 .markdown th { background: #f6f6f6; color: #555; font-weight: 600; }
 .markdown tr:last-child td { border-bottom: 0; }
-.copyableCodeBlock { position: relative; margin: .72em 0; }
-.remoteTerminal {
-  --terminal-green: #85c54c;
-  --terminal-yellow: #f5ae2e;
-  --terminal-blue: #1398b9;
-  --terminal-bright-white: #f6f7ec;
-  overflow: auto;
-  overscroll-behavior: contain;
-  max-height: 360px;
-  margin: 0;
-  border: 1px solid rgb(143 128 108 / 34%);
+.copyableCodeBlock {
+  --code-block-surface: #fbf7eb;
+  position: relative;
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid rgb(173 139 68 / 16%);
   border-radius: 10px;
-  background-color: rgb(69 64 56 / 92%);
-  background-image: linear-gradient(180deg,rgb(78 72 63 / 93%),rgb(62 57 50 / 94%));
-  background-clip: padding-box;
-  padding: 10px 12px 12px;
-  color: #f0ddc7;
-  box-shadow: inset 0 1px rgb(255 255 255 / 7%),inset 0 -1px rgb(18 16 13 / 15%),0 10px 28px rgb(48 42 34 / 13%);
-  backdrop-filter: blur(16px) saturate(118%);
+  background: var(--code-block-surface);
+  margin: 0;
 }
-.remoteTerminal code { display: block; color: #f0ddc7; font-family: var(--ew-mono); font-size: 11.5px; line-height: 1.72; white-space: pre-wrap; word-break: break-word; }
-.remoteTerminal code b { color: var(--terminal-yellow); }
-.remoteTerminal ::selection { background: rgb(19 152 185 / 42%); color: var(--terminal-bright-white); }
-.terminalCaption { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; border-bottom: 1px solid rgb(242 222 199 / 15%); padding-bottom: 7px; color: #c8b6a0; font-family: inherit; font-size: 10px; }
-.terminalCaption i { width: 6px; height: 6px; border-radius: 50%; background: var(--terminal-green); box-shadow: 0 0 0 3px rgb(133 197 76 / 12%); }
+.copyableCodeBlockWithCopy::after { position:absolute; z-index:3; top:1px; right:0; bottom:8px; width:58px; border-radius:0 9px 9px 0; background:var(--code-block-surface); content:""; pointer-events:none; }
+.markdown > :is(ul,ol) { --code-outdent:1.6em; }
+.markdown > :is(ul,ol) :is(ul,ol) { --code-outdent:3.2em; }
+.markdown > :is(ul,ol) :is(ul,ol) :is(ul,ol) { --code-outdent:4.8em; }
+.markdown > :is(ul,ol) :is(ul,ol) :is(ul,ol) :is(ul,ol) { --code-outdent:6.4em; }
+.markdown > :is(ul,ol) :is(ul,ol) :is(ul,ol) :is(ul,ol) :is(ul,ol) { --code-outdent:8em; }
+.markdown :is(ul,ol) .copyableCodeBlock {
+  width: calc(100% + var(--code-outdent));
+  max-width: calc(100% + var(--code-outdent));
+  margin-left: calc(-1 * var(--code-outdent));
+}
+.markdown li .copyableCodeBlock { margin-top:.35em; }
+.remoteTerminal {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: auto;
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: auto;
+  scrollbar-width: none;
+  max-height: 420px;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 3px 4px 7px 12px;
+  color: #514d43;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 400;
+  box-shadow: none;
+}
+.remoteTerminal::-webkit-scrollbar { width:7px; height:0; }
+.remoteTerminal::-webkit-scrollbar-track { background:transparent; }
+.remoteTerminal::-webkit-scrollbar-thumb { border:1px solid transparent; border-radius:999px; background:rgb(102 99 86 / 34%); background-clip:padding-box; }
+.remoteTerminal::-webkit-scrollbar-button { display:none; width:0; height:0; }
+.remoteTerminal::-webkit-scrollbar-corner { background:transparent; }
+.remoteTerminal code {
+  display: block;
+  box-sizing: border-box;
+  width: max-content;
+  min-width: 100%;
+  max-width: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 400;
+  line-height: 1.5;
+  padding-right: 60px;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+.terminalFence,.codeFence { background-image: none; }
+.remoteTerminal code b,.remoteTerminal code strong { color: inherit; font-family: inherit; font-weight: 400; }
+.remoteTerminal ::selection { background: rgb(82 128 151 / 18%); color: #30342f; }
+.codeScrollbar { --code-scroll-thumb-width:32px; position:absolute; z-index:5; right:1px; bottom:0; left:1px; box-sizing:border-box; width:calc(100% - 2px); height:10px; margin:0; border:0; padding:0; outline:0; appearance:none; -webkit-appearance:none; background:transparent; opacity:0; pointer-events:none; cursor:default; transition:opacity 140ms ease; }
+.codeScrollbar::-webkit-slider-runnable-track { width:100%; height:3px; border:0; border-radius:999px; background:transparent; transition:background 140ms ease; }
+.codeScrollbar::-webkit-slider-thumb { width:var(--code-scroll-thumb-width); height:3px; margin:0; border:0; border-radius:999px; appearance:none; -webkit-appearance:none; background:rgb(105 100 84 / 34%); box-shadow:0 1px 2px rgb(74 68 54 / 8%); cursor:default; transition:background 140ms ease; }
+.copyableCodeBlock:hover .codeScrollbar,.codeScrollbar:focus-visible { opacity:1; pointer-events:auto; }
+.copyableCodeBlock:hover .codeScrollbar::-webkit-slider-runnable-track { background:rgb(105 100 84 / 6%); }
+.codeScrollbar:active::-webkit-slider-thumb { background:rgb(91 86 72 / 48%); cursor:default; }
+.codeScrollbar::-moz-range-track { width:100%; height:3px; border:0; border-radius:999px; background:transparent; }
+.codeScrollbar::-moz-range-thumb { width:var(--code-scroll-thumb-width); height:3px; border:0; border-radius:999px; background:rgb(105 100 84 / 34%); box-shadow:0 1px 2px rgb(74 68 54 / 8%); cursor:default; }
+.codeScrollbarHidden,.copyableCodeBlock:hover .codeScrollbarHidden,.codeScrollbarHidden:focus-visible { opacity:0; pointer-events:none; }
 .blockCopyButton {
   position: absolute;
   z-index: 4;
@@ -80,20 +147,49 @@
   width: 25px;
   height: 25px;
   place-items: center;
-  border: 1px solid rgb(240 222 200 / 18%);
-  border-radius: 7px;
-  background: rgb(55 51 45 / 62%);
-  color: #d9cab8;
+  border: 1px solid rgb(86 78 64 / 11%);
+  border-radius: 8px;
+  background: rgb(250 249 246 / 72%);
+  color: #756e61;
   opacity: .62;
   box-shadow: none;
-  backdrop-filter: blur(10px) saturate(112%);
   cursor: pointer;
   transition: opacity 140ms ease,background 140ms ease,color 140ms ease,transform 140ms ease;
 }
+.copyableCodeBlock > .blockCopyButton { z-index:6; top:6px; right:9px; }
 .tableWrap > .blockCopyButton,.quoteBlock > .blockCopyButton { border-color: rgb(86 78 64 / 14%); background: rgb(251 248 239 / 72%); color: #756e61; box-shadow: 0 1px 4px rgb(46 39 28 / 5%); }
-.blockCopyButton:hover,.blockCopyButton:focus-visible { background: rgb(72 66 58 / 88%); color: #fff3e3; opacity: 1; transform: translateY(-1px); }
+.blockCopyButton:hover,.blockCopyButton:focus-visible { background: #e8e5de; color: #3f4935; opacity: 1; transform: translateY(-1px); }
 .tableWrap > .blockCopyButton:hover,.quoteBlock > .blockCopyButton:hover { background: rgb(249 245 235 / 94%); color: #3f4935; }
 .blockCopyButton.copied { border-color: rgb(83 119 70 / 23%); color: #527047; opacity: 1; }
 .compact { gap: .5em; font-size: 12px; line-height: 1.55; }
 .compact table { min-width: 0; font-size: 11px; }
 .compact th,.compact td { padding: 6px 7px; }
+.activity { gap:.52em; color:#57544d; font-size:inherit; line-height:inherit; }
+.activity p { white-space:normal; }
+.activity :is(h1,h2,h3,h4) { color:#3f493c; font-size:1em; font-weight:680; line-height:1.5; }
+.activity strong,.activity b { color:#3f493c; }
+.activityInline { padding:0; border:0; background:transparent; color:#397872; font-family:inherit; font-size:inherit; font-weight:650; line-height:inherit; }
+.activity .copyableCodeBlock { margin:0; border-color:rgb(173 139 68 / 14%); border-radius:8px; background:var(--code-block-surface); }
+.activity .remoteTerminal { max-height:340px; border:0; border-radius:0; background:transparent; padding:3px 10px 7px; color:#514d43; box-shadow:none; }
+.activity .remoteTerminal code { color:inherit; font-family:inherit; font-size:inherit; font-weight:400; line-height:1.5; padding-right:0; }
+.activity .remoteTerminal code b,.activity .remoteTerminal code strong { color:inherit; font-family:inherit; font-weight:400; }
+.activity .blockCopyButton { border-color:rgb(86 78 64 / 13%); background:rgb(250 248 242 / 82%); color:#756e61; }
+.activity .quoteBlock { border-left-width:2px; padding:.05em 34px .05em 9px; color:#5f6762; white-space:normal; }
+.activity .quoteBlock p { margin:0; white-space:normal; }
+.activity .tableWrap { overflow-x:auto; overflow-y:visible; }
+.activity table { font-size:inherit; }
+
+@media (max-width: 719px) {
+  .markdown { gap:.72em; font-size:var(--ew-mobile-body); line-height:1.72; }
+  .markdown h1 { font-size:19px; }
+  .markdown h2 { font-size:18px; }
+  .markdown h3 { font-size:17px; }
+  .markdown h4 { font-size:16px; }
+  .markdown table { font-size:14px; }
+  .copyableCodeBlockWithCopy::after { bottom:8px; width:58px; }
+  .remoteTerminal { padding:6px 4px 8px 10px; }
+  .remoteTerminal code { padding-right:60px; }
+  .blockCopyButton { width:36px; height:36px; opacity:.82; }
+  .copyableCodeBlock > .blockCopyButton { top:2px; right:7px; }
+  .quoteBlock { padding-right:42px; }
+}

@@ -1,0 +1,41 @@
+{
+  "user": {
+    "name": "remember_user",
+    "description": "保留跨项目仍适用的稳定用户偏好或事实",
+    "inputSchema": {
+      "type": "object",
+      "required": ["subject", "content"],
+      "properties": {
+        "subject": { "type": "string", "description": "简短、稳定的事实主题" },
+        "content": { "type": "string", "description": "未来可以直接使用的完整事实" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "project": {
+    "name": "remember_project",
+    "description": "保留同一项目的其他对话仍会需要的稳定事实",
+    "inputSchema": {
+      "type": "object",
+      "required": ["subject", "content"],
+      "properties": {
+        "subject": { "type": "string", "description": "简短、稳定的事实主题" },
+        "content": { "type": "string", "description": "未来可以直接使用的完整事实" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "conversation": {
+    "name": "remember_conversation",
+    "description": "保留当前对话后续仍会需要的决定或事实",
+    "inputSchema": {
+      "type": "object",
+      "required": ["subject", "content"],
+      "properties": {
+        "subject": { "type": "string", "description": "简短、稳定的事实主题" },
+        "content": { "type": "string", "description": "未来可以直接使用的完整事实" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

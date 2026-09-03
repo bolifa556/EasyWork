@@ -5,6 +5,7 @@ import { invariant } from "../errors.mjs";
 const MAX_INPUT_BYTES = 64 * 1024;
 const MAX_EVENT_BYTES = 48 * 1024;
 const MAX_SESSIONS = 32;
+const MAX_SCROLLBACK_BYTES = 1024 * 1024;
 
 function exactObject(value, keys, field) {
   const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -15,6 +16,19 @@ function exactObject(value, keys, field) {
 function dimension(value, fallback, field) {
   const result = Number(value ?? fallback);
   invariant(Number.isSafeInteger(result) && result > 0 && result <= 10_000, "TERMINAL_DIMENSION_INVALID", `${field} 无效`, { status: 400 });
+  return result;
+}
+
+function workingDirectory(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const result = String(value);
+  invariant(result.startsWith("/") && result.length <= 4_096 && !/[\0\r\n]/.test(result), "TERMINAL_CWD_INVALID", "终端工作目录无效", { status: 400 });
+  return result;
+}
+
+function terminalScopeKey(value) {
+  const result = String(value || "").trim();
+  invariant(result.length > 0 && result.length <= 1_024 && !/[\0\r\n]/.test(result), "TERMINAL_SCOPE_INVALID", "终端会话范围无效", { status: 400 });
   return result;
 }
 
@@ -47,12 +61,15 @@ export class SshTerminalManager {
   }
 
   async create(input = {}) {
-    const value = exactObject(input, ["term", "rows", "cols", "commandId"], "创建终端");
+    const value = exactObject(input, ["term", "rows", "cols", "cwd", "scopeKey", "commandId"], "创建终端");
     invariant(this.sessions.size < MAX_SESSIONS, "TERMINAL_SESSION_LIMIT", "当前服务器终端会话数已达上限", { status: 429, details: { limit: MAX_SESSIONS } });
+    const cwd = workingDirectory(value.cwd);
+    const scopeKey = terminalScopeKey(value.scopeKey);
     const descriptor = {
       term: String(value.term || "xterm-256color"),
       rows: dimension(value.rows, 24, "rows"),
       cols: dimension(value.cols, 80, "cols"),
+      ...(cwd ? { cwd } : {}),
     };
     const handle = await this.worker.withSession(this.serverId, async (session) => {
       invariant(typeof session.openPty === "function", "REMOTE_TERMINAL_UNAVAILABLE", "SSH transport 不支持受控 PTY", { status: 409 });
@@ -67,11 +84,13 @@ export class SshTerminalManager {
       handle,
       attached: true,
       status: "open",
+      scopeKey,
       descriptor,
       openedAt: now,
       updatedAt: now,
       publishChain: Promise.resolve(),
       closeResult: null,
+      outputBuffer: Buffer.alloc(0),
     };
     this.sessions.set(sessionId, state);
     handle.onData(({ stream, bytes }) => this.#publishOutput(state, stream, bytes));
@@ -104,30 +123,37 @@ export class SshTerminalManager {
     });
     state.descriptor = { ...state.descriptor, ...descriptor };
     state.updatedAt = new Date(this.clock()).toISOString();
-    await this.worker.touch?.(this.serverId);
     return this.#summary(state);
   }
 
   async detach(sessionId) {
     const state = this.#requireOpen(sessionId);
-    state.attached = false;
     state.updatedAt = new Date(this.clock()).toISOString();
-    await this.#publish(state, "terminal.detached", "completed", { sessionId: state.sessionId });
+    // A browser view disappearing must never detach the shared PTY for the
+    // same account on another device.  The socket stays attached to EasyWork;
+    // browser clients only unsubscribe from its realtime topic.
     return this.#summary(state);
   }
 
   async resume(sessionId) {
     const state = this.#requireOpen(sessionId);
-    state.attached = true;
     state.updatedAt = new Date(this.clock()).toISOString();
     await this.worker.touch?.(this.serverId);
-    await this.#publish(state, "terminal.resumed", "completed", { sessionId: state.sessionId });
     return this.#summary(state);
   }
 
   inspect(sessionId) {
     const state = this.#require(sessionId);
-    return this.#summary(state);
+    return this.#summary(state, { includeOutput: true });
+  }
+
+  list(input = {}) {
+    const value = exactObject(input, ["scopeKey"], "读取终端");
+    const scopeKey = terminalScopeKey(value.scopeKey);
+    return [...this.sessions.values()]
+      .filter((state) => state.scopeKey === scopeKey && state.status === "open")
+      .sort((left, right) => left.openedAt.localeCompare(right.openedAt))
+      .map((state) => this.#summary(state, { includeOutput: true }));
   }
 
   owns(sessionId) {
@@ -151,6 +177,10 @@ export class SshTerminalManager {
     await Promise.allSettled([...this.sessions.keys()].map((sessionId) => this.close(sessionId)));
   }
 
+  hasOpenSessions() {
+    return [...this.sessions.values()].some((state) => state.status === "open" && !state.handle.closed);
+  }
+
   #require(sessionId) {
     const id = String(sessionId || "");
     invariant(/^term_[a-f0-9]{32}$/.test(id), "TERMINAL_SESSION_ID_INVALID", "终端 sessionId 无效", { status: 400 });
@@ -165,23 +195,28 @@ export class SshTerminalManager {
     return state;
   }
 
-  #summary(state) {
+  #summary(state, { includeOutput = false } = {}) {
     return {
       sessionId: state.sessionId,
       topic: state.topic,
       status: state.status,
       attached: state.attached,
+      scopeKey: state.scopeKey,
       term: state.descriptor.term,
       rows: state.descriptor.rows,
       cols: state.descriptor.cols,
+      cwd: state.descriptor.cwd || null,
       openedAt: state.openedAt,
       updatedAt: state.updatedAt,
       closeResult: state.closeResult,
+      ...(includeOutput ? { outputBase64: state.outputBuffer.toString("base64") } : {}),
     };
   }
 
   #publishOutput(state, stream, bytes) {
     const value = Buffer.from(bytes);
+    state.outputBuffer = Buffer.concat([state.outputBuffer, value]);
+    if (state.outputBuffer.length > MAX_SCROLLBACK_BYTES) state.outputBuffer = state.outputBuffer.subarray(state.outputBuffer.length - MAX_SCROLLBACK_BYTES);
     for (let offset = 0; offset < value.length; offset += MAX_EVENT_BYTES) {
       const chunk = value.subarray(offset, Math.min(value.length, offset + MAX_EVENT_BYTES));
       this.#publish(state, "terminal.output", "updated", {
@@ -218,4 +253,4 @@ export class SshTerminalManager {
   }
 }
 
-export const terminalLimits = Object.freeze({ maxInputBytes: MAX_INPUT_BYTES, maxEventBytes: MAX_EVENT_BYTES, maxSessions: MAX_SESSIONS });
+export const terminalLimits = Object.freeze({ maxInputBytes: MAX_INPUT_BYTES, maxEventBytes: MAX_EVENT_BYTES, maxSessions: MAX_SESSIONS, maxScrollbackBytes: MAX_SCROLLBACK_BYTES });

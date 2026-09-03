@@ -1,131 +1,114 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { ChevronRight, LoaderCircle, Save, Settings2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { FileText, LoaderCircle, RefreshCw, Save, Settings2 } from "lucide-react";
 import type { AgentSummary } from "@/app/core/contracts";
 import { commandId } from "@/app/core/gateway/client";
 import { useAppRuntime } from "../../runtime/AppRuntime";
 import { Button } from "../../ui/Button";
 import { LoadingState } from "../../ui/LoadingState";
 import { Modal } from "../../ui/Modal";
+import { readAgentConfigurationCache, writeAgentConfigurationCache, type AgentConfiguration } from "./agent-configuration-cache";
 import styles from "./AgentConfigDialog.module.css";
 
-type ConfigField = {
-  key: string;
-  label: string;
-  type: "string" | "enum";
-  nativeKey: string;
-  options?: Array<{ value: string; label: string }>;
-};
+function sourceOf(agent: AgentSummary) {
+  return agent.managed || agent.source === "managed" ? "managed" : "user";
+}
 
-type AgentConfiguration = {
-  agentId: string;
-  source: "managed" | "user";
-  managed: boolean;
-  writable: boolean;
-  path?: string;
-  revision: number | null;
-  updatedAt: string | null;
-  fields: ConfigField[];
-  values: Record<string, string>;
-  reason?: string;
-};
+function errorCode(reason: unknown) {
+  if (!reason || typeof reason !== "object") return "";
+  return String((reason as { code?: unknown }).code || "");
+}
 
-type ProviderSummary = { id: string; name: string; configured: boolean };
-type ModelSummary = { id: string; name: string };
-
-export function AgentConfigDialog({ serverId, agent, onClose }: { serverId: string; agent: AgentSummary; onClose: () => void }) {
+export function AgentConfigDialog({ serverId, configScope, agent, onChanged, onClose }: { serverId: string; configScope: string; agent: AgentSummary; onChanged?: () => Promise<void>; onClose: () => void }) {
   const runtime = useAppRuntime();
-  const source = agent.managed || agent.source === "managed" ? "managed" : "user";
-  const [config, setConfig] = useState<AgentConfiguration | null>(null);
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [error, setError] = useState<string | null>(null);
+  const actorId = runtime.bootstrap?.actor.id;
+  const [initialConfig] = useState(() => readAgentConfigurationCache(actorId, serverId, configScope, agent.agentId));
+  const [config, setConfig] = useState<AgentConfiguration | null>(initialConfig);
+  const [content, setContent] = useState(() => initialConfig ? JSON.stringify(initialConfig.values, null, 2) : "");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [parseError, setParseError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [providers, setProviders] = useState<ProviderSummary[]>([]);
-  const [providerId, setProviderId] = useState("");
-  const [models, setModels] = useState<ModelSummary[]>([]);
-  const [detectingModels, setDetectingModels] = useState(false);
+  const [loading, setLoading] = useState(!initialConfig);
 
-  const providerStorageKey = `easywork.agent-provider:${serverId}:${agent.agentId}`;
-  const modelStorageKey = `easywork.agent-model:${serverId}:${agent.agentId}`;
-
-  const loadModels = async (nextProviderId: string, preserveModel = "") => {
-    setDetectingModels(true);
-    setModels([]);
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
     try {
-      const result = await runtime.api.post<{ models: ModelSummary[] }>(`/api/providers/${encodeURIComponent(nextProviderId)}/models`, { purpose: "agent" });
-      setModels(result.data.models);
-      const existing = preserveModel || values.model || localStorage.getItem(modelStorageKey) || "";
-      if (existing && result.data.models.some((item) => item.id === existing)) {
-        setValues((current) => ({ ...current, model: existing }));
-        localStorage.setItem(modelStorageKey, existing);
-      }
-    } catch (reason) {
-      runtime.notify(reason instanceof Error ? reason.message : "无法检测 Agent 模型", "error");
-    } finally { setDetectingModels(false); }
-  };
+      const query = new URLSearchParams({ source: sourceOf(agent), configScope });
+      const result = await runtime.api.get<AgentConfiguration>(`/api/servers/${encodeURIComponent(serverId)}/agents/${encodeURIComponent(agent.agentId)}/config?${query}`);
+      setConfig(result.data);
+      setContent(JSON.stringify(result.data.values, null, 2));
+      writeAgentConfigurationCache(actorId, serverId, configScope, result.data);
+    } catch (reason) { setLoadError(reason instanceof Error ? reason.message : "Agent 配置读取失败"); }
+    finally { setLoading(false); }
+  }, [actorId, agent, configScope, runtime.api, serverId]);
 
   useEffect(() => {
-    let active = true;
-    void Promise.all([
-      runtime.api.get<AgentConfiguration>(`/api/servers/${encodeURIComponent(serverId)}/agents/${encodeURIComponent(agent.agentId)}/config?source=${source}`),
-      source === "managed" ? runtime.api.get<ProviderSummary[]>("/api/providers?purpose=agent") : Promise.resolve(null),
-    ]).then(async ([configResult, providerResult]) => {
-      if (!active) return;
-      setConfig(configResult.data);
-      setValues(configResult.data.values);
-      const available = providerResult?.data || [];
-      setProviders(available);
-      if (configResult.data.fields.some((field) => field.key === "model") && available.length) {
-        const stored = localStorage.getItem(providerStorageKey);
-        const selected = available.find((item) => item.id === stored)?.id || available[0].id;
-        setProviderId(selected);
-        localStorage.setItem(providerStorageKey, selected);
-        await loadModels(selected, configResult.data.values.model || "");
-      }
-    }, (reason: Error) => { if (active) setError(reason.message); });
-    return () => { active = false; };
-    // Provider/model selection is loaded once for this concrete server Agent.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agent.agentId, runtime.api, serverId, source]);
+    if (initialConfig) return;
+    const handle = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(handle);
+  }, [initialConfig, load]);
 
-  const chooseProvider = async (nextProviderId: string) => {
-    setProviderId(nextProviderId);
-    localStorage.setItem(providerStorageKey, nextProviderId);
-    localStorage.removeItem(modelStorageKey);
-    setValues((current) => ({ ...current, model: "" }));
-    await loadModels(nextProviderId);
+  const parsed = useMemo(() => {
+    try {
+      const value = JSON.parse(content) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      return value as Record<string, unknown>;
+    } catch { return null; }
+  }, [content]);
+  const changes = useMemo(() => {
+    if (!parsed || !config) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([key, value]) => typeof value === "string" && value.trim() && value !== config.values[key]));
+  }, [config, parsed]);
+
+  const edit = (next: string) => {
+    setContent(next);
+    try {
+      const value = JSON.parse(next) as unknown;
+      setParseError(value && typeof value === "object" && !Array.isArray(value) ? null : "配置根节点必须是 JSON 对象");
+    } catch { setParseError("配置必须是有效的 JSON"); }
   };
 
-  const chooseModel = (model: string) => {
-    setValues((current) => ({ ...current, model }));
-    if (model) localStorage.setItem(modelStorageKey, model);
-    else localStorage.removeItem(modelStorageKey);
-  };
-
-  const changes = useMemo(() => Object.fromEntries(Object.entries(values).filter(([key, value]) => value.trim() && value !== config?.values[key])), [config?.values, values]);
   const save = async () => {
-    if (!config?.writable || config.revision == null || !Object.keys(changes).length) return;
+    if (!config?.writable || config.revision == null || !parsed || parseError || !Object.keys(changes).length) return;
     setSaving(true);
     try {
-      const result = await runtime.api.patch<AgentConfiguration>(`/api/servers/${encodeURIComponent(serverId)}/agents/${encodeURIComponent(agent.agentId)}/config`, {
-        source: "managed",
-        expectedRevision: config.revision,
-        values: changes,
-      }, { expectedRevision: config.revision, idempotencyKey: commandId("agent-config") });
-      setConfig(result.data);
-      setValues(result.data.values);
+      const endpoint = `/api/servers/${encodeURIComponent(serverId)}/agents/${encodeURIComponent(agent.agentId)}/config`;
+      const patchConfiguration = async (base: AgentConfiguration, commandPrefix: string) => {
+        const revision = base.revision;
+        if (revision == null) throw new Error("Agent 配置缺少 revision");
+        return (await runtime.api.patch<AgentConfiguration>(endpoint, {
+          source: base.source,
+          configScope,
+          expectedRevision: revision,
+          values: changes,
+        }, { expectedRevision: revision, idempotencyKey: commandId(commandPrefix) })).data;
+      };
+      let nextConfiguration: AgentConfiguration;
+      try {
+        nextConfiguration = await patchConfiguration(config, "agent-config");
+      } catch (reason) {
+        if (errorCode(reason) !== "REVISION_CONFLICT") throw reason;
+        const query = new URLSearchParams({ source: sourceOf(agent), configScope });
+        const latest = (await runtime.api.get<AgentConfiguration>(`${endpoint}?${query}`)).data;
+        const alreadyApplied = Object.entries(changes).every(([field, value]) => latest.values[field] === value);
+        nextConfiguration = alreadyApplied ? latest : await patchConfiguration(latest, "agent-config-retry");
+      }
+      setConfig(nextConfiguration);
+      setContent(JSON.stringify(nextConfiguration.values, null, 2));
+      writeAgentConfigurationCache(actorId, serverId, configScope, nextConfiguration);
+      await onChanged?.().catch(() => undefined);
       runtime.notify("Agent 配置已保存", "success");
-    } catch (reason) {
-      runtime.notify(reason instanceof Error ? reason.message : "Agent 配置失败", "error");
-    } finally { setSaving(false); }
+    } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "Agent 配置失败", "error"); }
+    finally { setSaving(false); }
   };
 
-  return <Modal title={`${agent.displayName} 配置`} size="normal" onClose={onClose}>
-    {!config && !error ? <LoadingState label="正在读取 Agent 配置" /> : error ? <div className={styles.unavailable}><Settings2 size={23} /><strong>配置暂时不可用</strong><span>{error}</span></div> : config ? <div className={styles.layout}>
-      <div className={styles.identity}><div><strong>{agent.displayName}</strong><span>{agent.version || "版本未知"}</span></div><span className={styles.source}>{config.managed ? "EasyWork 部署" : "用户部署"}</span></div>
-      {config.fields.length ? <div className={styles.fields}>{config.fields.map((field) => field.key === "model" ? <div className={`${styles.modelRoute} ${styles.wide}`} key={field.key}><span className={styles.fieldLabel}>模型</span><div className={styles.modelSteps}><label><span>API</span><select disabled={!config.writable || saving || !providers.length} value={providerId} onChange={(event) => void chooseProvider(event.target.value)}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label><ChevronRight size={17} /><label><span>模型</span><select disabled={!config.writable || saving || detectingModels || !providerId} value={values.model ?? ""} onChange={(event) => chooseModel(event.target.value)}><option value="">{detectingModels ? "检测中" : "选择模型"}</option>{models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label></div></div> : <label key={field.key}><span>{field.label}</span>{field.type === "enum" ? <select disabled={!config.writable || saving} value={values[field.key] ?? ""} onChange={(event) => setValues((current) => ({ ...current, [field.key]: event.target.value }))}><option value="">未设置</option>{field.options?.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select> : <input disabled={!config.writable || saving} value={values[field.key] ?? ""} placeholder="未设置" onChange={(event) => setValues((current) => ({ ...current, [field.key]: event.target.value }))} />}</label>)}</div> : <div className={styles.readonly}><strong>使用 Agent 自己的配置</strong><span>用户部署的 Agent 不由 EasyWork 修改。</span></div>}
-      {config.writable ? <footer className={styles.actions}><Button variant="primary" disabled={saving || !Object.keys(changes).length} icon={saving ? <LoaderCircle className={styles.spin} size={16} /> : <Save size={16} />} onClick={() => void save()}>{saving ? "配置中" : "保存"}</Button></footer> : null}
+  return <Modal title={`${agent.displayName} 配置`} size="wide" floating panelClassName={styles.nativePanel} bodyClassName={styles.nativeBody} onClose={onClose}>
+    {loading && !config ? <LoadingState label="正在读取 Agent 配置" /> : loadError && !config ? <div className={styles.unavailable}><Settings2 size={23} /><strong>配置暂时不可用</strong><span>{loadError}</span><Button compact icon={<RefreshCw size={14} />} onClick={() => void load()}>重新读取</Button></div> : config ? <div className={styles.nativeEditor}>
+      <div className={styles.nativePath}><FileText size={15} /><code>{config.path || "当前对话的 EasyWork 隔离配置"}</code><Button compact variant="ghost" disabled={loading || saving} icon={loading ? <LoaderCircle className={styles.spin} size={14} /> : <RefreshCw size={14} />} onClick={() => void load()}>{loading ? "读取中" : "重新读取远端"}</Button></div>
+      <textarea value={content} disabled={!config.writable || saving} spellCheck={false} aria-label="Agent 原生配置文件" onChange={(event) => edit(event.target.value)} />
+      <footer><span className={styles.parseError}>{parseError}</span><Button onClick={onClose}>取消</Button><Button variant="primary" disabled={!config.writable || saving || !Object.keys(changes).length || Boolean(parseError)} icon={saving ? <LoaderCircle className={styles.spin} size={16} /> : <Save size={16} />} onClick={() => void save()}>{saving ? "配置中" : "保存配置"}</Button></footer>
     </div> : null}
   </Modal>;
 }

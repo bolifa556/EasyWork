@@ -201,7 +201,12 @@ export class ConversationService {
         result: clone(mutation.result),
         preparedAt: timestamp,
       });
-      if (this.beforeIndexCommit) await this.beforeIndexCommit({ operation, conversationId: mutation.conversationId, snapshotId: mutation.snapshotId });
+      if (this.beforeIndexCommit) await this.beforeIndexCommit({
+        operation,
+        conversationId: mutation.conversationId,
+        conversationRevision: mutation.summary.revision,
+        snapshotId: mutation.snapshotId,
+      });
       await this.storage.commitIndexGeneration(generationId, nextSummaries.length, root.revision, this.clock);
       return clone(mutation.result);
     });
@@ -276,6 +281,57 @@ export class ConversationService {
         offset: nextOffset,
       }) : null,
     };
+  }
+
+  async bootstrapOverview(options = {}) {
+    assertInputKeys(options, ["limit", "projectId"], "ConversationBootstrapOverviewInput");
+    const limit = assertLimit(options.limit, 30);
+    const projectId = options.projectId === undefined ? undefined : assertOptionalProjectId(options.projectId);
+    const root = await this.storage.readIndexRoot();
+    const summaries = (await this.storage.readIndexGeneration(root.data.generationId))
+      .filter((summary) => !summary.deletedAt);
+    const filtered = projectId === undefined
+      ? summaries
+      : summaries.filter((summary) => summary.projectId === projectId);
+    const items = filtered.slice(0, limit).map(clone);
+    const projectConversationCounts = {};
+    for (const summary of summaries) {
+      if (!summary.projectId) continue;
+      projectConversationCounts[summary.projectId] = (projectConversationCounts[summary.projectId] || 0) + 1;
+    }
+    const filterDigest = queryDigest({ projectId, mode: undefined, pinned: undefined });
+    return {
+      items,
+      nextCursor: items.length < filtered.length ? this.cursorCodec.encode({
+        actorType: this.actor.actorType,
+        actorId: this.actor.actorId,
+        kind: "conversation-list",
+        filterDigest,
+        generationId: root.data.generationId,
+        offset: items.length,
+      }) : null,
+      projectConversationCounts,
+    };
+  }
+
+  async listDeletedConversations() {
+    const { summaries } = await this.#readIndex();
+    return summaries.filter((summary) => Boolean(summary.deletedAt)).map(clone);
+  }
+
+  async getConversationSummaries(conversationIds = []) {
+    invariant(Array.isArray(conversationIds), "CONVERSATION_IDS_INVALID", "对话 ID 列表无效", { status: 400 });
+    const requested = new Set(conversationIds.map((conversationId) => assertConversationId(conversationId)));
+    if (!requested.size) return [];
+    const { summaries } = await this.#readIndex();
+    return summaries.filter((summary) => requested.has(summary.id) && !summary.deletedAt).map(clone);
+  }
+
+  async listAllMessagesIncludingDeleted(conversationId) {
+    const { summaries } = await this.#readIndex();
+    const { chains } = await this.#loadConversation(summaries, conversationId, { includeDeleted: true });
+    const messageIds = [...new Set([...chains.values()].flat())];
+    return Promise.all(messageIds.map((messageId) => this.storage.readMessage(conversationId, messageId)));
   }
 
   async getConversation(conversationId) {
@@ -422,15 +478,6 @@ export class ConversationService {
     });
   }
 
-  convertMode(input) {
-    assertInputKeys(input, ["conversationId", "mode", "expectedRevision", "commandId"], "ConvertConversationModeInput");
-    const mode = assertConversationMode(input?.mode);
-    return this.#metadataMutation("conversation.convert_mode", { ...input, mode }, (meta) => {
-      invariant(meta.mode !== mode, "CONVERSATION_MODE_UNCHANGED", "对话已经是该模式", { status: 409 });
-      meta.mode = mode;
-    });
-  }
-
   activateBranch(input) {
     assertInputKeys(input, ["conversationId", "branchId", "expectedRevision", "commandId"], "ActivateConversationBranchInput");
     const branchId = assertBranchId(input?.branchId);
@@ -474,43 +521,81 @@ export class ConversationService {
     });
   }
 
-  async editLatestUserMessage(input) {
-    assertInputKeys(input, ["conversationId", "branchId", "messageId", "content", "expectedRevision", "commandId"], "EditLatestUserMessageInput");
-    const conversationId = assertConversationId(input?.conversationId);
-    const branchIdInput = input?.branchId ? assertBranchId(input.branchId) : null;
-    const targetMessageId = input?.messageId ? assertMessageId(input.messageId) : null;
-    const content = assertMessageContent(input?.content);
+  async forkConversation(input) {
+    assertInputKeys(input, ["conversationId", "sourceBranchId", "atMessageId", "expectedRevision", "commandId"], "ForkConversationInput");
+    const sourceConversationId = assertConversationId(input?.conversationId);
+    const sourceBranchIdInput = input?.sourceBranchId ? assertBranchId(input.sourceBranchId) : null;
+    const atMessageId = assertMessageId(input?.atMessageId);
     const expectedRevision = assertExpectedConversationRevision(input?.expectedRevision);
-    return this.#runMutation("conversation.edit_latest_user", input?.commandId, { conversationId, branchId: branchIdInput, messageId: targetMessageId, content, expectedRevision }, async ({ summaries, timestamp }) => {
-      const loaded = await this.#loadConversation(summaries, conversationId);
+    return this.#runMutation("conversation.fork_conversation", input?.commandId, {
+      conversationId: sourceConversationId,
+      sourceBranchId: sourceBranchIdInput,
+      atMessageId,
+      expectedRevision,
+    }, async ({ summaries, timestamp }) => {
+      const loaded = await this.#loadConversation(summaries, sourceConversationId);
       assertConversationRevision(loaded.summary, expectedRevision);
-      const branchId = branchIdInput || loaded.meta.activeBranchId;
-      branchById(loaded.meta, branchId);
-      const chain = loaded.chains.get(branchId);
-      const messages = await Promise.all(chain.map((id) => this.storage.readMessage(conversationId, id)));
-      const targetIndex = messages.findLastIndex((message) => message.role === "user");
-      invariant(targetIndex >= 0, "LATEST_USER_MESSAGE_NOT_FOUND", "当前分支没有可编辑的用户消息", { status: 404 });
-      invariant(!targetMessageId || messages[targetIndex].id === targetMessageId, "LATEST_USER_MESSAGE_REQUIRED", "只能编辑最新一条用户消息", { status: 409, details: { latestMessageId: messages[targetIndex].id } });
-      const removedIds = chain.slice(targetIndex);
-      const removedMessages = messages.slice(targetIndex);
-      const retained = chain.slice(0, targetIndex);
-      const messageId = this.#id("msg");
-      const message = createMessage({ id: messageId, conversationId, branchId, role: "user", content, taskId: null, replyToMessageId: retained.at(-1) || null, createdAt: timestamp });
-      retained.push(messageId);
-      loaded.chains.set(branchId, retained);
+      const sourceBranchId = sourceBranchIdInput || loaded.meta.activeBranchId;
+      branchById(loaded.meta, sourceBranchId);
+      const sourceChain = loaded.chains.get(sourceBranchId);
+      const forkIndex = sourceChain.indexOf(atMessageId);
+      invariant(forkIndex >= 0, "BRANCH_FORK_MESSAGE_NOT_FOUND", "分支起点不在来源消息链中", { status: 404 });
+
+      const sourceMessages = await Promise.all(sourceChain.slice(0, forkIndex + 1)
+        .map((messageId) => this.storage.readMessage(sourceConversationId, messageId)));
+      const conversationId = this.#id("conv");
+      const branchId = this.#id("branch");
       const snapshotId = this.#id("csnap");
-      const meta = nextSnapshotMeta(loaded.meta, loaded.summary.snapshotId, timestamp);
-      meta.activeBranchId = branchId;
-      meta.lastMessageAt = timestamp;
-      updateBranchCount(meta, branchId, retained, timestamp);
-      const summary = await this.#summaryFrom(meta, snapshotId, loaded.chains, [message]);
+      const idMap = new Map(sourceMessages.map((message) => [message.id, this.#id("msg")]));
+      const newMessages = sourceMessages.map((message) => createMessage({
+        id: idMap.get(message.id),
+        conversationId,
+        branchId,
+        role: message.role,
+        content: message.content,
+        // A derived webpage conversation keeps the immutable Task reference
+        // for every inherited answer.  Task and realtime journals are
+        // content-addressed historical records; retaining the reference lets
+        // the child render the complete pre-fork reasoning and Agent activity
+        // without copying or mutating the source run.
+        taskId: message.taskId,
+        replyToMessageId: message.replyToMessageId ? idMap.get(message.replyToMessageId) || null : null,
+        createdAt: message.createdAt,
+      }));
+      const chain = newMessages.map((message) => message.id);
+      const chains = new Map([[branchId, chain]]);
+      const baseTitle = Array.from(String(loaded.meta.title || "新对话")).slice(0, 232).join("");
+      const meta = {
+        schemaVersion: CONVERSATION_SCHEMA_VERSION,
+        entityType: "ConversationSnapshot",
+        conversationId,
+        revision: 1,
+        parentSnapshotId: null,
+        mode: loaded.meta.mode,
+        title: `${baseTitle} · 分支`,
+        projectId: loaded.meta.projectId,
+        pinned: false,
+        rootBranchId: branchId,
+        activeBranchId: branchId,
+        branches: [{ id: branchId, parentBranchId: null, forkMessageId: idMap.get(atMessageId), messageCount: chain.length, createdAt: timestamp, updatedAt: timestamp }],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        lastMessageAt: timestamp,
+        deletedAt: null,
+      };
+      const summary = await this.#summaryFrom(meta, snapshotId, chains, newMessages);
       return {
-        conversationId, snapshotId, meta, chains: loaded.chains, newMessages: [message], summary,
+        conversationId,
+        snapshotId,
+        meta,
+        chains,
+        newMessages,
+        summary,
         result: {
           conversation: summary,
-          messageId,
-          branchId,
-          removedBoundary: removedBoundary(removedIds, removedMessages, retained.at(-2) || null, { sourceSnapshotId: loaded.summary.snapshotId, branchId }),
+          branch: clone(meta.branches[0]),
+          source: { conversationId: sourceConversationId, branchId: sourceBranchId, atMessageId },
+          sourceMessageIds: sourceMessages.map((message) => message.id),
         },
       };
     });

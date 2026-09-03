@@ -5,10 +5,14 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-pdfjs-worker.mjs",
+    "predev": "node scripts/patch-pdfjs-worker.mjs",
     "dev": "node scripts/run-vinext.mjs dev",
+    "prebuild": "node scripts/patch-pdfjs-worker.mjs",
     "build": "node scripts/run-vinext.mjs build",
     "start": "node scripts/serve-easywork.mjs",
     "gateway": "node gateway/core/server.mjs",
+    "pretest:gateway": "node scripts/patch-pdfjs-worker.mjs",
     "frp": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File frp/start.ps1",
     "sync:setup": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File sync/install.ps1",
     "test:gateway": "node --test --test-reporter=spec tests/*.test.mjs",

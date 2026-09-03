@@ -20,8 +20,82 @@ function normalizeIds(value) {
   return Object.freeze(ids);
 }
 
+function sameIds(left, right) {
+  const leftEntries = Object.entries(left || {});
+  const rightEntries = Object.entries(right || {});
+  return leftEntries.length === rightEntries.length
+    && leftEntries.every(([key, value]) => right?.[key] === value);
+}
+
+function streamDescriptor(event) {
+  const payload = event?.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  if (["reasoning", "message"].includes(event.kind)
+    && payload.event?.delta === true
+    && typeof payload.event?.text === "string"
+    && payload.source?.itemId) {
+    return {
+      key: [event.producer, event.kind, payload.source.itemId].map(String).join(":"),
+      textPath: "event",
+    };
+  }
+  if (event.kind === "run.reasoning.delta" && typeof payload.content === "string") {
+    return {
+      key: [event.producer, event.kind, event.ids?.runId, payload.iteration ?? 0].map(String).join(":"),
+      textPath: "payload",
+    };
+  }
+  if (event.kind === "run.output.delta" && typeof payload.content === "string" && payload.segmentId) {
+    return {
+      key: [event.producer, event.kind, event.ids?.runId, payload.segmentId].map(String).join(":"),
+      textPath: "payload",
+    };
+  }
+  return null;
+}
+
+function compactStreamEvent(previous, next) {
+  const descriptor = streamDescriptor(next);
+  if (!descriptor
+    || previous?.producer !== next.producer
+    || previous?.kind !== next.kind
+    || previous?.status !== next.status
+    || !sameIds(previous?.ids, next.ids)
+    || streamDescriptor(previous)?.key !== descriptor.key) return null;
+  const previousPayload = previous.payload || {};
+  const nextPayload = next.payload || {};
+  if (descriptor.textPath === "event") {
+    return {
+      ...next,
+      payload: {
+        ...nextPayload,
+        realtimeStreamKey: previousPayload.realtimeStreamKey,
+        event: {
+          ...nextPayload.event,
+          text: `${String(previousPayload.event?.text || "")}${String(nextPayload.event?.text || "")}`,
+        },
+      },
+    };
+  }
+  return {
+    ...next,
+    payload: {
+      ...nextPayload,
+      realtimeStreamKey: previousPayload.realtimeStreamKey,
+      content: `${String(previousPayload.content || "")}${String(nextPayload.content || "")}`,
+    },
+  };
+}
+
+function markStreamEvent(event) {
+  const descriptor = streamDescriptor(event);
+  // Only adjacent deltas are cumulative snapshots. A later delta in the same
+  // model iteration starts a new segment after a tool/content event.
+  return descriptor ? { ...event, payload: { ...event.payload, realtimeStreamKey: `${descriptor.key}:${event.sequence}` } } : event;
+}
+
 export function createRealtimeEnvelope(input) {
-  invariant(!["timestamp", "seq", "type", "taskId", "conversationId"].some((key) => key in (input || {})), "REALTIME_LEGACY_FIELD_FORBIDDEN", "Realtime envelope 不接受旧字段", { status: 400 });
+  invariant(!["timestamp", "seq", "type", "taskId", "conversationId"].some((key) => key in (input || {})), "REALTIME_RESERVED_FIELD_FORBIDDEN", "Realtime envelope 包含保留字段", { status: 400 });
   const topic = String(input?.topic || "");
   const sequence = Number(input?.sequence);
   invariant(TOPIC_PATTERN.test(topic), "REALTIME_TOPIC_INVALID", "Realtime topic 格式无效", { status: 400 });
@@ -73,9 +147,11 @@ export class RealtimeEventJournal {
       try {
         const updated = await repository.update((data) => {
           const sequence = data.lastSequence + 1;
-          const envelope = createRealtimeEnvelope({ ...event, actor: this.actor, topic, sequence });
+          const envelope = markStreamEvent(createRealtimeEnvelope({ ...event, actor: this.actor, topic, sequence }));
+          const compacted = compactStreamEvent(data.events.at(-1), envelope);
           data.lastSequence = sequence;
-          data.events.push(envelope);
+          if (compacted) data.events[data.events.length - 1] = compacted;
+          else data.events.push(envelope);
           if (data.events.length > this.maxEventsPerTopic) {
             data.events.splice(0, data.events.length - this.maxEventsPerTopic);
           }
@@ -96,7 +172,10 @@ export class RealtimeEventJournal {
     invariant(Number.isSafeInteger(limit) && limit > 0 && limit <= 2_000, "REALTIME_LIMIT_INVALID", "Realtime replay limit 无效", { status: 400 });
     const envelope = await this.#repository(topic).read();
     const data = envelope.data;
-    invariant(data.lastSequence === 0 || afterSequence >= data.firstSequence - 1, "REALTIME_REPLAY_EXPIRED", "请求的事件已超出回放窗口", {
+    // `after=0` means "start from the earliest retained event". This remains
+    // useful after retention or stream compaction creates sequence gaps, while
+    // non-zero stale cursors still receive an explicit expiry response.
+    invariant(data.lastSequence === 0 || afterSequence === 0 || afterSequence >= data.firstSequence - 1, "REALTIME_REPLAY_EXPIRED", "请求的事件已超出回放窗口", {
       status: 410,
       details: { firstAvailableSequence: data.firstSequence },
     });

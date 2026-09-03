@@ -2,10 +2,14 @@ import crypto from "node:crypto";
 
 import { assertNoSensitiveFields, invariant } from "../errors.mjs";
 import { AtomicJsonRepository } from "../repository.mjs";
+import { durableStoredMemory } from "./policy.mjs";
 import { validateEffectiveContextScope } from "../entities/context.mjs";
+import { containsExplicitQueryAnchor, requiredExplicitQueryAnchors } from "../text-relevance.mjs";
 
-const LEVELS = Object.freeze(["user", "project", "conversation", "workspace", "task"]);
-const LEVEL_SET = new Set(LEVELS);
+const ACTIVE_LEVELS = Object.freeze(["user", "project", "conversation"]);
+const ACTIVE_LEVEL_SET = new Set(ACTIVE_LEVELS);
+const LEGACY_LEVEL_SET = new Set(["workspace", "task"]);
+const STORED_LEVEL_SET = new Set([...ACTIVE_LEVELS, ...LEGACY_LEVEL_SET]);
 const SENSITIVITIES = new Set(["public", "private", "restricted"]);
 const PORTABILITIES = new Set(["universal", "project-bound", "workspace-bound", "task-bound"]);
 const AUTHORITY_WEIGHT = Object.freeze({
@@ -27,10 +31,10 @@ function normalizeText(value, field, max = 200_000) {
   return value.trim();
 }
 
-function normalizeScope(value, actor) {
+function normalizeScope(value, actor, { allowLegacy = false } = {}) {
   invariant(value && typeof value === "object" && !Array.isArray(value), "MEMORY_SCOPE_INVALID", "Memory scope 无效", { status: 400 });
   const level = String(value.level || "");
-  invariant(LEVEL_SET.has(level), "MEMORY_SCOPE_INVALID", "Memory scope level 无效", { status: 400 });
+  invariant((allowLegacy ? STORED_LEVEL_SET : ACTIVE_LEVEL_SET).has(level), "MEMORY_SCOPE_INVALID", "Memory scope level 无效", { status: 400 });
   const id = level === "user" ? actor.actorId : String(value.id || "");
   invariant(id && id.length <= 256, "MEMORY_SCOPE_ID_REQUIRED", `${level} memory 必须包含 scope id`, { status: 400 });
   invariant(level !== "user" || id === actor.actorId, "MEMORY_SCOPE_ACTOR_MISMATCH", "User memory 不属于当前 Actor", { status: 403 });
@@ -54,7 +58,7 @@ function validateDocument(data) {
   if (!data.records || typeof data.records !== "object" || Array.isArray(data.records)) return false;
   if (!Array.isArray(data.invalidations)) return false;
   for (const [id, record] of Object.entries(data.records)) {
-    if (record?.id !== id || !LEVEL_SET.has(record?.scope?.level) || typeof record?.scope?.id !== "string") return false;
+    if (record?.id !== id || !STORED_LEVEL_SET.has(record?.scope?.level) || typeof record?.scope?.id !== "string") return false;
     if (!Number.isSafeInteger(record.revision) || record.revision < 0 || !Array.isArray(record.versions)) return false;
     for (const version of record.versions) {
       if (!version?.id || !Number.isSafeInteger(version.sequence) || version.sequence < 1 || typeof version.content !== "string") return false;
@@ -71,11 +75,18 @@ function scopeIdentity(scope, semanticKey) {
   return sha256(`${scope.level}\0${scope.id}\0${semanticKey}`);
 }
 
-function queryTokens(value) {
+function queryTokens(value, { suppressIncidentalHanUnigrams = false } = {}) {
   const text = String(value || "").toLowerCase();
   const words = text.match(/[\p{L}\p{N}_-]+/gu) || [];
   const cjk = [...text.replace(/[^\p{Script=Han}]/gu, "")];
-  return new Set([...words, ...cjk, ...cjk.slice(0, -1).map((item, index) => item + cjk[index + 1])]);
+  const tokens = new Set([...words, ...cjk, ...cjk.slice(0, -1).map((item, index) => item + cjk[index + 1])]);
+  if (!suppressIncidentalHanUnigrams) return tokens;
+  const meaningful = [...tokens].filter((token) => !/^\p{Script=Han}$/u.test(token));
+  // A genuinely one-character Chinese query still needs to work.  Once the
+  // query contains any word or bigram, however, individual Han characters are
+  // too weak: shared characters such as “项” or “定” otherwise surface
+  // unrelated project memories beside the requested fact.
+  return meaningful.length ? new Set(meaningful) : tokens;
 }
 
 function relevance(content, query) {
@@ -90,8 +101,9 @@ function scopeMatches(memoryScope, scope) {
   if (memoryScope.level === "user") return scope.memoryMode === "global" && memoryScope.id === scope.actorId;
   if (memoryScope.level === "project") return Boolean(scope.projectId) && memoryScope.id === scope.projectId;
   if (memoryScope.level === "conversation") return memoryScope.id === scope.conversationId;
-  if (memoryScope.level === "workspace") return Boolean(scope.workspaceId) && memoryScope.id === scope.workspaceId;
-  if (memoryScope.level === "task") return Boolean(scope.taskId) && memoryScope.id === scope.taskId;
+  // workspace/task records can exist in stores created by older releases.
+  // Keep them readable for audit and invalidation, but never project them into
+  // model context: cwd and remote Task identity are not memory boundaries.
   return false;
 }
 
@@ -213,6 +225,60 @@ export class PersistentMemoryService {
     return record ? structuredClone(record) : null;
   }
 
+  async forkConversationScope({ sourceConversationId, targetConversationId, sourceIds = [], source }) {
+    const sourceId = String(sourceConversationId || "");
+    const targetId = String(targetConversationId || "");
+    const includedSources = new Set((Array.isArray(sourceIds) ? sourceIds : []).map(String).filter(Boolean));
+    invariant(sourceId && targetId && sourceId !== targetId, "MEMORY_FORK_SCOPE_INVALID", "分支对话的 Memory scope 无效", { status: 400 });
+    invariant(includedSources.size > 0, "MEMORY_FORK_BOUNDARY_EMPTY", "分支对话缺少 Memory 来源边界", { status: 400 });
+    const provenance = normalizeSource(source);
+    let output = { copied: 0, versionIds: [] };
+    await this.#update((data) => {
+      const invalidated = invalidatedVersionIds(data, data.sequence);
+      const candidates = Object.values(data.records)
+        .filter((record) => record.scope?.level === "conversation" && record.scope.id === sourceId)
+        .map((record) => ({
+          record,
+          version: [...record.versions]
+            .filter((version) => includedSources.has(String(version.source?.id || "")) && !invalidated.has(version.id))
+            .sort((left, right) => right.sequence - left.sequence)[0] || null,
+        }))
+        .filter((entry) => entry.version);
+      const versionIds = [];
+      for (const { record, version: original } of candidates) {
+        const scope = { level: "conversation", id: targetId };
+        const recordId = `memory_${scopeIdentity(scope, record.semanticKey).slice(0, 32)}`;
+        if (data.records[recordId]) continue;
+        data.sequence += 1;
+        const createdAt = nowIso(this.clock);
+        const version = {
+          id: createId("memory_version"),
+          sequence: data.sequence,
+          content: original.content,
+          authority: original.authority,
+          confidence: original.confidence,
+          sensitivity: original.sensitivity,
+          portability: original.portability,
+          source: provenance,
+          supersedes: null,
+          createdAt,
+        };
+        data.records[recordId] = {
+          id: recordId,
+          scope,
+          semanticKey: record.semanticKey,
+          revision: 0,
+          versions: [version],
+          createdAt,
+          updatedAt: createdAt,
+        };
+        versionIds.push(version.id);
+      }
+      output = { copied: versionIds.length, versionIds };
+    });
+    return structuredClone(output);
+  }
+
   async invalidate(input) {
     const requested = [...new Set((input.versionIds || []).map(String))];
     invariant(requested.length > 0, "MEMORY_INVALIDATION_EMPTY", "必须指定需要失效的 Memory version", { status: 400 });
@@ -243,6 +309,25 @@ export class PersistentMemoryService {
     return { invalidated: versionIds.length, sequence: entry.sequence, invalidationId: entry.id };
   }
 
+  async invalidateScopes({ scopes, reason, source }) {
+    const requested = new Map();
+    for (const value of Array.isArray(scopes) ? scopes : []) {
+      const scope = normalizeScope(value, this.actor, { allowLegacy: true });
+      requested.set(`${scope.level}\0${scope.id}`, scope);
+    }
+    invariant(requested.size > 0, "MEMORY_INVALIDATION_SCOPE_EMPTY", "必须指定需要失效的 Memory scope", { status: 400 });
+    const state = await this.#repository().read();
+    const alreadyInvalidated = invalidatedVersionIds(state.data, state.data.sequence);
+    const versionIds = Object.values(state.data.records).flatMap((record) => (
+      requested.has(`${record.scope.level}\0${record.scope.id}`)
+        ? record.versions.filter((version) => !alreadyInvalidated.has(version.id)).map((version) => version.id)
+        : []
+    ));
+    if (!versionIds.length) return { invalidated: 0, sequence: state.data.sequence };
+    const entry = await this.invalidate({ versionIds, reason, source });
+    return { invalidated: versionIds.length, sequence: entry.sequence, invalidationId: entry.id };
+  }
+
   async invalidateAfter({ scope, afterSequence, reason, source }) {
     validateEffectiveContextScope(scope);
     invariant(scope.actorType === this.actor.actorType && scope.actorId === this.actor.actorId, "MEMORY_SCOPE_ACTOR_MISMATCH", "Memory scope 不属于当前 Actor", { status: 403 });
@@ -268,7 +353,8 @@ export class PersistentMemoryService {
     const baselineSequence = scope.memoryBaselineSequence ?? options.baselineSequence ?? null;
     invariant(baselineSequence === null || (Number.isSafeInteger(baselineSequence) && baselineSequence >= 0 && baselineSequence <= asOfSequence), "MEMORY_BASELINE_INVALID", "Memory baseline 无效", { status: 400 });
     const invalidatedAtBaseline = baselineSequence === null ? invalidated : invalidatedVersionIds(state.data, baselineSequence);
-    const query = queryTokens(options.query);
+    const query = queryTokens(options.query, { suppressIncidentalHanUnigrams: true });
+    const requiredAnchors = requiredExplicitQueryAnchors(options.query);
     const limit = Number(options.limit ?? 50);
     invariant(Number.isSafeInteger(limit) && limit > 0 && limit <= 500, "MEMORY_LIMIT_INVALID", "Memory limit 无效", { status: 400 });
     const entries = [];
@@ -276,12 +362,21 @@ export class PersistentMemoryService {
       if (!scopeMatches(record.scope, scope)) continue;
       const version = selectedVersion(record, { asOfSequence, snapshotVersionIds, invalidated, baselineSequence, invalidatedAtBaseline });
       if (!version || (version.sensitivity === "restricted" && !options.includeRestricted)) continue;
+      // Runtime measurements, absolute paths and unfinished activity summaries
+      // are audit material, not durable semantic memory.
+      if (!durableStoredMemory(record.semanticKey, version.content)) continue;
+      // Concrete filenames, job ids and similar identifiers constrain the
+      // requested subject. Generic prose such as “静态检查” must not surface a
+      // different fact merely because it shares one broad phrase.
+      if (requiredAnchors.length && !containsExplicitQueryAnchor(version.content, requiredAnchors)) continue;
+      const relevanceScore = relevance(version.content, query);
+      if (query.size && relevanceScore === 0) continue;
       entries.push({
         recordId: record.id,
         semanticKey: record.semanticKey,
         scope: structuredClone(record.scope),
         version: structuredClone(version),
-        score: LEVEL_WEIGHT[record.scope.level] * 10 + (AUTHORITY_WEIGHT[version.authority] || 0) + version.confidence + relevance(version.content, query),
+        score: LEVEL_WEIGHT[record.scope.level] * 10 + (AUTHORITY_WEIGHT[version.authority] || 0) + version.confidence + relevanceScore,
       });
     }
     entries.sort((left, right) => right.score - left.score || right.version.sequence - left.version.sequence || left.recordId.localeCompare(right.recordId));
@@ -302,13 +397,18 @@ export class PersistentMemoryService {
     return selected.entries.map((entry) => ({
       id: entry.version.id,
       kind: "memory",
+      semanticKey: entry.semanticKey,
       content: entry.version.content,
       tokenEstimate: options.tokenEstimator?.(entry.version.content),
       sensitivity: entry.version.sensitivity,
       priority: entry.score,
       source: { type: "memory", id: entry.recordId, version: entry.version.id },
+      // Provenance is consumed by the host before the semantic projection is
+      // shown to a model. It lets a reused native Agent session suppress facts
+      // that were extracted from that same session without exposing IDs.
+      origin: structuredClone(entry.version.source),
     }));
   }
 }
 
-export { LEVELS as MEMORY_LEVELS };
+export { ACTIVE_LEVELS as MEMORY_LEVELS };

@@ -22,6 +22,7 @@ export const TASK_STATUSES = Object.freeze([
   "delivering_context",
   "running",
   "waiting_approval",
+  "waiting_input",
   "waiting_append",
   "interrupting",
   "interrupted",
@@ -35,15 +36,16 @@ export const TASK_STATUSES = Object.freeze([
 export const TERMINAL_TASK_STATUSES = Object.freeze(["completed", "failed", "cancelled"]);
 
 const TRANSITIONS = Object.freeze({
-  queued: Object.freeze(["preparing", "failed", "cancelled"]),
-  preparing: Object.freeze(["delivering_context", "failed", "cancelled"]),
-  delivering_context: Object.freeze(["running", "failed", "cancelled"]),
-  running: Object.freeze(["waiting_approval", "waiting_append", "interrupting", "recovering", "finalizing", "failed", "cancelled"]),
+  queued: Object.freeze(["preparing", "interrupting", "failed", "cancelled"]),
+  preparing: Object.freeze(["delivering_context", "interrupting", "failed", "cancelled"]),
+  delivering_context: Object.freeze(["running", "interrupting", "failed", "cancelled"]),
+  running: Object.freeze(["waiting_approval", "waiting_input", "waiting_append", "interrupting", "recovering", "finalizing", "failed", "cancelled"]),
   waiting_approval: Object.freeze(["running", "interrupting", "recovering", "failed", "cancelled"]),
+  waiting_input: Object.freeze(["running", "interrupting", "recovering", "failed", "cancelled"]),
   waiting_append: Object.freeze(["running", "interrupting", "recovering", "finalizing", "failed", "cancelled"]),
   interrupting: Object.freeze(["interrupted", "failed"]),
   interrupted: Object.freeze(["recovering", "cancelled"]),
-  recovering: Object.freeze(["running", "failed", "cancelled"]),
+  recovering: Object.freeze(["running", "interrupting", "failed", "cancelled"]),
   finalizing: Object.freeze(["completed", "failed", "cancelled"]),
   completed: Object.freeze([]),
   failed: Object.freeze([]),
@@ -53,7 +55,7 @@ const TRANSITIONS = Object.freeze({
 export const TASK_TRANSITIONS = TRANSITIONS;
 
 const TASK_KEYS = [
-  "schemaVersion", "entityType", "revision", "id", "actorId", "conversationId", "branchId", "goal", "route",
+  "schemaVersion", "entityType", "revision", "id", "actorId", "conversationId", "branchId", "sourceMessageId", "conversationRunId", "goal", "route",
   "contextSessionId", "agentBindingId", "skillPins", "resourceBindingSnapshotId", "versionCheckpointId", "budgets",
   "idempotencyKey", "status", "taskEventSequence", "remoteRunId", "activeCommandId", "plan", "artifactIds",
   "failure", "createdAt", "updatedAt", "startedAt", "completedAt",
@@ -118,6 +120,8 @@ export function validateTask(task) {
   assertId(task.actorId, "Task.actorId");
   assertId(task.conversationId, "Task.conversationId");
   assertId(task.branchId, "Task.branchId");
+  assertId(task.sourceMessageId, "Task.sourceMessageId");
+  assertId(task.conversationRunId, "Task.conversationRunId");
   assertString(task.goal, "Task.goal", { max: 65536 });
   validateRoute(task.route);
   assertId(task.contextSessionId, "Task.contextSessionId");
@@ -144,7 +148,7 @@ export function validateTask(task) {
 
 export function createTask(input, options = {}) {
   assertExactKeys(input, [
-    "id", "actorId", "conversationId", "branchId", "goal", "route", "contextSessionId", "agentBindingId", "skillPins",
+    "id", "actorId", "conversationId", "branchId", "sourceMessageId", "conversationRunId", "goal", "route", "contextSessionId", "agentBindingId", "skillPins",
     "resourceBindingSnapshotId", "versionCheckpointId", "budgets", "idempotencyKey",
   ], "TaskInput");
   const task = {
@@ -153,6 +157,8 @@ export function createTask(input, options = {}) {
     actorId: input.actorId,
     conversationId: input.conversationId,
     branchId: input.branchId,
+    sourceMessageId: input.sourceMessageId,
+    conversationRunId: input.conversationRunId,
     goal: input.goal,
     route: clone(input.route),
     contextSessionId: input.contextSessionId,
@@ -193,8 +199,13 @@ export function transitionTask(task, nextStatus, options = {}) {
     ...revisedHeader(task, options.expectedRevision, { clock: () => now }),
     status: nextStatus,
     taskEventSequence: task.taskEventSequence + 1,
+    sourceMessageId: options.sourceMessageId === undefined ? task.sourceMessageId : options.sourceMessageId,
+    conversationRunId: options.conversationRunId === undefined ? task.conversationRunId : options.conversationRunId,
     remoteRunId: options.remoteRunId === undefined ? task.remoteRunId : options.remoteRunId,
     activeCommandId: options.activeCommandId === undefined ? task.activeCommandId : options.activeCommandId,
+    // The remote Agent's native plan/Todo stream is authoritative. Task
+    // lifecycle transitions must never infer progress for an unfinished item.
+    plan: clone(task.plan),
     failure: nextStatus === "failed" ? clone(options.failure ?? null) : null,
     startedAt: task.startedAt ?? (nextStatus === "running" ? new Date(now).toISOString() : null),
     completedAt: TERMINAL_TASK_STATUSES.includes(nextStatus) ? new Date(now).toISOString() : null,
@@ -205,9 +216,13 @@ export function transitionTask(task, nextStatus, options = {}) {
 
 export function updateTaskRuntime(task, changes, options = {}) {
   validateTask(task);
-  assertExactKeys(changes, ["remoteRunId", "activeCommandId", "plan", "artifactIds"], "TaskRuntimeChanges");
+  assertExactKeys(changes, ["remoteRunId", "activeCommandId", "plan", "artifactIds", "versionCheckpointId", "sourceMessageId", "conversationRunId"], "TaskRuntimeChanges");
   invariant(Object.keys(changes).length > 0, "TASK_RUNTIME_CHANGES_REQUIRED", "Task runtime 更新不能为空", { status: 400 });
-  invariant(!TERMINAL_TASK_STATUSES.includes(task.status), "TASK_TERMINAL_IMMUTABLE", "终态 Task 不能再更新运行态数据", { status: 409 });
+  const terminalVersionFinalization = TERMINAL_TASK_STATUSES.includes(task.status)
+    && Object.keys(changes).length === 1
+    && Object.hasOwn(changes, "versionCheckpointId");
+  invariant(!TERMINAL_TASK_STATUSES.includes(task.status) || terminalVersionFinalization,
+    "TASK_TERMINAL_IMMUTABLE", "终态 Task 只能补记文件版本边界", { status: 409 });
   const next = {
     ...clone(task),
     ...revisedHeader(task, options.expectedRevision, options),

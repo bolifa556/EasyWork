@@ -4,7 +4,6 @@ export {
   assertCommandId,
   commandFingerprint,
   createCommandRecord,
-  formatContextPrompt,
   taskTopic,
 } from "./contract.mjs";
 export { TaskOrchestrator } from "./service.mjs";

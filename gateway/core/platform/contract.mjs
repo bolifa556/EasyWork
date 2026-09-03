@@ -4,12 +4,13 @@ import net from "node:net";
 import { invariant } from "../errors.mjs";
 
 export const PLATFORM_SCHEMA_VERSION = 1;
-export const PROVIDER_PURPOSES = Object.freeze(["web", "agent", "embedding"]);
-export const PROVIDER_PROTOCOLS = Object.freeze(["auto", "responses", "chat-completions", "openai-embeddings"]);
+export const PROVIDER_PURPOSES = Object.freeze(["web", "agent", "embedding", "ocr"]);
+export const PROVIDER_PROTOCOLS = Object.freeze(["auto", "responses", "chat-completions", "openai-embeddings", "mineru"]);
 export const PLATFORM_PROVIDER_IDS = Object.freeze({
   web: "platform-web",
   agent: "platform-agent",
   embedding: "platform-embedding",
+  ocr: "platform-ocr",
 });
 
 const PROVIDER_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/;
@@ -73,12 +74,18 @@ export function normalizeBaseUrl(value) {
 }
 
 export function normalizeProtocol(value, purpose) {
-  const requested = String(value || (purpose === "embedding" ? "openai-embeddings" : "auto"));
+  const requested = String(value || (purpose === "embedding" ? "openai-embeddings" : purpose === "ocr" ? "chat-completions" : "auto"));
   invariant(PROVIDER_PROTOCOLS.includes(requested), "PROVIDER_PROTOCOL_INVALID", "Provider protocol 无效", { status: 400 });
   invariant(purpose !== "embedding" || requested === "openai-embeddings", "PROVIDER_PROTOCOL_INVALID", "Embedding Provider 必须使用 embeddings 协议", {
     status: 400,
   });
-  invariant(purpose === "embedding" || requested !== "openai-embeddings", "PROVIDER_PROTOCOL_INVALID", "对话 Provider 不能使用 embeddings 协议", {
+  invariant(purpose !== "ocr" || ["chat-completions", "mineru"].includes(requested), "PROVIDER_PROTOCOL_INVALID", "OCR Provider 仅支持视觉模型或 MinerU 协议", {
+    status: 400,
+  });
+  invariant(purpose === "embedding" || requested !== "openai-embeddings", "PROVIDER_PROTOCOL_INVALID", "当前 Provider 不能使用 embeddings 协议", {
+    status: 400,
+  });
+  invariant(purpose === "ocr" || requested !== "mineru", "PROVIDER_PROTOCOL_INVALID", "MinerU 协议仅供 OCR Provider 使用", {
     status: 400,
   });
   return requested;
@@ -100,6 +107,13 @@ export function normalizeEmbeddingSettings(value = {}) {
     chunkOverlap,
     batchSize: boundedInteger(value.batchSize ?? 32, "batchSize", 1, 256),
     hybridEnabled: value.hybridEnabled !== false,
+  });
+}
+
+export function normalizeOcrSettings(value = {}) {
+  return Object.freeze({
+    model: String(value.model || "").trim().slice(0, 256),
+    maxOutputTokens: boundedInteger(value.maxOutputTokens ?? 4096, "maxOutputTokens", 256, 32768),
   });
 }
 

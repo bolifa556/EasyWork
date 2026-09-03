@@ -43,6 +43,8 @@ function task(currentActor, clock, overrides = {}) {
     actorId: currentActor.actorId,
     conversationId: overrides.conversationId || "conversation_a",
     branchId: "main",
+    sourceMessageId: "message_source_a",
+    conversationRunId: "conversation_run_a",
     goal: "Create an artifact",
     route: {
       serverId: "server_a",
@@ -159,6 +161,8 @@ test("远端 Artifact 必须由工作区检查器完成 realpath、symlink、sco
     const currentActor = actor();
     const time = clockFixture();
     const inspections = [];
+    const availabilityChecks = [];
+    let remoteDeleted = false;
     const remoteSource = {
       async inspect(input) {
         inspections.push(structuredClone(input));
@@ -180,15 +184,33 @@ test("远端 Artifact 必须由工作区检查器完成 realpath、symlink、sco
         assert.equal(canonicalPath, "/srv/work/private/run/report.bin");
         return ReadableFrom(`remote:${range.start}-${range.endExclusive}`);
       },
+      async verifyAvailable(input) {
+        availabilityChecks.push(structuredClone(input));
+        if (remoteDeleted) {
+          const error = new Error("文件已被删除");
+          error.code = "ARTIFACT_REMOTE_DELETED";
+          error.status = 410;
+          throw error;
+        }
+        return { available: true, size: input.expectedSize };
+      },
     };
     const service = new ArtifactService(serviceOptions(dataRoot, currentActor, time.clock, { remoteSource }));
-    const captured = await service.capture({ task: task(currentActor, time.clock), event: remoteEvent(2) });
+    const captured = await service.capture({ task: task(currentActor, time.clock), event: remoteEvent(2, { name: "下载 report.bin（测试文件）" }) });
     assert.equal(inspections.length, 1);
     assert.equal(inspections[0].workspaceId, "workspace_a");
     assert.equal(captured.artifact.contentLocation, "remote-reference");
+    assert.equal(captured.artifact.name, "report.bin");
+    assert.equal(captured.artifact.expiresAt, null);
     const detail = await service.get({ artifactId: captured.artifact.id });
     const list = await service.list({ taskId: "task_a" });
+    assert.equal(availabilityChecks.length, 0, "capture/get/list must not probe the remote file");
+    const unexpectedBlobPath = path.join(actorDataRoot(dataRoot, currentActor), "artifacts", "blobs", "bb", "b".repeat(64));
+    await assert.rejects(() => access(unexpectedBlobPath));
     const descriptor = await service.issueDownload({ artifactId: captured.artifact.id });
+    assert.equal(availabilityChecks.length, 1);
+    assert.equal(availabilityChecks[0].canonicalPath, "/srv/work/private/run/report.bin");
+    assert.equal(availabilityChecks[0].expectedSize, 4096);
     for (const output of [captured, detail, list, descriptor]) {
       const serialized = JSON.stringify(output);
       assert.equal(serialized.includes("/srv/work/private"), false);
@@ -198,6 +220,8 @@ test("远端 Artifact 必须由工作区检查器完成 realpath、symlink、sco
     assert.equal(descriptor.downloadToken.includes("/srv/work/private"), false);
     const opened = await service.openDownload({ downloadToken: descriptor.downloadToken, range: { start: 4, endExclusive: 12 } });
     assert.equal(await streamText(opened.stream), "remote:4-12");
+    remoteDeleted = true;
+    await assert.rejects(() => service.issueDownload({ artifactId: captured.artifact.id }), (error) => error?.code === "ARTIFACT_REMOTE_DELETED" && error?.message === "文件已被删除");
     await assert.rejects(() => service.issueDownload({ artifactId: captured.artifact.id, remotePath: "/etc/shadow" }), (error) => error?.code === "ARTIFACT_INPUT_UNKNOWN_FIELD");
     await assert.rejects(() => service.openDownload({ downloadToken: descriptor.downloadToken, path: "/etc/shadow" }), (error) => error?.code === "ARTIFACT_INPUT_UNKNOWN_FIELD");
   });

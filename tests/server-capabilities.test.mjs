@@ -31,6 +31,7 @@ function completeBackend() {
     remoteArtifactSource: { inspect: action, openReadStream: action },
     terminal: { create: action, input: action, inspect: action, close: action, detach: action, resume: action },
     versionControl: { status: action, diff: action, commit: action },
+    conversationVersion: { capturePath: action, restoreSnapshot: action },
     remoteFs: { diffTree: action },
     remoteExec: { git: action },
     agentDeployment: { status: action, install: action, uninstall: action },
@@ -73,7 +74,7 @@ test("server capability profile returns typed SSH-unavailable features without p
   assert.equal(profile.features.remoteFiles.status, "unavailable");
   assert.equal(profile.features.remoteFiles.diagnostic.code, "SSH_NOT_CONNECTED");
   assert.equal(profile.features.scheduler.type, "none");
-  assert.equal(profile.diagnostics.length, 9);
+  assert.equal(profile.diagnostics.length, 8);
   assert.ok(profile.diagnostics.every((entry) => entry.retryable && entry.code === "SSH_NOT_CONNECTED"));
 });
 
@@ -100,14 +101,16 @@ test("server capability profile aggregates actual interfaces, Scheduler flags, T
     download: true,
     range: true,
     mkdir: true,
+    create: false,
+    copy: false,
     rename: true,
     delete: true,
     maxUploadBytes: 1024 ** 3,
     maxDownloadBytes: 1024 ** 3,
   });
   assert.equal(profile.features.preview.types.includes("pdf"), true);
-  assert.equal(profile.features.workspaces.dynamicWrite, true);
-  assert.deepEqual({ shadow: profile.features.versioning.shadow, userGit: profile.features.versioning.userGit, isolated: profile.features.versioning.isolated }, { shadow: true, userGit: false, isolated: true });
+  assert.equal(profile.features.workspaces.virtual, true);
+  assert.deepEqual({ eventLedger: profile.features.versioning.eventLedger, isolated: profile.features.versioning.isolated }, { eventLedger: true, isolated: true });
   assert.equal(profile.features.scheduler.type, "slurm");
   assert.equal(profile.features.scheduler.resourceSummary, true);
   assert.equal(profile.features.scheduler.jobHistory, false);

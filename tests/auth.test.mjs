@@ -148,6 +148,27 @@ test("管理员可手工编辑 adminList；用户名修改同步账号索引和�
   });
 });
 
+test("管理员用户列表分页读取登录状态；删除用户会撤销账号、会话与全部 Actor 数据", async () => {
+  await fixture(async (dataRoot) => {
+    const auth = service(dataRoot);
+    const admin = await auth.register({ username: "owner-admin", password: "password-123", deviceId: "owner-device" });
+    const member = await auth.register({ username: "member-user", password: "password-456", deviceId: "member-laptop" });
+    const phone = await auth.login({ username: "member-user", password: "password-456", deviceId: "member-phone" });
+    const page = await auth.pageUsersForAdmin(admin.actor, { query: "member", page: 1, limit: 30 });
+    assert.equal(page.total, 1);
+    assert.equal(page.items[0].userId, member.actor.actorId);
+    assert.equal(page.items[0].deviceCount, 2);
+    assert.equal(page.items[0].activeSessionCount, 2);
+    await assert.rejects(() => auth.deleteUserForAdmin(admin.actor, admin.actor.actorId), (error) => error?.code === "ADMIN_DELETE_SELF_FORBIDDEN");
+    const deleted = await auth.deleteUserForAdmin(admin.actor, member.actor.actorId);
+    assert.equal(deleted.deleted, true);
+    await assert.rejects(() => auth.resolveSession(member.token), (error) => ["SESSION_NOT_FOUND", "AUTH_PROFILE_CORRUPT"].includes(error?.code));
+    await assert.rejects(() => auth.resolveSession(phone.token), (error) => ["SESSION_NOT_FOUND", "AUTH_PROFILE_CORRUPT"].includes(error?.code));
+    await assert.rejects(() => access(path.join(dataRoot, "users", member.actor.actorId)));
+    assert.equal((await auth.pageUsersForAdmin(admin.actor)).total, 1);
+  });
+});
+
 test("单一 Profile PATCH 原子更新用户名与受控头像，公开描述符不暴露存储路径", async () => {
   await fixture(async (dataRoot) => {
     const auth = service(dataRoot);

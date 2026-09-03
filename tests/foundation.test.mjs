@@ -203,3 +203,34 @@ test("Windows 原子替换会重试瞬时 EPERM 且不吞掉永久错误", async
   }), (error) => error.code === "EINVAL");
   assert.equal(permanentAttempts, 1);
 });
+
+test("同一 JSON 文件即使越过 Actor 队列也会串行完成读改写", async () => withDataRoot(async (dataRoot) => {
+  const actor = userActor("same-file-writer");
+  const bypassQueue = { run(_actor, operation) { return operation(); } };
+  const options = {
+    dataRoot,
+    actor,
+    relativePath: ["state", "shared.json"],
+    schemaVersion: 1,
+    defaultData: () => ({ count: 0 }),
+    validate: (data) => Number.isSafeInteger(data?.count),
+    queue: bypassQueue,
+  };
+  const first = new AtomicJsonRepository(options);
+  const second = new AtomicJsonRepository(options);
+  const increment = async (repository) => {
+    for (;;) {
+      const current = await repository.read();
+      try {
+        return await repository.update((draft) => { draft.count += 1; }, { expectedRevision: current.revision });
+      } catch (error) {
+        if (error?.code !== "REVISION_CONFLICT") throw error;
+      }
+    }
+  };
+  await Promise.all([
+    increment(first),
+    increment(second),
+  ]);
+  assert.equal((await first.read()).data.count, 2);
+}));

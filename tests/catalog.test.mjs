@@ -47,8 +47,15 @@ function catalogFixture(dataRoot, options = {}) {
       return { projectId, detachedArtifactIds: [`artifact_${projectId}`] };
     },
   };
-  consistency = new CatalogConsistencyService({ ...common, projects, collections, conversations, resources, artifacts, faultInjector: options.faultInjector });
-  return { queue, collections, projects, conversations, resources, consistency, artifactCalls };
+  const memoryCalls = [];
+  const memories = {
+    invalidateProject: async ({ projectId, commandId }) => {
+      memoryCalls.push({ projectId, commandId });
+      return { invalidated: 2 };
+    },
+  };
+  consistency = new CatalogConsistencyService({ ...common, projects, collections, conversations, resources, artifacts, memories, faultInjector: options.faultInjector });
+  return { queue, collections, projects, conversations, resources, consistency, artifactCalls, memoryCalls };
 }
 
 test("File sets and projects are Actor-scoped, versioned, and projects default to project-only memory", async () => {
@@ -97,10 +104,13 @@ test("project delete saga retries after a crash, moves conversations out, detach
     assert.deepEqual(completed.movedConversationIds, [conversation.conversation.id]);
     assert.deepEqual(completed.detachedArtifactIds, ["artifact_project_a"]);
     assert.equal(fixture.artifactCalls.length, 1);
+    assert.deepEqual(fixture.memoryCalls, [{ projectId: "project_a", commandId: "delete_project_a:invalidate-memory" }]);
+    assert.equal(completed.cleanup.memory.invalidated, 2);
     await assert.rejects(() => fixture.projects.get(project.id), (error) => error?.code === "PROJECT_NOT_FOUND");
     assert.equal((await fixture.resources.inspect()).data.bindings.some((entry) => entry.ownerType === "project" && entry.ownerId === project.id), false);
     const replay = await fixture.projects.delete(deletion);
     assert.deepEqual(replay, completed);
+    assert.equal(fixture.memoryCalls.length, 1);
     const journal = await fixture.consistency.inspectOperations();
     assert.equal(journal.data.operations.delete_project_a.status, "completed");
   } finally {

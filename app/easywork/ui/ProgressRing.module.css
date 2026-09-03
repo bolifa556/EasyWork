@@ -1,0 +1,55 @@
+.agentContextRing,
+.webContextRing {
+  --context-ratio: 0%;
+  position: relative;
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border-radius: 50%;
+}
+
+.agentContextRing {
+  overflow: visible;
+  background: conic-gradient(
+    #668158 0 var(--context-ratio),
+    rgb(105 108 102 / 28%) var(--context-ratio) 100%
+  );
+  box-shadow: 0 0 0 1px rgb(60 68 57 / 8%);
+}
+
+.agentContextRing::after {
+  position: absolute;
+  inset: 3px;
+  border-radius: inherit;
+  background: rgb(255 253 248 / 96%);
+  content: "";
+}
+
+.agentContextRing.unreadable {
+  background: rgb(105 108 102 / 27%);
+}
+
+.agentContextRing.readable {
+  opacity: 1;
+}
+
+.webContextRing {
+  background: conic-gradient(
+    #8564b4 0 var(--context-ratio),
+    rgb(133 100 180 / 30%) var(--context-ratio) 100%
+  );
+  box-shadow: 0 0 0 1px rgb(111 80 153 / 12%);
+  transition: opacity 160ms ease;
+}
+
+.webContextRing > span {
+  position: absolute;
+  inset: 3px;
+  border-radius: inherit;
+  background: rgb(255 253 248 / 97%);
+}
+
+.webContextRing.loading {
+  opacity: .56;
+}

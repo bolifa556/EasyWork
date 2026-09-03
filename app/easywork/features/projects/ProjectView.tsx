@@ -61,8 +61,9 @@ type ResourceListItem = {
 type ResourceListResult = { items: ResourceListItem[]; revision: number; nextCursor: string | null };
 
 function statusOf(version: ResourceVersionRecord): ResourceStatus {
-  if (version.parseStatus === "failed" || version.embeddingStatus === "failed") return "error";
+  if (version.parseStatus === "failed") return "error";
   if (version.parseStatus === "ready" && version.embeddingStatus === "ready") return "ready";
+  if (version.parseStatus === "ready" && version.embeddingStatus === "failed") return "readable";
   if (version.parseStatus === "ready") return "embedding";
   return "extracting";
 }
@@ -79,8 +80,14 @@ function projectSummary(record: ProjectRecord, conversationCount: number, resour
   };
 }
 
-function collectionSummary(record: CollectionRecord): CollectionSummary {
-  return { ...record, fileCount: 0, readyCount: 0, failedCount: 0 };
+function collectionSummary(record: CollectionRecord, resources: ResourceListItem[]): CollectionSummary {
+  const statuses = resources.map((item) => statusOf(item.version));
+  return {
+    ...record,
+    fileCount: resources.length,
+    readyCount: statuses.filter((status) => status === "ready" || status === "readable").length,
+    failedCount: statuses.filter((status) => status === "error").length,
+  };
 }
 
 function conversationSummary(record: ConversationRecord): ConversationSummary {
@@ -118,7 +125,7 @@ function errorMessage(reason: unknown) {
 export type ProjectViewProps = { projectId: string };
 
 export default function ProjectView({ projectId }: ProjectViewProps) {
-  const { api, bootstrap, navigate, notify } = useAppRuntime();
+  const { api, bootstrap, navigate, notify, refreshBootstrap } = useAppRuntime();
   const [record, setRecord] = useState<ProjectRecord | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [collections, setCollections] = useState<CollectionSummary[]>([]);
@@ -130,15 +137,21 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     try {
-      const [projectResult, conversationResult, collectionResult, resourceResult] = await Promise.all([
+      const [projectResult, conversationResult, collectionResult, resourceResult, collectionResourceResult] = await Promise.all([
         api.get<ProjectRecord>(`/api/projects/${encodeURIComponent(projectId)}`, signal),
         api.get<{ items: ConversationRecord[] }>(`/api/conversations?projectId=${encodeURIComponent(projectId)}&limit=100`, signal),
         api.get<CollectionRecord[]>("/api/collections", signal),
         api.get<ResourceListResult>(`/api/resources?ownerType=project&ownerId=${encodeURIComponent(projectId)}&limit=1000`, signal),
+        api.get<ResourceListResult>("/api/resources?ownerType=collection&limit=1000", signal),
       ]);
+      const resourcesByCollection = new Map<string, ResourceListItem[]>();
+      for (const item of collectionResourceResult.data.items) {
+        if (item.binding.ownerType !== "collection") continue;
+        resourcesByCollection.set(item.binding.ownerId, [...(resourcesByCollection.get(item.binding.ownerId) ?? []), item]);
+      }
       setRecord(projectResult.data);
       setConversations(conversationResult.data.items.map(conversationSummary));
-      setCollections(collectionResult.data.map(collectionSummary));
+      setCollections(collectionResult.data.map((collection) => collectionSummary(collection, resourcesByCollection.get(collection.id) ?? [])));
       resourceRevision.current = resourceResult.data.revision;
       setFiles(resourceResult.data.items.map(fileFromList));
     } catch (reason) {
@@ -157,8 +170,17 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
   }, [load]);
 
   const bootstrapProject = bootstrap?.projects.find((project) => project.id === projectId);
-  const project = record
-    ? projectSummary(record, conversations.length, files.length)
+  const effectiveRecord = record && bootstrapProject && bootstrapProject.revision > record.revision
+    ? {
+      ...record,
+      name: bootstrapProject.name,
+      revision: bootstrapProject.revision,
+      memoryMode: bootstrapProject.memoryMode,
+      updatedAt: bootstrapProject.updatedAt,
+    }
+    : record;
+  const project = effectiveRecord
+    ? projectSummary(effectiveRecord, conversations.length, files.length)
     : bootstrapProject ?? {
       id: projectId,
       name: "正在读取项目",
@@ -170,11 +192,12 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
     };
 
   const changeMemory = async (memoryMode: ProjectSummary["memoryMode"]) => {
-    if (!record) return;
+    if (!effectiveRecord) return;
     setBusyAction("memory");
     try {
-      const result = await api.patch<ProjectRecord>(`/api/projects/${encodeURIComponent(projectId)}`, { memoryMode }, { expectedRevision: record.revision });
+      const result = await api.patch<ProjectRecord>(`/api/projects/${encodeURIComponent(projectId)}`, { memoryMode }, { expectedRevision: effectiveRecord.revision });
       setRecord(result.data);
+      await refreshBootstrap();
       notify("记忆范围已更新", "success");
     } catch (reason) {
       notify(errorMessage(reason), "error");
@@ -184,14 +207,15 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
   };
 
   const toggleCollection = async (collectionId: string, linked: boolean) => {
-    if (!record) return;
+    if (!effectiveRecord) return;
     setBusyAction(`collection:${collectionId}`);
     try {
       const path = `/api/projects/${encodeURIComponent(projectId)}/collections${linked ? `/${encodeURIComponent(collectionId)}` : ""}`;
       const result = linked
-        ? await api.delete<ProjectRecord>(path, { expectedRevision: record.revision })
-        : await api.post<ProjectRecord>(path, { collectionId }, { expectedRevision: record.revision });
+        ? await api.delete<ProjectRecord>(path, { expectedRevision: effectiveRecord.revision })
+        : await api.post<ProjectRecord>(path, { collectionId }, { expectedRevision: effectiveRecord.revision });
       setRecord(result.data);
+      await refreshBootstrap();
       notify(linked ? "已取消关联" : "文件集已关联", "success");
     } catch (reason) {
       notify(errorMessage(reason), "error");
@@ -217,6 +241,7 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
       notify(selected.length === 1 ? "文件已上传" : `${selected.length} 个文件已上传`, "success");
     } catch (reason) {
       notify(errorMessage(reason), "error");
+      await load();
     } finally {
       setBusyAction(null);
     }
@@ -246,7 +271,7 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
       conversations={conversations}
       files={files}
       collections={collections}
-      linkedCollectionIds={record?.collectionIds ?? []}
+      linkedCollectionIds={effectiveRecord?.collectionIds ?? []}
       loading={loading}
       busyAction={busyAction}
       onOpenConversation={(conversationId) => navigate({ kind: "conversation", conversationId })}

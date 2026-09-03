@@ -34,7 +34,13 @@ export function normalizeUsage(value) {
   const cache = object(usage.cache);
   const input = number(usage.input ?? usage.input_tokens ?? usage.inputTokens);
   const output = number(usage.output ?? usage.output_tokens ?? usage.outputTokens);
-  const reasoning = number(usage.reasoning ?? usage.reasoning_tokens ?? usage.reasoningTokens);
+  const reasoning = number(
+    usage.reasoning
+      ?? usage.reasoning_tokens
+      ?? usage.reasoningTokens
+      ?? usage.reasoning_output_tokens
+      ?? usage.reasoningOutputTokens,
+  );
   const cachedInput = number(
     usage.cached_input_tokens
       ?? usage.cache_read_input_tokens
@@ -78,14 +84,76 @@ export function toolNameIsFileChange(name) {
 export function fileChangeFromTool(name, input = {}, output = {}) {
   const source = object(input);
   const result = object(output);
-  const path = text(source.file_path || source.filePath || source.path || result.file_path || result.filePath || result.path);
-  const diff = text(result.diff || source.diff || source.patch);
+  const structured = object(result.structured);
+  const path = text(
+    source.file_path
+      || source.filePath
+      || source.path
+      || result.file_path
+      || result.filePath
+      || result.path
+      || result.target
+      || structured.file_path
+      || structured.filePath
+      || structured.path
+      || structured.target
+      || structured.resource,
+  );
+  const explicitDiff = text(structured.diff || result.diff || source.diff || source.patch);
+  const before = text(source.old_string || source.oldString || source.before);
+  const after = text(source.new_string || source.newString || source.content || source.after);
+  const edits = array(source.edits).map((entry) => object(entry));
+  const existed = typeof structured.existed === "boolean"
+    ? structured.existed
+    : typeof result.existed === "boolean"
+      ? result.existed
+      : undefined;
+  const diff = explicitDiff || syntheticUnifiedDiff({
+    path,
+    write: /^write$/i.test(String(name)),
+    existed,
+    before,
+    after,
+    edits,
+  });
   const change = {
     action: /^write$/i.test(String(name)) ? "write" : "edit",
   };
   if (path) change.path = path;
   if (diff) change.diff = diff;
+  if (existed !== undefined) change.existed = existed;
   return change;
+}
+
+function prefixedLines(value, prefix) {
+  const lines = String(value || "").replace(/\r\n/g, "\n").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines.map((line) => `${prefix}${line}`).join("\n");
+}
+
+function syntheticUnifiedDiff({ path, write, existed, before, after, edits }) {
+  // A Write over an existing file does not expose the overwritten bytes.  A
+  // plus-only pseudo diff would falsely describe the previous file as empty,
+  // so leave it unqualified and let the version ledger use its materialized or
+  // pre-execution snapshot instead.
+  if (write && existed === true && !before && !edits.length) return "";
+  const hunks = [];
+  if (edits.length) {
+    for (const edit of edits) {
+      const oldText = text(edit.old_string || edit.oldString || edit.before);
+      const newText = text(edit.new_string || edit.newString || edit.after);
+      if (!oldText && !newText) continue;
+      hunks.push(`@@\n${prefixedLines(oldText, "-")}${oldText && newText ? "\n" : ""}${prefixedLines(newText, "+")}`);
+    }
+  } else if (before || after) {
+    hunks.push(`@@\n${prefixedLines(before, "-")}${before && after ? "\n" : ""}${prefixedLines(after, "+")}`);
+  }
+  if (!hunks.length) return "";
+  const target = (path || "file").replace(/^\/+/, "");
+  const header = write && existed === false
+    ? `--- /dev/null\n+++ b/${target}`
+    : `--- a/${target}\n+++ b/${target}`;
+  return `${header}\n${hunks.join("\n")}`;
 }
 
 export function planItems(value) {
@@ -93,11 +161,21 @@ export function planItems(value) {
     const item = typeof entry === "string" ? { content: entry } : object(entry);
     return {
       id: idOf(item.id) || String(index + 1),
-      text: text(item.content || item.text || item.title),
-      status: text(item.status || "pending"),
+      text: text(item.content || item.text || item.title || item.step),
+      status: normalizePlanItemStatus(item.status),
       ...(item.priority ? { priority: String(item.priority) } : {}),
     };
   }).filter((item) => item.text);
+}
+
+export function normalizePlanItemStatus(value) {
+  const compact = String(value || "pending").replace(/[\s_-]/g, "").toLowerCase();
+  if (["inprogress", "active", "running"].includes(compact)) return "in_progress";
+  if (["done", "complete", "completed", "success", "succeeded"].includes(compact)) return "completed";
+  if (["error", "failed", "failure"].includes(compact)) return "failed";
+  if (["deleted", "removed"].includes(compact)) return "deleted";
+  if (["cancelled", "canceled", "skipped"].includes(compact)) return "skipped";
+  return "pending";
 }
 
 export function phaseForStatus(status, fallback = "updated") {
@@ -132,6 +210,61 @@ export function remoteArtifactPath(value) {
   }
 }
 
+function artifactNameFromLink(label, artifactPath) {
+  const fallback = artifactPath.split("/").filter(Boolean).at(-1);
+  if (fallback) return fallback;
+  const cleaned = text(label).replace(/[*_`]/g, "").trim();
+  return cleaned && cleaned.length <= 255 ? cleaned : "download";
+}
+
+function cleanLinkedArtifactLine(line, artifacts) {
+  let linked = false;
+  const cleaned = line.replace(/\[([^\]\r\n]{1,255})\]\((file:\/\/\/[^)\r\n]+)\)/g, (match, label, target) => {
+    const artifactPath = remoteArtifactPath(target);
+    if (!artifactPath) return match;
+    linked = true;
+    artifacts.push({ source: "remote", path: artifactPath, name: artifactNameFromLink(label, artifactPath), kind: "file" });
+    return "";
+  });
+  if (!linked) return line;
+  const normalized = cleaned
+    // A model may emphasize the Markdown link itself. Once the link becomes
+    // an Artifact card those now-empty emphasis markers must disappear too.
+    .replace(/(?:\*{2,}|_{2,}|~~)/g, "")
+    .replace(/[ \t]+([，。；：,.!?])/g, "$1")
+    .trimEnd();
+  if (/^\s*(?:[-*+]\s*|\d+[.)]\s*)?$/.test(normalized)) return "";
+  if (/^\s*(?:[-*+]\s*|\d+[.)]\s*)?(?:下载|download)\s*[:：]?\s*$/i.test(normalized)) return "";
+  return /[:：]\s*$/.test(normalized) ? normalized.replace(/[:：]\s*$/, "。") : normalized;
+}
+
+/**
+ * A remote Agent can expose an existing workspace file without copying its
+ * bytes through the model protocol by returning a standard Markdown file URL.
+ * The adapter turns that URL into a canonical remote Artifact and removes the
+ * unusable file:// target from the assistant body.  The Artifact service later
+ * verifies scope/hash and streams the file only when the user downloads it.
+ */
+export function emitLinkedRemoteArtifacts(context, value, source = {}) {
+  const original = text(value);
+  const artifacts = [];
+  const cleaned = original.split(/\r?\n/)
+    .map((line) => cleanLinkedArtifactLine(line, artifacts))
+    .filter((line) => line !== "")
+    .join("\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  for (const artifact of artifacts) {
+    const itemId = `download:${artifact.path}`;
+    if (object(context.state.items[itemId]).artifactEmitted === true) continue;
+    recordItem(context.state, itemId, { artifactEmitted: true, path: artifact.path, name: artifact.name });
+    context.emit("artifact", "completed", artifact, { ...source, itemId });
+  }
+  return cleaned || (artifacts.length ? "文件已准备好下载。" : original);
+}
+
 const SENSITIVE_FIELD = /^(?:api[-_]?key|password|passwd|private[-_]?key|secret|credential|two[-_]?factor[-_]?code|otp|authorization)$/i;
 
 export function safeDomainValue(value, seen = new WeakSet()) {
@@ -152,4 +285,41 @@ export function safeDomainValue(value, seen = new WeakSet()) {
     result[key] = safeDomainValue(entry, seen);
   }
   return result;
+}
+
+export function emitUnmappedAgentEvent(context, agentName, category, eventType, source = {}) {
+  const type = text(eventType) || "unknown";
+  const section = text(category) || "事件";
+  const agentVersion = text(source.agentVersion);
+  context.emit("job_status", "completed", {
+    operation: "unmapped_agent_event",
+    message: `${agentName}${agentVersion ? ` ${agentVersion}` : " 当前版本"} 的${section}尚未适配前端展示：${type}`,
+    eventType: type,
+    category: section,
+    ...(agentVersion ? { agentVersion } : {}),
+  }, source);
+}
+
+export function emitAgentCompatibilityIssue(context, agentName, issue, source = {}) {
+  const detail = object(issue);
+  const feature = text(detail.feature) || "native_protocol";
+  const agentVersion = text(detail.agentVersion || source.agentVersion);
+  const message = text(detail.message)
+    || `${agentName}${agentVersion ? ` ${agentVersion}` : " 当前版本"} 的 ${feature} 能力与 EasyWork 尚未完全兼容。`;
+  context.emit("job_status", detail.blocking === true ? "failed" : "completed", {
+    operation: "agent_compatibility_issue",
+    message,
+    feature,
+    blocking: detail.blocking === true,
+    ...(detail.eventType ? { eventType: text(detail.eventType) } : {}),
+    ...(agentVersion ? { agentVersion } : {}),
+  }, source);
+}
+
+export function emitAgentEffortAdjustment(context, adjustment, source = {}) {
+  const detail = safeDomainValue(object(adjustment));
+  context.emit("job_status", "completed", {
+    ...detail,
+    operation: "agent_effort_adjusted",
+  }, source);
 }

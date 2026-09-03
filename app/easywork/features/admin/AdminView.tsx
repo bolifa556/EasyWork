@@ -6,6 +6,7 @@ import {
   Check,
   Copy,
   Database,
+  ChevronRight,
   Eye,
   EyeOff,
   Globe2,
@@ -13,8 +14,11 @@ import {
   Network,
   RefreshCw,
   Save,
+  ScanText,
+  Search,
   ServerCog,
   ShieldCheck,
+  Trash2,
   Unplug,
   UsersRound,
 } from "lucide-react";
@@ -23,10 +27,11 @@ import { commandId } from "@/app/core/gateway/client";
 import { useAppRuntime } from "../../runtime/AppRuntime";
 import { Button } from "../../ui/Button";
 import { LoadingState } from "../../ui/LoadingState";
+import { Modal } from "../../ui/Modal";
 import { PageFrame } from "../../ui/PageFrame";
 import styles from "./AdminView.module.css";
 
-type Purpose = "web" | "agent" | "embedding";
+type Purpose = "web" | "agent" | "embedding" | "ocr";
 type Provider = {
   id: string;
   revision: number;
@@ -46,6 +51,10 @@ type Provider = {
     chunkOverlap: number;
     batchSize: number;
     hybridEnabled: boolean;
+  };
+  ocr?: {
+    model: string;
+    maxOutputTokens: number;
   };
 };
 
@@ -91,8 +100,6 @@ type UsageSummary = {
 type UsageScope = "all" | Purpose;
 
 type ManagedConnection = {
-  actorId: string;
-  username?: string;
   serverId: string;
   serverName: string;
   host: string;
@@ -101,10 +108,33 @@ type ManagedConnection = {
   conversationCount: number;
 };
 
+type AdminUser = {
+  userId: string;
+  username: string;
+  admin: boolean;
+  createdAt: string;
+  lastActiveAt: string | null;
+  deviceCount: number;
+  activeSessionCount: number;
+  liveSshCount: number;
+};
+
+type AdminUserDetail = {
+  user: AdminUser;
+  conversations: {
+    items: Array<{ id: string; title: string; mode: "chat" | "work"; updatedAt: string; lastMessagePreview: string; revision: number }>;
+    nextCursor: string | null;
+  };
+  taskCount: number;
+  activeTaskCount: number;
+  servers: Array<ManagedConnection & { desiredConnection: boolean }>;
+};
+
 type ProviderDraft = {
   name: string;
   baseUrl: string;
   apiKey: string;
+  protocol: string;
   model: string;
   dimensions: string;
   chunkStrategy: "semantic" | "fixed" | "paragraph";
@@ -112,6 +142,7 @@ type ProviderDraft = {
   chunkOverlap: string;
   batchSize: string;
   hybridEnabled: boolean;
+  maxOutputTokens: string;
 };
 
 const emptyUsage: UsageSummary = {
@@ -125,6 +156,7 @@ const purposeMeta: Record<Purpose, { title: string; description: string; icon: t
   web: { title: "网页对话 API", description: "提供给所有用户的网页模型", icon: Globe2 },
   agent: { title: "Agent API", description: "为 EasyWork 部署的远端 Agent 提供模型", icon: Bot },
   embedding: { title: "Embedding API", description: "用于文件解析后的向量索引", icon: Database },
+  ocr: { title: "OCR API", description: "用于图片与扫描 PDF 的文字识别", icon: ScanText },
 };
 
 function formatCount(value: number) {
@@ -136,13 +168,15 @@ function draftOf(provider: Provider): ProviderDraft {
     name: provider.name,
     baseUrl: provider.baseUrl,
     apiKey: "",
-    model: provider.embedding?.model ?? "",
+    protocol: provider.protocol || (provider.purpose === "embedding" ? "openai-embeddings" : provider.purpose === "ocr" ? "chat-completions" : "auto"),
+    model: provider.embedding?.model ?? provider.ocr?.model ?? "",
     dimensions: provider.embedding?.dimensions?.toString() ?? "",
     chunkStrategy: provider.embedding?.chunkStrategy ?? "semantic",
     chunkSize: String(provider.embedding?.chunkSize ?? 3000),
     chunkOverlap: String(provider.embedding?.chunkOverlap ?? 600),
     batchSize: String(provider.embedding?.batchSize ?? 32),
     hybridEnabled: provider.embedding?.hybridEnabled !== false,
+    maxOutputTokens: String(provider.ocr?.maxOutputTokens ?? 4096),
   };
 }
 
@@ -214,10 +248,13 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
     runtime.notify("API Key 已复制", "success");
   };
 
+  const changed = keyDirty || JSON.stringify({ ...draft, apiKey: "" }) !== JSON.stringify(draftOf(provider));
+  const showStoredKeyMask = provider.hasKey && !showKey && !keyDirty;
+
   const save = async () => {
     setSaving(true);
     try {
-      const patch: Record<string, unknown> = { name: draft.name.trim(), baseUrl: draft.baseUrl.trim(), protocol: provider.purpose === "embedding" ? "openai-embeddings" : "auto" };
+      const patch: Record<string, unknown> = { name: draft.name.trim(), baseUrl: draft.baseUrl.trim(), protocol: provider.purpose === "embedding" ? "openai-embeddings" : provider.purpose === "ocr" ? draft.protocol : "auto" };
       if (provider.purpose === "embedding") Object.assign(patch, {
         model: draft.model.trim(),
         dimensions: draft.dimensions ? Number(draft.dimensions) : null,
@@ -226,6 +263,10 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
         chunkOverlap: Number(draft.chunkOverlap),
         batchSize: Number(draft.batchSize),
         hybridEnabled: draft.hybridEnabled,
+      });
+      if (provider.purpose === "ocr") Object.assign(patch, {
+        model: draft.model.trim(),
+        maxOutputTokens: Number(draft.maxOutputTokens),
       });
       await runtime.api.patch(`/api/admin/providers/${provider.purpose}`, {
         patch,
@@ -246,7 +287,7 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
           baseUrl: draft.baseUrl.trim(),
           apiKey: draft.apiKey,
         })
-        : await runtime.api.post<{ models: Array<{ id: string; name: string }> }>(`/api/providers/${provider.id}/models`, { purpose: "embedding" });
+        : await runtime.api.post<{ models: Array<{ id: string; name: string }> }>(`/api/providers/${provider.id}/models`, { purpose: provider.purpose });
       setModels(result.data.models.map((model) => model.id));
       if (!draft.model && result.data.models[0]) setDraft((current) => ({ ...current, model: result.data.models[0].id }));
     } catch (reason) {
@@ -263,10 +304,14 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
       </header>
       <div className={styles.formGrid}>
         <label><span>名称</span><input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
-        <label className={styles.wideField}><span>API URL</span><input inputMode="url" value={draft.baseUrl} placeholder="https://api.example.com/v1" onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} /></label>
-        <label className={styles.keyField}><span>API Key</span><span className={styles.keyInput}><input type={showKey ? "text" : "password"} value={draft.apiKey} placeholder={provider.hasKey ? provider.maskedKey : "输入 API Key"} onChange={(event) => changeApiKey(event.target.value)} /><span className={styles.keyButtons}>{showKey && draft.apiKey ? <button type="button" aria-label="复制 API Key" onClick={() => void copyKey()}><Copy size={16} /></button> : null}<button type="button" aria-label={showKey ? "隐藏 API Key" : "显示 API Key"} disabled={revealingKey} onClick={() => void toggleKey()}>{revealingKey ? <LoaderCircle className={styles.spin} size={16} /> : showKey ? <EyeOff size={17} /> : <Eye size={17} />}</button></span></span></label>
+        {provider.purpose === "ocr" ? <label><span>协议</span><select value={draft.protocol} onChange={(event) => {
+          const protocol = event.target.value;
+          setDraft((current) => ({ ...current, protocol, ...(protocol === "mineru" ? { model: "mineru" } : {}) }));
+        }}><option value="chat-completions">OpenAI 视觉模型</option><option value="mineru">MinerU 文档解析</option></select></label> : null}
+        <label className={styles.wideField}><span>API URL</span><input inputMode="url" value={draft.baseUrl} placeholder={draft.protocol === "mineru" ? "https://api.llm.ustc.edu.cn" : "https://api.example.com/v1"} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} /></label>
+        <label className={styles.keyField}><span>API Key</span><span className={styles.keyInput}><input autoComplete="new-password" type={showKey ? "text" : "password"} value={draft.apiKey} placeholder={provider.hasKey ? "" : "输入 API Key"} onChange={(event) => changeApiKey(event.target.value)} />{showStoredKeyMask ? <span className={styles.storedSecretMask} aria-hidden="true">••••••••••••</span> : null}<span className={styles.keyButtons}>{showKey && draft.apiKey ? <button type="button" aria-label="复制 API Key" onClick={() => void copyKey()}><Copy size={16} /></button> : null}<button type="button" aria-label={showKey ? "隐藏 API Key" : "显示 API Key"} disabled={revealingKey} onClick={() => void toggleKey()}>{revealingKey ? <LoaderCircle className={styles.spin} size={16} /> : showKey ? <EyeOff size={17} /> : <Eye size={17} />}</button></span></span></label>
+        {["embedding", "ocr"].includes(provider.purpose) ? <label className={styles.modelField}><span>模型</span><span className={styles.modelControl}><input list={`${provider.purpose}-models`} value={draft.model} placeholder="选择或输入模型" readOnly={provider.purpose === "ocr" && draft.protocol === "mineru"} aria-readonly={provider.purpose === "ocr" && draft.protocol === "mineru"} onChange={(event) => setDraft({ ...draft, model: event.target.value })} />{provider.purpose !== "ocr" || draft.protocol !== "mineru" ? <Button type="button" compact onClick={detect} disabled={detecting} icon={detecting ? <LoaderCircle className={styles.spin} size={15} /> : <RefreshCw size={15} />}>检测</Button> : <span className={styles.fixedModel}>固定</span>}</span><datalist id={`${provider.purpose}-models`}>{models.map((model) => <option value={model} key={model} />)}</datalist></label> : null}
         {provider.purpose === "embedding" ? <>
-          <label className={styles.modelField}><span>模型</span><span className={styles.modelControl}><input list="embedding-models" value={draft.model} placeholder="选择或输入模型" onChange={(event) => setDraft({ ...draft, model: event.target.value })} /><Button type="button" compact onClick={detect} disabled={detecting} icon={detecting ? <LoaderCircle className={styles.spin} size={15} /> : <RefreshCw size={15} />}>检测</Button></span><datalist id="embedding-models">{models.map((model) => <option value={model} key={model} />)}</datalist></label>
           <label><span>分块策略</span><select value={draft.chunkStrategy} onChange={(event) => setDraft({ ...draft, chunkStrategy: event.target.value as ProviderDraft["chunkStrategy"] })}><option value="semantic">语义</option><option value="paragraph">段落</option><option value="fixed">固定长度</option></select></label>
           <label><span>分块大小</span><input type="number" min="128" max="20000" value={draft.chunkSize} onChange={(event) => setDraft({ ...draft, chunkSize: event.target.value })} /></label>
           <label><span>重叠字符</span><input type="number" min="0" value={draft.chunkOverlap} onChange={(event) => setDraft({ ...draft, chunkOverlap: event.target.value })} /></label>
@@ -274,8 +319,9 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
           <label><span>向量维度</span><input type="number" min="1" placeholder="自动" value={draft.dimensions} onChange={(event) => setDraft({ ...draft, dimensions: event.target.value })} /></label>
           <label className={styles.toggleLabel}><input type="checkbox" checked={draft.hybridEnabled} onChange={(event) => setDraft({ ...draft, hybridEnabled: event.target.checked })} /><span>混合检索</span></label>
         </> : null}
+        {provider.purpose === "ocr" && draft.protocol !== "mineru" ? <label><span>最大输出 Token</span><input type="number" min="256" max="32768" value={draft.maxOutputTokens} onChange={(event) => setDraft({ ...draft, maxOutputTokens: event.target.value })} /></label> : null}
       </div>
-      <footer className={styles.cardFooter}><span>{provider.updatedAt ? `更新于 ${new Date(provider.updatedAt).toLocaleString("zh-CN")}` : ""}</span><Button variant="primary" onClick={save} disabled={saving || !draft.name.trim() || !draft.baseUrl.trim() || (provider.purpose === "embedding" && !draft.model.trim())} icon={saving ? <LoaderCircle className={styles.spin} size={16} /> : <Save size={16} />}>{saving ? "保存中" : "保存"}</Button></footer>
+      <footer className={styles.cardFooter}><span>{provider.updatedAt ? `更新于 ${new Date(provider.updatedAt).toLocaleString("zh-CN")}` : ""}</span><Button variant="primary" onClick={save} disabled={saving || !changed || (keyDirty && !draft.apiKey) || !draft.name.trim() || !draft.baseUrl.trim() || (["embedding", "ocr"].includes(provider.purpose) && !draft.model.trim())} icon={saving ? <LoaderCircle className={styles.spin} size={16} /> : <Save size={16} />}>{saving ? "保存中" : "保存"}</Button></footer>
     </article>
   );
 }
@@ -288,12 +334,12 @@ function TokenStat({ title, metrics }: { title: string; metrics: UsageMetrics })
 function UsagePanel({ usages }: { usages: Record<UsageScope, UsageSummary> }) {
   const [scope, setScope] = useState<UsageScope>("all");
   const usage = usages[scope];
-  return <aside className={styles.usagePanel}><div className={styles.sectionTitle}><div><h2>API 用量</h2><p>请求次数与 Token 消耗</p></div><Activity size={19} /></div><div className={styles.usageTabs}>{(["all", "web", "agent", "embedding"] as UsageScope[]).map((item) => <button key={item} className={scope === item ? styles.active : ""} onClick={() => setScope(item)}>{item === "all" ? "全部" : item === "web" ? "网页" : item === "agent" ? "Agent" : "Embedding"}</button>)}</div><div className={styles.metrics}><TokenStat title="今日" metrics={usage.daily} /><TokenStat title="近 7 天" metrics={usage.weekly} /><TokenStat title="累计" metrics={usage.total} /></div><UsageChart series={usage.series} /></aside>;
+  return <aside className={styles.usagePanel}><div className={styles.sectionTitle}><div><h2>API 用量</h2><p>请求次数与 Token 消耗</p></div><Activity size={19} /></div><div className={styles.usageTabs}>{(["all", "web", "agent", "embedding", "ocr"] as UsageScope[]).map((item) => <button key={item} className={scope === item ? styles.active : ""} onClick={() => setScope(item)}>{item === "all" ? "全部" : item === "web" ? "网页" : item === "agent" ? "Agent" : item === "embedding" ? "Embedding" : "OCR"}</button>)}</div><div className={styles.metrics}><TokenStat title="今日" metrics={usage.daily} /><TokenStat title="近 7 天" metrics={usage.weekly} /><TokenStat title="累计" metrics={usage.total} /></div><UsageChart series={usage.series} /></aside>;
 }
 
 function ApiPanel({ snapshot, usages, reload }: { snapshot: PlatformSnapshot; usages: Record<UsageScope, UsageSummary>; reload: () => Promise<void> }) {
   return <div className={styles.apiPanel}>
-    <section className={styles.providers}>{(["web", "agent", "embedding"] as Purpose[]).map((purpose) => <ProviderCard key={purpose} provider={snapshot.providers[purpose]} revision={snapshot.revision} onSaved={reload} />)}</section>
+    <section className={styles.providers}>{(["web", "agent", "embedding", "ocr"] as Purpose[]).map((purpose) => <ProviderCard key={`${purpose}:${snapshot.providers[purpose].revision}`} provider={snapshot.providers[purpose]} revision={snapshot.revision} onSaved={reload} />)}</section>
     <UsagePanel usages={usages} />
   </div>;
 }
@@ -301,11 +347,10 @@ function ApiPanel({ snapshot, usages, reload }: { snapshot: PlatformSnapshot; us
 function parseLines(value: string) { return value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean); }
 function parsePorts(value: string) { return parseLines(value).map(Number).filter((port) => Number.isInteger(port)); }
 
-function SshPanel({ snapshot, connections, connectionsAvailable, reload }: { snapshot: PlatformSnapshot; connections: ManagedConnection[]; connectionsAvailable: boolean; reload: () => Promise<void> }) {
+function SshPanel({ snapshot, reload }: { snapshot: PlatformSnapshot; reload: () => Promise<void> }) {
   const runtime = useAppRuntime();
   const [draft, setDraft] = useState(() => snapshot.ssh);
   const [saving, setSaving] = useState(false);
-  const [disconnecting, setDisconnecting] = useState<string | null>(null);
   const set = <K extends keyof SshPolicy>(key: K, value: SshPolicy[K]) => setDraft((current) => ({ ...current, [key]: value }));
   const save = async () => {
     setSaving(true);
@@ -315,17 +360,6 @@ function SshPanel({ snapshot, connections, connectionsAvailable, reload }: { sna
       await reload();
     } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "保存失败", "error"); }
     finally { setSaving(false); }
-  };
-  const disconnect = async (connection: ManagedConnection) => {
-    const key = `${connection.actorId}:${connection.serverId}`;
-    setDisconnecting(key);
-    try {
-      await runtime.api.post(`/api/admin/ssh-connections/${encodeURIComponent(connection.actorId)}/${encodeURIComponent(connection.serverId)}/disconnect`, {}, { idempotencyKey: commandId("admin-ssh-disconnect") });
-      runtime.notify("SSH 连接已断开", "success");
-      await reload();
-    } catch (reason) {
-      runtime.notify(reason instanceof Error ? reason.message : "断开失败", "error");
-    } finally { setDisconnecting(null); }
   };
   return <div className={styles.sshPanel}>
     <section className={styles.policyCard}>
@@ -349,34 +383,128 @@ function SshPanel({ snapshot, connections, connectionsAvailable, reload }: { sna
       <div className={styles.authOptions}><label><input type="checkbox" checked={draft.allowPrivateKeyAuth} onChange={(event) => set("allowPrivateKeyAuth", event.target.checked)} />允许密钥登录</label><label><input type="checkbox" checked={draft.allowPasswordAuth} onChange={(event) => set("allowPasswordAuth", event.target.checked)} />允许密码登录</label></div>
       <div className={styles.policyActions}><Button variant="primary" onClick={save} disabled={saving || (!draft.allowPasswordAuth && !draft.allowPrivateKeyAuth)} icon={saving ? <LoaderCircle className={styles.spin} size={16} /> : <Save size={16} />}>{saving ? "保存中" : "保存策略"}</Button></div>
     </section>
-    <section className={styles.connectionCard}>
-      <div className={styles.sectionTitle}><div><h2>用户连接</h2><p>{connectionsAvailable ? `${connections.length} 个 SSH 会话` : "连接信息暂时不可用"}</p></div><UsersRound size={20} /></div>
-      {connectionsAvailable && connections.length ? <div className={styles.connectionTable}><div className={styles.connectionHeader}><span>用户</span><span>服务器</span><span>对话</span><span>状态</span><span>最近活动</span><span /></div>{connections.map((item) => { const key = `${item.actorId}:${item.serverId}`; return <div className={styles.connectionRow} key={key}><strong>{item.username || item.actorId}</strong><span>{item.serverName}<small>{item.host}</small></span><span>{item.conversationCount}</span><span className={`${styles.connectionStatus} ${styles[item.status]}`}>{item.status === "connected" ? "已连接" : item.status === "connecting" ? "连接中" : item.status === "failed" ? "失败" : "未连接"}</span><time>{item.lastActiveAt ? new Date(item.lastActiveAt).toLocaleString("zh-CN") : "—"}</time><Button compact variant="danger" disabled={item.status !== "connected" || Boolean(disconnecting)} icon={disconnecting === key ? <LoaderCircle className={styles.spin} size={14} /> : <Unplug size={14} />} onClick={() => void disconnect(item)}>断开</Button></div>; })}</div> : <div className={styles.unavailable}><Network size={23} /><strong>{connectionsAvailable ? "暂无用户 SSH 连接" : "连接信息暂时不可用"}</strong></div>}
+  </div>;
+}
+
+function connectionLabel(status: ManagedConnection["status"]) {
+  return status === "connected" ? "已连接" : status === "connecting" ? "连接中" : status === "failed" ? "失败" : "未连接";
+}
+
+function UserPanel({ refreshKey, onChanged }: { refreshKey: number; onChanged: () => void }) {
+  const runtime = useAppRuntime();
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(1);
+  const [result, setResult] = useState<{ items: AdminUser[]; total: number; page: number; limit: number; hasMore: boolean } | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<AdminUserDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [disconnecting, setDisconnecting] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<AdminUser | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  const loadUsers = useCallback(async (search: string, nextPage: number) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ page: String(nextPage), limit: "30" });
+      if (search.trim()) params.set("query", search.trim());
+      const response = await runtime.api.get<{ items: AdminUser[]; total: number; page: number; limit: number; hasMore: boolean }>(`/api/admin/users?${params}`);
+      setResult(response.data);
+      if (selectedId && !response.data.items.some((user) => user.userId === selectedId) && search.trim()) {
+        setSelectedId(null);
+        setDetail(null);
+      }
+    } catch (reason) {
+      runtime.notify(reason instanceof Error ? reason.message : "用户列表读取失败", "error");
+    } finally { setLoading(false); }
+  }, [runtime, selectedId]);
+
+  const loadDetail = useCallback(async (userId: string, cursor?: string) => {
+    setDetailLoading(true);
+    try {
+      const suffix = cursor ? `?conversationCursor=${encodeURIComponent(cursor)}` : "";
+      const response = await runtime.api.get<AdminUserDetail>(`/api/admin/users/${encodeURIComponent(userId)}${suffix}`);
+      setDetail((current) => cursor && current
+        ? { ...response.data, conversations: { ...response.data.conversations, items: [...current.conversations.items, ...response.data.conversations.items] } }
+        : response.data);
+    } catch (reason) {
+      runtime.notify(reason instanceof Error ? reason.message : "用户详情读取失败", "error");
+    } finally { setDetailLoading(false); }
+  }, [runtime]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => void loadUsers(query, page), query ? 280 : 0);
+    return () => window.clearTimeout(handle);
+  }, [loadUsers, page, query, refreshKey]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    const handle = window.setTimeout(() => void loadDetail(selectedId), 0);
+    return () => window.clearTimeout(handle);
+  }, [loadDetail, selectedId, refreshKey]);
+
+  const disconnect = async (connection: AdminUserDetail["servers"][number]) => {
+    if (!selectedId) return;
+    setDisconnecting(connection.serverId);
+    try {
+      await runtime.api.post(`/api/admin/ssh-connections/${encodeURIComponent(selectedId)}/${encodeURIComponent(connection.serverId)}/disconnect`, {}, { idempotencyKey: commandId("admin-ssh-disconnect") });
+      runtime.notify("SSH 连接已断开", "success");
+      await Promise.all([loadDetail(selectedId), loadUsers(query, page)]);
+    } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "断开失败", "error"); }
+    finally { setDisconnecting(null); }
+  };
+
+  const removeUser = async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    try {
+      await runtime.api.delete(`/api/admin/users/${encodeURIComponent(pendingDelete.userId)}`, { idempotencyKey: commandId("admin-delete-user") });
+      runtime.notify(`用户 ${pendingDelete.username} 已删除`, "success");
+      if (selectedId === pendingDelete.userId) { setSelectedId(null); setDetail(null); }
+      setPendingDelete(null);
+      onChanged();
+      await loadUsers(query, page);
+    } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "删除用户失败", "error"); }
+    finally { setDeleting(false); }
+  };
+
+  return <div className={styles.userPanel}>
+    <section className={styles.userListCard}>
+      <div className={styles.sectionTitle}><div><h2>用户</h2><p>{result ? `共 ${result.total} 位用户` : "按需读取账号与在线状态"}</p></div><UsersRound size={20} /></div>
+      <label className={styles.userSearch}><Search size={16} /><input value={query} placeholder="搜索用户名或用户 ID" onChange={(event) => { setQuery(event.target.value); setPage(1); }} /></label>
+      {loading && !result ? <div className={styles.unavailable}><LoaderCircle className={styles.spin} size={22} /><strong>正在读取用户</strong></div> : result?.items.length ? <div className={styles.userRows}>{result.items.map((user) => <button type="button" className={`${styles.userRow} ${selectedId === user.userId ? styles.selectedUser : ""}`} key={user.userId} onClick={() => setSelectedId(user.userId)}><span className={styles.userAvatar}>{user.username.slice(0, 1).toLocaleUpperCase("zh-CN")}</span><span className={styles.userIdentity}><strong>{user.username}{user.admin ? <em>管理员</em> : null}</strong><small>{user.activeSessionCount} 个活跃登录 · {user.liveSshCount} 个 SSH</small></span><time>{user.lastActiveAt ? new Date(user.lastActiveAt).toLocaleDateString("zh-CN") : "—"}</time><ChevronRight size={16} /></button>)}</div> : <div className={styles.unavailable}><Network size={22} /><strong>没有匹配的用户</strong></div>}
+      {result && result.total > result.limit ? <footer className={styles.pager}><Button compact disabled={page <= 1 || loading} onClick={() => setPage((value) => Math.max(1, value - 1))}>上一页</Button><span>{page} / {Math.ceil(result.total / result.limit)}</span><Button compact disabled={!result.hasMore || loading} onClick={() => setPage((value) => value + 1)}>下一页</Button></footer> : null}
     </section>
+    <section className={styles.userDetailCard}>
+      {!selectedId ? <div className={styles.unavailable}><UsersRound size={24} /><strong>选择一位用户</strong><span>仅在选中后读取其对话和服务器，避免拖慢页面。</span></div> : detailLoading && !detail ? <div className={styles.unavailable}><LoaderCircle className={styles.spin} size={22} /><strong>正在读取用户详情</strong></div> : detail ? <>
+        <header className={styles.userDetailHeader}><div><strong>{detail.user.username}</strong><span>{detail.user.deviceCount} 台设备 · {detail.user.activeSessionCount} 个活跃登录 · {detail.taskCount} 个任务</span></div><Button compact variant="danger" icon={<Trash2 size={14} />} onClick={() => setPendingDelete(detail.user)}>删除用户</Button></header>
+        <div className={styles.detailSection}><h3>SSH 连接 <span>{detail.servers.length}</span></h3>{detail.servers.length ? <div className={styles.detailRows}>{detail.servers.map((server) => <div className={styles.detailRow} key={server.serverId}><span><strong>{server.serverName}</strong><small>{server.host} · {server.conversationCount} 个对话</small></span><em className={`${styles.connectionStatus} ${styles[server.status]}`}>{connectionLabel(server.status)}</em><Button compact disabled={server.status !== "connected" || Boolean(disconnecting)} icon={disconnecting === server.serverId ? <LoaderCircle className={styles.spin} size={13} /> : <Unplug size={13} />} onClick={() => void disconnect(server)}>断开</Button></div>)}</div> : <p className={styles.emptyDetail}>尚未配置服务器</p>}</div>
+        <div className={styles.detailSection}><h3>对话 <span>{detail.conversations.items.length}{detail.conversations.nextCursor ? "+" : ""}</span></h3>{detail.conversations.items.length ? <div className={styles.conversationRows}>{detail.conversations.items.map((conversation) => <div className={styles.conversationRow} key={conversation.id}><span><strong>{conversation.title}</strong><small>{conversation.lastMessagePreview || "暂无消息"}</small></span><em>{conversation.mode === "work" ? "工作" : "聊天"}</em><time>{new Date(conversation.updatedAt).toLocaleString("zh-CN")}</time></div>)}</div> : <p className={styles.emptyDetail}>暂无对话</p>}{detail.conversations.nextCursor ? <Button compact disabled={detailLoading} onClick={() => void loadDetail(selectedId, detail.conversations.nextCursor || undefined)}>加载更多</Button> : null}</div>
+      </> : null}
+    </section>
+    {pendingDelete ? <Modal title="删除用户？" subtitle="账号、对话、服务器、技能、文件、记忆和运行数据都会永久删除。" size="compact" onClose={() => { if (!deleting) setPendingDelete(null); }}><div className={styles.deleteDialog}><p>确认删除“{pendingDelete.username}”及其全部数据？该操作无法撤销，当前登录会话也会立即失效。</p><footer><Button disabled={deleting} onClick={() => setPendingDelete(null)}>取消</Button><Button variant="danger" disabled={deleting} icon={deleting ? <LoaderCircle className={styles.spin} size={14} /> : <Trash2 size={14} />} onClick={() => void removeUser()}>{deleting ? "正在删除" : "删除全部数据"}</Button></footer></div></Modal> : null}
   </div>;
 }
 
 export default function AdminView() {
   const runtime = useAppRuntime();
   const { api, notify } = runtime;
-  const [tab, setTab] = useState<"api" | "ssh">("api");
+  const [tab, setTab] = useState<"api" | "ssh" | "users">("api");
   const [snapshot, setSnapshot] = useState<PlatformSnapshot | null>(null);
-  const [usages, setUsages] = useState<Record<UsageScope, UsageSummary>>({ all: emptyUsage, web: emptyUsage, agent: emptyUsage, embedding: emptyUsage });
-  const [connections, setConnections] = useState<ManagedConnection[]>([]);
-  const [connectionsAvailable, setConnectionsAvailable] = useState(true);
+  const [usages, setUsages] = useState<Record<UsageScope, UsageSummary>>({ all: emptyUsage, web: emptyUsage, agent: emptyUsage, embedding: emptyUsage, ocr: emptyUsage });
+  const [userRefreshKey, setUserRefreshKey] = useState(0);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
-    const [platformResult, usageResult, connectionResult] = await Promise.allSettled([
+    const [platformResult, usageResult] = await Promise.allSettled([
       api.get<PlatformSnapshot>("/api/admin/platform"),
       api.get<UsageSummary>("/api/admin/usage?seriesDays=14"),
-      api.get<{ items: ManagedConnection[] }>("/api/admin/ssh-connections"),
     ]);
     if (platformResult.status === "fulfilled") setSnapshot(platformResult.value.data);
     else notify(platformResult.reason instanceof Error ? platformResult.reason.message : "管理员配置读取失败", "error");
     if (usageResult.status === "fulfilled") setUsages((current) => ({ ...current, all: usageResult.value.data }));
     if (platformResult.status === "fulfilled") {
-      const scoped = await Promise.allSettled((["web", "agent", "embedding"] as Purpose[]).map(async (purpose) => ({
+      const scoped = await Promise.allSettled((["web", "agent", "embedding", "ocr"] as Purpose[]).map(async (purpose) => ({
         purpose,
         result: await api.get<UsageSummary>(`/api/admin/usage?seriesDays=14&providerId=${encodeURIComponent(platformResult.value.data.providers[purpose].id)}`),
       })));
@@ -386,8 +514,6 @@ export default function AdminView() {
         return next;
       });
     }
-    if (connectionResult.status === "fulfilled") { setConnections(connectionResult.value.data.items); setConnectionsAvailable(true); }
-    else setConnectionsAvailable(false);
   }, [api, notify]);
 
   useEffect(() => {
@@ -398,9 +524,9 @@ export default function AdminView() {
   if (loading) return <LoadingState label="正在读取管理员配置" />;
   if (!snapshot) return <PageFrame icon={<ServerCog size={19} />} title="管理员面板"><div className={styles.pageError}>管理员配置暂时不可用</div></PageFrame>;
   return (
-    <PageFrame icon={<ServerCog size={19} />} title="管理员面板" actions={<Button compact onClick={() => void load()} icon={<RefreshCw size={15} />}>刷新</Button>}>
-      <div className={styles.tabs} role="tablist"><button className={tab === "api" ? styles.activeTab : ""} onClick={() => setTab("api")} role="tab" aria-selected={tab === "api"}><Activity size={16} />模型 API</button><button className={tab === "ssh" ? styles.activeTab : ""} onClick={() => setTab("ssh")} role="tab" aria-selected={tab === "ssh"}><ServerCog size={16} />SSH</button></div>
-      <div className={styles.tabStage}>{tab === "api" ? <ApiPanel key={`api:${snapshot.revision}`} snapshot={snapshot} usages={usages} reload={load} /> : <SshPanel key={`ssh:${snapshot.revision}`} snapshot={snapshot} connections={connections} connectionsAvailable={connectionsAvailable} reload={load} />}</div>
+    <PageFrame icon={<ServerCog size={19} />} title="管理员面板" actions={<Button compact onClick={() => { if (tab === "users") setUserRefreshKey((value) => value + 1); else void load(); }} icon={<RefreshCw size={15} />}>刷新</Button>}>
+      <div className={styles.tabs} role="tablist"><button className={tab === "api" ? styles.activeTab : ""} onClick={() => setTab("api")} role="tab" aria-selected={tab === "api"}><Activity size={16} />模型API</button><button className={tab === "ssh" ? styles.activeTab : ""} onClick={() => setTab("ssh")} role="tab" aria-selected={tab === "ssh"}><ServerCog size={16} />SSH管理</button><button className={tab === "users" ? styles.activeTab : ""} onClick={() => setTab("users")} role="tab" aria-selected={tab === "users"}><UsersRound size={16} />用户管理</button></div>
+      <div className={styles.tabStage}>{tab === "api" ? <ApiPanel key={`api:${snapshot.revision}`} snapshot={snapshot} usages={usages} reload={load} /> : tab === "ssh" ? <SshPanel key={`ssh:${snapshot.revision}`} snapshot={snapshot} reload={load} /> : <UserPanel refreshKey={userRefreshKey} onChanged={() => setUserRefreshKey((value) => value + 1)} />}</div>
     </PageFrame>
   );
 }

@@ -199,12 +199,17 @@ export async function createGatewayServer(options = {}) {
       }
       const remoteFileContentMatch = /^\/api\/servers\/([^/]+)\/workspaces\/([^/]+)\/files\/content\/?$/.exec(url.pathname);
       if (["GET", "PUT"].includes(request.method) && remoteFileContentMatch) {
-        const session = await runtime.auth.resolveSession(bearer(request));
+        const routeServerId = decodeURIComponent(remoteFileContentMatch[1]);
+        const routeWorkspaceId = decodeURIComponent(remoteFileContentMatch[2]);
+        const downloadToken = request.method === "GET" ? url.searchParams.get("downloadToken") : null;
+        const ticket = downloadToken ? runtime.resolveRemoteFileDownloadToken(downloadToken) : null;
+        const session = ticket ? { actor: ticket.actor } : await runtime.auth.resolveSession(bearer(request));
         const services = await runtime.servicesForActor(session.actor);
-        const serverId = decodeURIComponent(remoteFileContentMatch[1]);
-        const workspaceId = decodeURIComponent(remoteFileContentMatch[2]);
+        const serverId = ticket?.serverId || routeServerId;
+        const workspaceId = ticket?.workspaceId || routeWorkspaceId;
+        invariant(!ticket || ticket.serverId === routeServerId && ticket.workspaceId === routeWorkspaceId, "REMOTE_FILE_DOWNLOAD_SCOPE_INVALID", "下载链接与请求范围不一致", { status: 403 });
         const backend = await services.remoteBackend(serverId);
-        const relativePath = String(url.searchParams.get("path") || "");
+        const relativePath = ticket?.path || String(url.searchParams.get("path") || "");
         const auditTarget = remoteFileAuditTarget(serverId, workspaceId, relativePath);
         if (request.method === "PUT") {
           await services.audit.append({ action: "remote-file.upload", status: "attempted", target: auditTarget, requestId: id, metadata: { method: "PUT" } });
@@ -293,13 +298,15 @@ export async function createGatewayServer(options = {}) {
       }
       const artifactMatch = /^\/api\/artifacts\/([^/]+)\/download\/?$/.exec(url.pathname);
       if (request.method === "GET" && artifactMatch) {
-        const session = await runtime.auth.resolveSession(bearer(request));
         const downloadToken = url.searchParams.get("token");
         invariant(downloadToken, "ARTIFACT_DOWNLOAD_TOKEN_REQUIRED", "缺少 Artifact 下载 token", { status: 401 });
+        const ticket = runtime.resolveArtifactDownloadTicket(downloadToken);
+        const routeArtifactId = decodeURIComponent(artifactMatch[1]);
+        invariant(ticket.artifactId === routeArtifactId, "ARTIFACT_DOWNLOAD_SCOPE_INVALID", "结果文件下载链接与请求不一致", { status: 403 });
         const opened = await runtime.openArtifactDownload({
-          actor: session.actor,
-          artifactId: decodeURIComponent(artifactMatch[1]),
-          downloadToken,
+          actor: ticket.actor,
+          artifactId: routeArtifactId,
+          downloadToken: ticket.artifactToken,
           rangeHeader: request.headers.range,
         });
         const partial = Boolean(request.headers.range);
@@ -308,7 +315,7 @@ export async function createGatewayServer(options = {}) {
           "accept-ranges": "bytes",
           "content-type": opened.mime || "application/octet-stream",
           "content-length": opened.contentLength,
-          "content-disposition": `attachment; filename="${safeFilename(opened.filename)}"`,
+          "content-disposition": attachmentDisposition(opened.filename),
           ...(partial ? { "content-range": `bytes ${opened.range.start}-${opened.range.endExclusive - 1}/${opened.size}` } : {}),
           "cache-control": "private, no-store",
           "x-request-id": id,

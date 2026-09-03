@@ -44,39 +44,26 @@ class FakeRemoteControl {
 }
 
 class FakeVersioning {
-  domains = new Map();
+  ledgers = new Map();
 
-  async assessWorkspace({ rootPath }) {
-    if (rootPath === "/srv/project/nested") {
-      return {
-        rootPath,
-        exact: null,
-        canCreate: false,
-        risk: {
-          code: "WORKSPACE_DOMAIN_OVERLAP",
-          relationships: [{ relationship: "contained_by", rootPath: "/srv/project", versionDomainId: "vd_parent" }],
-        },
-      };
-    }
-    const existing = this.domains.get(rootPath) || null;
-    return { rootPath, exact: existing, risk: null, canCreate: !existing };
+  async ensureConversationDomain({ conversationId, workspaceId, rootPath }) {
+    const created = !this.ledgers.has(conversationId);
+    const domain = this.ledgers.get(conversationId) || {
+      versionDomainId: `vl_${crypto.createHash("sha256").update(conversationId).digest("hex").slice(0, 24)}`,
+      workspaces: [],
+    };
+    if (!domain.workspaces.some((entry) => entry.id === workspaceId)) domain.workspaces.push({ id: workspaceId, rootPath });
+    this.ledgers.set(conversationId, domain);
+    return { state: domain, created, reused: !created, risk: null };
   }
 
-  async openDomain({ rootPath }, options = {}) {
-    if (rootPath === "/srv/project/nested") {
-      if (options.overlapPolicy !== "reuse-containing") return { state: null, risk: { code: "WORKSPACE_DOMAIN_OVERLAP" } };
-      return { state: { versionDomainId: "vd_parent" }, reused: true, risk: { code: "WORKSPACE_DOMAIN_OVERLAP" } };
-    }
-    const domain = this.domains.get(rootPath) || { versionDomainId: `vd_${crypto.createHash("sha256").update(rootPath).digest("hex").slice(0, 12)}` };
-    this.domains.set(rootPath, domain);
-    return { state: domain, reused: this.domains.has(rootPath), risk: null };
+  async openDomain(input) {
+    return this.ensureConversationDomain(input);
   }
 
-  async resolveDynamicWrite({ targetPath, targetKind }) {
-    const rootPath = targetKind === "file" ? path.posix.dirname(targetPath) : targetPath;
-    const domain = this.domains.get(rootPath) || { versionDomainId: `vd_dynamic_${crypto.createHash("sha256").update(rootPath).digest("hex").slice(0, 8)}` };
-    this.domains.set(rootPath, domain);
-    return { state: domain, created: true, risk: null };
+  async resolveDynamicWrite({ conversationId, workspaceId, workspaceRootPath, targetPath, targetKind }) {
+    const rootPath = workspaceRootPath || (targetKind === "directory" ? targetPath : path.posix.dirname(targetPath));
+    return this.ensureConversationDomain({ conversationId, workspaceId: workspaceId || `ws_dynamic_${conversationId}`, rootPath });
   }
 }
 
@@ -111,7 +98,7 @@ test("virtual workspace lives under remote .easywork and command replay is idemp
   assert.equal(first.created, true);
   assert.equal(first.workspace.kind, "virtual");
   assert.match(first.workspace.canonicalPath, /^\/home\/alice\/\.easywork\/workspaces\/alice\/conv-a\//);
-  assert.equal(first.workspace.versionDomainId, null);
+  assert.equal("versionDomainId" in first.workspace, false);
   assert.match(first.workspace.remoteRef, /^~\/\.easywork\/bindings\/workspaces\//);
   const writes = remoteControl.calls.length;
   const replay = await service.createVirtual(input);
@@ -122,8 +109,8 @@ test("virtual workspace lives under remote .easywork and command replay is idemp
   assert.equal(JSON.stringify(registry).includes("privateKey"), false);
 });
 
-test("real workspace overlap requires an explicit shared version-domain decision", async (t) => {
-  const { service } = await fixture(t);
+test("real workspaces register independently and do not touch the lazy version ledger", async (t) => {
+  const { service, versioning } = await fixture(t);
   const base = await service.registerUserWorkspace({
     conversationId: "conv-a",
     serverIdentity: SERVER_IDENTITY,
@@ -132,30 +119,17 @@ test("real workspace overlap requires an explicit shared version-domain decision
     commandId: "cmd-real-base",
   });
   assert.equal(base.workspace.kind, "user");
-  assert.ok(base.workspace.versionDomainId);
+  assert.equal("versionDomainId" in base.workspace, false);
 
-  const assessment = await service.assessUserWorkspace({ conversationId: "conv-a", serverIdentity: SERVER_IDENTITY, path: "/srv/project/nested" });
-  assert.equal(assessment.canCreate, false);
-  assert.equal(assessment.overlapRisk.code, "WORKSPACE_DOMAIN_OVERLAP");
-  await assert.rejects(
-    service.registerUserWorkspace({
-      conversationId: "conv-a",
-      serverIdentity: SERVER_IDENTITY,
-      path: "/srv/project/nested",
-      expectedRevision: 0,
-      commandId: "cmd-real-nested-reject",
-    }),
-    (error) => error?.code === "WORKSPACE_OVERLAP_CONFIRMATION_REQUIRED",
-  );
   const shared = await service.registerUserWorkspace({
     conversationId: "conv-a",
     serverIdentity: SERVER_IDENTITY,
     path: "/srv/project/nested",
-    overlapPolicy: "reuse-containing-domain",
     expectedRevision: 0,
-    commandId: "cmd-real-nested-share",
+    commandId: "cmd-real-nested",
   });
-  assert.equal(shared.workspace.versionDomainId, "vd_parent");
+  assert.equal("versionDomainId" in shared.workspace, false);
+  assert.equal(versioning.ledgers.size, 0);
 });
 
 test("agent and workspace combinations own independent native sessions while workspaces may be shared", async (t) => {
@@ -185,6 +159,8 @@ test("agent and workspace combinations own independent native sessions while wor
   });
   assert.notEqual(openCode.binding.id, codex.binding.id);
   assert.notEqual(codex.binding.id, secondConversation.binding.id);
+  assert.equal(openCode.binding.versionDomainId, codex.binding.versionDomainId);
+  assert.notEqual(codex.binding.versionDomainId, secondConversation.binding.versionDomainId);
 
   const firstDescriptor = await service.describeSwitch({ conversationId: "conv-a", branchId: "main", workspaceId: virtual.workspace.id, agentId: "opencode", contextEpoch: 0 });
   assert.equal(firstDescriptor.requiresConfirmation, false);
@@ -239,50 +215,144 @@ test("agent and workspace combinations own independent native sessions while wor
   assert.equal(bindings.find((entry) => entry.id === openCode.binding.id).status, "stale");
 });
 
-test("dynamic writes reuse the same agent session for repeated writes to one target directory", async (t) => {
-  const { remoteControl, service } = await fixture(t);
-  const descriptor = await service.describeDynamicWrite({
+test("删除父网页对话保留派生对话共享工作区，最后一个派生引用删除后回收", async (t) => {
+  const { service } = await fixture(t);
+  const virtual = await service.createVirtual({
     conversationId: "conv-a",
     branchId: "main",
-    agentId: "claude-code",
     serverIdentity: SERVER_IDENTITY,
-    contextEpoch: 2,
-    targetPath: "/srv/output/report.md",
-    targetKind: "file",
-  });
-  assert.equal(descriptor.requiresConfirmation, true);
-  assert.equal(descriptor.canonicalRootPath, "/srv/output");
-  const confirmed = await service.confirmDynamicWrite({
-    ...descriptor,
-    descriptorId: descriptor.id,
     expectedRevision: 0,
-    commandId: "cmd-dynamic-confirm",
+    commandId: "cmd-delete-derived-virtual",
   });
-  assert.equal(confirmed.workspace.kind, "dynamic");
-  assert.equal(confirmed.workspace.canonicalPath, "/srv/output");
-  const updated = await service.updateNativeSession({
-    bindingId: confirmed.binding.id,
-    nativeSessionId: "claude-session-output",
-    lastDeliverySequence: 11,
-    expectedRevision: confirmed.binding.revision,
-    commandId: "cmd-dynamic-session",
-  });
-  assert.equal(updated.binding.nativeSessionId, "claude-session-output");
-
-  const second = await service.describeDynamicWrite({
+  const parent = await service.ensureAgentBinding({
     conversationId: "conv-a",
     branchId: "main",
-    agentId: "claude-code",
-    serverIdentity: SERVER_IDENTITY,
-    contextEpoch: 2,
-    targetPath: "/srv/output/figure.png",
-    targetKind: "file",
+    workspaceId: virtual.workspace.id,
+    agentId: "codex",
+    contextEpoch: 0,
+    expectedRevision: 0,
+    commandId: "cmd-delete-derived-parent-binding",
   });
-  assert.equal(second.requiresConfirmation, false);
-  assert.equal(second.reusesNativeAgentSession, true);
-  assert.equal(second.lastDeliverySequence, 11);
+  const derived = await service.forkConversation({
+    sourceConversationId: "conv-a",
+    conversationId: "conv-b",
+    sourceBranchId: "main",
+    branchId: "main",
+    sourceBindingId: parent.binding.id,
+    commandId: "cmd-delete-derived-fork",
+  });
+  assert.equal(derived.workspace.id, virtual.workspace.id);
+
+  const parentCleanup = await service.forgetConversations({
+    conversationIds: ["conv-a"],
+    serverIdentity: SERVER_IDENTITY,
+  });
+  assert.deepEqual(parentCleanup.removedWorkspaces, []);
+  assert.deepEqual(parentCleanup.retainedInheritedWorkspaces.map((entry) => entry.id), [virtual.workspace.id]);
+  assert.ok(parentCleanup.protectedWorkspaceIds.includes(virtual.workspace.id));
+  assert.equal((await service.listBindings({ conversationId: "conv-b", branchId: "main" })).length, 1);
+  assert.equal((await service.getWorkspace(virtual.workspace.id)).id, virtual.workspace.id);
+
+  const derivedCleanup = await service.forgetConversations({
+    conversationIds: ["conv-b"],
+    serverIdentity: SERVER_IDENTITY,
+  });
+  assert.deepEqual(derivedCleanup.retainedInheritedWorkspaces, []);
+  assert.deepEqual(derivedCleanup.removedWorkspaces.map((entry) => entry.id), [virtual.workspace.id]);
+  await assert.rejects(service.getWorkspace(virtual.workspace.id), (error) => error.code === "WORKSPACE_NOT_FOUND");
+});
+
+test("远端清理失败时不提前丢失派生工作区清理计划，重试成功后才提交本地遗忘", async (t) => {
+  const { service } = await fixture(t);
+  const virtual = await service.createVirtual({
+    conversationId: "conv-a",
+    branchId: "main",
+    serverIdentity: SERVER_IDENTITY,
+    expectedRevision: 0,
+    commandId: "cmd-cleanup-retry-virtual",
+  });
+  const parent = await service.ensureAgentBinding({
+    conversationId: "conv-a",
+    branchId: "main",
+    workspaceId: virtual.workspace.id,
+    agentId: "opencode",
+    contextEpoch: 0,
+    expectedRevision: 0,
+    commandId: "cmd-cleanup-retry-parent",
+  });
+  await service.forkConversation({
+    sourceConversationId: "conv-a",
+    conversationId: "conv-b",
+    sourceBranchId: "main",
+    branchId: "main",
+    sourceBindingId: parent.binding.id,
+    commandId: "cmd-cleanup-retry-child",
+  });
+  await service.forgetConversations({ conversationIds: ["conv-a"], serverIdentity: SERVER_IDENTITY });
+
+  let failedPlan = null;
+  await assert.rejects(
+    service.forgetConversations({ conversationIds: ["conv-b"], serverIdentity: SERVER_IDENTITY }, {
+      beforeCommit: async (cleanup) => {
+        failedPlan = cleanup;
+        throw Object.assign(new Error("simulated SSH loss"), { code: "SSH_CONNECTION_LOST" });
+      },
+    }),
+    (error) => error?.code === "SSH_CONNECTION_LOST",
+  );
+  assert.deepEqual(failedPlan.removedWorkspaces.map((entry) => entry.id), [virtual.workspace.id]);
+  assert.equal((await service.listBindings({ conversationId: "conv-b", branchId: "main" })).length, 1);
+  assert.equal((await service.getWorkspace(virtual.workspace.id)).id, virtual.workspace.id);
+
+  let retryPlan = null;
+  const completed = await service.forgetConversations({ conversationIds: ["conv-b"], serverIdentity: SERVER_IDENTITY }, {
+    beforeCommit: async (cleanup) => { retryPlan = cleanup; },
+  });
+  assert.deepEqual(retryPlan.removedWorkspaces.map((entry) => entry.id), [virtual.workspace.id]);
+  assert.deepEqual(completed.removedWorkspaces.map((entry) => entry.id), [virtual.workspace.id]);
+  await assert.rejects(service.getWorkspace(virtual.workspace.id), (error) => error.code === "WORKSPACE_NOT_FOUND");
+});
+
+test("forked branches share the workspace and version domain but keep independent native sessions", async (t) => {
+  const { remoteControl, service } = await fixture(t);
+  const virtual = await service.createVirtual({
+    conversationId: "conv-a",
+    serverIdentity: SERVER_IDENTITY,
+    expectedRevision: 0,
+    commandId: "cmd-fork-virtual",
+  });
+  const main = await service.ensureAgentBinding({
+    conversationId: "conv-a",
+    branchId: "main",
+    workspaceId: virtual.workspace.id,
+    agentId: "claude-code",
+    contextEpoch: 2,
+    expectedRevision: 0,
+    commandId: "cmd-fork-main",
+  });
+  const activeMain = await service.updateNativeSession({
+    bindingId: main.binding.id,
+    nativeSessionId: "claude-session-main",
+    lastDeliverySequence: 11,
+    expectedRevision: main.binding.revision,
+    commandId: "cmd-fork-main-session",
+  });
+
+  const forked = await service.forkBranch({
+    conversationId: "conv-a",
+    sourceBranchId: "main",
+    branchId: "alternate",
+    commandId: "cmd-fork-alternate",
+  });
+  const route = await service.getRoute({ conversationId: "conv-a", branchId: "alternate" });
+
+  assert.equal(forked.routed, true);
+  assert.equal(route.workspace.id, virtual.workspace.id);
+  assert.equal(route.binding.versionDomainId, activeMain.binding.versionDomainId);
+  assert.notEqual(route.binding.id, activeMain.binding.id);
+  assert.equal(route.binding.nativeSessionId, null);
+  assert.equal(route.binding.lastDeliverySequence, 0);
   assert.ok(remoteControl.calls.filter((entry) => entry.kind === "write").every((entry) => entry.path.includes("/.easywork/bindings/workspaces/")));
-  assert.equal(remoteControl.calls.some((entry) => ["write", "mkdir"].includes(entry.kind) && entry.path?.startsWith("/srv/output")), false);
 });
 
 test("workspace service rejects guest actors, unauthorized conversations and stale revisions", async (t) => {

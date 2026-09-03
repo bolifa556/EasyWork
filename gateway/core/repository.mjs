@@ -12,6 +12,24 @@ function clone(value) {
 }
 
 const TRANSIENT_RENAME_ERRORS = new Set(["EPERM", "EACCES", "EBUSY"]);
+const fileMutationTails = new Map();
+
+async function runFileMutation(filePath, operation) {
+  const resolved = path.resolve(filePath);
+  const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  const previous = fileMutationTails.get(key) || Promise.resolve();
+  let release;
+  const turn = new Promise((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => turn);
+  fileMutationTails.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (fileMutationTails.get(key) === tail) fileMutationTails.delete(key);
+  }
+}
 
 export async function replaceFileWithRetry(sourcePath, targetPath, options = {}) {
   const fileSystem = options.fileSystem || fs;
@@ -31,6 +49,24 @@ export async function replaceFileWithRetry(sourcePath, targetPath, options = {})
   throw lastError;
 }
 
+async function overwriteFileInPlace(sourcePath, targetPath) {
+  const contents = await fs.readFile(sourcePath);
+  let handle;
+  try {
+    try { handle = await fs.open(targetPath, "r+"); }
+    catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      handle = await fs.open(targetPath, "wx", 0o600);
+    }
+    await handle.write(contents, 0, contents.length, 0);
+    await handle.truncate(contents.length);
+    await handle.sync();
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+  await fs.rm(sourcePath, { force: true });
+}
+
 async function fsyncDirectory(directory) {
   let handle;
   try {
@@ -43,7 +79,7 @@ async function fsyncDirectory(directory) {
   }
 }
 
-async function atomicWriteJson(filePath, value) {
+export async function atomicWriteJson(filePath, value) {
   const directory = path.dirname(filePath);
   await fs.mkdir(directory, { recursive: true });
   const temporaryPath = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
@@ -55,7 +91,17 @@ async function atomicWriteJson(filePath, value) {
     await handle.close();
   }
   try {
-    await replaceFileWithRetry(temporaryPath, filePath);
+    try {
+      await replaceFileWithRetry(temporaryPath, filePath);
+    } catch (error) {
+      // Windows can keep an existing JSON file open long enough that every
+      // atomic replacement attempt fails with EPERM even though mutations for
+      // this path are already serialized. Preserve the fully-fsynced temporary
+      // payload and fall back to an in-place replacement only for that platform
+      // and those transient lock errors.
+      if (process.platform !== "win32" || !TRANSIENT_RENAME_ERRORS.has(error?.code)) throw error;
+      await overwriteFileInPlace(temporaryPath, filePath);
+    }
     await fsyncDirectory(directory);
   } catch (error) {
     await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
@@ -73,6 +119,8 @@ export class AtomicJsonRepository {
     this.defaultData = options.defaultData;
     this.validate = options.validate || (() => true);
     this.queue = options.queue || defaultActorMutationQueue;
+    this.relativePath = (Array.isArray(options.relativePath) ? options.relativePath : [options.relativePath])
+      .map((segment) => String(segment));
     this.filePath = resolveActorPath(options.dataRoot, options.actor, options.relativePath);
   }
 
@@ -104,15 +152,23 @@ export class AtomicJsonRepository {
 
   #validateData(data) {
     const result = this.validate(data);
-    invariant(result !== false, "ENTITY_VALIDATION_FAILED", "实体未通过 Repository 校验", { status: 400 });
+    invariant(result !== false, "ENTITY_VALIDATION_FAILED", "实体未通过 Repository 校验", {
+      status: 400,
+      details: { repository: this.relativePath.join("/") },
+    });
   }
 
   async read() {
-    return clone(await this.#readEnvelope());
+    // Atomic rename is normally invisible to readers. The Windows lock
+    // fallback replaces the destination in place, so an unsynchronised read
+    // could briefly observe the file between write/truncate operations and
+    // report valid persisted data as corrupt JSON. Share the same per-file
+    // mutation lane for reads to keep that fallback transactional in-process.
+    return runFileMutation(this.filePath, async () => clone(await this.#readEnvelope()));
   }
 
   async replace(data, options = {}) {
-    return this.queue.run(this.actor, async () => {
+    return this.queue.run(this.actor, () => runFileMutation(this.filePath, async () => {
       const current = await this.#readEnvelope();
       assertExpectedRevision(current.revision, options.expectedRevision);
       const nextData = clone(data);
@@ -125,12 +181,12 @@ export class AtomicJsonRepository {
       };
       await atomicWriteJson(this.filePath, next);
       return clone(next);
-    });
+    }));
   }
 
   async update(mutator, options = {}) {
     invariant(typeof mutator === "function", "REPOSITORY_MUTATOR_INVALID", "Repository mutator 必须是函数", { status: 500, expose: false });
-    return this.queue.run(this.actor, async () => {
+    return this.queue.run(this.actor, () => runFileMutation(this.filePath, async () => {
       const current = await this.#readEnvelope();
       assertExpectedRevision(current.revision, options.expectedRevision);
       const draft = clone(current.data);
@@ -145,6 +201,6 @@ export class AtomicJsonRepository {
       };
       await atomicWriteJson(this.filePath, next);
       return clone(next);
-    });
+    }));
   }
 }

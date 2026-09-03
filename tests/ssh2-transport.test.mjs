@@ -30,7 +30,11 @@ class FakeClient extends EventEmitter {
     this.command = command;
     const channel = new FakeChannel();
     callback(null, channel);
-    queueMicrotask(() => {
+    // `session.exec()` attaches capture listeners after the channel-open
+    // promise unwinds through the bounded channel scheduler. Emit on the next
+    // event-loop turn so this fake matches ssh2's asynchronous channel I/O
+    // instead of racing the consumer with a microtask-only close.
+    setImmediate(() => {
       channel.emit("data", Buffer.from("hello"));
       channel.stderr.emit("data", Buffer.from("warn"));
       channel.emit("close", 0, null);
@@ -67,6 +71,26 @@ test("ssh2 transport pins resolved address and exposes only the observed SHA256 
   assert.deepEqual(await session.sftp(), { kind: "sftp" });
   await session.close();
   assert.equal(await session.isAlive(), false);
+});
+
+test("ssh2 transport leaves room for terminal, monitoring, downloads and a foreground Agent", async () => {
+  class ConcurrentClient extends FakeClient {
+    constructor() {
+      super();
+      this.channels = [];
+    }
+    exec(_command, _options, callback) {
+      const channel = new FakeChannel();
+      this.channels.push(channel);
+      callback(null, channel);
+    }
+  }
+  const factory = new Ssh2TransportFactory({ ClientClass: ConcurrentClient });
+  const session = await factory.connect(request);
+  const channels = await Promise.all(Array.from({ length: 8 }, (_, index) => session.openExec(`operation-${index}`)));
+  assert.equal(session.client.channels.length, 8);
+  for (const channel of channels) channel.emit("close", 0, null);
+  await session.close();
 });
 
 test("ssh2 transport rejects a changed host key before authentication is accepted", async () => {

@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FileStack } from "lucide-react";
+import { commandId } from "@/app/core/gateway/client";
 import { uploadResource } from "@/app/core/gateway/resource-upload";
 import { useAppRuntime } from "@/app/easywork/runtime/AppRuntime";
+import LibraryFilePreview from "./LibraryFilePreview";
 import LibraryPage from "./LibraryPage";
 import type { LibraryCollection, LibraryFile } from "./types";
 import styles from "./LibraryView.module.css";
@@ -48,14 +50,15 @@ function collectionSummary(record: CollectionRecord, files: LibraryFile[]): Libr
     revision: record.revision,
     updatedAt: record.updatedAt,
     fileCount: files.length,
-    readyCount: files.filter((file) => file.status === "ready").length,
+    readyCount: files.filter((file) => ["ready", "readable"].includes(file.status)).length,
     failedCount: files.filter((file) => file.status === "error").length,
   };
 }
 
 function resourceStatus(version: ResourceVersionRecord): LibraryFile["status"] {
-  if (version.parseStatus === "failed" || version.embeddingStatus === "failed") return "error";
+  if (version.parseStatus === "failed") return "error";
   if (version.parseStatus === "ready" && version.embeddingStatus === "ready") return "ready";
+  if (version.parseStatus === "ready" && version.embeddingStatus === "failed") return "readable";
   if (version.parseStatus === "ready") return "embedding";
   return "extracting";
 }
@@ -88,17 +91,27 @@ function errorMessage(reason: unknown) {
   return reason instanceof Error ? reason.message : "操作未完成";
 }
 
+type LibraryPageCache = {
+  records: CollectionRecord[];
+  filesByCollection: Record<string, LibraryFile[]>;
+  resourceRevision: number;
+};
+const libraryPageCache = new Map<string, LibraryPageCache>();
+
 export type LibraryViewProps = { collectionId?: string };
 
 export default function LibraryView({ collectionId }: LibraryViewProps) {
   const runtime = useAppRuntime();
   const { api, navigate, notify } = runtime;
   const enabled = runtime.bootstrap?.featureFlags.resources === true;
-  const [records, setRecords] = useState<CollectionRecord[]>([]);
-  const [filesByCollection, setFilesByCollection] = useState<Record<string, LibraryFile[]>>({});
-  const [loading, setLoading] = useState(true);
+  const cacheKey = runtime.bootstrap?.actor.id || "unresolved";
+  const initialCache = libraryPageCache.get(cacheKey);
+  const [records, setRecords] = useState<CollectionRecord[]>(() => initialCache?.records || []);
+  const [filesByCollection, setFilesByCollection] = useState<Record<string, LibraryFile[]>>(() => initialCache?.filesByCollection || {});
+  const [loading, setLoading] = useState(() => !initialCache);
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const resourceRevision = useRef(0);
+  const [previewFile, setPreviewFile] = useState<LibraryFile | null>(null);
+  const resourceRevision = useRef(initialCache?.resourceRevision || 0);
 
   const loadCollections = useCallback(async (signal?: AbortSignal) => {
     if (!enabled) { setLoading(false); return; }
@@ -125,10 +138,15 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
   }, [api, enabled, notify]);
 
   useEffect(() => {
+    if (libraryPageCache.has(cacheKey)) return;
     const controller = new AbortController();
     const timer = window.setTimeout(() => void loadCollections(controller.signal), 0);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [loadCollections]);
+  }, [cacheKey, loadCollections]);
+
+  useEffect(() => {
+    if (!loading && enabled) libraryPageCache.set(cacheKey, { records, filesByCollection, resourceRevision: resourceRevision.current });
+  }, [cacheKey, enabled, filesByCollection, loading, records]);
 
   const collections = records.map((record) => collectionSummary(record, filesByCollection[record.id] ?? []));
 
@@ -167,10 +185,14 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
     if (!current) return;
     setBusyAction("collection");
     try {
-      await api.delete(`/api/collections/${encodeURIComponent(id)}`, { expectedRevision: current.revision });
+      await api.delete(`/api/collections/${encodeURIComponent(id)}`, {
+        expectedRevision: current.revision,
+        idempotencyKey: commandId("collection-delete"),
+      });
       setRecords((items) => items.filter((item) => item.id !== id));
       setFilesByCollection((items) => { const next = { ...items }; delete next[id]; return next; });
       if (collectionId === id) navigate({ kind: "library" }, { replace: true });
+      await loadCollections();
       notify("文件集已删除", "success");
     } catch (reason) {
       notify(errorMessage(reason), "error");
@@ -199,6 +221,7 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
       notify(selected.length === 1 ? "文件已上传" : `${selected.length} 个文件已上传`, "success");
     } catch (reason) {
       notify(errorMessage(reason), "error");
+      await loadCollections();
     } finally {
       setBusyAction(null);
     }
@@ -227,7 +250,7 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
 
   if (!enabled) return <div className={styles.unavailable}><FileStack size={29} /><strong>文件库暂时不可用</strong></div>;
 
-  return (
+  return <>
     <LibraryPage
       collections={collections}
       selectedCollectionId={collectionId ?? null}
@@ -240,6 +263,8 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
       onDeleteCollection={deleteCollection}
       onUploadFiles={uploadFiles}
       onRetryIndex={retryIndex}
+      onPreviewFile={setPreviewFile}
     />
-  );
+    {previewFile ? <LibraryFilePreview key={previewFile.id} file={previewFile} onClose={() => setPreviewFile(null)} /> : null}
+  </>;
 }

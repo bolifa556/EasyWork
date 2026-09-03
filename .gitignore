@@ -50,8 +50,7 @@ next-env.d.ts
 /skill/users/
 /skill/guests/
 
-# Local product notes and device-specific FRP runtime
+# Local device-specific notes and FRP runtime
 /requirments.md
-/doc/
 /frp/
 /agent-app/

@@ -20,11 +20,16 @@ import { assertExpectedRevision } from "../revision.mjs";
 import { assertActorOwnedPath, resolveActorPath } from "../paths.mjs";
 import { AtomicJsonRepository } from "../repository.mjs";
 import { ActorMutationQueue } from "../mutation-queue.mjs";
+import { containsExplicitQueryAnchor, requiredExplicitQueryAnchors } from "../text-relevance.mjs";
+import { documentMetadata } from "./extractor.mjs";
 
 const RESOURCE_STORE_SCHEMA_VERSION = 1;
 const PROCESSING_FILE_SCHEMA_VERSION = 1;
 const SUPPORTED_OWNER_TYPES = Object.freeze(["collection", "project", "conversation"]);
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+const DIRECT_READ_CHARACTERS = 20_000;
+const MODEL_IMAGE_BYTES = 8 * 1024 * 1024;
+const MODEL_IMAGE_MIME = /^image\/(?:png|jpe?g|webp|gif)$/i;
 const sharedResourceMutationQueue = new ActorMutationQueue();
 const inlineRepositoryQueue = Object.freeze({
   run: async (_actor, operation) => operation(),
@@ -280,6 +285,7 @@ export class ResourceService {
       const ownerId = assertId(String(bindingInput.ownerId || ""), "ownerId");
       const bindingPath = assertBindingPath(bindingInput.path);
       await this.#authorize(ownerType, ownerId, "write");
+      await this.extractor.preflight?.({ actor: this.actor, filename, mime });
       const createdSequence = Number(input?.createdSequence ?? 0);
       invariant(Number.isSafeInteger(createdSequence) && createdSequence >= 0, "RESOURCE_SEQUENCE_INVALID", "createdSequence 无效", { status: 400 });
 
@@ -375,6 +381,7 @@ export class ResourceService {
       const ownerId = assertId(String(bindingInput.ownerId || ""), "ownerId");
       const bindingPath = assertBindingPath(bindingInput.path);
       await this.#authorize(ownerType, ownerId, "write");
+      await this.extractor.preflight?.({ actor: this.actor, filename, mime });
       const createdSequence = Number(input?.createdSequence ?? 0);
       invariant(Number.isSafeInteger(createdSequence) && createdSequence >= 0, "RESOURCE_SEQUENCE_INVALID", "createdSequence 无效", { status: 400 });
 
@@ -520,7 +527,7 @@ export class ResourceService {
       });
       version = snapshot.data.versions.find((entry) => entry.id === versionId);
     } catch (error) {
-      return this.#setVersionProcessing(version.id, {
+      const failed = await this.#setVersionProcessing(version.id, {
         parseStatus: "failed",
         embeddingStatus: "pending",
         parserVersion: this.parserVersion,
@@ -528,6 +535,8 @@ export class ResourceService {
         parseError: publicFailureMessage(error),
         embeddingError: null,
       });
+      if (error?.code === "RESOURCE_OCR_NOT_CONFIGURED") throw error;
+      return failed;
     }
 
     try {
@@ -695,7 +704,88 @@ export class ResourceService {
     });
   }
 
+  async catalog(input = {}) {
+    const scope = normalizeScope(input.scope);
+    for (const collectionId of scope.collectionIds) await this.#authorize("collection", collectionId, "read");
+    if (scope.projectId) await this.#authorize("project", scope.projectId, "read");
+    if (scope.conversationId) await this.#authorize("conversation", scope.conversationId, "read");
+    const limit = Number(input.limit ?? 80);
+    invariant(Number.isSafeInteger(limit) && limit >= 1 && limit <= 200, "RESOURCE_CATALOG_LIMIT_INVALID", "文件概览数量无效", { status: 400 });
+    const snapshot = await this.#repository.read();
+    const groupedBindings = new Map();
+    for (const binding of snapshot.data.bindings.filter((entry) => bindingMatchesScope(entry, scope, Number.MAX_SAFE_INTEGER))) {
+      const values = groupedBindings.get(binding.resourceVersionId) || [];
+      values.push(binding);
+      groupedBindings.set(binding.resourceVersionId, values);
+    }
+    const items = [];
+    for (const version of snapshot.data.versions) {
+      if (items.length >= limit || !groupedBindings.has(version.id) || version.parseStatus !== "ready") continue;
+      const parsedEnvelope = await readJson(this.#actorFile(processingPath("parsed", version.id)), "RESOURCE_PARSED_OUTPUT_MISSING");
+      invariant(parsedEnvelope.resourceVersionId === version.id, "RESOURCE_PROCESSING_OUTPUT_MISMATCH", "资源处理结果与版本不匹配", { status: 500, expose: false });
+      const metadata = parsedEnvelope.content?.metadata || documentMetadata(parsedEnvelope.content?.text, version.filename);
+      items.push({
+        // These immutable identities are consumed only by the Work-context
+        // receipt filter. The model-facing catalog renderer removes them.
+        resourceId: version.resourceId,
+        resourceVersionId: version.id,
+        filename: version.filename,
+        title: String(metadata.title || "").slice(0, 160),
+        summary: String(metadata.summary || "").slice(0, 360),
+        keywords: (Array.isArray(metadata.keywords) ? metadata.keywords : []).map(String).slice(0, 10),
+        bindings: clone(groupedBindings.get(version.id)).map((binding) => ({ ownerType: binding.ownerType, ownerId: binding.ownerId, path: binding.path })),
+      });
+    }
+    return { revision: snapshot.revision, items };
+  }
+
+  async read(input = {}) {
+    const filename = String(input.filename || "").normalize("NFKC").trim();
+    invariant(filename.length >= 1 && filename.length <= 512, "RESOURCE_READ_FILENAME_INVALID", "直接读取需要文件概览中的精确文件名", { status: 400 });
+    const start = Number(input.start ?? 0);
+    invariant(Number.isSafeInteger(start) && start >= 0 && start <= 100_000_000, "RESOURCE_READ_OFFSET_INVALID", "文件读取位置无效", { status: 400 });
+    const scope = normalizeScope(input.scope);
+    for (const collectionId of scope.collectionIds) await this.#authorize("collection", collectionId, "read");
+    if (scope.projectId) await this.#authorize("project", scope.projectId, "read");
+    if (scope.conversationId) await this.#authorize("conversation", scope.conversationId, "read");
+    const snapshot = await this.#repository.read();
+    const groupedBindings = new Map();
+    for (const binding of snapshot.data.bindings.filter((entry) => bindingMatchesScope(entry, scope, Number.MAX_SAFE_INTEGER))) {
+      const values = groupedBindings.get(binding.resourceVersionId) || [];
+      values.push(binding);
+      groupedBindings.set(binding.resourceVersionId, values);
+    }
+    const results = [];
+    const modelImages = [];
+    for (const version of snapshot.data.versions) {
+      if (results.length >= 5 || version.parseStatus !== "ready" || !groupedBindings.has(version.id)) continue;
+      if (version.filename.normalize("NFKC") !== filename) continue;
+      const parsedEnvelope = await readJson(this.#actorFile(processingPath("parsed", version.id)), "RESOURCE_PARSED_OUTPUT_MISSING");
+      invariant(parsedEnvelope.resourceVersionId === version.id, "RESOURCE_PROCESSING_OUTPUT_MISMATCH", "资源处理结果与版本不匹配", { status: 500, expose: false });
+      const text = String(parsedEnvelope.content?.text || "");
+      const segment = text.slice(start, start + DIRECT_READ_CHARACTERS);
+      const nextOffset = start + segment.length < text.length ? start + segment.length : null;
+      results.push({
+        resourceVersionId: version.id,
+        resourceId: version.resourceId,
+        chunkId: `read_${start}`,
+        filename: version.filename,
+        text: segment,
+        nextOffset,
+        bindingIds: groupedBindings.get(version.id).map((binding) => binding.id),
+      });
+      const blob = snapshot.data.blobs.find((entry) => entry.id === version.blobId);
+      if (start === 0 && blob && blob.size <= MODEL_IMAGE_BYTES && MODEL_IMAGE_MIME.test(blob.mime)) {
+        const bytes = await fs.readFile(this.#actorFile(blob.storagePath));
+        modelImages.push({ filename: version.filename, mime: blob.mime, dataUrl: `data:${blob.mime};base64,${bytes.toString("base64")}` });
+      }
+    }
+    invariant(results.length > 0, "RESOURCE_FILE_NOT_FOUND", "当前文件范围内找不到该文件，或文件正文尚未解析完成", { status: 404 });
+    return { revision: snapshot.revision, results, modelImages };
+  }
+
   async search(input) {
+    await this.embedder.assertConfigured?.();
     const query = String(input?.query || "").trim();
     invariant(query.length > 0 && query.length <= 32768, "RESOURCE_QUERY_INVALID", "检索文本无效", { status: 400 });
     const scope = normalizeScope(input?.scope);
@@ -734,9 +824,17 @@ export class ResourceService {
       });
     }
     if (candidates.length === 0) return { revision: snapshot.revision, results: [] };
-    const rawResults = await this.embedder.search({ actor: this.actor, query, candidates: clone(candidates), limit });
+    const requiredAnchors = requiredExplicitQueryAnchors(query);
+    const eligibleCandidates = requiredAnchors.length
+      ? candidates.filter((candidate) => containsExplicitQueryAnchor(
+        `${candidate.filename}\n${String(candidate.parsed?.text || "")}`,
+        requiredAnchors,
+      ))
+      : candidates;
+    if (eligibleCandidates.length === 0) return { revision: snapshot.revision, results: [] };
+    const rawResults = await this.embedder.search({ actor: this.actor, query, candidates: clone(eligibleCandidates), limit });
     invariant(Array.isArray(rawResults), "RESOURCE_SEARCH_OUTPUT_INVALID", "Embedding 检索输出无效", { status: 500, expose: false });
-    const candidateMap = new Map(candidates.map((entry) => [entry.resourceVersionId, entry]));
+    const candidateMap = new Map(eligibleCandidates.map((entry) => [entry.resourceVersionId, entry]));
     const results = rawResults.slice(0, limit).map((entry) => {
       invariant(entry && typeof entry === "object" && candidateMap.has(entry.resourceVersionId), "RESOURCE_SEARCH_OUTPUT_INVALID", "检索结果引用了 Scope 外资源", {
         status: 500,

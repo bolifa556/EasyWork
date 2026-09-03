@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 
 import { invariant } from "../errors.mjs";
 
-export const TASK_COMMAND_TYPES = Object.freeze(["create", "start", "append", "interrupt", "resume"]);
+export const TASK_COMMAND_TYPES = Object.freeze(["create", "start", "append", "interrupt", "resume", "respondApproval", "respondInput"]);
 export const TASK_COMMAND_STATUSES = Object.freeze(["accepted", "running", "completed", "failed"]);
 
 const COMMAND_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
@@ -47,29 +47,19 @@ export function createCommandRecord({ taskId, commandId, type, fingerprint, cloc
   });
 }
 
-export function formatContextPrompt(delivery, goal) {
-  const sections = [];
-  for (const entry of delivery?.entries || []) {
-    const value = String(entry?.content?.value || "");
-    if (!value) continue;
-    sections.push(`<context kind="${String(entry.kind || "context")}" source="${String(entry.source?.type || "unknown")}">\n${value}\n</context>`);
-  }
-  if (sections.length === 0) return String(goal || "");
-  return `${sections.join("\n\n")}\n\n<task>\n${String(goal || "")}\n</task>`;
-}
-
 export function assertOrchestratorDependencies(dependencies) {
   const requiredMethods = {
-    taskStore: ["claimCommand", "getCommand", "updateCommand", "createTask", "getTask", "saveTask"],
+    taskStore: ["claimCommand", "getCommand", "updateCommand", "createTask", "getTask", "saveTask", "scanTasks", "listCommands"],
     runtime: ["launch", "loadBinding", "saveBinding"],
     transport: ["execute"],
-    contextHub: ["assemble", "deliveryForBinding", "acknowledge"],
+    contextHub: ["assemble", "deliveryForBinding", "deliveryForRebinding", "stageDeliveredKnowledge", "acknowledge"],
     journal: ["append"],
-    workspaceService: ["prepare"],
-    versionService: ["prepare", "recordFileChange", "finalize"],
+    workspaceService: ["prepare", "finalize"],
+    versionService: ["prepare", "recordFileChange", "finalize", "abandon"],
     artifactService: ["capture"],
     skillService: ["prepare"],
-    reportService: ["generate", "get"],
+    reportService: ["generate", "get", "recoverableFinal"],
+    prompts: ["remoteDelivery"],
   };
   for (const [name, methods] of Object.entries(requiredMethods)) {
     const service = dependencies?.[name];

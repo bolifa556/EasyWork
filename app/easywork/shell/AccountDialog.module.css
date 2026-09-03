@@ -31,6 +31,29 @@
 .inline { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 7px; }
 .select { min-height: 43px; padding: 8px 10px; border: 1px solid var(--ew-line-strong); border-radius: 11px; background: rgba(255,255,255,.48); color: var(--ew-ink); outline: 0; }
 .providerFooter { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; padding-top: 14px; border-top: 1px solid var(--ew-line); }
+.deleteConfirm { display: grid; gap: 20px; }
+.deleteConfirm p { margin: 0; color: var(--ew-ink-soft); line-height: 1.65; }
+.deleteActions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .saveAction { min-width: 88px; min-height: 38px; }
-.keyWrap { position: relative; }.keyWrap .input { padding-right: 80px; }.keyActions { position: absolute; top: 5px; right: 5px; display: flex; align-items: center; }.keyToggle { display: grid; width: 33px; height: 33px; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--ew-ink-muted); cursor: pointer; }.keyToggle:hover { background: rgba(70,72,62,.06); color: var(--ew-ink); }.keyToggle:disabled { cursor: wait; opacity: .65; }.spin { animation: spin 800ms linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
-@media (max-width: 600px) { .accountFrame { min-height: min(68dvh,520px); }.providerLayout { grid-template-columns: 1fr; }.providerNav { flex-direction: row; overflow-x: auto; padding: 0 0 10px; border-right: 0; border-bottom: 1px solid var(--ew-line); }.providerItem { width: auto; flex: 0 0 auto; }.profile { min-height: 0; grid-template-columns: 1fr; gap: 16px; }.avatarEditor { justify-items: start; grid-template-columns: auto auto; align-items: center; }.profileAvatar { width: 58px; height: 58px; }.profileAvatar > span { width: 23px; height: 23px; }.avatarAction { align-self: center; } }
+.keyWrap { position: relative; }.keyWrap .input { padding-right: 80px; }.storedSecretMask { position:absolute; left:13px; top:50%; transform:translateY(-50%); color:var(--ew-ink); font:inherit; letter-spacing:.08em; line-height:1; pointer-events:none; }.keyActions { position: absolute; top: 5px; right: 5px; display: flex; align-items: center; }.keyToggle { display: grid; width: 33px; height: 33px; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--ew-ink-muted); cursor: pointer; }.keyToggle:hover { background: rgba(70,72,62,.06); color: var(--ew-ink); }.keyToggle:disabled { cursor: default; opacity: .65; }.spin { animation: spin 800ms linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
+@media (max-width: 600px) {
+  .accountFrame { height: auto; min-height: 0; }
+  .accountTabs { margin-bottom: 12px; }
+  .tab { min-height: 40px; padding: 0 2px 8px; }
+  .providerLayout { grid-template-columns: 1fr; overflow: visible; }
+  .providerNav { flex-direction: row; overflow-x: auto; padding: 0 0 10px; border-right: 0; border-bottom: 1px solid var(--ew-line); scrollbar-width: none; }
+  .providerNav::-webkit-scrollbar { display: none; }
+  .providerItem { width: auto; min-height: var(--ew-mobile-touch); flex: 0 0 auto; }
+  .providerForm { overflow: visible; }
+  .profile { min-height: 0; grid-template-columns: 1fr; grid-template-rows: auto auto; align-content: start; gap: 16px; padding-top: 10px; }
+  .avatarEditor { justify-items: start; grid-template-columns: auto auto; align-items: center; }
+  .profileAvatar { width: 58px; height: 58px; }
+  .profileAvatar > span { width: 23px; height: 23px; }
+  .avatarAction { min-height: 40px; align-self: center; }
+  .profileBody { justify-content: flex-start; }
+  .profileActions { margin-top: 4px; }
+  .input,
+  .select { min-height: var(--ew-mobile-touch); }
+  .keyToggle { width: 40px; height: 40px; }
+  .deleteActions button { min-height: var(--ew-mobile-touch); }
+}

@@ -57,6 +57,7 @@ function services(dataRoot, overrides = {}) {
     platform,
     detector: overrides.detector,
     clock: overrides.clock,
+    detectionCacheTtlMs: overrides.detectionCacheTtlMs,
   });
   return { platform, providers };
 }
@@ -75,7 +76,15 @@ async function configurePlatformProvider(platform, admin, purpose, revision, com
         batchSize: 24,
         hybridEnabled: true,
       }
-    : {
+    : purpose === "ocr"
+      ? {
+          name: "平台 OCR",
+          baseUrl: "https://models.example.test/v1/",
+          protocol: "chat-completions",
+          model: "qwen-vl-ocr",
+          maxOutputTokens: 6144,
+        }
+      : {
         name: purpose === "web" ? "网页公共模型" : "Agent 公共模型",
         baseUrl: "https://models.example.test/v1/",
         protocol: "auto",
@@ -89,7 +98,7 @@ async function configurePlatformProvider(platform, admin, purpose, revision, com
   });
 }
 
-test("平台配置只有管理员可查看和修改，默认三类 Provider 与 SSH 策略分属平台 scope", async () => {
+test("平台配置只有管理员可查看和修改，默认四类 Provider 与 SSH 策略分属平台 scope", async () => {
   await fixture(async (dataRoot) => {
     const { platform } = services(dataRoot);
     const admin = actor("admin_platform", ["admin"]);
@@ -97,10 +106,12 @@ test("平台配置只有管理员可查看和修改，默认三类 Provider 与 
     await assert.rejects(() => platform.inspect(ordinary), (error) => error?.code === "ROLE_REQUIRED");
     const snapshot = await platform.inspect(admin);
     assert.equal(snapshot.revision, 0);
-    assert.deepEqual(Object.keys(snapshot.providers), ["web", "agent", "embedding"]);
+    assert.deepEqual(Object.keys(snapshot.providers), ["web", "agent", "embedding", "ocr"]);
     assert.equal(snapshot.providers.web.scope, "platform");
     assert.equal(snapshot.providers.agent.id, PLATFORM_PROVIDER_IDS.agent);
     assert.equal(snapshot.providers.embedding.embedding.model, "");
+    assert.equal(snapshot.providers.ocr.ocr.model, "");
+    assert.equal(snapshot.providers.ocr.protocol, "chat-completions");
     assert.equal(snapshot.ssh.idleTtlMinutes, 43_200);
   });
 });
@@ -169,6 +180,53 @@ test("Embedding 只有平台配置，保留模型和分块 profile；用户 Prov
       modelId: "qwen3-embedding",
       requireModel: true,
     }), (error) => error?.code === "EMBEDDING_PLATFORM_ONLY");
+  });
+});
+
+test("OCR 只有管理员可配置，并保留视觉模型与输出限制", async () => {
+  await fixture(async (dataRoot) => {
+    const { platform, providers } = services(dataRoot);
+    const admin = actor("admin_ocr", ["admin"]);
+    const user = actor("user_ocr");
+    const result = await configurePlatformProvider(platform, admin, "ocr", 0, "command-ocr-0001");
+    assert.equal(result.provider.configured, true);
+    assert.deepEqual(result.provider.ocr, { model: "qwen-vl-ocr", maxOutputTokens: 6144 });
+    assert.deepEqual((await providers.listAvailableProviders(user, "ocr")).map((entry) => entry.id), [PLATFORM_PROVIDER_IDS.ocr]);
+    await assert.rejects(() => providers.resolve(user, {
+      providerId: "provider_private",
+      purpose: "ocr",
+      modelId: "qwen-vl-ocr",
+      requireModel: true,
+    }), (error) => error?.code === "OCR_PLATFORM_ONLY");
+  });
+});
+
+test("OCR 可切换到 MinerU 文档解析协议，其他 Provider 不能误用", async () => {
+  await fixture(async (dataRoot) => {
+    const { platform } = services(dataRoot);
+    const admin = actor("admin_mineru", ["admin"]);
+    const result = await platform.updateProvider(admin, {
+      purpose: "ocr",
+      patch: {
+        name: "MinerU 文档解析",
+        baseUrl: "https://api.example.test/",
+        protocol: "mineru",
+        model: "mineru",
+        maxOutputTokens: 4096,
+      },
+      apiKey: "sk-mineru-platform-secret",
+      expectedRevision: 0,
+      commandId: "command-mineru-ocr-0001",
+    });
+    assert.equal(result.provider.protocol, "mineru");
+    assert.equal(result.provider.baseUrl, "https://api.example.test");
+    assert.equal((await platform.resolveProvider("ocr")).credential.protocol, "mineru");
+    await assert.rejects(() => platform.updateProvider(admin, {
+      purpose: "web",
+      patch: { name: "错误协议", baseUrl: "https://api.example.test", protocol: "mineru" },
+      expectedRevision: result.revision,
+      commandId: "command-mineru-web-0001",
+    }), (error) => error?.code === "PROVIDER_PROTOCOL_INVALID");
   });
 });
 
@@ -306,23 +364,85 @@ test("OpenAI-compatible 模型检测生成能力 descriptor，不在响应中泄
   assert.equal(JSON.stringify(descriptors).includes("sk-detector-secret"), false);
 });
 
-test("Provider 检测按用途过滤；Embedding 模型检测只允许管理员", async () => {
+test("OpenAI-compatible 模型检测允许只填写服务根地址，并仅在路由不存在时兼容 /models", async () => {
+  const preferredRequests = [];
+  const preferred = new OpenAICompatibleModelDetector({
+    fetchImpl: async (url) => {
+      preferredRequests.push(String(url));
+      return { ok: true, status: 200, json: async () => ({ data: [{ id: "root-model" }] }) };
+    },
+  });
+  assert.deepEqual((await preferred.detect({ baseUrl: "http://211.86.151.186:8000", apiKey: "root-secret" })).map((model) => model.id), ["root-model"]);
+  assert.deepEqual(preferredRequests, ["http://211.86.151.186:8000/v1/models"]);
+
+  const fallbackRequests = [];
+  const legacy = new OpenAICompatibleModelDetector({
+    fetchImpl: async (url) => {
+      fallbackRequests.push(String(url));
+      if (String(url).endsWith("/v1/models")) return { ok: false, status: 404 };
+      return { ok: true, status: 200, json: async () => ({ data: [{ id: "legacy-model" }] }) };
+    },
+  });
+  assert.deepEqual((await legacy.detect({ baseUrl: "https://legacy.example", apiKey: "legacy-secret" })).map((model) => model.id), ["legacy-model"]);
+  assert.deepEqual(fallbackRequests, ["https://legacy.example/v1/models", "https://legacy.example/models"]);
+});
+
+test("OpenAI-compatible 模型检测有明确超时，不会让配置页无限等待", async () => {
+  const detector = new OpenAICompatibleModelDetector({
+    timeoutMs: 15,
+    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+    }),
+  });
+  await assert.rejects(
+    () => detector.detect({ baseUrl: "https://slow.example", apiKey: "slow-secret" }),
+    (error) => error?.code === "PROVIDER_DETECTION_TIMEOUT",
+  );
+});
+
+test("Provider 模型检测合并同一配置的并发读取并短时复用结果", async () => {
+  await fixture(async (dataRoot) => {
+    let calls = 0;
+    const detector = {
+      async detect() {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return [{ id: "cached-chat", purposes: ["web"], capabilities: {} }];
+      },
+    };
+    const { platform, providers } = services(dataRoot, { detector, detectionCacheTtlMs: 60_000 });
+    const admin = actor("admin_cached_detection", ["admin"]);
+    const user = actor("user_cached_detection");
+    await configurePlatformProvider(platform, admin, "web", 0, "command-cached-detect-web-0001");
+    const request = { providerId: PLATFORM_PROVIDER_IDS.web, purpose: "web" };
+    const [left, right] = await Promise.all([providers.detectModels(user, request), providers.detectModels(user, request)]);
+    const third = await providers.detectModels(user, request);
+    assert.equal(calls, 1);
+    assert.deepEqual(left.models.map((model) => model.id), ["cached-chat"]);
+    assert.deepEqual(right.models, left.models);
+    assert.deepEqual(third.models, left.models);
+  });
+});
+
+test("Provider 检测按用途过滤；Embedding 与 OCR 模型检测只允许管理员", async () => {
   await fixture(async (dataRoot) => {
     const detector = {
       detect: async () => [
         { id: "chat", name: "Chat", purposes: ["web", "agent"], capabilities: {} },
         { id: "embed", name: "Embed", purposes: ["embedding"], capabilities: {} },
+        { id: "vision", name: "Vision", purposes: ["web", "agent", "ocr"], capabilities: { vision: true } },
       ],
     };
     const { platform, providers } = services(dataRoot, { detector });
     const admin = actor("admin_detect", ["admin"]);
     const user = actor("user_detect");
     const web = await configurePlatformProvider(platform, admin, "web", 0, "command-detect-web-0001");
-    await configurePlatformProvider(platform, admin, "embedding", web.revision, "command-detect-embed-0001");
+    const embedding = await configurePlatformProvider(platform, admin, "embedding", web.revision, "command-detect-embed-0001");
+    await configurePlatformProvider(platform, admin, "ocr", embedding.revision, "command-detect-ocr-0001");
     assert.deepEqual((await providers.detectModels(user, {
       providerId: PLATFORM_PROVIDER_IDS.web,
       purpose: "web",
-    })).models.map((entry) => entry.id), ["chat"]);
+    })).models.map((entry) => entry.id), ["chat", "vision"]);
     await assert.rejects(() => providers.detectModels(user, {
       providerId: PLATFORM_PROVIDER_IDS.embedding,
       purpose: "embedding",
@@ -336,6 +456,14 @@ test("Provider 检测按用途过滤；Embedding 模型检测只允许管理员"
       baseUrl: "https://draft-embedding.example/v1",
       apiKey: "sk-draft-embedding",
     })).models.map((entry) => entry.id), ["embed"]);
+    await assert.rejects(() => providers.detectModels(user, {
+      providerId: PLATFORM_PROVIDER_IDS.ocr,
+      purpose: "ocr",
+    }), (error) => error?.code === "ROLE_REQUIRED");
+    assert.deepEqual((await providers.detectModels(admin, {
+      providerId: PLATFORM_PROVIDER_IDS.ocr,
+      purpose: "ocr",
+    })).models.map((entry) => entry.id), ["vision"]);
     await assert.rejects(() => providers.detectModelsFromDraft(user, {
       purpose: "embedding",
       baseUrl: "https://draft-embedding.example/v1",
@@ -520,4 +648,8 @@ test("模型检测网络与响应失败返回稳定错误且不回显密钥", as
   ));
   const invalid = new OpenAICompatibleModelDetector({ fetchImpl: async () => ({ ok: true, json: async () => ({ unexpected: [] }) }) });
   await assert.rejects(() => invalid.detect({ baseUrl: "https://invalid.example/v1", apiKey: "sk-invalid-response" }), (error) => error?.code === "PROVIDER_DETECTION_INVALID_RESPONSE");
+  const unauthorized = new OpenAICompatibleModelDetector({ fetchImpl: async () => ({ ok: false, status: 401 }) });
+  await assert.rejects(() => unauthorized.detect({ baseUrl: "https://unauthorized.example", apiKey: "wrong-key" }), (error) => (
+    error?.code === "PROVIDER_DETECTION_FAILED" && error?.expose === true && /API Key/.test(error.message)
+  ));
 });

@@ -42,6 +42,7 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
   const [showKey, setShowKey] = useState(false);
   const [keyDirty, setKeyDirty] = useState(false);
   const [revealingKey, setRevealingKey] = useState(false);
+  const [providerPendingDelete, setProviderPendingDelete] = useState<Provider | null>(null);
   const revealTimer = useRef<number | null>(null);
   const keyDirtyRef = useRef(false);
   const [profileRevision, setProfileRevision] = useState(0);
@@ -71,6 +72,7 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
 
   const selectProvider = (provider: Provider | null, id: string) => {
     if (revealTimer.current) window.clearTimeout(revealTimer.current);
+    setError(null);
     setSelectedId(id);
     setDraft(provider
       ? { name: provider.name, baseUrl: provider.baseUrl, apiKey: "" }
@@ -170,13 +172,16 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
   };
 
   const removeProvider = async () => {
-    if (!selectedId || selectedId === "new" || !window.confirm("删除这个 API 配置？")) return;
+    if (!providerPendingDelete) return;
     setBusy(true);
+    setError(null);
     try {
-      await runtime.api.delete(`/api/providers/${selectedId}`, { body: {}, expectedRevision: providerRevision, idempotencyKey: commandId("provider-delete") });
+      await runtime.api.delete(`/api/providers/${providerPendingDelete.id}`, { body: {}, expectedRevision: providerRevision, idempotencyKey: commandId("provider-delete") });
+      setProviderPendingDelete(null);
       await loadProviders(null);
+      runtime.notify("模型 API 已删除", "success");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "删除失败"); }
-    finally { setBusy(false); }
+    finally { setProviderPendingDelete(null); setBusy(false); }
   };
 
   const chooseAvatar = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -208,12 +213,23 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
     finally { setBusy(false); }
   };
 
+  const selectedProvider = providers.find((item) => item.id === selectedId) ?? null;
+  const providerChanged = selectedId === "new"
+    ? Boolean(draft.name.trim() || draft.baseUrl.trim() || draft.apiKey)
+    : Boolean(selectedProvider && (
+      draft.name.trim() !== selectedProvider.name
+      || draft.baseUrl.trim() !== selectedProvider.baseUrl
+      || keyDirty
+    ));
+  const showStoredKeyMask = Boolean(selectedProvider?.hasKey && !showKey && !keyDirty);
+
   return (
+    <>
     <Modal title={authenticated ? "账号设置" : "登录 EasyWork"} size={authenticated ? "normal" : "compact"} onClose={onClose}>
       {authenticated ? (
         <div className={styles.accountFrame}>
           <div className={styles.accountTabs}>
-            <button className={`${styles.tab} ${accountTab === "profile" ? styles.active : ""}`} onClick={() => setAccountTab("profile")}>个人资料</button>
+            <button className={`${styles.tab} ${accountTab === "profile" ? styles.active : ""}`} onClick={() => { setError(null); setAccountTab("profile"); }}>个人资料</button>
             <button className={`${styles.tab} ${accountTab === "providers" ? styles.active : ""}`} onClick={() => void openProviders()}>模型 API</button>
           </div>
           {accountTab === "profile" ? <div className={styles.profile}>
@@ -223,7 +239,7 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
               <span className={styles.profileSpacer} />
               {error ? <div className={styles.error}>{error}</div> : null}
             </div>
-            <div className={styles.profileActions}><Button variant="danger" icon={<LogOut size={16} />} onClick={() => void runtime.logout().then(onClose)}>退出登录</Button><Button className={styles.saveAction} variant="primary" disabled={busy || profileName.trim().length < 2} icon={<Save size={16} />} onClick={() => void saveProfile()}>{busy ? "保存中" : "保存"}</Button></div>
+            <div className={styles.profileActions}><Button variant="danger" icon={<LogOut size={16} />} onClick={() => void runtime.logout().then(onClose)}>退出登录</Button><Button className={styles.saveAction} variant="primary" disabled={busy || profileName.trim().length < 2 || profileName.trim() === actor.username} icon={<Save size={16} />} onClick={() => void saveProfile()}>{busy ? "保存中" : "保存"}</Button></div>
           </div> : <div className={styles.providerLayout}>
             <aside className={styles.providerNav}>
               {providers.map((provider) => <button key={provider.id} className={`${styles.providerItem} ${selectedId === provider.id ? styles.active : ""}`} onClick={() => selectProvider(provider, provider.id)}><span>{provider.name}</span></button>)}
@@ -233,9 +249,9 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
               {selectedId ? <>
                 <label className={styles.field}><span>API 名称</span><input className={styles.input} value={draft.name} onChange={(event) => setDraft((value) => ({ ...value, name: event.target.value }))} /></label>
                 <label className={styles.field}><span>API URL</span><input className={styles.input} value={draft.baseUrl} placeholder="https://api.example.com" onChange={(event) => setDraft((value) => ({ ...value, baseUrl: event.target.value }))} /></label>
-                <label className={styles.field}><span>API Key</span><div className={styles.keyWrap}><input className={styles.input} type={showKey ? "text" : "password"} value={draft.apiKey} placeholder={selectedId === "new" ? "输入 API Key" : providers.find((item) => item.id === selectedId)?.maskedKey || "保持现有 Key"} onChange={(event) => changeApiKey(event.target.value)} /><div className={styles.keyActions}>{showKey && draft.apiKey ? <button className={styles.keyToggle} type="button" aria-label="复制 API Key" onClick={() => void copyKey()}><Copy size={16} /></button> : null}<button className={styles.keyToggle} type="button" aria-label={showKey ? "隐藏 API Key" : "显示 API Key"} disabled={revealingKey} onClick={() => void toggleKey()}>{revealingKey ? <LoaderCircle className={styles.spin} size={16} /> : showKey ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></div></label>
+                <label className={styles.field}><span>API Key</span><div className={styles.keyWrap}><input className={styles.input} autoComplete="new-password" type={showKey ? "text" : "password"} value={draft.apiKey} placeholder={selectedId === "new" || !selectedProvider?.hasKey ? "输入 API Key" : ""} onChange={(event) => changeApiKey(event.target.value)} />{showStoredKeyMask ? <span className={styles.storedSecretMask} aria-hidden="true">••••••••••••</span> : null}<div className={styles.keyActions}>{showKey && draft.apiKey ? <button className={styles.keyToggle} type="button" aria-label="复制 API Key" onClick={() => void copyKey()}><Copy size={16} /></button> : null}<button className={styles.keyToggle} type="button" aria-label={showKey ? "隐藏 API Key" : "显示 API Key"} disabled={revealingKey} onClick={() => void toggleKey()}>{revealingKey ? <LoaderCircle className={styles.spin} size={16} /> : showKey ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></div></label>
                 {error ? <div className={styles.error}>{error}</div> : null}
-                <div className={styles.providerFooter}>{selectedId !== "new" ? <Button variant="danger" icon={<Trash2 size={15} />} onClick={() => void removeProvider()}>删除</Button> : <span />}<Button className={styles.saveAction} variant="primary" disabled={busy || !draft.name.trim() || !draft.baseUrl.trim() || (selectedId === "new" && !draft.apiKey)} onClick={() => void saveProvider()}>{busy ? "保存中" : "保存"}</Button></div>
+                <div className={styles.providerFooter}>{selectedId !== "new" ? <Button variant="danger" icon={<Trash2 size={15} />} onClick={() => selectedProvider && setProviderPendingDelete(selectedProvider)}>删除</Button> : <span />}<Button className={styles.saveAction} variant="primary" disabled={busy || !providerChanged || !draft.name.trim() || !draft.baseUrl.trim() || ((selectedId === "new" || keyDirty) && !draft.apiKey)} onClick={() => void saveProvider()}>{busy ? "保存中" : "保存"}</Button></div>
               </> : <div>选择一个 API，或新建配置。</div>}
             </section>
           </div>}
@@ -252,5 +268,15 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
         </>
       )}
     </Modal>
+    {providerPendingDelete ? <Modal title="删除 API 配置？" size="compact" onClose={() => { if (!busy) setProviderPendingDelete(null); }}>
+      <div className={styles.deleteConfirm}>
+        <p>“{providerPendingDelete.name}”将从账号中删除，此操作无法撤销。</p>
+        <div className={styles.deleteActions}>
+          <Button disabled={busy} onClick={() => setProviderPendingDelete(null)}>取消</Button>
+          <Button variant="danger" disabled={busy} icon={busy ? <LoaderCircle className={styles.spin} size={15} /> : <Trash2 size={15} />} onClick={() => void removeProvider()}>{busy ? "正在删除" : "删除"}</Button>
+        </div>
+      </div>
+    </Modal> : null}
+    </>
   );
 }

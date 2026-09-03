@@ -45,3 +45,10 @@
 .compact { min-height: 30px; padding: 5px 9px; border-radius: 9px; font-size: 0.84rem; }
 .iconOnly { width: 36px; padding-inline: 0; }
 .compact.iconOnly { width: 30px; }
+
+@media (max-width: 720px) {
+  .button { min-height: var(--ew-mobile-touch); }
+  .compact { min-height: var(--ew-mobile-touch-compact); }
+  .iconOnly { width: var(--ew-mobile-touch); }
+  .compact.iconOnly { width: var(--ew-mobile-touch-compact); }
+}

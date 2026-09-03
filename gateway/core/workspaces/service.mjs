@@ -16,10 +16,12 @@ import {
   assertWorkspaceStore,
   canonicalWorkspacePath,
   createSwitchDescriptorId,
+  createVirtualWorkspaceId,
   createWorkspaceBindingKey,
   createWorkspaceId,
 } from "./contract.mjs";
 import { assertId, assertServerIdentity } from "../entities/common.mjs";
+import { versionDomainId as deriveVersionDomainId } from "../versioning/contract.mjs";
 
 const clone = (value) => structuredClone(value);
 const inlineQueue = Object.freeze({ run: async (_actor, operation) => operation() });
@@ -45,12 +47,6 @@ function workspaceRemoteRef(workspaceId) {
 
 function routeKey(conversationId, branchId) {
   return `${assertId(conversationId, "conversationId")}:${assertId(branchId, "branchId")}`;
-}
-
-function overlapResolutions(risk) {
-  if (!risk) return [];
-  const containing = (risk.relationships || []).filter((entry) => entry.relationship === "contained_by");
-  return containing.length === 1 ? ["reuse-containing-domain", "cancel"] : ["cancel"];
 }
 
 export class WorkspaceService {
@@ -99,14 +95,89 @@ export class WorkspaceService {
       .map(clone);
   }
 
+  async forgetConversations({ conversationIds = [], serverIdentity: serverIdentityValue } = {}, options = {}) {
+    const deleted = new Set((Array.isArray(conversationIds) ? conversationIds : [])
+      .map((value) => assertId(value, "conversationId")));
+    const serverIdentity = assertServerIdentity(serverIdentityValue);
+    const beforeCommit = options?.beforeCommit;
+    invariant(beforeCommit === undefined || typeof beforeCommit === "function", "WORKSPACE_CLEANUP_CALLBACK_INVALID", "工作区清理回调无效", { status: 500, expose: false });
+    if (!deleted.size) {
+      return {
+        removedBindings: [],
+        removedRoutes: [],
+        removedWorkspaces: [],
+        retainedInheritedWorkspaces: [],
+        protectedWorkspaceIds: [],
+      };
+    }
+    return this.queue.run(this.actor, async () => {
+      const current = await this.repository.read();
+      const draft = clone(current.data);
+      const removedBindings = draft.bindings.filter((binding) => (
+        binding.serverIdentity === serverIdentity && deleted.has(binding.conversationId)
+      ));
+      const removedBindingIds = new Set(removedBindings.map((binding) => binding.id));
+      const workspacesTouchedByRemovedBindings = new Set(removedBindings.map((binding) => binding.workspaceId));
+      const removedRoutes = draft.routes.filter((route) => removedBindingIds.has(route.bindingId));
+      draft.bindings = draft.bindings.filter((binding) => !removedBindingIds.has(binding.id));
+      draft.routes = draft.routes.filter((route) => !removedBindingIds.has(route.bindingId));
+
+      const referencedWorkspaceIds = new Set(draft.bindings
+        .filter((binding) => binding.serverIdentity === serverIdentity)
+        .map((binding) => binding.workspaceId));
+      const ownedByDeletedConversation = (workspace) => deleted.has(
+        String(workspace.canonicalPath || "")
+          .split("/")
+          .find((segment) => deleted.has(segment)) || "",
+      );
+      const removedWorkspaces = draft.workspaces.filter((workspace) => (
+        workspace.serverIdentity === serverIdentity
+          && workspace.kind === "virtual"
+          && (ownedByDeletedConversation(workspace) || workspacesTouchedByRemovedBindings.has(workspace.id))
+          && !referencedWorkspaceIds.has(workspace.id)
+      ));
+      const removedWorkspaceIds = new Set(removedWorkspaces.map((workspace) => workspace.id));
+      const retainedInheritedWorkspaces = draft.workspaces.filter((workspace) => (
+        workspace.serverIdentity === serverIdentity
+          && workspace.kind === "virtual"
+          && (ownedByDeletedConversation(workspace) || workspacesTouchedByRemovedBindings.has(workspace.id))
+          && referencedWorkspaceIds.has(workspace.id)
+      ));
+      draft.workspaces = draft.workspaces.filter((workspace) => !removedWorkspaceIds.has(workspace.id));
+
+      // Workspace commands are idempotency receipts, not user history. Once a
+      // conversation is tombstoned, receipts whose result still embeds that
+      // conversation would otherwise keep an unreachable control-plane graph
+      // alive forever.
+      draft.commands = draft.commands.filter((entry) => {
+        const serialized = JSON.stringify(entry?.result || null);
+        return ![...deleted].some((conversationId) => serialized.includes(conversationId));
+      });
+      const cleanup = {
+        removedBindings: removedBindings.map(clone),
+        removedRoutes: removedRoutes.map(clone),
+        removedWorkspaces: removedWorkspaces.map(clone),
+        retainedInheritedWorkspaces: retainedInheritedWorkspaces.map(clone),
+        protectedWorkspaceIds: [...referencedWorkspaceIds].sort(),
+      };
+      // Remote cleanup is deliberately inside the same Actor mutation lock and
+      // before the local registry commit. If SSH drops midway, a retry still
+      // sees the binding/workspace plan (including a virtual workspace whose
+      // canonical owner was an already-deleted parent conversation). Route
+      // changes in a surviving derived conversation cannot race this decision.
+      if (beforeCommit) await beforeCommit(clone(cleanup));
+      await this.repository.replace(draft, { expectedRevision: current.revision, clock: this.clock });
+      return cleanup;
+    });
+  }
+
   async createVirtual(input) {
     const conversationId = await this.#authorize(input?.conversationId, "write");
     const serverIdentity = assertServerIdentity(input?.serverIdentity);
     const commandId = assertCommandId(input?.commandId);
     assertExpectedEntityRevision(input?.expectedRevision, { create: true });
     const branchId = assertId(input?.branchId || "main", "branchId");
-    const idSeed = `virtual:${this.actor.actorId}:${serverIdentity}:${conversationId}:${branchId}`;
-    const id = input?.workspaceId ? assertId(input.workspaceId, "workspaceId") : `ws_${crypto.createHash("sha256").update(idSeed).digest("hex").slice(0, 24)}`;
+    const id = input?.workspaceId ? assertId(input.workspaceId, "workspaceId") : createVirtualWorkspaceId({ actorId: this.actor.actorId, serverIdentity, conversationId, branchId });
     const remoteRelative = `workspaces/${this.actor.actorId}/${conversationId}/${id}`;
     const canonicalPath = assertRemoteControlPath(await this.remoteControl.resolveEasyWork(remoteRelative), "virtualWorkspacePath");
     const remoteRef = workspaceRemoteRef(id);
@@ -114,7 +185,6 @@ export class WorkspaceService {
     return this.#command("workspace.create-virtual", commandId, { conversationId, branchId, serverIdentity, id }, async (draft) => {
       const existing = draft.workspaces.find((entry) => entry.id === id || (entry.kind === "virtual" && entry.serverIdentity === serverIdentity && entry.canonicalPath === canonicalPath));
       if (existing) return { created: false, reused: true, workspace: clone(existing) };
-      await this.remoteControl.ensureDirectory(canonicalPath);
       const createdAt = nowIso(this.clock);
       const workspace = {
         schemaVersion: WORKSPACE_SCHEMA_VERSION,
@@ -124,31 +194,17 @@ export class WorkspaceService {
         kind: "virtual",
         canonicalPath,
         remoteRef,
-        versionDomainId: null,
         revision: 0,
         createdAt,
         updatedAt: createdAt,
       };
-      await this.#writeRemoteWorkspace(workspace);
+      await Promise.all([
+        this.remoteControl.ensureDirectory(canonicalPath),
+        this.#writeRemoteWorkspace(workspace),
+      ]);
       draft.workspaces.push(workspace);
       return { created: true, reused: false, workspace: clone(workspace) };
     });
-  }
-
-  async assessUserWorkspace(input) {
-    await this.#authorize(input?.conversationId, "read");
-    const serverIdentity = assertServerIdentity(input?.serverIdentity);
-    const canonicalPath = await this.#canonicalUserPath(input?.path);
-    const state = await this.repository.read();
-    const exact = state.data.workspaces.find((entry) => entry.kind === "user" && entry.serverIdentity === serverIdentity && entry.canonicalPath === canonicalPath) || null;
-    const versionAssessment = await this.versioning.assessWorkspace({ actorId: this.actor.actorId, serverIdentity, rootPath: canonicalPath });
-    return {
-      canonicalPath,
-      exactWorkspace: exact ? clone(exact) : null,
-      overlapRisk: clone(versionAssessment.risk),
-      canCreate: Boolean(exact || versionAssessment.canCreate),
-      allowedResolutions: overlapResolutions(versionAssessment.risk),
-    };
   }
 
   async registerUserWorkspace(input) {
@@ -157,32 +213,9 @@ export class WorkspaceService {
     const commandId = assertCommandId(input?.commandId);
     assertExpectedEntityRevision(input?.expectedRevision, { create: true });
     const canonicalPath = await this.#canonicalUserPath(input?.path);
-    const overlapPolicy = input?.overlapPolicy == null ? null : String(input.overlapPolicy);
-    invariant([null, "reuse-containing-domain"].includes(overlapPolicy), "WORKSPACE_OVERLAP_POLICY_INVALID", "工作区重叠处理方式无效", { status: 400 });
-
-    return this.#command("workspace.register-user", commandId, { conversationId, serverIdentity, canonicalPath, overlapPolicy }, async (draft) => {
+    return this.#command("workspace.register-user", commandId, { conversationId, serverIdentity, canonicalPath }, async (draft) => {
       const existing = draft.workspaces.find((entry) => entry.kind === "user" && entry.serverIdentity === serverIdentity && entry.canonicalPath === canonicalPath);
-      if (existing) return { created: false, reused: true, workspace: clone(existing), overlapRisk: null };
-      const assessment = await this.versioning.assessWorkspace({ actorId: this.actor.actorId, serverIdentity, rootPath: canonicalPath });
-      if (assessment.risk && !overlapPolicy) {
-        invariant(false, "WORKSPACE_OVERLAP_CONFIRMATION_REQUIRED", "工作区与已有工作区重叠，需要选择共享版本域或取消", {
-          status: 409,
-          details: { risk: assessment.risk, allowedResolutions: overlapResolutions(assessment.risk) },
-        });
-      }
-      if (overlapPolicy) {
-        invariant(overlapResolutions(assessment.risk).includes(overlapPolicy), "WORKSPACE_OVERLAP_POLICY_UNAVAILABLE", "当前重叠关系不能共享已有版本域", {
-          status: 409,
-          details: { risk: assessment.risk, allowedResolutions: overlapResolutions(assessment.risk) },
-        });
-      }
-      const opened = await this.versioning.openDomain({
-        actorId: this.actor.actorId,
-        serverIdentity,
-        rootPath: canonicalPath,
-        mode: "real",
-      }, overlapPolicy ? { overlapPolicy: "reuse-containing" } : {});
-      invariant(opened.state, "WORKSPACE_VERSION_DOMAIN_UNAVAILABLE", "无法为工作区建立隔离版本域", { status: 409, details: { risk: opened.risk } });
+      if (existing) return { created: false, reused: true, workspace: clone(existing) };
       const id = createWorkspaceId({ actorId: this.actor.actorId, serverIdentity, canonicalPath, kind: "user" });
       const createdAt = nowIso(this.clock);
       const workspace = {
@@ -193,14 +226,13 @@ export class WorkspaceService {
         kind: "user",
         canonicalPath,
         remoteRef: workspaceRemoteRef(id),
-        versionDomainId: opened.state.versionDomainId,
         revision: 0,
         createdAt,
         updatedAt: createdAt,
       };
       await this.#writeRemoteWorkspace(workspace);
       draft.workspaces.push(workspace);
-      return { created: true, reused: false, workspace: clone(workspace), overlapRisk: clone(opened.risk) };
+      return { created: true, reused: false, workspace: clone(workspace) };
     });
   }
 
@@ -356,104 +388,6 @@ export class WorkspaceService {
     });
   }
 
-  async describeDynamicWrite(input) {
-    const conversationId = await this.#authorize(input?.conversationId, "read");
-    const branchId = assertId(input?.branchId || "main", "branchId");
-    const agentId = assertId(input?.agentId, "agentId");
-    const serverIdentity = assertServerIdentity(input?.serverIdentity);
-    const contextEpoch = Number(input?.contextEpoch ?? 0);
-    invariant(Number.isSafeInteger(contextEpoch) && contextEpoch >= 0, "WORKSPACE_CONTEXT_EPOCH_INVALID", "contextEpoch 无效", { status: 400 });
-    const targetKind = input?.targetKind || "directory";
-    invariant(["file", "directory"].includes(targetKind), "WORKSPACE_DYNAMIC_TARGET_KIND_INVALID", "动态写入目标类型无效", { status: 400 });
-    const canonicalTargetPath = await this.#canonicalUserPath(input?.targetPath);
-    const canonicalRootPath = targetKind === "file" ? path.posix.dirname(canonicalTargetPath) : canonicalTargetPath;
-    const state = await this.repository.read();
-    const workspace = state.data.workspaces.find((entry) => entry.kind === "dynamic" && entry.serverIdentity === serverIdentity && entry.canonicalPath === canonicalRootPath) || null;
-    const bindingKey = workspace ? createWorkspaceBindingKey({
-      actorId: this.actor.actorId,
-      serverIdentity,
-      conversationId,
-      branchId,
-      workspaceId: workspace.id,
-      agentId,
-      contextEpoch,
-    }) : null;
-    const binding = bindingKey ? state.data.bindings.find((entry) => entry.bindingKey === bindingKey) || null : null;
-    const assessment = await this.versioning.assessWorkspace({ actorId: this.actor.actorId, serverIdentity, rootPath: canonicalRootPath });
-    const core = {
-      conversationId,
-      branchId,
-      agentId,
-      serverIdentity,
-      contextEpoch,
-      targetPath: canonicalTargetPath,
-      canonicalTargetPath,
-      canonicalRootPath,
-      targetKind,
-      workspaceId: workspace?.id ?? null,
-      bindingId: binding?.id ?? null,
-    };
-    return {
-      id: createSwitchDescriptorId(core),
-      ...core,
-      requiresConfirmation: !binding,
-      reusesNativeAgentSession: Boolean(binding?.nativeSessionId),
-      lastDeliverySequence: binding?.lastDeliverySequence ?? 0,
-      overlapRisk: clone(assessment.risk),
-      explanation: "动态写入只授权当前目标目录；同一对话、Agent 和目录再次写入时复用原生会话与版本域。",
-    };
-  }
-
-  async confirmDynamicWrite(input) {
-    await this.#authorize(input?.conversationId, "write");
-    const commandId = assertCommandId(input?.commandId);
-    const replay = await this.#readCommandReplay("workspace.confirm-dynamic-write", commandId, {
-      descriptorId: String(input?.descriptorId || ""),
-    });
-    if (replay) return replay;
-    const descriptor = await this.describeDynamicWrite(input);
-    invariant(input?.descriptorId === descriptor.id, "WORKSPACE_DYNAMIC_DESCRIPTOR_STALE", "动态写入信息已经变化，请重新确认", { status: 409 });
-    assertExpectedEntityRevision(input?.expectedRevision, { create: true });
-    return this.#command("workspace.confirm-dynamic-write", commandId, { descriptorId: descriptor.id }, async (draft) => {
-      let workspace = draft.workspaces.find((entry) => entry.kind === "dynamic" && entry.serverIdentity === descriptor.serverIdentity && entry.canonicalPath === descriptor.canonicalRootPath);
-      if (!workspace) {
-        const resolved = await this.versioning.resolveDynamicWrite({
-          actorId: this.actor.actorId,
-          serverIdentity: descriptor.serverIdentity,
-          targetPath: descriptor.canonicalTargetPath,
-          targetKind: descriptor.targetKind,
-        });
-        invariant(resolved.state, "WORKSPACE_VERSION_DOMAIN_UNAVAILABLE", "无法为动态写入建立版本域", { status: 409, details: { risk: resolved.risk } });
-        const id = createWorkspaceId({ actorId: this.actor.actorId, serverIdentity: descriptor.serverIdentity, canonicalPath: descriptor.canonicalRootPath, kind: "dynamic" });
-        const timestamp = nowIso(this.clock);
-        workspace = {
-          schemaVersion: WORKSPACE_SCHEMA_VERSION,
-          id,
-          actorId: this.actor.actorId,
-          serverIdentity: descriptor.serverIdentity,
-          kind: "dynamic",
-          canonicalPath: descriptor.canonicalRootPath,
-          remoteRef: workspaceRemoteRef(id),
-          versionDomainId: resolved.state.versionDomainId,
-          revision: 0,
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        };
-        await this.#writeRemoteWorkspace(workspace);
-        draft.workspaces.push(workspace);
-      }
-      const normalized = this.#normalizeBindingInput({
-        conversationId: descriptor.conversationId,
-        branchId: descriptor.branchId,
-        workspaceId: workspace.id,
-        agentId: descriptor.agentId,
-        contextEpoch: descriptor.contextEpoch,
-      });
-      const result = await this.#ensureBinding(draft, normalized);
-      return { workspace: clone(workspace), binding: clone(result.binding), reused: !result.created };
-    });
-  }
-
   async getRoute(input) {
     const conversationId = await this.#authorize(input?.conversationId, "read");
     const branchId = assertId(input?.branchId || "main", "branchId");
@@ -464,6 +398,157 @@ export class WorkspaceService {
     const workspace = state.data.workspaces.find((entry) => entry.id === binding?.workspaceId);
     invariant(binding && workspace, "WORKSPACE_ROUTE_CORRUPT", "工作区路由引用无效", { status: 500, expose: false });
     return { route: clone(route), binding: clone(binding), workspace: clone(workspace) };
+  }
+
+  async forkBranch(input) {
+    const conversationId = await this.#authorize(input?.conversationId, "write");
+    const sourceBranchId = assertId(input?.sourceBranchId, "sourceBranchId");
+    const branchId = assertId(input?.branchId, "branchId");
+    const commandId = assertCommandId(input?.commandId);
+    return this.#command("workspace.fork-branch", commandId, { conversationId, sourceBranchId, branchId }, async (draft) => {
+      const sourceRoute = draft.routes.find((entry) => entry.key === routeKey(conversationId, sourceBranchId));
+      if (!sourceRoute) return { routed: false, reason: "source-route-missing" };
+      const sourceBinding = draft.bindings.find((entry) => entry.id === sourceRoute.bindingId);
+      invariant(sourceBinding, "WORKSPACE_ROUTE_CORRUPT", "来源工作区路由引用无效", { status: 500, expose: false });
+      const normalized = this.#normalizeBindingInput({
+        conversationId,
+        branchId,
+        workspaceId: sourceBinding.workspaceId,
+        agentId: sourceBinding.agentId,
+        contextEpoch: sourceBinding.contextEpoch,
+      });
+      const { binding } = await this.#ensureBinding(draft, normalized);
+      const key = routeKey(conversationId, branchId);
+      let route = draft.routes.find((entry) => entry.key === key) || null;
+      const timestamp = nowIso(this.clock);
+      if (!route) {
+        route = {
+          schemaVersion: WORKSPACE_SCHEMA_VERSION,
+          key,
+          actorId: this.actor.actorId,
+          conversationId,
+          branchId,
+          bindingId: binding.id,
+          revision: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        draft.routes.push(route);
+      }
+      return { routed: true, binding: clone(binding), route: clone(route) };
+    });
+  }
+
+  async forkConversation(input) {
+    const sourceConversationId = await this.#authorize(input?.sourceConversationId, "read");
+    const conversationId = await this.#authorize(input?.conversationId, "write");
+    const sourceBranchId = assertId(input?.sourceBranchId, "sourceBranchId");
+    const branchId = assertId(input?.branchId, "branchId");
+    const sourceBindingId = input?.sourceBindingId == null ? null : assertId(input.sourceBindingId, "sourceBindingId");
+    const commandId = assertCommandId(input?.commandId);
+    return this.#command("workspace.fork-conversation", commandId, {
+      sourceConversationId,
+      conversationId,
+      sourceBranchId,
+      branchId,
+      sourceBindingId,
+    }, async (draft) => {
+      const sourceRoute = draft.routes.find((entry) => entry.key === routeKey(sourceConversationId, sourceBranchId));
+      if (!sourceRoute) return { routed: false, reason: "source-route-missing" };
+      const sourceBinding = draft.bindings.find((entry) => entry.id === (sourceBindingId || sourceRoute.bindingId));
+      invariant(sourceBinding, "WORKSPACE_ROUTE_CORRUPT", "来源工作区路由引用无效", { status: 500, expose: false });
+      invariant(sourceBinding.conversationId === sourceConversationId && sourceBinding.branchId === sourceBranchId, "WORKSPACE_FORK_BINDING_SCOPE_MISMATCH", "分支来源工作区绑定不属于来源对话边界", { status: 409 });
+      const normalized = this.#normalizeBindingInput({
+        conversationId,
+        branchId,
+        workspaceId: sourceBinding.workspaceId,
+        agentId: sourceBinding.agentId,
+        contextEpoch: sourceBinding.contextEpoch,
+      });
+      const { binding } = await this.#ensureBinding(draft, normalized);
+      const key = routeKey(conversationId, branchId);
+      let route = draft.routes.find((entry) => entry.key === key) || null;
+      const timestamp = nowIso(this.clock);
+      if (!route) {
+        route = {
+          schemaVersion: WORKSPACE_SCHEMA_VERSION,
+          key,
+          actorId: this.actor.actorId,
+          conversationId,
+          branchId,
+          bindingId: binding.id,
+          revision: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        draft.routes.push(route);
+      }
+      const workspace = draft.workspaces.find((entry) => entry.id === binding.workspaceId);
+      return { routed: true, binding: clone(binding), route: clone(route), workspace: clone(workspace) };
+    });
+  }
+
+  async advanceContextEpoch(input) {
+    const conversationId = await this.#authorize(input?.conversationId, "write");
+    const branchId = assertId(input?.branchId, "branchId");
+    const commandId = assertCommandId(input?.commandId);
+    return this.#command("workspace.advance-context-epoch", commandId, { conversationId, branchId }, async (draft) => {
+      const key = routeKey(conversationId, branchId);
+      const route = draft.routes.find((entry) => entry.key === key);
+      if (!route) return { routed: false, reason: "route-missing" };
+      const current = draft.bindings.find((entry) => entry.id === route.bindingId);
+      invariant(current, "WORKSPACE_ROUTE_CORRUPT", "工作区路由引用无效", { status: 500, expose: false });
+      const { binding } = await this.#ensureBinding(draft, this.#normalizeBindingInput({
+        conversationId,
+        branchId,
+        workspaceId: current.workspaceId,
+        agentId: current.agentId,
+        contextEpoch: current.contextEpoch + 1,
+      }));
+      route.bindingId = binding.id;
+      route.revision += 1;
+      route.updatedAt = nowIso(this.clock);
+      return { routed: true, binding: clone(binding), route: clone(route) };
+    });
+  }
+
+  async restoreUnusedContextEpoch(input) {
+    const conversationId = await this.#authorize(input?.conversationId, "write");
+    const branchId = assertId(input?.branchId, "branchId");
+    const currentBindingId = assertId(input?.currentBindingId, "currentBindingId");
+    const targetBindingId = assertId(input?.targetBindingId, "targetBindingId");
+    const commandId = assertCommandId(input?.commandId);
+    return this.#command("workspace.restore-unused-context-epoch", commandId, {
+      conversationId,
+      branchId,
+      currentBindingId,
+      targetBindingId,
+    }, async (draft) => {
+      const route = draft.routes.find((entry) => entry.key === routeKey(conversationId, branchId));
+      invariant(route?.bindingId === currentBindingId, "WORKSPACE_ROUTE_STALE", "工作区路由已经变化", { status: 409 });
+      const current = draft.bindings.find((entry) => entry.id === currentBindingId);
+      const target = draft.bindings.find((entry) => entry.id === targetBindingId);
+      invariant(current && target, "WORKSPACE_BINDING_NOT_FOUND", "工作区 Agent Binding 不存在", { status: 404 });
+      invariant(target.conversationId === conversationId
+        && target.branchId === branchId
+        && target.serverIdentity === current.serverIdentity
+        && target.workspaceId === current.workspaceId
+        && target.agentId === current.agentId
+        && target.contextEpoch < current.contextEpoch,
+      "WORKSPACE_CONTEXT_EPOCH_RESTORE_INVALID", "不能恢复到该 Agent 上下文代次", { status: 409 });
+      const timestamp = nowIso(this.clock);
+      current.status = "stale";
+      current.revision += 1;
+      current.updatedAt = timestamp;
+      target.status = "active";
+      target.revision += 1;
+      target.updatedAt = timestamp;
+      route.bindingId = target.id;
+      route.revision += 1;
+      route.updatedAt = timestamp;
+      await Promise.all([this.#writeRemoteBinding(current), this.#writeRemoteBinding(target)]);
+      return { routed: true, binding: clone(target), route: clone(route), repairedBindingId: current.id };
+    });
   }
 
   async #authorize(conversationIdValue, action) {
@@ -500,8 +585,26 @@ export class WorkspaceService {
       agentId: normalized.agentId,
       contextEpoch: normalized.contextEpoch,
     });
-    const existing = draft.bindings.find((entry) => entry.bindingKey === bindingKey);
-    if (existing) return { created: false, binding: existing };
+    const existing = draft.bindings.find((entry) => entry.bindingKey === bindingKey) || null;
+    // The ledger identity is pure control-plane data.  Do not open or create a
+    // remote ledger while establishing a route.  A task only reads an existing
+    // head during parallel preparation; the first native file mutation creates
+    // the ledger lazily.  Thus a read-only conversation leaves no empty version
+    // state behind and route creation stays outside the first-turn critical path.
+    const versionDomainId = deriveVersionDomainId({
+      actorId: this.actor.actorId,
+      serverIdentity: workspace.serverIdentity,
+      conversationId: normalized.conversationId,
+    });
+    if (existing) {
+      if (existing.versionDomainId !== versionDomainId) {
+        existing.versionDomainId = versionDomainId;
+        existing.revision += 1;
+        existing.updatedAt = nowIso(this.clock);
+        await this.#writeRemoteBinding(existing);
+      }
+      return { created: false, binding: existing };
+    }
     const superseded = draft.bindings.filter((entry) => entry.status === "active"
       && entry.serverIdentity === workspace.serverIdentity
       && entry.conversationId === normalized.conversationId
@@ -526,7 +629,7 @@ export class WorkspaceService {
       branchId: normalized.branchId,
       serverIdentity: workspace.serverIdentity,
       workspaceId: workspace.id,
-      versionDomainId: workspace.versionDomainId,
+      versionDomainId,
       agentId: normalized.agentId,
       contextEpoch: normalized.contextEpoch,
       nativeSessionId: null,
@@ -550,7 +653,6 @@ export class WorkspaceService {
       workspaceId: workspace.id,
       kind: workspace.kind,
       canonicalPath: workspace.canonicalPath,
-      versionDomainId: workspace.versionDomainId,
       actorId: workspace.actorId,
       serverIdentity: workspace.serverIdentity,
     });

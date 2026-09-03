@@ -19,6 +19,7 @@ import { ActorMutationQueue } from "../mutation-queue.mjs";
 import { assertActorOwnedPath, resolveActorPath } from "../paths.mjs";
 import { AtomicJsonRepository } from "../repository.mjs";
 import { assertExpectedRevision } from "../revision.mjs";
+import { DEFAULT_SKILL_APPLICABILITY, normalizeSkillApplicability } from "./applicability.mjs";
 
 const SKILL_STORE_SCHEMA_VERSION = 1;
 const PACKAGE_SCHEMA_VERSION = 1;
@@ -36,6 +37,23 @@ function clone(value) {
 
 function defaultStore() {
   return { registries: [], versions: [], taskPins: [] };
+}
+
+function defaultApplicabilityStore(actorId) {
+  return { actorId, items: [] };
+}
+
+function validateApplicabilityStore(store, actorId) {
+  if (!store || typeof store !== "object" || Array.isArray(store) || store.actorId !== actorId || !Array.isArray(store.items)) return false;
+  if (Object.keys(store).length !== 2) return false;
+  const seen = new Set();
+  try {
+    return store.items.every((entry) => entry && typeof entry === "object" && !Array.isArray(entry)
+      && Object.keys(entry).length === 3
+      && typeof entry.skillId === "string" && !seen.has(entry.skillId) && seen.add(entry.skillId)
+      && Boolean(normalizeSkillApplicability(entry.applicability))
+      && Number.isFinite(Date.parse(entry.updatedAt)));
+  } catch { return false; }
 }
 
 function assertId(value, field) {
@@ -328,6 +346,7 @@ function remoteRoot(skillId, version) {
 
 export class SkillService {
   #repository;
+  #applicabilityRepository;
 
   constructor(options) {
     invariant(options?.actor?.actorId, "ACTOR_CONTEXT_REQUIRED", "SkillService 需要 ActorContext", { status: 500, expose: false });
@@ -358,6 +377,20 @@ export class SkillService {
       validate: (store) => assertStore(store, this.actor.actorId),
       queue: inlineRepositoryQueue,
     });
+    this.#applicabilityRepository = new AtomicJsonRepository({
+      dataRoot: this.dataRoot,
+      actor: this.actor,
+      relativePath: "skills/applicability.json",
+      schemaVersion: 1,
+      defaultData: () => defaultApplicabilityStore(this.actor.actorId),
+      validate: (store) => validateApplicabilityStore(store, this.actor.actorId),
+      queue: inlineRepositoryQueue,
+    });
+  }
+
+  async #applicabilityBySkill() {
+    const snapshot = await this.#applicabilityRepository.read();
+    return new Map(snapshot.data.items.map((entry) => [entry.skillId, normalizeSkillApplicability(entry.applicability)]));
   }
 
   #newId(kind) {
@@ -382,6 +415,96 @@ export class SkillService {
     return this.#repository.read();
   }
 
+  async listInstalled() {
+    const [snapshot, applicability] = await Promise.all([this.#repository.read(), this.#applicabilityBySkill()]);
+    return {
+      revision: snapshot.revision,
+      items: snapshot.data.registries
+        .map((registry) => ({
+          id: registry.id,
+          skillId: registry.skillId,
+          name: registry.displayName,
+          description: registry.description,
+          updatedAt: registry.updatedAt,
+          revision: snapshot.revision,
+          applicability: applicability.get(registry.skillId) || clone(DEFAULT_SKILL_APPLICABILITY),
+        }))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    };
+  }
+
+  // Internal catalog used before exposing Skill discovery to the Web Agent.
+  // The version identity is kept out of the model-facing presentation, but it
+  // lets the context receipt suppress Skills already known by this exact
+  // native Agent session and expose them again after an update/session switch.
+  async listInstalledKnowledge() {
+    const [snapshot, applicability] = await Promise.all([this.#repository.read(), this.#applicabilityBySkill()]);
+    return {
+      revision: snapshot.revision,
+      items: snapshot.data.registries
+        .flatMap((registry) => {
+          const version = snapshot.data.versions.find((entry) => entry.id === registry.activeVersionId);
+          if (!version) return [];
+          return [{
+            id: registry.id,
+            skillId: registry.skillId,
+            name: registry.displayName,
+            description: registry.description,
+            updatedAt: registry.updatedAt,
+            revision: snapshot.revision,
+            // Keep legacy/default applicability distinguishable from an
+            // explicit user rule. Automatic Work discovery may then apply a
+            // conservative server/scheduler heuristic without overriding a
+            // rule the user deliberately configured.
+            ...(applicability.has(registry.skillId)
+              ? { applicability: applicability.get(registry.skillId) }
+              : {}),
+            knowledge: {
+              key: `skill:${registry.skillId}`,
+              version: `semantic-v1:${version.version}:${version.sha256}`,
+            },
+          }];
+        })
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    };
+  }
+
+  async getInstalledDetail(skillIdInput) {
+    const skillId = assertSegment(String(skillIdInput || ""), "skillId");
+    const [snapshot, applicability] = await Promise.all([this.#repository.read(), this.#applicabilityBySkill()]);
+    const registry = snapshot.data.registries.find((entry) => entry.skillId === skillId);
+    invariant(registry, "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
+    const version = snapshot.data.versions.find((entry) => entry.id === registry.activeVersionId);
+    invariant(version, "SKILL_ACTIVE_VERSION_REQUIRED", "技能没有可用内容", { status: 409 });
+    const verified = await this.#loadVerifiedPackage(version);
+    let remainingBytes = MAX_SKILL_SEARCH_TOTAL_BYTES;
+    const files = verified.files.map((file) => {
+      const binary = file.content.includes(0);
+      const previewBytes = binary ? 0 : Math.min(file.content.length, MAX_SKILL_SEARCH_FILE_BYTES, remainingBytes);
+      const content = previewBytes > 0 ? file.content.subarray(0, previewBytes).toString("utf8") : null;
+      remainingBytes -= previewBytes;
+      return {
+        path: file.relativePath,
+        size: file.size,
+        sha256: file.sha256,
+        binary,
+        content,
+        truncated: !binary && previewBytes < file.content.length,
+      };
+    });
+    return {
+      id: registry.id,
+      skillId: registry.skillId,
+      name: registry.displayName,
+      description: registry.description,
+      updatedAt: registry.updatedAt,
+      applicability: applicability.get(registry.skillId) || clone(DEFAULT_SKILL_APPLICABILITY),
+      entrypoint: version.manifest.entrypoint,
+      primaryFile: files.some((file) => file.path === "SKILL.md") ? "SKILL.md" : version.manifest.entrypoint,
+      files,
+    };
+  }
+
   async searchContext(input = {}) {
     const query = String(input.query || "").trim();
     const terms = queryTerms(query);
@@ -393,12 +516,14 @@ export class SkillService {
       }))
       : [];
     const selectedKeys = new Set(selectedVersions.map((entry) => `${entry.skillId}:${entry.version}`));
+    const selectedSkillIds = new Set((Array.isArray(input.selectedSkillIds) ? input.selectedSkillIds : [])
+      .map((entry) => assertSegment(String(entry || ""), "selectedSkillIds[]")));
     const snapshot = await this.#repository.read();
     const candidates = snapshot.data.registries.flatMap((registry) => {
       const versions = selectedKeys.size > 0
         ? snapshot.data.versions.filter((entry) => entry.skillId === registry.skillId && selectedKeys.has(`${entry.skillId}:${entry.version}`))
         : snapshot.data.versions.filter((entry) => entry.id === registry.activeVersionId);
-      return versions.map((version) => ({ registry, version }));
+      return selectedSkillIds.size > 0 && !selectedSkillIds.has(registry.skillId) ? [] : versions.map((version) => ({ registry, version }));
     });
     const ranked = candidates
       .map((entry) => ({
@@ -412,6 +537,7 @@ export class SkillService {
           entry.version.manifest.entrypoint,
         ].join("\n"), terms),
       }))
+      .filter((entry) => entry.score > 0 || selectedKeys.has(`${entry.version.skillId}:${entry.version.version}`) || selectedSkillIds.has(entry.version.skillId))
       .sort((left, right) => right.score - left.score || right.version.updatedAt.localeCompare(left.version.updatedAt))
       .slice(0, limit);
 
@@ -458,6 +584,10 @@ export class SkillService {
   }
 
   async uploadVersion(input) {
+    return this.#uploadVersion(input);
+  }
+
+  async #uploadVersion(input, { install = false, initialApplicability = null } = {}) {
     return this.#mutate(async () => {
       const skillId = assertSegment(String(input?.skillId || ""), "skillId");
       const versionLabel = assertSegment(String(input?.version || ""), "version");
@@ -469,7 +599,7 @@ export class SkillService {
       });
       const sha256 = hashPackage(skillId, versionLabel, manifest, files);
       const current = await this.#repository.read();
-      assertExpectedRevision(current.revision, input?.expectedRevision);
+      if (!install) assertExpectedRevision(current.revision, input?.expectedRevision);
       const existing = current.data.versions.find((entry) => entry.skillId === skillId && entry.version === versionLabel);
       if (existing) {
         invariant(existing.sha256 === sha256, "SKILL_VERSION_IMMUTABLE", "相同 Skill 版本已经存在，内容不能覆盖", {
@@ -502,8 +632,9 @@ export class SkillService {
 
       let skillVersion;
       let registry;
+      let result;
       try {
-        const result = await this.#repository.update((store) => {
+        result = await this.#repository.update((store) => {
           skillVersion = createSkillVersion({
             id: this.#newId("skill_version"),
             actorId: this.actor.actorId,
@@ -530,16 +661,50 @@ export class SkillService {
               activate: input?.activate !== false,
               clock: this.clock,
             });
+            registry = {
+              ...registry,
+              displayName: manifest.name,
+              description: manifest.description,
+            };
+            validateSkillRegistry(registry);
             store.registries[registryIndex] = registry;
           }
           store.versions.push(skillVersion);
         }, { expectedRevision: current.revision, clock: this.clock });
-        return { revision: result.revision, duplicate: false, version: clone(skillVersion), registry: clone(registry) };
       } catch (error) {
         if (packageCreated) await fs.rm(finalRoot, { recursive: true, force: true }).catch(() => undefined);
         throw error;
       }
+      if (initialApplicability && !current.data.registries.some((entry) => entry.skillId === skillId)) {
+        await this.#updateApplicability(skillId, initialApplicability);
+      }
+      return { revision: result.revision, duplicate: false, version: clone(skillVersion), registry: clone(registry) };
     });
+  }
+
+  async installPackage(input) {
+    const initialApplicability = input?.applicability === undefined ? null : normalizeSkillApplicability(input.applicability);
+    return this.#uploadVersion({ ...input, activate: true }, { install: true, initialApplicability });
+  }
+
+  async updateApplicability(skillIdInput, input) {
+    return this.#mutate(() => this.#updateApplicability(skillIdInput, input));
+  }
+
+  async #updateApplicability(skillIdInput, input) {
+    const skillId = assertSegment(String(skillIdInput || ""), "skillId");
+    const applicability = normalizeSkillApplicability(input);
+    const installed = await this.#repository.read();
+    invariant(installed.data.registries.some((entry) => entry.skillId === skillId), "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
+    const current = await this.#applicabilityRepository.read();
+    const updatedAt = this.clock().toISOString();
+    const result = await this.#applicabilityRepository.update((store) => {
+      const index = store.items.findIndex((entry) => entry.skillId === skillId);
+      const entry = { skillId, applicability, updatedAt };
+      if (index >= 0) store.items[index] = entry;
+      else store.items.push(entry);
+    }, { expectedRevision: current.revision, clock: this.clock });
+    return { skillId, applicability: clone(applicability), revision: result.revision, updatedAt };
   }
 
   async activateVersion(input) {
@@ -652,6 +817,32 @@ export class SkillService {
       }, { expectedRevision: current.revision, clock: this.clock });
       await fs.rm(this.#actorPath(packageRelativeRoot(skillId, versionLabel)), { recursive: true, force: true });
       return { revision: result.revision, skillId, version: versionLabel };
+    });
+  }
+
+  async uninstall(input) {
+    return this.#mutate(async () => {
+      const skillId = assertSegment(String(input?.skillId || ""), "skillId");
+      const current = await this.#repository.read();
+      assertExpectedRevision(current.revision, input?.expectedRevision);
+      const registry = current.data.registries.find((entry) => entry.skillId === skillId);
+      invariant(registry, "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
+      const versionIds = new Set(registry.versions.map((entry) => entry.skillVersionId));
+      const removedTaskPins = current.data.taskPins.filter((entry) => versionIds.has(entry.skillVersionId)).length;
+      const result = await this.#repository.update((store) => {
+        store.registries = store.registries.filter((entry) => entry.skillId !== skillId);
+        store.versions = store.versions.filter((entry) => !versionIds.has(entry.id));
+        // Uninstall is an explicit catalog decision. Historical Tasks retain
+        // their immutable skillPins snapshot, while the mutable deployment
+        // index stops resolving those pins immediately.
+        store.taskPins = store.taskPins.filter((entry) => !versionIds.has(entry.skillVersionId));
+      }, { expectedRevision: current.revision, clock: this.clock });
+      await fs.rm(this.#actorPath(`skills/packages/${skillId}`), { recursive: true, force: true });
+      const applicability = await this.#applicabilityRepository.read();
+      await this.#applicabilityRepository.update((store) => {
+        store.items = store.items.filter((entry) => entry.skillId !== skillId);
+      }, { expectedRevision: applicability.revision, clock: this.clock });
+      return { revision: result.revision, skillId, removedVersions: versionIds.size, removedTaskPins };
     });
   }
 

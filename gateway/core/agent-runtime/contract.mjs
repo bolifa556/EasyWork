@@ -82,6 +82,14 @@ export function bindingDirectoryName(bindingId) {
   return `${readable}-${digest}`;
 }
 
+export function configurationScopeDirectoryName(actorId, configScope) {
+  const actor = assertRuntimeIdentifier(actorId, "actorId");
+  const scope = assertRuntimeIdentifier(configScope || "default", "configScope");
+  const readable = scope.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 48);
+  const digest = crypto.createHash("sha256").update(actor).update("\0").update(scope).digest("hex").slice(0, 20);
+  return `${readable}-${digest}`;
+}
+
 function assertAbsoluteHome(home) {
   const value = path.posix.normalize(String(home || ""));
   invariant(value.startsWith("/") && value !== "/", "AGENT_REMOTE_HOME_INVALID", "远端 HOME 无效", { status: 409 });
@@ -101,10 +109,13 @@ export function remoteAgentPaths(home, agentId, bindingId = null) {
     managedBinary: `${managedRoot}/current/bin/${definition.binary}`,
     managedState: `${managedRoot}/state.json`,
     managedReleases: `${managedRoot}/releases`,
-    managedRuntime: `${managedRoot}/runtime`,
-    managedRuntimeConfig: `${managedRoot}/runtime/config.json`,
     runtimeReleases: `${easyworkRoot}/runtime/releases`,
+    agentCacheRoot: `${easyworkRoot}/cache/agents/${agentId}`,
     registryRoot: `${easyworkRoot}/runtime/agents/registry`,
+    // Immutable packages are cached once per server.  Every exact native
+    // conversation binding receives its own view below, so selecting a Skill
+    // for one webpage conversation never exposes it to another binding.
+    skillCacheRoot: `${easyworkRoot}/skills`,
     skillsRoot: `${easyworkRoot}/skills`,
   };
   if (bindingId !== null && bindingId !== undefined) {
@@ -121,16 +132,37 @@ export function remoteAgentPaths(home, agentId, bindingId = null) {
       runtimeCache: `${runtimeRoot}/cache`,
       runtimeState: `${runtimeRoot}/state`,
       runtimeLogs: `${runtimeRoot}/logs`,
+      providerConfiguration: `${runtimeRoot}/config/provider.json`,
+      providerEnvironment: `${runtimeRoot}/config/provider.env`,
+      skillsRoot: `${runtimeRoot}/skills`,
     });
   }
   return Object.freeze(result);
+}
+
+export function remoteAgentConfigurationPaths(home, agentId, actorId, configScope) {
+  const base = remoteAgentPaths(home, agentId);
+  const definition = runtimeAgentDefinition(agentId);
+  const scopeDirectory = configurationScopeDirectoryName(actorId, configScope);
+  const conversationsRoot = `${base.easyworkRoot}/runtime/conversations`;
+  const conversationRoot = `${conversationsRoot}/${scopeDirectory}`;
+  const configurationRoot = `${conversationRoot}/agents/${definition.packageId}`;
+  return Object.freeze({
+    ...base,
+    configScope: assertRuntimeIdentifier(configScope || "default", "configScope"),
+    scopeDirectory,
+    conversationsRoot,
+    conversationRoot,
+    configurationRoot,
+    configurationFile: `${configurationRoot}/config.json`,
+  });
 }
 
 export function assertEasyWorkSkillPaths(skills, skillsRoot) {
   const root = `${path.posix.normalize(String(skillsRoot || ""))}/`;
   return (Array.isArray(skills) ? skills : []).map((skill) => {
     const remotePath = path.posix.normalize(String(skill?.remotePath || ""));
-    invariant(remotePath.startsWith(root), "AGENT_SKILL_PATH_FORBIDDEN", "Agent Skill 必须来自 ~/.easywork/skills", {
+    invariant(remotePath.startsWith(root), "AGENT_SKILL_PATH_FORBIDDEN", "Agent Skill 必须来自当前 .easywork 对话 Skill 目录", {
       status: 409,
       details: { skillId: skill?.skillId || null },
     });

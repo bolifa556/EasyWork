@@ -1,0 +1,3 @@
+用户：{{USER_PROMPT}}
+
+回答：{{ASSISTANT_RESPONSE}}

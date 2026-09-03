@@ -6,11 +6,12 @@ import {
   ArrowUp,
   CheckCircle2,
   ChevronRight,
+  Eye,
+  FileStack,
   FileText,
   Folder,
   FolderOpen,
   FolderUp,
-  Library,
   LoaderCircle,
   MoreHorizontal,
   Pencil,
@@ -157,6 +158,9 @@ function Status({ file }: { file: LibraryFile }) {
   if (file.status === "ready") {
     return <span className={`${styles.status} ${styles.ready}`}><CheckCircle2 size={15} />已就绪</span>;
   }
+  if (file.status === "readable") {
+    return <span className={`${styles.status} ${styles.readable}`}><FileText size={15} />可直接读取</span>;
+  }
   if (file.status === "error") {
     return <span className={`${styles.status} ${styles.failed}`}><TriangleAlert size={15} />索引失败</span>;
   }
@@ -250,15 +254,15 @@ function CollectionsView({
   return (
     <div className={styles.page}>
       <header className={styles.pageHeader}>
-        <div className={styles.titleLine}><span className={styles.titleIcon}><Library size={19} /></span><h1>文件库</h1><span>{collections.length}</span></div>
-        <Button variant="primary" icon={<Plus size={17} />} onClick={onCreate}>新建文件集</Button>
+        <div className={styles.titleLine}><span className={styles.titleIcon}><FileStack size={19} /></span><h1>文件库</h1><span>{collections.length}</span></div>
       </header>
 
       <div className={styles.collectionToolbar}>
         <label className={styles.searchField}>
-          <Search size={17} />
+          <Search size={16} />
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件集" aria-label="搜索文件集" />
         </label>
+        <Button className={styles.createCollectionButton} variant="primary" icon={<Plus size={17} />} onClick={onCreate}>新建文件集</Button>
       </div>
 
       {loading ? (
@@ -313,13 +317,14 @@ function SortButton({ label, sortKey, activeKey, direction, onSort }: {
   );
 }
 
-function CollectionDetail({ collection, files, busyAction, onBack, onUpload, onRetry }: {
+function CollectionDetail({ collection, files, busyAction, onBack, onUpload, onRetry, onPreview }: {
   collection: LibraryCollection;
   files: LibraryFile[];
   busyAction: string | null;
   onBack: () => void;
   onUpload: (directory: string, files: File[]) => void;
   onRetry: (fileId: string) => void;
+  onPreview: (file: LibraryFile) => void;
 }) {
   const [directory, setDirectory] = useState("");
   const [query, setQuery] = useState("");
@@ -403,18 +408,19 @@ function CollectionDetail({ collection, files, busyAction, onBack, onUpload, onR
           {rows.length ? rows.map((row) => row.kind === "directory" ? (
             <button key={row.path} className={styles.fileRow} onClick={() => setDirectory(row.path)}>
               <span className={styles.fileName}><Folder size={18} /><strong>{row.name}</strong></span>
-              <time>{formatter.format(new Date(row.updatedAt))}</time>
-              <span>{formatSize(row.size)}</span>
+              <time className={styles.fileTime}>{formatter.format(new Date(row.updatedAt))}</time>
+              <span className={styles.fileSize}>{formatSize(row.size)}</span>
               <span className={styles.folderLabel}>文件夹</span>
             </button>
           ) : (
             <div key={row.id} className={`${styles.fileRow} ${row.status === "error" ? styles.errorRow : ""}`}>
               <span className={styles.fileName}><FileText size={18} /><strong>{row.name || basename(row.relativePath)}</strong></span>
-              <time>{formatter.format(new Date(row.updatedAt))}</time>
-              <span>{formatSize(row.size)}</span>
+              <time className={styles.fileTime}>{formatter.format(new Date(row.updatedAt))}</time>
+              <span className={styles.fileSize}>{formatSize(row.size)}</span>
               <span className={styles.statusCell}>
                 <Status file={row} />
-                {row.status === "error" ? <Button compact variant="ghost" icon={<RotateCcw size={14} />} disabled={busyAction === `retry:${row.id}`} onClick={() => onRetry(row.id)}>重试</Button> : null}
+                <Button compact variant="ghost" icon={<Eye size={14} />} onClick={() => onPreview(row)}>预览</Button>
+                {["error", "readable"].includes(row.status) ? <Button compact variant="ghost" icon={<RotateCcw size={14} />} disabled={busyAction === `retry:${row.id}`} onClick={() => onRetry(row.id)}>{row.status === "readable" ? "向量化" : "重试"}</Button> : null}
               </span>
               {row.status === "error" && row.error ? <span className={styles.errorReason}>{row.error}</span> : null}
             </div>
@@ -440,6 +446,7 @@ export default function LibraryPage({
   onDeleteCollection,
   onUploadFiles,
   onRetryIndex,
+  onPreviewFile,
 }: LibraryPageProps) {
   const [dialog, setDialog] = useState<CollectionDialog>(null);
   const [menu, setMenu] = useState<MenuState>(null);
@@ -473,6 +480,7 @@ export default function LibraryPage({
           onBack={() => onSelectCollection(null)}
           onUpload={(directory, selectedFiles) => onUploadFiles(selected.id, directory, selectedFiles)}
           onRetry={(fileId) => onRetryIndex(selected.id, fileId)}
+          onPreview={onPreviewFile}
         />
       ) : (
         <CollectionsView

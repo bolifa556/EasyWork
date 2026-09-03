@@ -10,6 +10,8 @@ export const AGENT_EVENT_KINDS = Object.freeze([
   "tool_result",
   "approval_request",
   "approval_response",
+  "input_request",
+  "input_response",
   "file_change",
   "job_status",
   "artifact",
@@ -33,8 +35,12 @@ export const AGENT_OPERATIONS = Object.freeze([
   "append",
   "interrupt",
   "resume",
+  "respondApproval",
+  "respondInput",
   "compact",
   "contextUsage",
+  "fork",
+  "revert",
 ]);
 
 const AVAILABILITY = new Set(["available", "unavailable"]);
@@ -79,12 +85,16 @@ export function createAgentState(adapterId, seed = {}) {
     status: String(seed.status || "idle"),
     sessionId: seed.sessionId == null ? null : String(seed.sessionId),
     turnId: seed.turnId == null ? null : String(seed.turnId),
+    eventSequence: Number.isSafeInteger(seed.eventSequence) && seed.eventSequence >= 0 ? seed.eventSequence : 0,
     items: copyJson(seed.items || {}),
     messageRoles: copyJson(seed.messageRoles || {}),
     pendingApprovals: copyJson(seed.pendingApprovals || {}),
+    pendingInputs: copyJson(seed.pendingInputs || {}),
+    plan: copyJson(Array.isArray(seed.plan) ? seed.plan : []),
     contextUsage: seed.contextUsage == null ? null : copyJson(seed.contextUsage),
     finalText: String(seed.finalText || ""),
     finalSeen: Boolean(seed.finalSeen),
+    streamMessageId: seed.streamMessageId == null ? null : String(seed.streamMessageId),
   };
 }
 

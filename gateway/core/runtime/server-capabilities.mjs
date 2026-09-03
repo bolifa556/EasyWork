@@ -10,7 +10,6 @@ const REMOTE_FEATURES = Object.freeze([
   "workspaces",
   "versioning",
   "scheduler",
-  "artifacts",
   "agents",
   "skills",
 ]);
@@ -42,11 +41,11 @@ function capability(status, reason = null, diagnostic = null, details = {}) {
 function unavailableFeatures(status, reason, diagnostic) {
   const common = (details) => capability(status, reason, diagnostic, details);
   return Object.freeze({
-    remoteFiles: common({ list: false, upload: false, download: false, range: false, mkdir: false, rename: false, delete: false, maxUploadBytes: null, maxDownloadBytes: null }),
+    remoteFiles: common({ list: false, upload: false, download: false, range: false, mkdir: false, create: false, copy: false, rename: false, delete: false, maxUploadBytes: null, maxDownloadBytes: null }),
     preview: common({ types: [] }),
     terminal: common({ pty: false, resume: false }),
-    workspaces: common({ virtual: false, user: false, switch: false, dynamicWrite: false }),
-    versioning: common({ shadow: false, userGit: false, isolated: true }),
+    workspaces: common({ virtual: false, user: false, switch: false }),
+    versioning: common({ eventLedger: false, isolated: true }),
     scheduler: common({
       type: "none",
       resourceSummary: false,
@@ -57,7 +56,6 @@ function unavailableFeatures(status, reason, diagnostic) {
       cancelJob: false,
       jobOutput: false,
     }),
-    artifacts: common({ capture: false, download: false, range: false }),
     agents: common({ inspect: false, install: false, update: false, uninstall: false, configure: false, context: false, compact: false }),
     skills: common({ registry: false, deploy: false }),
   });
@@ -86,15 +84,16 @@ function interfaceFeatures(backend) {
   const remoteUpload = method(backend.remoteFiles, "uploadStream");
   const remoteDownload = method(backend.remoteFiles, "inspectDownload") && method(backend.remoteFiles, "openDownloadStream");
   const remoteMkdir = method(backend.remoteFiles, "mkdir");
+  const remoteCreate = method(backend.remoteFiles, "createFile");
+  const remoteCopy = method(backend.remoteFiles, "copy");
   const remoteRename = method(backend.remoteFiles, "rename");
   const remoteDelete = method(backend.remoteFiles, "delete");
   const remoteFileCapabilities = typeof backend.remoteFiles?.capabilities === "function" ? backend.remoteFiles.capabilities() : {};
   const preview = method(backend.remoteArtifactSource, "inspect") && method(backend.remoteArtifactSource, "openReadStream");
   const terminal = method(backend.terminal, "create") && method(backend.terminal, "input") && method(backend.terminal, "inspect") && method(backend.terminal, "close");
   const terminalResume = terminal && method(backend.terminal, "detach") && method(backend.terminal, "resume");
-  const shadow = method(backend.versionControl, "status") && method(backend.versionControl, "diff") && method(backend.versionControl, "commit") && Boolean(backend.remoteFs && backend.remoteExec);
+  const eventLedger = Boolean(backend.conversationVersion);
   const workspaces = Boolean(backend.remoteControl && backend.remoteFs && backend.remoteExec);
-  const artifact = preview;
   const inspectAgents = Boolean(backend.agentDeployment && method(backend.agentDeployment, "status"));
   const installAgents = inspectAgents && method(backend.agentDeployment, "install");
   const uninstallAgents = inspectAgents && method(backend.agentDeployment, "uninstall");
@@ -112,6 +111,8 @@ function interfaceFeatures(backend) {
       download: remoteDownload,
       range: remoteDownload && remoteFileCapabilities.range === true,
       mkdir: remoteMkdir,
+      create: remoteCreate,
+      copy: remoteCopy,
       rename: remoteRename,
       delete: remoteDelete,
       maxUploadBytes: Number.isSafeInteger(remoteFileCapabilities.maxUploadBytes) ? remoteFileCapabilities.maxUploadBytes : null,
@@ -119,9 +120,8 @@ function interfaceFeatures(backend) {
     }),
     preview: available(preview, "远端文件预览不可用", { types: preview ? [...PREVIEW_TYPES] : [] }),
     terminal: available(terminal, "远程终端不可用", { pty: terminal, resume: terminalResume }),
-    workspaces: available(workspaces, "远端工作区不可用", { virtual: workspaces, user: workspaces, switch: workspaces, dynamicWrite: workspaces }),
-    versioning: available(shadow, "隔离版本管理不可用", { shadow, userGit: false, isolated: true }),
-    artifacts: available(artifact, "远端产物读取不可用", { capture: artifact, download: artifact, range: artifact }),
+    workspaces: available(workspaces, "远端工作区不可用", { virtual: workspaces, user: workspaces, switch: workspaces }),
+    versioning: available(eventLedger, "版本管理不可用", { eventLedger, isolated: eventLedger }),
     agents: available(inspectAgents && Boolean(backend.agentTransport), "远端 Agent 管理不可用", {
       inspect: inspectAgents,
       install: installAgents,
@@ -181,7 +181,7 @@ export class ServerCapabilityService {
     const now = dateFrom(this.clock);
     if (!refresh && current?.key === key && Date.parse(current.profile.expiresAt) > now.valueOf()) return clone(current.profile);
     if (!refresh && this.pending.has(serverId)) return clone(await this.pending.get(serverId));
-    const detection = this.#detect(server, now).then((profile) => {
+    const detection = this.#detect(server, now, { refreshScheduler: refresh }).then((profile) => {
       this.cache.set(serverId, { key, profile });
       return profile;
     }).finally(() => this.pending.delete(serverId));
@@ -189,11 +189,18 @@ export class ServerCapabilityService {
     return clone(await detection);
   }
 
+  async peek(serverId) {
+    const server = await this.servers.get(serverId);
+    const key = `${server.connection.status}:${server.connection.generation}:${server.profile.serverIdentity || "unidentified"}`;
+    const current = this.cache.get(serverId);
+    return current?.key === key ? clone(current.profile) : null;
+  }
+
   invalidate(serverId) {
     this.cache.delete(String(serverId));
   }
 
-  async #detect(server, detectedAt) {
+  async #detect(server, detectedAt, { refreshScheduler = false } = {}) {
     const serverId = server.profile.id;
     const expiresAt = new Date(detectedAt.valueOf() + this.ttlMs);
     const diagnostics = [];
@@ -233,7 +240,8 @@ export class ServerCapabilityService {
     const interfaces = interfaceFeatures(backend);
     let scheduler;
     try {
-      scheduler = schedulerFeature(await (await this.resolveScheduler(serverId)).getCapabilities());
+      const service = await this.resolveScheduler(serverId);
+      scheduler = schedulerFeature(await (refreshScheduler && typeof service.inspectCapabilities === "function" ? service.inspectCapabilities() : service.getCapabilities()));
     } catch (error) {
       const failure = safeFailure(error, "SCHEDULER_CAPABILITY_PROBE_FAILED");
       diagnostics.push(diagnostic("scheduler", failure.code, failure.message, failure.retryable));
@@ -248,7 +256,6 @@ export class ServerCapabilityService {
       workspaces: interfaces.workspaces,
       versioning: interfaces.versioning,
       scheduler,
-      artifacts: interfaces.artifacts,
       agents: interfaces.agents,
       skills: interfaces.skills,
     });

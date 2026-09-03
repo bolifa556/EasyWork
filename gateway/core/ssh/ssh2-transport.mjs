@@ -8,10 +8,51 @@ import { createHostApiRelay } from "./api-reverse-proxy.mjs";
 
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
 const MAX_PTY_INPUT_BYTES = 64 * 1024;
+// OpenSSH defaults MaxSessions to 10. Keep two server-side slots in reserve,
+// while leaving enough room for a retained PTY, resource sampling, downloads,
+// Agent discovery and one foreground Agent turn to coexist on the shared SSH
+// connection. A limit of four let background reads starve the user turn.
+const MAX_CONCURRENT_SESSION_CHANNELS = 8;
+const SESSION_CHANNEL_WAIT_TIMEOUT_MS = 15_000;
+const SESSION_CHANNEL_OPEN_TIMEOUT_MS = 15_000;
+const CHANNEL_OPEN_RETRY_DELAYS_MS = Object.freeze([0, 120, 320, 750, 1_500]);
+
+function channelOpenWasRefused(error) {
+  return /channel open failure|open failed|administratively prohibited|resource shortage/i.test(String(error?.message || error || ""));
+}
+
+function wait(milliseconds, signal) {
+  if (!milliseconds) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", abort);
+      reject(Object.assign(new Error("SSH 命令已中断"), { code: "SSH_COMMAND_ABORTED", status: 409 }));
+    };
+    function done() {
+      signal?.removeEventListener?.("abort", abort);
+      resolve();
+    }
+    if (signal?.aborted) abort();
+    else signal?.addEventListener?.("abort", abort, { once: true });
+  });
+}
 
 function ptyDimension(value, fallback, field) {
   const result = Number(value ?? fallback);
   invariant(Number.isSafeInteger(result) && result > 0 && result <= 10_000, "SSH_PTY_DIMENSION_INVALID", `${field} 无效`, { status: 400 });
+  return result;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function ptyWorkingDirectory(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const result = String(value);
+  invariant(result.startsWith("/") && result.length <= 4_096 && !/[\0\r\n]/.test(result), "SSH_PTY_CWD_INVALID", "PTY 工作目录无效", { status: 400 });
   return result;
 }
 
@@ -127,9 +168,12 @@ class Ssh2Session {
     this.closed = false;
     this.closeListeners = new Set();
     this.apiProxies = new Map();
+    this.activeSessionChannels = 0;
+    this.sessionChannelWaiters = [];
     client.on("tcp connection", (details, accept, reject) => this.#acceptReverseConnection(details, accept, reject));
     client.once("close", () => {
       this.closed = true;
+      this.#rejectSessionChannelWaiters();
       void this.#closeApiProxies();
       for (const listener of this.closeListeners) listener(null);
     });
@@ -148,13 +192,127 @@ class Ssh2Session {
     return !this.closed;
   }
 
+  #rejectSessionChannelWaiters() {
+    const error = safeError(Object.assign(new Error("SSH 连接已关闭"), { code: "SSH_CONNECTION_CLOSED", status: 409 }));
+    for (const waiter of this.sessionChannelWaiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.signal?.removeEventListener?.("abort", waiter.abort);
+      waiter.reject(error);
+    }
+  }
+
+  #sessionSlotRelease() {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeSessionChannels = Math.max(0, this.activeSessionChannels - 1);
+      while (this.sessionChannelWaiters.length) {
+        const waiter = this.sessionChannelWaiters.shift();
+        clearTimeout(waiter.timer);
+        waiter.signal?.removeEventListener?.("abort", waiter.abort);
+        if (waiter.signal?.aborted) continue;
+        this.activeSessionChannels += 1;
+        waiter.resolve(this.#sessionSlotRelease());
+        break;
+      }
+    };
+  }
+
+  async #acquireSessionSlot(signal) {
+    invariant(!this.closed, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
+    if (signal?.aborted) throw Object.assign(new Error("SSH 命令已中断"), { code: "SSH_COMMAND_ABORTED", status: 409 });
+    if (this.activeSessionChannels < MAX_CONCURRENT_SESSION_CHANNELS) {
+      this.activeSessionChannels += 1;
+      return this.#sessionSlotRelease();
+    }
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, signal, abort: null, timer: null };
+      const fail = (error) => {
+        const index = this.sessionChannelWaiters.indexOf(waiter);
+        if (index >= 0) this.sessionChannelWaiters.splice(index, 1);
+        clearTimeout(waiter.timer);
+        signal?.removeEventListener?.("abort", waiter.abort);
+        reject(error);
+      };
+      waiter.abort = () => {
+        fail(Object.assign(new Error("SSH 命令已中断"), { code: "SSH_COMMAND_ABORTED", status: 409 }));
+      };
+      waiter.timer = setTimeout(() => fail(new ApiError("SSH_CHANNEL_SLOT_TIMEOUT", "SSH 会话通道等待超时", {
+        status: 504,
+        retryable: true,
+        details: { limit: MAX_CONCURRENT_SESSION_CHANNELS, timeoutMs: SESSION_CHANNEL_WAIT_TIMEOUT_MS },
+      })), SESSION_CHANNEL_WAIT_TIMEOUT_MS);
+      signal?.addEventListener?.("abort", waiter.abort, { once: true });
+      this.sessionChannelWaiters.push(waiter);
+    });
+  }
+
+  async #openSessionChannel(open, options = {}) {
+    let lastError = null;
+    for (let attempt = 0; attempt < CHANNEL_OPEN_RETRY_DELAYS_MS.length; attempt += 1) {
+      await wait(CHANNEL_OPEN_RETRY_DELAYS_MS[attempt], options.signal);
+      const release = await this.#acquireSessionSlot(options.signal);
+      try {
+        const channel = await new Promise((resolve, reject) => {
+          let settled = false;
+          const finish = (error, opened) => {
+            if (settled) {
+              opened?.destroy?.();
+              opened?.end?.();
+              return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            options.signal?.removeEventListener?.("abort", abort);
+            if (error) reject(error);
+            else resolve(opened);
+          };
+          const abort = () => finish(Object.assign(new Error("SSH 命令已中断"), { code: "SSH_COMMAND_ABORTED", status: 409 }));
+          const timer = setTimeout(() => finish(new ApiError("SSH_CHANNEL_OPEN_TIMEOUT", "SSH 会话通道打开超时", {
+            status: 504,
+            retryable: true,
+            details: { timeoutMs: SESSION_CHANNEL_OPEN_TIMEOUT_MS },
+          })), SESSION_CHANNEL_OPEN_TIMEOUT_MS);
+          if (options.signal?.aborted) abort();
+          else {
+            options.signal?.addEventListener?.("abort", abort, { once: true });
+            try { open((error, opened) => finish(error, opened)); }
+            catch (error) { finish(error); }
+          }
+        });
+        channel.once?.("close", release);
+        channel.once?.("end", release);
+        channel.once?.("error", release);
+        return channel;
+      } catch (error) {
+        release();
+        lastError = error;
+        if (!channelOpenWasRefused(error) || attempt === CHANNEL_OPEN_RETRY_DELAYS_MS.length - 1) throw error;
+      }
+    }
+    throw lastError || new Error("SSH channel 无法打开");
+  }
+
+  async openExec(command, options = {}) {
+    invariant(!this.closed, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
+    try {
+      return await this.#openSessionChannel(
+        (callback) => this.client.exec(command, { env: options.env, pty: options.pty || false }, callback),
+        options,
+      );
+    } catch (error) {
+      throw safeError(error, "SSH_COMMAND_FAILED");
+    }
+  }
+
   async exec(command, options = {}) {
     invariant(!this.closed, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
     const maxBytes = Number(options.maxOutputBytes || MAX_CAPTURE_BYTES);
     invariant(Number.isSafeInteger(maxBytes) && maxBytes > 0 && maxBytes <= 64 * 1024 * 1024, "SSH_CAPTURE_LIMIT_INVALID", "SSH 输出上限无效", { status: 400 });
+    const stream = await this.openExec(command, { env: options.env, pty: options.pty || false, signal: options.signal });
     return new Promise((resolve, reject) => {
       let settled = false;
-      let stream;
       const stdout = [];
       const stderr = [];
       const state = { bytes: 0 };
@@ -172,41 +330,41 @@ class Ssh2Session {
       };
       if (options.signal?.aborted) return abort();
       options.signal?.addEventListener?.("abort", abort, { once: true });
-      this.client.exec(command, { env: options.env, pty: options.pty || false }, (error, channel) => {
-        if (error) return finish(error);
-        stream = channel;
-        channel.on("data", (chunk) => {
+      stream.on("data", (chunk) => {
           try {
             captureChunk(stdout, chunk, state, maxBytes);
             options.onStdout?.(Buffer.from(chunk));
           } catch (captureError) {
-            channel.close?.();
+            stream.close?.();
             finish(captureError);
           }
         });
-        channel.stderr?.on("data", (chunk) => {
+      stream.stderr?.on("data", (chunk) => {
           try {
             captureChunk(stderr, chunk, state, maxBytes);
             options.onStderr?.(Buffer.from(chunk));
           } catch (captureError) {
-            channel.close?.();
+            stream.close?.();
             finish(captureError);
           }
         });
-        channel.once("error", (channelError) => finish(channelError));
-        channel.once("close", (code, signal) => finish(null, {
+      stream.once("error", (channelError) => finish(channelError));
+      stream.once("close", (code, signal) => finish(null, {
           stdout: Buffer.concat(stdout).toString(options.encoding || "utf8"),
           stderr: Buffer.concat(stderr).toString(options.encoding || "utf8"),
           code: Number.isInteger(code) ? code : null,
           signal: signal || null,
         }));
-      });
     });
   }
 
   async sftp() {
     invariant(!this.closed, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
-    return new Promise((resolve, reject) => this.client.sftp((error, client) => error ? reject(safeError(error, "SFTP_OPEN_FAILED")) : resolve(client)));
+    try {
+      return await this.#openSessionChannel((callback) => this.client.sftp(callback));
+    } catch (error) {
+      throw safeError(error, "SFTP_OPEN_FAILED");
+    }
   }
 
   async openPty(options = {}) {
@@ -215,11 +373,18 @@ class Ssh2Session {
     invariant(/^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/.test(term), "SSH_PTY_TERM_INVALID", "PTY TERM 无效", { status: 400 });
     const rows = ptyDimension(options.rows, 24, "rows");
     const cols = ptyDimension(options.cols, 80, "cols");
-    invariant(Object.keys(options).every((key) => ["term", "rows", "cols"].includes(key)), "SSH_PTY_OPTIONS_INVALID", "PTY 不接受命令、工作目录或自定义环境", { status: 400 });
-    return new Promise((resolve, reject) => this.client.shell({ term, rows, cols, width: 0, height: 0 }, (error, channel) => {
-      if (error) reject(safeError(error, "SSH_PTY_OPEN_FAILED"));
-      else resolve(new SshPtyHandle(channel, { term, rows, cols }));
-    }));
+    const cwd = ptyWorkingDirectory(options.cwd);
+    invariant(Object.keys(options).every((key) => ["term", "rows", "cols", "cwd"].includes(key)), "SSH_PTY_OPTIONS_INVALID", "PTY 选项无效", { status: 400 });
+    const descriptor = { term, rows, cols, ...(cwd ? { cwd } : {}) };
+    const pty = { term, rows, cols, width: 0, height: 0 };
+    const open = cwd
+      ? (callback) => this.client.exec(`cd -- ${shellQuote(cwd)} && exec "\${SHELL:-/bin/sh}" -l`, { pty }, callback)
+      : (callback) => this.client.shell(pty, callback);
+    try {
+      return new SshPtyHandle(await this.#openSessionChannel(open), descriptor);
+    } catch (error) {
+      throw safeError(error, "SSH_PTY_OPEN_FAILED");
+    }
   }
 
   async forwardOut({ sourceHost = "127.0.0.1", sourcePort = 0, destinationHost, destinationPort }) {
@@ -249,16 +414,19 @@ class Ssh2Session {
     });
   }
 
-  async openLoopbackProxy({ bindingId, baseUrl, apiKey }) {
+  async openLoopbackProxy({ bindingId, baseUrl, apiKey, onEffortAdapted = null }) {
     invariant(!this.closed, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
     const key = String(bindingId || "");
     invariant(key, "AGENT_API_PROXY_BINDING_REQUIRED", "Agent API proxy 缺少 bindingId", { status: 400 });
     const routeFingerprint = crypto.createHash("sha256").update(String(baseUrl || "")).update("\0").update(String(apiKey || "")).digest("hex");
     const existing = this.apiProxies.get(key);
-    if (existing?.routeFingerprint === routeFingerprint) return existing.publicHandle;
+    if (existing?.routeFingerprint === routeFingerprint) {
+      existing.relay.setEffortAdaptationHandler?.(onEffortAdapted);
+      return existing.publicHandle;
+    }
     if (existing) await this.#closeApiProxy(key, existing);
 
-    const relay = await createHostApiRelay({ baseUrl, apiKey });
+    const relay = await createHostApiRelay({ baseUrl, apiKey, onEffortAdapted });
     let remotePort;
     try {
       remotePort = await new Promise((resolve, reject) => this.client.forwardIn("127.0.0.1", 0, (error, allocatedPort) => {
@@ -286,6 +454,7 @@ class Ssh2Session {
       protocol: relay.protocol,
       endpointPath: relay.endpointPath,
       isClosed: () => entry.closed || this.closed,
+      setEffortAdaptationHandler: (handler) => relay.setEffortAdaptationHandler?.(handler),
       close: () => this.#closeApiProxy(key, entry),
     });
     this.apiProxies.set(key, entry);

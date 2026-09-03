@@ -34,7 +34,7 @@ async function fixture(t) {
   const address = await gateway.start({ host: "127.0.0.1", port: 0 });
   t.after(async () => {
     await gateway.close().catch(() => undefined);
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
   });
   return { gateway, baseUrl: `http://127.0.0.1:${address.port}`, sessions };
 }
@@ -60,6 +60,60 @@ async function register(baseUrl, username, deviceId) {
   assert.equal(result.response.status, 200);
   return result.payload.data;
 }
+
+test("历史作业 HTTP 接口接受浏览器时区并原样传给调度器，仍拒绝未知参数", async (t) => {
+  const { gateway, baseUrl } = await fixture(t);
+  const account = await register(baseUrl, "scheduler-history-zone", "history-device");
+  const session = await gateway.runtime.auth.resolveSession(account.token);
+  const services = await gateway.runtime.servicesForActor(session.actor);
+  const calls = [];
+  services.schedulerFor = async (serverId) => ({
+    async jobHistory(input) { calls.push({ serverId, input }); return [{ id: "5335664", state: "completed" }]; },
+  });
+  const query = "/api/servers/test-scheduler/scheduler/jobs/history?startDate=2026-09-01&endDate=2026-09-03&utcOffsetMinutes=480";
+  const result = await requestJson(baseUrl, query, { token: account.token });
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.payload.data, [{ id: "5335664", state: "completed" }]);
+  assert.deepEqual(calls, [{ serverId: "test-scheduler", input: { startDate: "2026-09-01", endDate: "2026-09-03", utcOffsetMinutes: "480" } }]);
+  const invalid = await requestJson(baseUrl, `${query}&unexpected=value`, { token: account.token });
+  assert.equal(invalid.response.status, 400);
+  assert.equal(invalid.payload.error.code, "QUERY_SCHEMA_INVALID");
+  assert.equal(calls.length, 1);
+});
+
+test("用户成功连接 SSH 后立即调度已删除网页对话的远端 Agent 会话回收", async (t) => {
+  const { gateway, baseUrl } = await fixture(t);
+  const account = await register(baseUrl, "ssh-agent-gc", "gc-device");
+  const session = await gateway.runtime.auth.resolveSession(account.token);
+  const services = await gateway.runtime.servicesForActor(session.actor);
+  const scheduled = [];
+  services.scheduleDeletedAgentConversationCleanup = async (serverId) => {
+    scheduled.push(serverId);
+    return { scheduled: true, key: `agent-gc:${serverId}` };
+  };
+  const created = await requestJson(baseUrl, "/api/servers", {
+    token: account.token,
+    method: "POST",
+    body: {
+      id: "server-agent-gc",
+      name: "Agent cleanup host",
+      host: "203.0.113.77",
+      port: 22,
+      username: "remote-user",
+      authMethod: "password",
+      credential: { password: "remote-password" },
+    },
+  });
+  assert.equal(created.response.status, 200);
+  const connected = await requestJson(baseUrl, "/api/servers/server-agent-gc/connect", {
+    token: account.token,
+    method: "POST",
+    body: { acceptedFingerprint: fingerprint },
+  });
+  assert.equal(connected.response.status, 200);
+  assert.equal(connected.payload.data.status, "connected");
+  assert.deepEqual(scheduled, ["server-agent-gc"]);
+});
 
 test("Profile PATCH serves an Actor-authorized avatar and bootstrap exposes only its public descriptor", async (t) => {
   const { baseUrl } = await fixture(t);
@@ -139,4 +193,24 @@ test("Admin lists safe cross-user SSH state and disconnect is idempotent without
     assert.equal(disconnected.payload.data.item.status, "disconnected");
   }
   assert.equal(sessions[0].closed, true);
+
+  const users = await requestJson(baseUrl, "/api/admin/users?query=ssh-member&page=1&limit=30", { token: admin.token });
+  assert.equal(users.response.status, 200);
+  assert.equal(users.payload.data.total, 1);
+  assert.equal(users.payload.data.items[0].liveSshCount, 0);
+  const detail = await requestJson(baseUrl, `/api/admin/users/${encodeURIComponent(member.actor.actorId)}`, { token: admin.token });
+  assert.equal(detail.response.status, 200);
+  assert.equal(detail.payload.data.servers[0].serverId, "server-admin-test");
+  assert.equal(detail.payload.data.servers[0].status, "disconnected");
+  assert.equal(JSON.stringify(detail.payload).includes("never-return-this-secret"), false);
+
+  const deleted = await requestJson(baseUrl, `/api/admin/users/${encodeURIComponent(member.actor.actorId)}`, {
+    token: admin.token,
+    method: "DELETE",
+    headers: { "idempotency-key": "admin-delete-user-0001" },
+  });
+  assert.equal(deleted.response.status, 200);
+  assert.equal(deleted.payload.data.deleted, true);
+  const revoked = await requestJson(baseUrl, "/api/bootstrap", { token: member.token });
+  assert.equal(revoked.response.status, 401);
 });

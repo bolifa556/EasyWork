@@ -1,0 +1,60 @@
+{
+  "emptyResult": "没有找到相关内容。",
+  "alreadyObserved": "没有新增内容；命中的同一版本已经在当前上下文中。",
+  "failedResult": "查询失败：{{ERROR_MESSAGE}}",
+  "toolUnavailable": "当前没有可用工具：{{TOOL_NAME}}",
+  "invalidToolArguments": "模型提供的工具参数不是有效 JSON",
+  "invalidToolInput": "工具参数无效",
+  "toolFailure": "工具调用失败",
+  "resourceContinuation": "文件 {{FILENAME}} 尚未读完；如后续内容仍与问题相关，请再次调用 resource_read，并设置 start={{NEXT_OFFSET}}。",
+  "candidateItem": "candidate_id: {{CANDIDATE_ID}}\n{{CONTENT}}",
+  "candidateUnknown": "候选不存在或已失效：{{CANDIDATE_IDS}}",
+  "candidateMixed": "请单独调用 handoff_submit 提交已选候选。",
+  "observationWorkHeading": "当前分支已经读取的知识候选；可直接提交相关 candidate_id，无需重复读取相同版本：",
+  "observationChatHeading": "当前分支已经读取的知识；回答时可直接使用，无需重复读取相同版本：",
+  "observationCandidate": "candidate_id: {{CANDIDATE_ID}}\n",
+  "observationItem": "{{CANDIDATE}}{{KIND}}：{{NAME}}\n{{CONTENT}}",
+  "observationDefaultKind": "知识",
+  "observationDefaultName": "已读内容",
+  "memorySection": "相关记忆：\n{{ITEMS}}",
+  "resourcesSection": "相关文件：\n{{ITEMS}}",
+  "conversationSection": "相关历史对话：\n{{ITEMS}}",
+  "skillsSection": "相关 Skill：\n{{ITEMS}}",
+  "stateSection": "当前状态：\n{{ITEMS}}",
+  "listItem": "- {{ITEM}}",
+  "resourceWithContent": "- 文件：{{FILENAME}}\n  {{CONTENT}}",
+  "conversationItem": {
+    "user": "- 用户：{{CONTENT}}",
+    "assistant": "- 助手：{{CONTENT}}",
+    "message": "- 消息：{{CONTENT}}"
+  },
+  "skillItem": "- {{HEADING}}{{INSTRUCTIONS}}",
+  "skillInstructionPrefix": "\n  ",
+  "stateItem": {
+    "conversation": "- 对话：{{VALUE}}",
+    "project": "- 项目：{{VALUE}}",
+    "server": "- 服务器：{{VALUE}}",
+    "workspace": "- 工作区：{{VALUE}}",
+    "agent": "- Agent：{{VALUE}}"
+  },
+  "serverStatuses": {
+    "connected": "已连接",
+    "disconnected": "未连接",
+    "connecting": "连接中"
+  },
+  "serverNameStatus": "{{NAME}}（{{STATUS}}）",
+  "serverWithScheduler": "{{VALUE}}；调度器：{{SCHEDULER}}",
+  "schedulerTypes": {
+    "slurm": "Slurm",
+    "pbs": "PBS",
+    "generic": "通用调度器",
+    "none": "未检测到",
+    "unknown": "未确定"
+  },
+  "fieldSeparator": "\n",
+  "headingSeparator": "：",
+  "continuationIndent": "  ",
+  "truncationSuffix": "…",
+  "itemSeparator": "\n",
+  "sectionSeparator": "\n\n"
+}

@@ -50,7 +50,7 @@ async function startConversation(api, commandId = "create-1", content = "第一�
   });
 }
 
-test("新对话只在首条用户消息发送时创建，并固定 chat/work 模式", async () => withFixture(async (dataRoot) => {
+test("新对话只在首条用户消息发送时创建，创建后不允许更改类型", async () => withFixture(async (dataRoot) => {
   const api = service(dataRoot);
   assert.deepEqual(await api.listConversations(), { items: [], nextCursor: null });
   await assert.rejects(api.sendMessage({ type: "chat", role: "user", content: "旧字段", expectedRevision: 0, commandId: "legacy-mode" }), (error) => error.code === "CONVERSATION_INPUT_UNKNOWN_FIELD");
@@ -72,9 +72,13 @@ test("新对话只在首条用户消息发送时创建，并固定 chat/work 模
     commandId: "wrong-type",
   }), (error) => error.code === "CONVERSATION_MODE_FIXED");
 
-  const converted = await api.convertMode({ conversationId: created.conversation.id, mode: "work", expectedRevision: 1, commandId: "convert-1" });
-  assert.equal(converted.conversation.mode, "work");
-  assert.equal(converted.conversation.revision, 2);
+  const work = await startConversation(api, "create-work", "工作任务", "work");
+  await assert.rejects(api.sendMessage({
+    conversationId: work.conversation.id, mode: "chat", role: "user", content: "不能改为聊天",
+    expectedRevision: 1, commandId: "wrong-work-type",
+  }), (error) => error.code === "CONVERSATION_MODE_FIXED");
+  assert.equal((await api.getConversation(work.conversation.id)).summary.mode, "work");
+  assert.equal(typeof api.convertWorkToChat, "undefined");
 }));
 
 test("Actor 数据与游标严格隔离 users/guests", async () => withFixture(async (dataRoot) => {
@@ -123,6 +127,31 @@ test("摘要和消息均使用不透明游标分页，存储为分片索引与�
   assert.equal(indexPages.length, 3);
   const messageFiles = await fs.readdir(path.join(rootPath, firstConversation.conversation.id, "messages"));
   assert.equal(messageFiles.length, 2);
+}));
+
+test("bootstrap 仅返回首屏非项目聊天，同时保留项目计数与兼容分页游标", async () => withFixture(async (dataRoot) => {
+  const api = service(dataRoot);
+  const firstStandalone = await startConversation(api, "bootstrap-standalone-a", "独立聊天 A");
+  const projectConversation = await startConversation(api, "bootstrap-project", "项目聊天");
+  await api.moveToProject({
+    conversationId: projectConversation.conversation.id,
+    projectId: "project-a",
+    expectedRevision: projectConversation.conversation.revision,
+    commandId: "bootstrap-move-project",
+  });
+  await startConversation(api, "bootstrap-standalone-b", "独立聊天 B");
+
+  const overview = await api.bootstrapOverview({ limit: 1, projectId: null });
+  assert.equal(overview.items.length, 1);
+  assert.equal(overview.items[0].projectId, null);
+  assert.equal(overview.projectConversationCounts["project-a"], 1);
+  assert.ok(overview.nextCursor);
+
+  const secondPage = await api.listConversations({ limit: 10, projectId: null, cursor: overview.nextCursor });
+  assert.deepEqual(secondPage.items.map((item) => item.id), [firstStandalone.conversation.id]);
+  assert.equal(secondPage.nextCursor, null);
+  const projectPage = await api.listConversations({ limit: 4, projectId: "project-a" });
+  assert.deepEqual(projectPage.items.map((item) => item.id), [projectConversation.conversation.id]);
 }));
 
 test("重命名、项目移动/移出、置顶和删除都要求 expectedRevision", async () => withFixture(async (dataRoot) => {
@@ -201,20 +230,29 @@ test("分支共享起点历史，但后续消息链保持独立", async () => wi
   assert.equal(answered.conversation.branchCount, 1);
 }));
 
-test("编辑最新用户消息在同一对话截断后续回复并返回 message/task 边界", async () => withFixture(async (dataRoot) => {
+test("派生分支创建新的网页对话并保留来源对话不变", async () => withFixture(async (dataRoot) => {
   const api = service(dataRoot);
-  const created = await startConversation(api, "edit-create", "问题 1");
-  await api.sendMessage({ conversationId: created.conversation.id, role: "assistant", content: "回答 1", taskId: "task-1", expectedRevision: 1, commandId: "edit-a1" });
-  const user2 = await api.sendMessage({ conversationId: created.conversation.id, role: "user", content: "问题 2", expectedRevision: 2, commandId: "edit-u2" });
-  await api.sendMessage({ conversationId: created.conversation.id, role: "assistant", content: "回答 2", taskId: "task-2", expectedRevision: 3, commandId: "edit-a2" });
+  const created = await startConversation(api, "fork-conversation-create", "共同问题", "work");
+  const answered = await api.sendMessage({ conversationId: created.conversation.id, role: "assistant", content: "共同回答", taskId: "task-source", expectedRevision: 1, commandId: "fork-conversation-answer" });
+  await api.sendMessage({ conversationId: created.conversation.id, role: "user", content: "来源后续", expectedRevision: 2, commandId: "fork-conversation-followup" });
 
-  const edited = await api.editLatestUserMessage({ conversationId: created.conversation.id, messageId: user2.messageId, content: "修改后的问题 2", expectedRevision: 4, commandId: "edit-latest" });
-  assert.equal(edited.conversation.id, created.conversation.id);
-  assert.equal(edited.removedBoundary.message.count, 2);
-  assert.equal(edited.removedBoundary.task.firstRemovedTaskId, "task-2");
-  const messages = await api.listMessages({ conversationId: created.conversation.id });
-  assert.deepEqual(messages.items.map((message) => message.content), ["问题 1", "回答 1", "修改后的问题 2"]);
-  await assert.rejects(api.editLatestUserMessage({ conversationId: created.conversation.id, messageId: created.messageId, content: "不能改旧消息", expectedRevision: 5, commandId: "edit-old" }), (error) => error.code === "LATEST_USER_MESSAGE_REQUIRED");
+  const forked = await api.forkConversation({
+    conversationId: created.conversation.id,
+    sourceBranchId: created.branchId,
+    atMessageId: answered.messageId,
+    expectedRevision: 3,
+    commandId: "fork-conversation",
+  });
+
+  assert.notEqual(forked.conversation.id, created.conversation.id);
+  assert.equal(forked.conversation.mode, "work");
+  assert.match(forked.conversation.title, /· 分支$/);
+  assert.deepEqual((await api.listMessages({ conversationId: forked.conversation.id })).items.map((message) => [message.content, message.taskId]), [
+    ["共同问题", null],
+    ["共同回答", "task-source"],
+  ]);
+  assert.deepEqual((await api.listMessages({ conversationId: created.conversation.id })).items.map((message) => message.content), ["共同问题", "共同回答", "来源后续"]);
+  assert.equal((await api.listConversations()).items.length, 2);
 }));
 
 test("retry 替换同一对话最新回复，rewind 返回清理边界", async () => withFixture(async (dataRoot) => {

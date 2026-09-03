@@ -65,6 +65,20 @@ function auditTarget(route, params) {
   return { route: route.pattern, ...(Object.keys(safeParams).length ? { params: safeParams } : {}) };
 }
 
+function validSecretResponse(secret) {
+  if (!secret || typeof secret !== "object" || Array.isArray(secret)) return false;
+  const keys = Object.keys(secret);
+  const hasValidExpiry = Number.isFinite(Date.parse(secret.expiresAt));
+  if (!hasValidExpiry) return false;
+  if (keys.every((key) => ["providerId", "apiKey", "expiresAt"].includes(key))) {
+    return typeof secret.providerId === "string" && typeof secret.apiKey === "string" && secret.apiKey.length > 0;
+  }
+  if (!keys.every((key) => ["serverId", "method", "password", "fileName", "hasPassphrase", "expiresAt", "profileRevision"].includes(key))) return false;
+  if (typeof secret.serverId !== "string" || !Number.isSafeInteger(secret.profileRevision) || secret.profileRevision < 0) return false;
+  if (secret.method === "password") return typeof secret.password === "string" && secret.password.length > 0;
+  return secret.method === "private-key" && typeof secret.fileName === "string" && typeof secret.hasPassphrase === "boolean";
+}
+
 export class HttpRouter {
   constructor({ auth, servicesForActor, allowedOrigins = [] }) {
     invariant(auth?.resolveSession && typeof servicesForActor === "function", "HTTP_ROUTER_DEPENDENCY_INVALID", "HTTP Router 缺少依赖", { status: 500, expose: false });
@@ -144,9 +158,7 @@ export class HttpRouter {
       let response;
       if (route.secretResponse) {
         const secret = result?.data === undefined ? result : result.data;
-        invariant(secret && typeof secret === "object" && !Array.isArray(secret), "SECRET_RESPONSE_INVALID", "密钥响应结构无效", { status: 500, expose: false });
-        invariant(Object.keys(secret).every((key) => ["providerId", "apiKey", "expiresAt"].includes(key)), "SECRET_RESPONSE_INVALID", "密钥响应结构无效", { status: 500, expose: false });
-        invariant(typeof secret.providerId === "string" && typeof secret.apiKey === "string" && secret.apiKey.length > 0 && Number.isFinite(Date.parse(secret.expiresAt)), "SECRET_RESPONSE_INVALID", "密钥响应结构无效", { status: 500, expose: false });
+        invariant(validSecretResponse(secret), "SECRET_RESPONSE_INVALID", "密钥响应结构无效", { status: 500, expose: false });
         response = { status: Number.isInteger(result?.status) ? result.status : 200, body: { data: secret, meta: { requestId } } };
       } else {
         response = apiSuccess(result?.data === undefined ? result : result.data, {

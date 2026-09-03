@@ -49,13 +49,14 @@ async function allProjectConversations(conversations, projectId) {
 export class CatalogConsistencyService {
   constructor(options) {
     invariant(options?.actor?.actorId, "ACTOR_CONTEXT_REQUIRED", "CatalogConsistencyService 需要 ActorContext", { status: 500, expose: false });
-    invariant(options?.projects && options?.collections && options?.conversations && options?.resources && typeof options?.artifacts?.detachProject === "function", "CATALOG_CONSISTENCY_DEPENDENCIES_REQUIRED", "目录一致性服务依赖不完整", { status: 500, expose: false });
+    invariant(options?.projects && options?.collections && options?.conversations && options?.resources && typeof options?.artifacts?.detachProject === "function" && typeof options?.memories?.invalidateProject === "function", "CATALOG_CONSISTENCY_DEPENDENCIES_REQUIRED", "目录一致性服务依赖不完整", { status: 500, expose: false });
     this.actor = options.actor;
     this.projects = options.projects;
     this.collections = options.collections;
     this.conversations = options.conversations;
     this.resources = options.resources;
     this.artifacts = options.artifacts;
+    this.memories = options.memories;
     this.clock = options.clock || (() => new Date());
     this.faultInjector = options.faultInjector || null;
     this.repository = new AtomicJsonRepository({
@@ -177,10 +178,14 @@ export class CatalogConsistencyService {
         commandId: `${input.commandId}:detach-artifacts`,
       }));
       const cleanup = await this.#step(operation, "remove-resource-bindings", () => this.resources.removeOwnerBindings({ ownerType: "project", ownerId: input.projectId }));
+      const memoryCleanup = await this.#step(operation, "invalidate-project-memory", () => this.memories.invalidateProject({
+        projectId: input.projectId,
+        commandId: `${input.commandId}:invalidate-memory`,
+      }));
       const deletedProject = await this.#step(operation, "tombstone", finalize);
       return this.#complete(operation, {
         project: deletedProject,
-        cleanup: { ownerType: "project", ownerId: input.projectId, ...cleanup },
+        cleanup: { ownerType: "project", ownerId: input.projectId, ...cleanup, memory: memoryCleanup },
         conversationPolicy: "move-out",
         movedConversationIds: moved?.conversationIds || [],
         detachedArtifactIds: detachedArtifacts?.detachedArtifactIds || [],

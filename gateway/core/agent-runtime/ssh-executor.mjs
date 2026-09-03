@@ -5,23 +5,41 @@ import { ApiError, invariant } from "../errors.mjs";
 
 const HTTP_LIMIT = 16 * 1024 * 1024;
 const HTTP_TIMEOUT_MS = 15_000;
+const JSON_RPC_TIMEOUT_MS = 60_000;
+const CONTROL_REQUEST_TIMEOUT_MS = 3_000;
+const SFTP_OPERATION_TIMEOUT_MS = 60_000;
+const SFTP_UPLOAD_TIMEOUT_MS = 10 * 60_000;
+const AGENT_STREAM_QUEUE_MAX_ITEMS = 4_096;
+const AGENT_STREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
+const AGENT_STREAM_BACKLOG_MAX_BYTES = 8 * 1024 * 1024;
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
-function commandLine({ executable, args = [], cwd, env = {} }) {
+function providerEnvironmentPrefix(envFile) {
+  const value = String(envFile || "").trim();
+  if (!value) return "";
+  const quoted = shellQuote(value);
+  return `[ -f ${quoted} ] || exit 78; . ${quoted}; `;
+}
+
+function commandLine({ executable, args = [], cwd, env = {}, envFile = null }) {
   const command = [shellQuote(executable), ...args.map(shellQuote)].join(" ");
   const exported = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
-  const body = `printf '__EASYWORK_REMOTE_PID__:%s\\n' "$$"; ${exported ? `${exported} ` : ""}exec ${command}`;
+  const body = `${providerEnvironmentPrefix(envFile)}printf '__EASYWORK_REMOTE_PID__:%s\\n' "$$"; ${exported ? `${exported} ` : ""}exec ${command}`;
   return cwd ? `cd ${shellQuote(cwd)} && { ${body}; }` : `{ ${body}; }`;
 }
 
-function detachedCommandLine({ executable, args = [], cwd, env = {}, logPath }) {
+function detachedCommandLine({ executable, args = [], cwd, env = {}, envFile = null, logPath }) {
   const command = [shellQuote(executable), ...args.map(shellQuote)].join(" ");
   const exported = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
   const output = shellQuote(logPath);
-  const body = `nohup ${exported ? `${exported} ` : ""}${command} </dev/null >>${output} 2>&1 & pid=$!; kill -0 "$pid" 2>/dev/null || exit 74; printf '__EASYWORK_REMOTE_PID__:%s\\n' "$pid"`;
+  // Shell assignments must precede `nohup`. Placing HOME=... after nohup
+  // makes coreutils try to execute the assignment as a program, so the
+  // detached service exits immediately and every later SSH forward is
+  // refused even though the Agent and model are configured correctly.
+  const body = `${providerEnvironmentPrefix(envFile)}${exported ? `${exported} ` : ""}nohup ${command} </dev/null >>${output} 2>&1 & pid=$!; kill -0 "$pid" 2>/dev/null || exit 74; printf '__EASYWORK_REMOTE_PID__:%s\\n' "$pid"`;
   return cwd ? `cd ${shellQuote(cwd)} && { ${body}; }` : `{ ${body}; }`;
 }
 
@@ -44,19 +62,110 @@ class DetachedSshProcessHandle {
 }
 
 class AsyncQueue {
-  constructor(onReturn = null) {
+  constructor(onReturn = null, {
+    maxItems = AGENT_STREAM_QUEUE_MAX_ITEMS,
+    maxBytes = AGENT_STREAM_QUEUE_MAX_BYTES,
+    onOverflow = null,
+    merge = null,
+    replaceKey = null,
+    discardPrevious = null,
+  } = {}) {
     this.values = [];
+    this.head = 0;
+    this.queuedBytes = 0;
+    this.queuedItems = 0;
     this.waiters = [];
     this.done = false;
     this.error = null;
     this.onReturn = onReturn;
+    this.onOverflow = onOverflow;
+    this.merge = merge;
+    this.replaceKey = replaceKey;
+    this.discardPrevious = discardPrevious;
+    this.replacementIndexes = new Map();
+    this.maxItems = maxItems;
+    this.maxBytes = maxBytes;
   }
 
   push(value) {
     if (this.done) return;
     const waiter = this.waiters.shift();
     if (waiter) waiter.resolve({ value, done: false });
-    else this.values.push(value);
+    else {
+      const removeQueued = (index) => {
+        const queued = this.values[index];
+        if (!queued || queued.removed) return;
+        queued.removed = true;
+        this.queuedItems -= 1;
+        this.queuedBytes -= queued.bytes;
+        if (queued.key && this.replacementIndexes.get(queued.key) === index) this.replacementIndexes.delete(queued.key);
+      };
+      const lastQueuedIndex = () => {
+        for (let index = this.values.length - 1; index >= this.head; index -= 1) {
+          if (!this.values[index].removed) return index;
+        }
+        return -1;
+      };
+      if (typeof this.discardPrevious === "function") {
+        let candidateIndex = lastQueuedIndex();
+        while (candidateIndex >= 0 && this.discardPrevious(this.values[candidateIndex].value, value) === true) {
+          removeQueued(candidateIndex);
+          candidateIndex = lastQueuedIndex();
+        }
+      }
+      let queuedValue = value;
+      let replaceIndex = -1;
+      if (typeof this.merge === "function") {
+        const candidateIndex = lastQueuedIndex();
+        if (candidateIndex >= 0) {
+          const merged = this.merge(this.values[candidateIndex].value, value);
+          if (merged !== undefined) {
+            queuedValue = merged;
+            replaceIndex = candidateIndex;
+          }
+        }
+      }
+      let replacementKey = null;
+      if (replaceIndex < 0 && typeof this.replaceKey === "function") {
+        const selected = this.replaceKey(queuedValue);
+        replacementKey = selected == null ? null : String(selected);
+        const priorIndex = replacementKey ? this.replacementIndexes.get(replacementKey) : null;
+        if (Number.isSafeInteger(priorIndex) && priorIndex >= this.head) removeQueued(priorIndex);
+      }
+      const bytes = typeof queuedValue === "string" || Buffer.isBuffer(queuedValue)
+        ? Buffer.byteLength(queuedValue)
+        : Buffer.byteLength(JSON.stringify(queuedValue) ?? String(queuedValue));
+      const itemCount = this.queuedItems;
+      const replacedBytes = replaceIndex >= 0 ? this.values[replaceIndex].bytes : 0;
+      const nextItems = itemCount + (replaceIndex >= 0 ? 0 : 1);
+      const nextBytes = this.queuedBytes - replacedBytes + bytes;
+      if (nextItems > this.maxItems || nextBytes > this.maxBytes) {
+        const error = new ApiError("AGENT_EVENT_BACKPRESSURE_OVERFLOW", "Agent 事件产生速度超过网关处理能力，已停止本轮以保护服务", {
+          status: 502,
+          retryable: true,
+          expose: true,
+          details: { queuedItems: itemCount, queuedBytes: this.queuedBytes, maxItems: this.maxItems, maxBytes: this.maxBytes },
+        });
+        this.values = [];
+        this.head = 0;
+        this.queuedBytes = 0;
+        this.queuedItems = 0;
+        this.replacementIndexes.clear();
+        this.onOverflow?.(error);
+        this.end(error);
+        return;
+      }
+      if (replaceIndex >= 0) {
+        const prior = this.values[replaceIndex];
+        this.values[replaceIndex] = { value: queuedValue, bytes, key: prior.key || null, removed: false };
+      } else {
+        const index = this.values.length;
+        this.values.push({ value: queuedValue, bytes, key: replacementKey, removed: false });
+        this.queuedItems += 1;
+        if (replacementKey) this.replacementIndexes.set(replacementKey, index);
+      }
+      this.queuedBytes = nextBytes;
+    }
   }
 
   end(error = null) {
@@ -75,7 +184,24 @@ class AsyncQueue {
   }
 
   next() {
-    if (this.values.length) return Promise.resolve({ value: this.values.shift(), done: false });
+    while (this.head < this.values.length) {
+      const queued = this.values[this.head];
+      const consumedIndex = this.head;
+      this.head += 1;
+      if (queued.removed) continue;
+      this.queuedItems -= 1;
+      this.queuedBytes -= queued.bytes;
+      if (queued.key && this.replacementIndexes.get(queued.key) === consumedIndex) this.replacementIndexes.delete(queued.key);
+      if (this.head >= 1_024 && this.head * 2 >= this.values.length) {
+        this.values = this.values.slice(this.head);
+        this.head = 0;
+        this.replacementIndexes.clear();
+        for (const [index, entry] of this.values.entries()) {
+          if (!entry.removed && entry.key) this.replacementIndexes.set(entry.key, index);
+        }
+      }
+      return Promise.resolve({ value: queued.value, done: false });
+    }
     if (this.done) return this.error ? Promise.reject(this.error) : Promise.resolve({ value: undefined, done: true });
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
@@ -88,9 +214,11 @@ class AsyncQueue {
 }
 
 class LineHub {
-  constructor({ maxBacklog = 256 } = {}) {
+  constructor({ maxBacklog = 256, maxBacklogBytes = AGENT_STREAM_BACKLOG_MAX_BYTES } = {}) {
     this.maxBacklog = maxBacklog;
+    this.maxBacklogBytes = maxBacklogBytes;
     this.backlog = [];
+    this.backlogBytes = 0;
     this.subscribers = new Set();
     this.closed = false;
     this.failure = null;
@@ -100,17 +228,30 @@ class LineHub {
     if (this.closed) return;
     if (this.subscribers.size === 0) {
       this.backlog.push(line);
-      if (this.backlog.length > this.maxBacklog) this.backlog.shift();
+      this.backlogBytes += Buffer.byteLength(line);
+      while (this.backlog.length > this.maxBacklog || this.backlogBytes > this.maxBacklogBytes) {
+        this.backlogBytes -= Buffer.byteLength(this.backlog.shift());
+      }
     }
     for (const subscriber of this.subscribers) subscriber.push(line);
   }
 
-  subscribe() {
-    const queue = new AsyncQueue(() => this.subscribers.delete(queue));
+  subscribe(options = {}) {
+    const queue = new AsyncQueue(
+      () => this.subscribers.delete(queue),
+      {
+        ...options,
+        onOverflow: (error) => {
+          this.subscribers.delete(queue);
+          options.onOverflow?.(error);
+        },
+      },
+    );
     for (const line of this.backlog) queue.push(line);
     this.backlog = [];
+    this.backlogBytes = 0;
     if (this.closed) queue.end(this.failure);
-    else this.subscribers.add(queue);
+    else if (!queue.done) this.subscribers.add(queue);
     return queue;
   }
 
@@ -123,15 +264,19 @@ class LineHub {
 }
 
 class SshProcessHandle {
-  constructor({ channel, processId, onStderr }) {
+  constructor({ channel, processId, onStderr, session }) {
     this.channel = channel;
+    this.session = session;
+    this.detached = false;
     this.processId = processId;
     this.remotePidObserved = false;
     this.hub = new LineHub();
     this.pendingRpc = new Map();
+    this.pendingControls = new Map();
     this.rpcSequence = 0;
     this.buffer = "";
     this.closed = false;
+    this.inputEnded = false;
     this.exit = new Promise((resolve, reject) => {
       this.resolveExit = resolve;
       this.rejectExit = reject;
@@ -167,14 +312,39 @@ class SshProcessHandle {
     }
     try {
       const frame = JSON.parse(line);
-      const pending = frame?.id == null || frame?.method ? null : this.pendingRpc.get(String(frame.id));
-      if (pending) {
-        this.pendingRpc.delete(String(frame.id));
-        if (frame.error) pending.reject(new ApiError("AGENT_RPC_FAILED", String(frame.error.message || "Agent RPC 失败"), {
-          status: 502,
-          details: { code: frame.error.code ?? null },
-        }));
-        else pending.resolve(frame.result);
+      if (frame?.type === "control_response") {
+        const requestId = String(frame.response?.request_id || frame.request_id || "");
+        const pending = this.pendingControls.get(requestId);
+        if (pending) {
+          this.pendingControls.delete(requestId);
+          clearTimeout(pending.timer);
+          if (frame.response?.subtype === "error") {
+            pending.reject(new ApiError("AGENT_CONTROL_FAILED", String(frame.response.error || "Agent 控制请求失败"), {
+              status: 502,
+              retryable: true,
+            }));
+          } else pending.resolve(frame);
+          return;
+        }
+      }
+      if (frame?.id != null && !frame?.method) {
+        const requestId = String(frame.id);
+        const pending = this.pendingRpc.get(requestId);
+        if (pending) {
+          this.pendingRpc.delete(requestId);
+          clearTimeout(pending.timer);
+          if (frame.error) pending.reject(new ApiError("AGENT_RPC_FAILED", String(frame.error.message || "Agent RPC 失败"), {
+            status: 502,
+            details: { code: frame.error.code ?? null },
+          }));
+          else pending.resolve(frame.result);
+        }
+        // JSON-RPC responses are transport control data.  Feeding a
+        // thread/resume response (which can contain the complete native
+        // history) into the Agent event reducer duplicates that history and
+        // can exhaust the Gateway heap.  Only notifications and server-side
+        // requests belong on the event stream.
+        return;
       }
     } catch {
       // Protocol adapters decide whether a non-JSON line is meaningful.
@@ -186,20 +356,29 @@ class SshProcessHandle {
     if (this.closed) return;
     this.closed = true;
     if (this.buffer) this.#publish(this.buffer);
-    for (const pending of this.pendingRpc.values()) pending.reject(error || new Error("Agent process exited"));
+    for (const pending of this.pendingRpc.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error || new Error("Agent process exited"));
+    }
     this.pendingRpc.clear();
+    for (const pending of this.pendingControls.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error || new Error("Agent process exited"));
+    }
+    this.pendingControls.clear();
     if (error || !this.remotePidObserved) this.rejectReady(error || new Error("Agent process exited before reporting its remote PID"));
     this.hub.close(error);
     if (error) this.rejectExit(error);
     else this.resolveExit(result);
   }
 
-  lines() {
-    return this.hub.subscribe();
+  lines(options = {}) {
+    return this.hub.subscribe(options);
   }
 
   discardBufferedLines() {
     this.hub.backlog = [];
+    this.hub.backlogBytes = 0;
     this.buffer = "";
   }
 
@@ -212,11 +391,49 @@ class SshProcessHandle {
     this.write(`${JSON.stringify(value)}\n`);
   }
 
+  endInput() {
+    if (this.closed || this.inputEnded) return;
+    this.inputEnded = true;
+    this.channel.end();
+  }
+
+  requestControl(frame, timeoutMs = CONTROL_REQUEST_TIMEOUT_MS) {
+    invariant(!this.closed, "AGENT_PROCESS_CLOSED", "Agent 进程已退出", { status: 409 });
+    const requestId = String(frame?.request_id || "");
+    invariant(frame?.type === "control_request" && requestId, "AGENT_CONTROL_REQUEST_INVALID", "Agent 控制请求无效", { status: 400 });
+    invariant(!this.pendingControls.has(requestId), "AGENT_CONTROL_REQUEST_DUPLICATE", "Agent 控制请求重复", { status: 409 });
+    const promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pendingControls.delete(requestId)) return;
+        reject(new ApiError("AGENT_CONTROL_TIMEOUT", "Agent 未及时确认控制请求", {
+          status: 504,
+          retryable: true,
+          details: { requestId, timeoutMs },
+        }));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pendingControls.set(requestId, { resolve, reject, timer });
+    });
+    this.writeJson(frame);
+    return promise;
+  }
+
   requestJsonRpc(method, params = {}) {
     invariant(!this.closed, "AGENT_PROCESS_CLOSED", "Agent 进程已退出", { status: 409 });
     this.rpcSequence += 1;
     const id = this.rpcSequence;
-    const promise = new Promise((resolve, reject) => this.pendingRpc.set(String(id), { resolve, reject }));
+    const promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pendingRpc.delete(String(id))) return;
+        reject(new ApiError("AGENT_RPC_TIMEOUT", `Agent RPC ${method} 超时`, {
+          status: 504,
+          retryable: true,
+          details: { method, timeoutMs: JSON_RPC_TIMEOUT_MS },
+        }));
+      }, JSON_RPC_TIMEOUT_MS);
+      timer.unref?.();
+      this.pendingRpc.set(String(id), { resolve, reject, timer });
+    });
     this.writeJson({ id, method, params });
     return promise;
   }
@@ -225,9 +442,41 @@ class SshProcessHandle {
     this.writeJson({ method, ...(params === undefined ? {} : { params }) });
   }
 
+  respondJsonRpc(id, result) {
+    invariant(id !== null && id !== undefined && (typeof id === "string" || Number.isSafeInteger(id)), "AGENT_RPC_RESPONSE_ID_INVALID", "Agent RPC 响应 id 无效", { status: 400 });
+    this.writeJson({ id, result });
+  }
+
+  rejectJsonRpc(id, code, message) {
+    invariant(id !== null && id !== undefined && (typeof id === "string" || Number.isSafeInteger(id)), "AGENT_RPC_RESPONSE_ID_INVALID", "Agent RPC 响应 id 无效", { status: 400 });
+    invariant(Number.isSafeInteger(code) && typeof message === "string" && message, "AGENT_RPC_ERROR_INVALID", "Agent RPC 错误响应无效", { status: 400 });
+    this.writeJson({ id, error: { code, message } });
+  }
+
   async signal(signal = "SIGINT") {
     invariant(!this.closed, "AGENT_PROCESS_CLOSED", "Agent 进程已退出", { status: 409 });
-    await new Promise((resolve, reject) => this.channel.signal(String(signal).replace(/^SIG/, ""), (error) => error ? reject(error) : resolve()));
+    const normalized = String(signal).replace(/^SIG/, "");
+    const remotePid = String(this.processId).match(/^remote-(\d+)$/)?.[1];
+    try {
+      // ssh2 sends SSH_MSG_CHANNEL_REQUEST without an acknowledgement and its
+      // Channel.signal API is deliberately synchronous (there is no callback).
+      this.channel.signal(normalized);
+    } catch (error) {
+      // The PID prelude gives us a verifiable, session-scoped fallback when a
+      // server rejects channel signals outright.
+      if (!remotePid || !this.session?.exec) throw error;
+      const result = await this.session.exec(`kill -${normalized} -- ${remotePid} 2>/dev/null || true`, { maxOutputBytes: 16 * 1024 });
+      invariant(result.code === 0, "AGENT_PROCESS_SIGNAL_FAILED", "无法中断远端 Agent", { status: 502, retryable: true });
+    }
+    // Some SSH servers accept the channel request but do not forward the
+    // signal to the remote process.  The PID prelude is scoped to this exact
+    // Agent process, so also issue a PID-targeted signal whenever possible.
+    // This makes delivery observable instead of treating a fire-and-forget
+    // SSH channel request as proof of interruption.
+    if (remotePid && this.session?.exec) {
+      const result = await this.session.exec(`kill -${normalized} -- ${remotePid} 2>/dev/null || true`, { maxOutputBytes: 16 * 1024 });
+      invariant(result.code === 0, "AGENT_PROCESS_SIGNAL_FAILED", "无法中断远端 Agent", { status: 502, retryable: true });
+    }
   }
 
   wait() {
@@ -240,7 +489,24 @@ class SshProcessHandle {
 }
 
 function sftpCall(client, method, ...args) {
-  return new Promise((resolve, reject) => client[method](...args, (error, result) => error ? reject(error) : resolve(result)));
+  const timeoutMs = method === "fastPut" ? SFTP_UPLOAD_TIMEOUT_MS : SFTP_OPERATION_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const timer = setTimeout(() => finish(new ApiError("SFTP_OPERATION_TIMEOUT", `SFTP ${method} 操作超时`, {
+      status: 504,
+      retryable: true,
+      details: { method, timeoutMs },
+    })), timeoutMs);
+    try { client[method](...args, (error, result) => finish(error, result)); }
+    catch (error) { finish(error); }
+  });
 }
 
 function parseHttpResponse(buffer) {
@@ -335,14 +601,20 @@ export class SshAgentExecutor {
     this.session = session;
     this.proxyFactory = proxyFactory;
     this.cachedHome = null;
+    this.pendingHome = null;
   }
 
   async home() {
     if (this.cachedHome) return this.cachedHome;
-    const result = await this.session.exec("printf '%s' \"$HOME\"", { maxOutputBytes: 16 * 1024 });
-    invariant(result.code === 0 && String(result.stdout).startsWith("/"), "AGENT_REMOTE_HOME_UNAVAILABLE", "无法读取远端 HOME", { status: 502 });
-    this.cachedHome = path.posix.normalize(String(result.stdout).trim()).replace(/\/$/, "");
-    return this.cachedHome;
+    if (this.pendingHome) return this.pendingHome;
+    this.pendingHome = (async () => {
+      const result = await this.session.exec("printf '%s' \"$HOME\"", { maxOutputBytes: 16 * 1024 });
+      invariant(result.code === 0 && String(result.stdout).startsWith("/"), "AGENT_REMOTE_HOME_UNAVAILABLE", "无法读取远端 HOME", { status: 502 });
+      this.cachedHome = path.posix.normalize(String(result.stdout).trim()).replace(/\/$/, "");
+      return this.cachedHome;
+    })();
+    try { return await this.pendingHome; }
+    finally { this.pendingHome = null; }
   }
 
   exec(command, options = {}) {
@@ -371,8 +643,8 @@ export class SshAgentExecutor {
     }
   }
 
-  async writeAtomic(remotePath, content, { mode = 0o600 } = {}) {
-    await this.exec(`mkdir -p ${shellQuote(path.posix.dirname(remotePath))}`);
+  async writeAtomic(remotePath, content, { mode = 0o600, parentPrepared = false } = {}) {
+    if (!parentPrepared) await this.exec(`mkdir -p ${shellQuote(path.posix.dirname(remotePath))}`);
     const sftp = await this.session.sftp();
     const temporary = `${remotePath}.write-${crypto.randomBytes(6).toString("hex")}`;
     try {
@@ -409,15 +681,12 @@ export class SshAgentExecutor {
       status: 409,
     });
     const processId = `proc_${crypto.randomBytes(12).toString("hex")}`;
-    return new Promise((resolve, reject) => {
-      client.exec(commandLine(specification), { pty: false }, (error, channel) => {
-        if (error) reject(error);
-        else {
-          const process = new SshProcessHandle({ channel, processId, onStderr: specification.onStderr });
-          process.ready().then(() => resolve(process), reject);
-        }
-      });
-    });
+    const channel = typeof this.session.openExec === "function"
+      ? await this.session.openExec(commandLine(specification), { pty: false })
+      : await new Promise((resolve, reject) => client.exec(commandLine(specification), { pty: false }, (error, opened) => error ? reject(error) : resolve(opened)));
+    const process = new SshProcessHandle({ channel, processId, onStderr: specification.onStderr, session: this.session });
+    await process.ready();
+    return process;
   }
 
   async spawnDetached(specification) {
@@ -489,6 +758,7 @@ export class SshAgentExecutor {
     const body = parsed.headers["transfer-encoding"]?.toLowerCase() === "chunked" ? decodeChunked(parsed.rawBody) : parsed.rawBody;
     invariant(parsed.status >= 200 && parsed.status < 300, "AGENT_HTTP_REQUEST_FAILED", `Agent HTTP 请求失败：${parsed.status}`, {
       status: 502,
+      expose: true,
       details: { remoteStatus: parsed.status, body: body.toString("utf8").slice(0, 2_000) },
     });
     const text = body.toString("utf8");
@@ -499,7 +769,10 @@ export class SshAgentExecutor {
   async openHttpEventStream({ host = "127.0.0.1", port, path: requestPath = "/event" }) {
     invariant(["127.0.0.1", "::1", "localhost"].includes(host), "AGENT_HTTP_HOST_FORBIDDEN", "Agent event stream 必须绑定远端 loopback", { status: 400 });
     const stream = await this.session.forwardOut({ destinationHost: host, destinationPort: port });
-    const queue = new AsyncQueue(() => stream.destroy());
+    const queue = new AsyncQueue(
+      () => stream.destroy(),
+      { onOverflow: () => stream.destroy() },
+    );
     let buffer = "";
     let headersComplete = false;
     stream.on("data", (chunk) => {

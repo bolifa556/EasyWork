@@ -367,7 +367,10 @@ export class ArtifactService {
       const sha256 = String(inspected.sha256 || "");
       invariant(/^[a-f0-9]{64}$/.test(sha256), "ARTIFACT_REMOTE_HASH_REQUIRED", "远端 Artifact 必须完成内容 hash 后才能登记", { status: 502 });
       const mime = assertMime(inspected.mime || "application/octet-stream");
-      const name = safeName(payload.name || inspected.name || "artifact");
+      // The remote filesystem is authoritative for the filename. Agent link
+      // labels often contain prose (duration, format, or a leading “下载”),
+      // which belongs in the reply rather than in the download card/title.
+      const name = safeName(inspected.name || payload.name || "artifact");
       const kind = normalizeKind(payload.kind);
       const now = nowIso(this.clock);
       const artifactId = this.#newId("artifact");
@@ -408,7 +411,10 @@ export class ArtifactService {
         originArtifact,
         locators: [{ versionId, source: "remote", actorRelativePath: null, remotePath: inspected.canonicalPath, serverIdentity: task.route.serverIdentity }],
         promotion: null,
-        expiresAt: normalizeExpiresAt(payload.expiresAt, now, this.defaultRetentionMs),
+        // A remote Artifact stores only a lightweight reference; EasyWork does
+        // not copy the file onto the host. Keep that reference with the
+        // conversation unless the producer explicitly supplies an expiry.
+        expiresAt: payload.expiresAt === undefined ? null : normalizeExpiresAt(payload.expiresAt, now, this.defaultRetentionMs),
         pinnedAt: null,
         deletedAt: null,
         createdAt: now,
@@ -587,6 +593,19 @@ export class ArtifactService {
     assertAllowedKeys(input, ["artifactId", "ttlMs"], "issueDownload");
     const record = await this.#readRecord(input.artifactId);
     invariant(!["deleted", "expired"].includes(record.lifecycle), "ARTIFACT_NOT_AVAILABLE", "Artifact 已删除或过期", { status: 410 });
+    const { version, locator } = versionFor(record, record.activeVersionId);
+    if (version.source === "remote") {
+      invariant(typeof this.remoteSource?.verifyAvailable === "function", "ARTIFACT_REMOTE_VERIFY_UNAVAILABLE", "远端文件状态检测服务不可用", { status: 503 });
+      await this.remoteSource.verifyAvailable({
+        actor: this.actor,
+        taskId: record.taskId,
+        workspaceId: record.workspaceId,
+        serverIdentity: locator.serverIdentity,
+        canonicalPath: locator.remotePath,
+        expectedSize: version.size,
+        expectedSha256: version.sha256,
+      });
+    }
     const ttlMs = Number(input.ttlMs ?? 5 * 60 * 1000);
     invariant(Number.isSafeInteger(ttlMs) && ttlMs >= 1000 && ttlMs <= MAX_DOWNLOAD_TTL_MS, "ARTIFACT_DOWNLOAD_TTL_INVALID", "Artifact 下载 token 有效期无效", { status: 400 });
     const now = Date.parse(nowIso(this.clock));

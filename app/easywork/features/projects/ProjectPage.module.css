@@ -31,7 +31,7 @@
 .memoryControl button { display:inline-flex; min-height:32px; align-items:center; gap:6px; padding:6px 10px; border:0; border-radius:8px; background:transparent; color:var(--ew-ink-muted); font:inherit; font-size:.82rem; cursor:pointer; transition:background-color 150ms ease,color 150ms ease,box-shadow 150ms ease; }
 .memoryControl button:hover:not(:disabled) { color:var(--ew-ink); }
 .memoryControl .activeMemory { background:rgba(255,254,250,.92); color:var(--ew-green-deep); font-weight:620; box-shadow:0 1px 4px rgba(45,42,33,.09); }
-.memoryControl button:disabled { cursor:wait; opacity:.62; }
+.memoryControl button:disabled { cursor:default; opacity:.62; }
 
 .tabs {
   display: flex;
@@ -154,6 +154,7 @@
 .fileStatusCell { display: flex; align-items: center; justify-content: space-between; gap: 3px; }
 .fileStatus { display: inline-flex; align-items: center; gap: 5px; font-size: 0.82rem; font-weight: 560; white-space: nowrap; }
 .ready { color: var(--ew-green); }
+.readable { color: var(--ew-blue); }
 .failed { color: var(--ew-red); }
 .processing { color: var(--ew-amber); }
 .fileError { grid-template-rows: auto auto; background: rgba(248, 233, 230, 0.2); }
@@ -186,19 +187,53 @@
 @media (max-width: 900px) {
   .page { padding: 30px 24px; }
   .linkGrid { grid-template-columns: 1fr; }
-  .projectFiles { overflow-x: auto; overscroll-behavior: contain; }
-  .fileHeader,
-  .projectFileRow { min-width: 760px; }
+  .projectFiles {
+    display: grid;
+    gap: 8px;
+    overflow-x: hidden;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+  .fileHeader { display: none; }
+  .projectFileRow {
+    min-width: 0;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto auto auto;
+    column-gap: 12px;
+    row-gap: 7px;
+    padding: 12px;
+    border: 1px solid rgba(52, 56, 46, 0.1);
+    border-radius: 13px;
+    background: rgba(255, 254, 250, 0.56);
+  }
+  .projectFileRow:last-child { border-bottom: 1px solid rgba(52, 56, 46, 0.1); }
+  .projectFileName { grid-column: 1 / -1; }
+  .projectFileName strong { font-size: var(--ew-mobile-body); }
+  .projectFileTime,
+  .projectFileSize { display: inline-flex; align-items: center; gap: 5px; color: var(--ew-ink-muted); font-size: var(--ew-mobile-caption); }
+  .projectFileTime { grid-column: 1; }
+  .projectFileSize { grid-column: 2; justify-self: end; }
+  .projectFileTime::before { content: "更新"; color: var(--ew-ink-muted); }
+  .projectFileSize::before { content: "大小"; color: var(--ew-ink-muted); }
+  .fileStatusCell { min-height: var(--ew-mobile-touch-compact); grid-column: 1 / -1; justify-content: flex-start; }
+  .fileErrorReason { grid-column: 1 / -1; padding-left: 0; }
+}
+
+@media (max-width: 720px) {
+  .page { padding-top: max(68px, calc(env(safe-area-inset-top) + 60px)); }
 }
 
 @media (max-width: 680px) {
-  .page { padding: 20px 14px max(24px, env(safe-area-inset-bottom)); }
+  .page { padding: max(68px, calc(env(safe-area-inset-top) + 60px)) 14px max(24px, env(safe-area-inset-bottom)); }
   .projectHeader { align-items: flex-start; flex-direction: column; gap: 16px; margin-bottom: 20px; }
   .projectIdentity h1 { font-size: 1.4rem; }
   .memoryControl { width: max-content; max-width:100%; }
   .tabs { overflow-x: auto; overscroll-behavior-inline: contain; scrollbar-width: none; }
   .tabs::-webkit-scrollbar { display: none; }
-  .tabs button { flex: none; padding-inline: 12px; }
+  .memoryControl button { min-height: var(--ew-mobile-touch-compact); }
+  .tabs button { min-height: var(--ew-mobile-touch); flex: none; padding-inline: 12px; }
   .tabContent { padding-top: 15px; }
   .conversationRow { min-height: 65px; grid-template-columns: 36px minmax(0, 1fr) 17px; padding-inline: 12px; }
   .conversationRow time { display: none; }
@@ -207,6 +242,7 @@
   .fileToolbar .searchField { width: 100%; }
   .collectionLinkToolbar { align-items: stretch; flex-direction: column; }
   .collectionLinkToolbar .searchField { width: 100%; }
+  .searchField { min-height: var(--ew-mobile-touch); }
   .linkCard { grid-template-columns: 38px minmax(0, 1fr) auto; padding-inline: 10px; }
 }
 

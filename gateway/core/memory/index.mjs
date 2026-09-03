@@ -1,2 +1,2 @@
 export { MEMORY_LEVELS, PersistentMemoryService } from "./service.mjs";
-export { MemoryCoordinator, parseMemoryCandidates } from "./coordinator.mjs";
+export { MemoryCoordinator, parseMemoryToolCalls } from "./coordinator.mjs";

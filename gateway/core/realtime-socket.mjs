@@ -79,13 +79,15 @@ export class RealtimeSocketServer {
           invariant(Array.isArray(message.topics) && message.topics.length <= 100, "REALTIME_TOPICS_INVALID", "订阅 topic 无效", { status: 400 });
           for (const topic of [...new Set(message.topics.map(String))]) {
             invariant(TOPIC_PATTERN.test(topic), "REALTIME_TOPIC_INVALID", "Realtime topic 无效", { status: 400 });
-            await this.authorizeTopic({ actor: state.session.actor, session: state.session, topic });
+            const authorizedTopic = await this.authorizeTopic({ actor: state.session.actor, session: state.session, topic });
+            const brokerTopic = typeof authorizedTopic === "string" ? authorizedTopic : topic;
+            invariant(TOPIC_PATTERN.test(brokerTopic), "REALTIME_TOPIC_INVALID", "Realtime 内部 topic 无效", { status: 500, expose: false });
             const afterSequence = Number(message.resume?.[topic] || 0);
-            const replay = await state.broker.replay(topic, { afterSequence });
-            for (const event of replay.events) send(socket, { type: "event", event }, this.maxBufferedBytes);
+            const replay = await state.broker.replay(brokerTopic, { afterSequence });
+            for (const event of replay.events) send(socket, { type: "event", event: { ...event, topic } }, this.maxBufferedBytes);
             if (!state.subscriptions.has(topic)) {
-              state.subscriptions.set(topic, state.broker.subscribe(topic, (event) => {
-                try { send(socket, { type: "event", event }, this.maxBufferedBytes); } catch (error) { fail(error, message.requestId); }
+              state.subscriptions.set(topic, state.broker.subscribe(brokerTopic, (event) => {
+                try { send(socket, { type: "event", event: { ...event, topic } }, this.maxBufferedBytes); } catch (error) { fail(error, message.requestId); }
               }));
             }
           }

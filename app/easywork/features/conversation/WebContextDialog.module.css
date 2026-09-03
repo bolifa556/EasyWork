@@ -26,7 +26,7 @@
   gap: 12px;
   padding: 17px 18px 15px;
   background:
-    radial-gradient(circle at 88% 8%, rgb(111 128 96 / 8%), transparent 40%),
+    radial-gradient(circle at 88% 8%, rgb(133 100 180 / 8%), transparent 40%),
     rgb(255 254 250 / 65%);
 }
 
@@ -43,8 +43,8 @@
   height: 38px;
   place-items: center;
   border-radius: 12px;
-  background: rgb(83 99 63 / 9%);
-  color: var(--ew-green-deep);
+  background: rgb(133 100 180 / 10%);
+  color: #6d4f94;
 }
 
 .usageHeading > div {
@@ -70,7 +70,7 @@
 }
 
 .usageHeading em {
-  color: var(--ew-green-deep);
+  color: #6d4f94;
   font-size: 13px;
   font-style: normal;
   font-variant-numeric: tabular-nums;
@@ -81,15 +81,22 @@
   height: 7px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgb(83 99 63 / 10%);
+  background: rgb(133 100 180 / 14%);
 }
 
 .progress > i {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #7c936c, #9fad91);
+  background: linear-gradient(90deg, #8564b4, #a58ac9);
   transition: width 240ms ease;
+}
+
+.usageSource {
+  margin: -3px 0 0;
+  color: var(--ew-ink-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
 }
 
 .composition,
@@ -229,10 +236,14 @@
 .unavailable strong { color: var(--ew-ink); font-size: .98rem; }
 .unavailable span { max-width: 430px; font-size: .82rem; line-height: 1.55; }
 
-@media (max-width: 680px) {
+@media (max-width: 719px) {
   .dialogPanel { width: 100%; max-height: 88dvh; }
   .parts,
   .settingsGrid { grid-template-columns: 1fr; }
+  .numberField { min-height:var(--ew-mobile-touch); }
+  .numberField input { font-size:var(--ew-mobile-control); }
+  .saveButton,
+  .compactButton { min-height:var(--ew-mobile-touch); }
 }
 
 @media (prefers-reduced-motion: reduce) {

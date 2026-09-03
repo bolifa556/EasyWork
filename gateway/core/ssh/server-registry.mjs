@@ -50,6 +50,10 @@ function validateState(data) {
       boundConversations.add(conversationId);
     }
   }
+  if (data.disabledBindings !== undefined) {
+    if (!Array.isArray(data.disabledBindings) || data.disabledBindings.some((value) => typeof value !== "string" || !boundConversations.has(value))) return false;
+    if (new Set(data.disabledBindings).size !== data.disabledBindings.length) return false;
+  }
   return true;
 }
 
@@ -69,7 +73,7 @@ export class SshServerRegistry {
       actor: this.actor,
       relativePath: ["state", "servers.json"],
       schemaVersion: 1,
-      defaultData: () => ({ profiles: {}, connections: {}, bindings: {} }),
+      defaultData: () => ({ profiles: {}, connections: {}, bindings: {}, disabledBindings: [] }),
       validate: validateState,
       queue: this.queue,
     });
@@ -119,6 +123,7 @@ export class SshServerRegistry {
       profile: structuredClone(state.data.profiles[id]),
       connection: structuredClone(state.data.connections[id]),
       conversationIds: structuredClone(state.data.bindings[id]),
+      activeConversationIds: structuredClone(state.data.bindings[id].filter((conversationId) => !(state.data.disabledBindings || []).includes(conversationId))),
     };
   }
 
@@ -128,6 +133,7 @@ export class SshServerRegistry {
       profile: structuredClone(profile),
       connection: structuredClone(state.data.connections[profile.id]),
       conversationIds: structuredClone(state.data.bindings[profile.id]),
+      activeConversationIds: structuredClone(state.data.bindings[profile.id].filter((conversationId) => !(state.data.disabledBindings || []).includes(conversationId))),
     }));
   }
 
@@ -231,6 +237,7 @@ export class SshServerRegistry {
         details: { conversationId: conversation, serverId: existingServerId },
       });
       data.bindings[id] = [...new Set([...(data.bindings[id] || []), conversation])];
+      data.disabledBindings = (data.disabledBindings || []).filter((value) => value !== conversation);
     });
     return this.get(id);
   }
@@ -243,6 +250,24 @@ export class SshServerRegistry {
     return Object.freeze({ conversationId: conversation, serverId });
   }
 
+  async isConversationConnectionEnabled(conversationId) {
+    const binding = await this.findConversationBinding(conversationId);
+    if (!binding.serverId) return false;
+    const state = await this.#repository().read();
+    return !(state.data.disabledBindings || []).includes(binding.conversationId);
+  }
+
+  async disableConversation(conversationId) {
+    const conversation = String(conversationId || "");
+    invariant(conversation, "CONVERSATION_ID_REQUIRED", "缺少对话 id", { status: 400 });
+    await this.#update((data) => {
+      const serverId = Object.entries(data.bindings).find(([, ids]) => ids.includes(conversation))?.[0] || null;
+      invariant(serverId, "CONVERSATION_SERVER_BINDING_NOT_FOUND", "对话尚未绑定服务器", { status: 404 });
+      data.disabledBindings = [...new Set([...(data.disabledBindings || []), conversation])];
+    });
+    return this.findConversationBinding(conversation);
+  }
+
   async unbindConversationEverywhere(conversationId) {
     const conversation = String(conversationId || "");
     invariant(conversation, "CONVERSATION_ID_REQUIRED", "缺少对话 id", { status: 400 });
@@ -250,6 +275,7 @@ export class SshServerRegistry {
       for (const serverId of Object.keys(data.bindings)) {
         data.bindings[serverId] = data.bindings[serverId].filter((value) => value !== conversation);
       }
+      data.disabledBindings = (data.disabledBindings || []).filter((value) => value !== conversation);
     });
     return Object.freeze({ conversationId: conversation, serverId: null });
   }
@@ -259,6 +285,7 @@ export class SshServerRegistry {
     await this.#update((data) => {
       invariant(data.profiles[id], "SERVER_NOT_FOUND", "服务器配置不存在", { status: 404 });
       data.bindings[id] = (data.bindings[id] || []).filter((value) => value !== conversationId);
+      data.disabledBindings = (data.disabledBindings || []).filter((value) => value !== conversationId);
     });
     return this.get(id);
   }

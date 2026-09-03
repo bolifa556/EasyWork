@@ -1,0 +1,3 @@
+{{PRIOR_SUMMARY_BLOCK}}## 待压缩对话
+
+{{MESSAGES}}

@@ -28,6 +28,8 @@ export type ServerCapabilityProfile = {
       download: boolean;
       range: boolean;
       mkdir: boolean;
+      create: boolean;
+      copy: boolean;
       rename: boolean;
       delete: boolean;
       maxUploadBytes: number | null;
@@ -35,8 +37,8 @@ export type ServerCapabilityProfile = {
     };
     preview: Capability & { types: string[] };
     terminal: Capability & { pty: boolean; resume: boolean };
-    workspaces: Capability & { virtual: boolean; user: boolean; switch: boolean; dynamicWrite: boolean };
-    versioning: Capability & { shadow: boolean; userGit: boolean; isolated: boolean };
+    workspaces: Capability & { virtual: boolean; user: boolean; switch: boolean };
+    versioning: Capability & { eventLedger: boolean; isolated: boolean };
     scheduler: Capability & {
       type: "slurm" | "pbs" | "generic" | "none";
       resourceSummary: boolean;
@@ -47,7 +49,6 @@ export type ServerCapabilityProfile = {
       cancelJob: boolean;
       jobOutput: boolean;
     };
-    artifacts: Capability & { capture: boolean; download: boolean; range: boolean };
     agents: Capability & {
       inspect: boolean;
       install: boolean;

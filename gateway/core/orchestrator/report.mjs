@@ -26,6 +26,74 @@ function textOf(value) {
   return "";
 }
 
+function reconstructedAssistantMessage(events) {
+  const messages = new Map();
+  for (const envelope of events) {
+    if (envelope.kind !== "message") continue;
+    const payload = eventPayload(envelope);
+    if (payload.role && String(payload.role).toLowerCase() !== "assistant") continue;
+    const value = textOf(payload);
+    if (!value) continue;
+    const source = sourceOf(envelope);
+    const key = String(source.itemId || source.id || `${envelope.producer}:assistant`);
+    const previous = messages.get(key);
+    messages.set(key, {
+      text: payload.delta === true ? `${previous?.text || ""}${value}` : value,
+      envelope,
+    });
+  }
+  const ordered = [...messages.values()].sort((left, right) => left.envelope.sequence - right.envelope.sequence);
+  if (!ordered.length) return null;
+  const lastToolSequence = events
+    .filter((envelope) => envelope.kind === "tool_result")
+    .reduce((sequence, envelope) => Math.max(sequence, Number(envelope.sequence || 0)), 0);
+  const finalItems = ordered.filter((entry) => entry.envelope.sequence > lastToolSequence);
+  const selected = finalItems.length ? finalItems : [ordered.at(-1)];
+  const deduplicated = [];
+  for (const entry of selected) {
+    const previous = deduplicated.at(-1);
+    if (!previous) {
+      deduplicated.push(entry);
+      continue;
+    }
+    if (entry.text === previous.text || previous.text.startsWith(entry.text)) {
+      previous.envelope = entry.envelope;
+      continue;
+    }
+    if (entry.text.startsWith(previous.text)) {
+      deduplicated[deduplicated.length - 1] = entry;
+      continue;
+    }
+    deduplicated.push(entry);
+  }
+  return {
+    text: deduplicated.map((entry) => entry.text).join(""),
+    envelope: deduplicated.at(-1).envelope,
+  };
+}
+
+function terminalAgentStatus(events) {
+  const terminalStatuses = new Set([
+    "idle", "completed", "complete", "success", "succeeded",
+    "message_complete", "message_completed", "turn_complete", "turn_completed",
+  ]);
+  return [...events].reverse().find((envelope) => {
+    if (envelope.kind !== "status" || envelope.status !== "completed" || !String(envelope.producer || "").startsWith("agent:")) return false;
+    const status = String(eventPayload(envelope).status || "").trim().toLowerCase();
+    return terminalStatuses.has(status);
+  }) || null;
+}
+
+function preferredFinalText(explicitText, reconstructedText) {
+  const explicit = String(explicitText || "").trim();
+  const reconstructed = String(reconstructedText || "").trim();
+  // A canonical `final` event is the Agent's authoritative outside-the-
+  // activity answer.  Message-completion snapshots are only a recovery source:
+  // Claude Code may emit the same completed block through both `assistant` and
+  // `content_block_stop`, and concatenating those snapshots duplicates output.
+  return explicit || reconstructed;
+}
+
 function safeObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? clone(redactSensitive(value)) : {};
 }
@@ -149,13 +217,34 @@ export class TaskReportService {
     return clone(report);
   }
 
+  async recoverableFinal(taskId) {
+    const events = await replayAll(this.journal, taskTopic(String(taskId)));
+    const finalEnvelope = [...events].reverse().find((entry) => entry.kind === "final") || null;
+    const message = reconstructedAssistantMessage(events);
+    const text = preferredFinalText(textOf(eventPayload(finalEnvelope)), message?.text);
+    const terminal = finalEnvelope || terminalAgentStatus(events);
+    if (!text || !terminal || (message && terminal.sequence < message.envelope.sequence)) return null;
+    const sourceEnvelope = finalEnvelope || message?.envelope || terminal;
+    return {
+      text,
+      explicit: Boolean(finalEnvelope),
+      producer: String(sourceEnvelope?.producer || terminal.producer || ""),
+      source: sourceOf(sourceEnvelope),
+      eventSequence: Number(sourceEnvelope?.sequence || terminal.sequence),
+      agentSequence: Number(sourceEnvelope?.payload?.agentSequence || terminal?.payload?.agentSequence || 0),
+    };
+  }
+
   async generate({ task, finalEvent = null, finalizer = null }) {
     invariant(task?.actorId === this.actor.actorId, "TASK_REPORT_ACTOR_MISMATCH", "TaskReport 不属于当前 Actor", { status: 403 });
     invariant(["completed", "failed", "cancelled"].includes(task.status), "TASK_REPORT_TASK_NOT_TERMINAL", "只有终态 Task 才能生成报告", { status: 409 });
     const events = await replayAll(this.journal, taskTopic(task.id));
     const finalEnvelope = [...events].reverse().find((entry) => entry.kind === "final") || null;
     const finalPayload = finalEnvelope ? eventPayload(finalEnvelope) : safeObject(finalEvent?.payload);
-    const remoteText = textOf(finalPayload);
+    const fallbackMessage = reconstructedAssistantMessage(events);
+    const explicitText = textOf(finalPayload);
+    const remoteText = preferredFinalText(explicitText, fallbackMessage?.text);
+    const remoteEnvelope = remoteText !== explicitText ? fallbackMessage?.envelope || finalEnvelope : finalEnvelope;
     const evidence = [];
     const changedFiles = [];
     const jobs = [];
@@ -216,8 +305,8 @@ export class TaskReportService {
       branchId: task.branchId,
       remoteFinal: remoteText ? {
         text: remoteText,
-        eventSequence: finalEnvelope?.sequence || Math.max(1, task.taskEventSequence),
-        producer: String(finalEnvelope?.producer || finalEvent?.producer?.adapter || task.route.agentId),
+        eventSequence: remoteEnvelope?.sequence || Math.max(1, task.taskEventSequence),
+        producer: String(remoteEnvelope?.producer || finalEvent?.producer?.adapter || task.route.agentId),
       } : null,
       claims,
       evidence,

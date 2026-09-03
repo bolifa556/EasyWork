@@ -136,10 +136,11 @@ export class RealtimeClient {
     if (this.seenEventIds.has(event.eventId)) return;
     const previous = this.lastSequence.get(event.topic) ?? 0;
     if (event.sequence <= previous) return;
-    if (previous && event.sequence !== previous + 1) {
-      this.sendSubscription([event.topic]);
-      return;
-    }
+    // Sequence numbers are monotonic cursors, not a promise that every value
+    // is retained.  The journal deliberately compacts adjacent token deltas
+    // into the newest envelope, so a valid replay commonly contains gaps.
+    // Re-subscribing on such a gap replays the same next event forever and can
+    // eventually exhaust both the socket buffer and the Gateway heap.
     this.seenEventIds.add(event.eventId);
     if (this.seenEventIds.size > 20_000) this.seenEventIds.clear();
     this.lastSequence.set(event.topic, event.sequence);

@@ -70,6 +70,8 @@ function taskInput(overrides = {}) {
     actorId: "user_01",
     conversationId: "conversation_01",
     branchId: "main",
+    sourceMessageId: "message_source_01",
+    conversationRunId: "conversation_run_01",
     goal: "检查远端环境并生成报告",
     route: {
       serverId: "server_01",
@@ -166,11 +168,14 @@ test("Task 状态机覆盖运行、等待、中断、恢复和完成路径", () 
       expectedRevision: task.revision,
       clock: () => new Date(AT_1),
       ...(status === "running" && !task.remoteRunId ? { remoteRunId: "run_01" } : {}),
+      ...(status === "waiting_append" ? { sourceMessageId: "message-append", conversationRunId: "run-append" } : {}),
     });
     assert.equal(task.revision, index + 1);
     assert.equal(task.taskEventSequence, index + 1);
   }
   assert.equal(task.status, "completed");
+  assert.equal(task.sourceMessageId, "message-append");
+  assert.equal(task.conversationRunId, "run-append");
   assert.equal(task.completedAt, AT_1);
   assert.equal(canTransitionTask("completed", "running"), false);
   expectCode(() => transitionTask(task, "running", { expectedRevision: task.revision, ...at(AT_2) }), "TASK_TRANSITION_INVALID");
@@ -206,6 +211,25 @@ test("Task runtime 更新会递增 revision，终态不可修改", () => {
   assert.equal(next.taskEventSequence, 2);
   assert.equal(next.plan[0].status, "running");
   expectCode(() => updateTaskRuntime(next, { plan: [] }, { expectedRevision: 1, ...at(AT_2) }), "REVISION_CONFLICT");
+});
+
+test("Task 终态不替远端 Agent 推进原生 Todo", () => {
+  for (const [index, status] of ["completed", "failed", "cancelled"].entries()) {
+    let task = createTask(taskInput({ id: `task_native_plan_${index}` }), at(AT_0));
+    task = transitionTask(task, "preparing", { expectedRevision: task.revision, ...at(AT_1) });
+    task = transitionTask(task, "delivering_context", { expectedRevision: task.revision, ...at(AT_2) });
+    task = transitionTask(task, "running", { expectedRevision: task.revision, ...at(AT_2) });
+    task = updateTaskRuntime(task, {
+      plan: [{ id: "native_step", text: "由远端 Agent 维护", status: "running" }],
+    }, { expectedRevision: task.revision, ...at(AT_2) });
+    task = transitionTask(task, "finalizing", { expectedRevision: task.revision, ...at(AT_2) });
+    const terminal = transitionTask(task, status, {
+      expectedRevision: task.revision,
+      ...(status === "failed" ? { failure: { code: "REMOTE_FAILED", message: "远端失败", retryable: false } } : {}),
+      ...at(AT_2),
+    });
+    assert.deepEqual(terminal.plan, [{ id: "native_step", text: "由远端 Agent 维护", status: "running" }]);
+  }
 });
 
 test("Artifact 严格区分 remote/host，物化需要 revision 且凭据字段被拒绝", () => {

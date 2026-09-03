@@ -52,7 +52,7 @@ test("catalog HTTP deletion performs the canonical cascade and Artifact save-as-
   const session = await gateway.runtime.auth.resolveSession(token);
   const services = await gateway.runtime.servicesForActor(session.actor);
   const task = createTask({
-    id: "task_artifact_api", actorId: session.actor.actorId, conversationId, branchId: "branch_api", goal: "artifact",
+    id: "task_artifact_api", actorId: session.actor.actorId, conversationId, branchId: "branch_api", sourceMessageId: "message_artifact_api", conversationRunId: "conversation_run_artifact_api", goal: "artifact",
     route: { serverId: "server_api", serverIdentity: `ssh_${"a".repeat(43)}`, workspaceId: "workspace_api", agentId: "codex", providerId: "provider_agent", modelId: "model_agent" },
     contextSessionId: "context_api", agentBindingId: "binding_api", skillPins: [], resourceBindingSnapshotId: "resource_snapshot_api",
     versionCheckpointId: null, budgets: { maxWallTimeMs: 60_000, maxInputTokens: 10_000, maxOutputTokens: 4_000, maxToolCalls: 10 }, idempotencyKey: "create_task_artifact_api",
@@ -62,6 +62,10 @@ test("catalog HTTP deletion performs the canonical cascade and Artifact save-as-
     kind: "artifact", phase: "completed", sequence: 1,
     payload: { source: "host", content: "promote through API", name: "result.txt", kind: "report", mime: "text/plain" },
   } });
+  const listedArtifacts = await json(baseUrl, `/api/artifacts?conversationId=${encodeURIComponent(conversationId)}&limit=100`, { token });
+  assert.equal(listedArtifacts.response.status, 200);
+  assert.equal(listedArtifacts.payload.data.items.length, 1);
+  assert.equal(listedArtifacts.payload.data.items[0].id, captured.artifact.id);
   const artifactRoute = await json(baseUrl, `/api/artifacts/${captured.artifact.id}/save-as-resource`, {
     token, method: "POST", headers: { "if-match": '"0"', "idempotency-key": "catalog-api-promote" }, body: { projectId: liveProject.payload.data.id },
   });

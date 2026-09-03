@@ -12,9 +12,6 @@ export type FeatureId =
   | "workspaces"
   | "remote-files"
   | "terminal"
-  | "git"
-  | "tasks"
-  | "artifacts"
   | "hpc";
 
 export type FeatureContext = {
@@ -36,17 +33,15 @@ export const featureRegistry: Partial<Record<FeatureId, FeatureDefinition<Record
 export function featureCapability(featureId: FeatureId, context: FeatureContext): { available: boolean; reason: string | null } {
   const profile = context.serverCapabilities;
   if (!profile) {
-    const serverFeature = ["agents", "workspaces", "remote-files", "terminal", "git", "artifacts", "hpc"].includes(featureId);
+    const serverFeature = ["agents", "workspaces", "remote-files", "terminal", "hpc"].includes(featureId);
     return { available: !serverFeature, reason: serverFeature ? "尚未检测服务器能力" : null };
   }
   const capability = featureId === "remote-files" ? profile.features.remoteFiles
-    : featureId === "terminal" ? profile.features.terminal
+      : featureId === "terminal" ? profile.features.terminal
       : featureId === "workspaces" ? profile.features.workspaces
-      : featureId === "git" ? profile.features.versioning
         : featureId === "hpc" ? profile.features.scheduler
-          : featureId === "artifacts" ? profile.features.artifacts
-            : featureId === "agents" ? profile.features.agents
-              : null;
+          : featureId === "agents" ? profile.features.agents
+            : null;
   return capability ? { available: capability.available, reason: capability.reason } : { available: true, reason: null };
 }
 

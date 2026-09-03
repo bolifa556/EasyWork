@@ -5,7 +5,7 @@ import "@xterm/xterm/css/xterm.css";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Terminal as XTermTerminal } from "@xterm/xterm";
-import { CirclePause, LoaderCircle, Play, Power, RotateCcw, Search, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, LoaderCircle, Plus, Search, SquareTerminal, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RealtimeEnvelope } from "@/app/core/contracts";
 import { commandId } from "@/app/core/gateway/client";
@@ -18,16 +18,58 @@ type TerminalSession = {
   topic: string;
   status: "open" | "closed" | string;
   attached: boolean;
+  scopeKey?: string;
+  outputBase64?: string;
   term: string;
   cols: number;
   rows: number;
+  cwd?: string | null;
   openedAt?: string;
   updatedAt?: string;
   closeResult?: { code: number | null; signal: string | null; error?: { message?: string } | null } | null;
 };
 
-type CachedSession = TerminalSession & { output: string };
-const cachedSessions = new Map<string, CachedSession>();
+type TerminalRecord = {
+  session: TerminalSession;
+  label: string;
+  output: string;
+  decoder: TextDecoder;
+};
+type TerminalGroup = {
+  records: Map<string, TerminalRecord>;
+  activeSessionId: string | null;
+  nextOrdinal: number;
+};
+type TerminalSessionView = { session: TerminalSession; label: string };
+type PendingInput = { text: string; timer: number | null };
+type InputPump = { queued: string; running: Promise<void> | null };
+
+const cachedTerminalGroups = new Map<string, TerminalGroup>();
+
+function terminalGroup(cacheKey: string) {
+  const cached = cachedTerminalGroups.get(cacheKey);
+  if (cached) return cached;
+  const created: TerminalGroup = { records: new Map(), activeSessionId: null, nextOrdinal: 1 };
+  cachedTerminalGroups.set(cacheKey, created);
+  return created;
+}
+
+function terminalSessionViews(group: TerminalGroup): TerminalSessionView[] {
+  return [...group.records.values()].map((record) => ({ session: { ...record.session }, label: record.label }));
+}
+
+function decodeBase64Text(value?: string) {
+  if (!value) return "";
+  try {
+    return new TextDecoder().decode(Uint8Array.from(atob(value), (character) => character.charCodeAt(0)));
+  } catch {
+    return "";
+  }
+}
+
+function createRecord(session: TerminalSession, label: string, output = decodeBase64Text(session.outputBase64)): TerminalRecord {
+  return { session, label, output, decoder: new TextDecoder() };
+}
 
 function decodeOutput(event: RealtimeEnvelope) {
   const payload = event.payload as { dataBase64?: string } | null;
@@ -47,7 +89,7 @@ const statusText: Record<string, string> = {
   failed: "连接失败",
 };
 
-const earthsongTheme = {
+const terminalTheme = {
   background: "#403f37",
   foreground: "#e8dfc8",
   cursor: "#f2e8cf",
@@ -71,63 +113,160 @@ const earthsongTheme = {
   brightWhite: "#fff8e7",
 } as const;
 
-export default function TerminalPane({ serverId, resumeAvailable, cacheScope }: { serverId: string; resumeAvailable: boolean; cacheScope: string }) {
+type Props = {
+  serverId: string;
+  cacheScope: string;
+  workspacePath: string;
+};
+
+export default function TerminalPane({ serverId, cacheScope, workspacePath }: Props) {
   const runtime = useAppRuntime();
   const cacheKey = `server:${serverId}:${cacheScope}`;
-  const [session, setSession] = useState<TerminalSession | null>(null);
-  const [status, setStatus] = useState("creating");
+  const [initialGroup] = useState(() => terminalGroup(cacheKey));
+  const groupRef = useRef<TerminalGroup>(initialGroup);
+  const [sessionList, setSessionList] = useState<TerminalSessionView[]>(() => terminalSessionViews(initialGroup));
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(() => initialGroup.activeSessionId);
+  const [creating, setCreating] = useState(() => initialGroup.records.size === 0);
   const [error, setError] = useState<string | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
+  const [switcherOpen, setSwitcherOpen] = useState(false);
   const terminalNode = useRef<HTMLDivElement>(null);
+  const switcherRoot = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTermTerminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
-  const sessionRef = useRef<TerminalSession | null>(null);
-  const outputRef = useRef(cachedSessions.get(cacheKey)?.output || "");
-  const decoderRef = useRef(new TextDecoder());
-  const unsubscribeRef = useRef<(() => void) | null>(null);
-  const closeRequested = useRef(false);
+  const activeSessionIdRef = useRef(activeSessionId);
+  const subscriptionsRef = useRef(new Map<string, () => void>());
   const resizeTimer = useRef<number | null>(null);
-  const inputQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const inputPumps = useRef(new Map<string, InputPump>());
+  const pendingInputs = useRef(new Map<string, PendingInput>());
+  const mountedRef = useRef(true);
+
+  const refreshSessionList = useCallback(() => {
+    const group = groupRef.current;
+    cachedTerminalGroups.set(cacheKey, group);
+    setSessionList(terminalSessionViews(group));
+  }, [cacheKey]);
+
+  const writeRecord = useCallback((sessionId: string, chunk: string) => {
+    if (!chunk) return;
+    const record = groupRef.current.records.get(sessionId);
+    if (!record) return;
+    record.output = `${record.output}${chunk}`.slice(-2_000_000);
+    if (activeSessionIdRef.current === sessionId) terminalRef.current?.write(chunk);
+  }, []);
+
+  const appendRemoteOutput = useCallback((sessionId: string, bytes: Uint8Array) => {
+    const record = groupRef.current.records.get(sessionId);
+    if (!record) return;
+    const decoded = record.decoder.decode(bytes, { stream: true });
+    writeRecord(sessionId, decoded);
+  }, [writeRecord]);
 
   const updateSession = useCallback((next: TerminalSession) => {
-    sessionRef.current = next;
-    setSession(next);
-    setStatus(next.status === "closed" ? "closed" : next.attached ? "open" : "detached");
-    cachedSessions.set(cacheKey, { ...next, output: outputRef.current });
-  }, [cacheKey]);
+    const record = groupRef.current.records.get(next.sessionId);
+    if (!record) return;
+    record.session = next;
+    refreshSessionList();
+  }, [refreshSessionList]);
 
-  const appendOutput = useCallback((bytes: Uint8Array | string) => {
-    const chunk = typeof bytes === "string" ? bytes : decoderRef.current.decode(bytes, { stream: true });
-    if (!chunk) return;
-    outputRef.current = `${outputRef.current}${chunk}`.slice(-2_000_000);
-    const current = sessionRef.current;
-    if (current) cachedSessions.set(cacheKey, { ...current, output: outputRef.current });
-    terminalRef.current?.write(chunk);
-  }, [cacheKey]);
-
-  const send = useCallback((text: string) => {
-    const current = sessionRef.current;
-    if (!current || current.status !== "open" || !current.attached || !text) return Promise.resolve();
-    inputQueue.current = inputQueue.current.then(() => runtime.api.post(
-      `/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(current.sessionId)}/input`,
-      { text },
-      { idempotencyKey: commandId("terminal-input") },
-    )).catch((reason) => {
-      setError(reason instanceof Error ? reason.message : "终端输入发送失败");
+  const sendToSession = useCallback((sessionId: string, text: string) => {
+    const record = groupRef.current.records.get(sessionId);
+    if (!record || record.session.status !== "open" || !record.session.attached || !text) return Promise.resolve();
+    let pump = inputPumps.current.get(sessionId);
+    if (!pump) {
+      pump = { queued: "", running: null };
+      inputPumps.current.set(sessionId, pump);
+    }
+    pump.queued += text;
+    if (pump.running) return pump.running;
+    const run = async () => {
+      while (pump.queued) {
+        const payload = pump.queued;
+        pump.queued = "";
+        await runtime.api.post(
+          `/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(sessionId)}/input`,
+          { text: payload },
+          { idempotencyKey: commandId("terminal-input") },
+        );
+      }
+    };
+    pump.running = run().catch((reason) => {
+      if (mountedRef.current) setError(reason instanceof Error ? reason.message : "终端输入发送失败");
+    }).finally(() => {
+      pump.running = null;
+      if (!pump.queued) inputPumps.current.delete(sessionId);
     });
-    return inputQueue.current;
+    return pump.running;
   }, [runtime.api, serverId]);
 
+  const flushPendingInput = useCallback((sessionId: string) => {
+    const pending = pendingInputs.current.get(sessionId);
+    if (!pending?.text) return;
+    if (pending.timer !== null) window.clearTimeout(pending.timer);
+    pendingInputs.current.delete(sessionId);
+    void sendToSession(sessionId, pending.text);
+  }, [sendToSession]);
+
+  const queueTerminalInput = useCallback((sessionId: string, raw: string) => {
+    let pending = pendingInputs.current.get(sessionId);
+    if (!pending) {
+      pending = { text: "", timer: null };
+      pendingInputs.current.set(sessionId, pending);
+    }
+    pending.text += raw;
+    const immediate = raw.length > 1 || /[\r\n\t\u0003\u0004\u001b\u007f\b]/u.test(raw);
+    if (immediate) {
+      flushPendingInput(sessionId);
+      return;
+    }
+    if (pending.timer === null) {
+      pending.timer = window.setTimeout(() => flushPendingInput(sessionId), 80);
+    }
+  }, [flushPendingInput]);
+
+  const selectSession = useCallback((sessionId: string) => {
+    const group = groupRef.current;
+    const record = group.records.get(sessionId);
+    if (!record) return;
+    group.activeSessionId = sessionId;
+    activeSessionIdRef.current = sessionId;
+    setActiveSessionId(sessionId);
+    setSwitcherOpen(false);
+    const terminal = terminalRef.current;
+    if (terminal) {
+      terminal.reset();
+      if (record.output) terminal.write(record.output);
+      terminal.focus();
+    }
+  }, []);
+
+  const handleTerminalData = useCallback((raw: string) => {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || !raw) return;
+    queueTerminalInput(sessionId, raw);
+  }, [queueTerminalInput]);
+
+  useEffect(() => () => {
+    for (const pending of pendingInputs.current.values()) {
+      if (pending.timer !== null) window.clearTimeout(pending.timer);
+    }
+    pendingInputs.current.clear();
+  }, []);
+
   const resizeRemote = useCallback((cols: number, rows: number) => {
-    const current = sessionRef.current;
-    if (!current || current.status !== "open" || !current.attached) return;
-    if (Math.abs(cols - current.cols) < 1 && Math.abs(rows - current.rows) < 1) return;
+    // The drawer enters with a transform animation. During that first frame
+    // ResizeObserver can report a tiny transient box (for example 10 x 5).
+    // Never propagate that animation artefact to the real remote PTY.
+    if (cols < 24 || rows < 6) return;
+    const record = groupRef.current.records.get(activeSessionIdRef.current || "");
+    if (!record || record.session.status !== "open" || !record.session.attached) return;
+    if (record.session.cols === cols && record.session.rows === rows) return;
     if (resizeTimer.current !== null) window.clearTimeout(resizeTimer.current);
     resizeTimer.current = window.setTimeout(() => {
       void runtime.api.post<TerminalSession>(
-        `/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(current.sessionId)}/resize`,
+        `/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(record.session.sessionId)}/resize`,
         { cols, rows },
         { idempotencyKey: commandId("terminal-resize") },
       ).then((result) => updateSession(result.data)).catch(() => undefined);
@@ -142,13 +281,14 @@ export default function TerminalPane({ serverId, resumeAvailable, cacheScope }: 
       convertEol: false,
       cursorBlink: true,
       cursorStyle: "bar",
+      disableStdin: false,
       fontFamily: "Cascadia Code, JetBrains Mono, SFMono-Regular, Consolas, monospace",
       fontSize: 14,
       lineHeight: 1.2,
       minimumContrastRatio: 4.5,
       screenReaderMode: true,
       scrollback: 10_000,
-      theme: earthsongTheme,
+      theme: terminalTheme,
     });
     const fit = new FitAddon();
     const search = new SearchAddon();
@@ -158,17 +298,39 @@ export default function TerminalPane({ serverId, resumeAvailable, cacheScope }: 
     terminalRef.current = terminal;
     fitAddonRef.current = fit;
     searchAddonRef.current = search;
-    fit.fit();
-    if (outputRef.current) terminal.write(outputRef.current);
-    const inputSubscription = terminal.onData((data) => { void send(data); });
+    let fitFrames: number[] = [];
+    let fitTimers: number[] = [];
+    const fitWhenStable = () => {
+      if (node.clientWidth < 220 || node.clientHeight < 96) return;
+      try {
+        const proposed = fit.proposeDimensions();
+        if (!proposed || proposed.cols < 24 || proposed.rows < 6) return;
+        fit.fit();
+      } catch { /* the drawer may be closing */ }
+    };
+    const scheduleFit = () => {
+      fitFrames.forEach((frame) => window.cancelAnimationFrame(frame));
+      fitTimers.forEach((timer) => window.clearTimeout(timer));
+      fitFrames = [window.requestAnimationFrame(() => {
+        fitFrames.push(window.requestAnimationFrame(fitWhenStable));
+      })];
+      fitTimers = [80, 240].map((delay) => window.setTimeout(fitWhenStable, delay));
+    };
+    scheduleFit();
+    const activeRecord = groupRef.current.records.get(activeSessionIdRef.current || "");
+    if (activeRecord?.output) terminal.write(activeRecord.output);
+    const inputSubscription = terminal.onData(handleTerminalData);
     const resizeSubscription = terminal.onResize(({ cols, rows }) => resizeRemote(cols, rows));
-    const observer = new ResizeObserver(() => {
-      try { fit.fit(); } catch { /* the drawer may be closing */ }
-    });
+    const observer = new ResizeObserver(scheduleFit);
     observer.observe(node);
+    if (node.parentElement) observer.observe(node.parentElement);
+    window.addEventListener("resize", scheduleFit);
     terminal.focus();
     return () => {
       observer.disconnect();
+      window.removeEventListener("resize", scheduleFit);
+      fitFrames.forEach((frame) => window.cancelAnimationFrame(frame));
+      fitTimers.forEach((timer) => window.clearTimeout(timer));
       inputSubscription.dispose();
       resizeSubscription.dispose();
       terminal.dispose();
@@ -177,83 +339,111 @@ export default function TerminalPane({ serverId, resumeAvailable, cacheScope }: 
       searchAddonRef.current = null;
       if (resizeTimer.current !== null) window.clearTimeout(resizeTimer.current);
     };
-  }, [resizeRemote, send]);
-
-  const subscribe = useCallback((current: TerminalSession) => {
-    unsubscribeRef.current?.();
-    if (!runtime.realtime) return;
-    unsubscribeRef.current = runtime.realtime.subscribe(current.topic, (event) => {
-      if (event.kind === "terminal.output") {
-        const bytes = decodeOutput(event);
-        if (bytes) appendOutput(bytes);
-      }
-      if (event.kind === "terminal.detached") setStatus("detached");
-      if (event.kind === "terminal.resumed") setStatus("open");
-      if (event.kind === "terminal.closed") {
-        const payload = event.payload as TerminalSession["closeResult"];
-        setStatus(payload?.error ? "failed" : "closed");
-        setSession((value) => value ? { ...value, status: "closed", attached: false, closeResult: payload } : value);
-        appendOutput(`\r\n\u001b[2m[终端${payload?.error?.message ? `异常结束：${payload.error.message}` : "已关闭"}]\u001b[0m\r\n`);
-        cachedSessions.delete(cacheKey);
-      }
-    });
-  }, [appendOutput, cacheKey, runtime.realtime]);
-
-  const createSession = useCallback(async (discard?: () => boolean) => {
-    closeRequested.current = false;
-    setStatus("creating");
-    setError(null);
-    const created = await runtime.api.post<TerminalSession>(`/api/servers/${encodeURIComponent(serverId)}/terminal`, {
-      term: "xterm-256color",
-      cols: terminalRef.current?.cols || 100,
-      rows: terminalRef.current?.rows || 30,
-    }, { idempotencyKey: commandId("terminal-create") });
-    if (discard?.()) {
-      await runtime.api.delete(`/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(created.data.sessionId)}`).catch(() => undefined);
-      return null;
-    }
-    decoderRef.current = new TextDecoder();
-    outputRef.current = "";
-    terminalRef.current?.reset();
-    updateSession(created.data);
-    subscribe(created.data);
-    return created.data;
-  }, [runtime.api, serverId, subscribe, updateSession]);
+  }, [handleTerminalData, resizeRemote]);
 
   useEffect(() => {
+    if (!activeSessionId) return undefined;
+    let frame = 0;
+    const timers: number[] = [];
+    const fitAndSync = () => {
+      const terminal = terminalRef.current;
+      const fit = fitAddonRef.current;
+      if (!terminal || !fit || !terminalNode.current) return;
+      if (terminalNode.current.clientWidth < 220 || terminalNode.current.clientHeight < 96) return;
+      try { fit.fit(); } catch { return; }
+      resizeRemote(terminal.cols, terminal.rows);
+    };
+    frame = window.requestAnimationFrame(fitAndSync);
+    timers.push(window.setTimeout(fitAndSync, 140), window.setTimeout(fitAndSync, 360));
+    return () => {
+      window.cancelAnimationFrame(frame);
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [activeSessionId, resizeRemote]);
+
+  const subscribeSession = useCallback((record: TerminalRecord) => {
+    subscriptionsRef.current.get(record.session.sessionId)?.();
+    if (!runtime.realtime) return;
+    const unsubscribe = runtime.realtime.subscribe(record.session.topic, (event) => {
+      if (event.kind === "terminal.output") {
+        const bytes = decodeOutput(event);
+        if (bytes) appendRemoteOutput(record.session.sessionId, bytes);
+      } else if (event.kind === "terminal.detached") {
+        updateSession({ ...record.session, attached: false });
+      } else if (event.kind === "terminal.resumed") {
+        updateSession({ ...record.session, status: "open", attached: true });
+      } else if (event.kind === "terminal.closed") {
+        const payload = event.payload as TerminalSession["closeResult"];
+        updateSession({ ...record.session, status: "closed", attached: false, closeResult: payload });
+        writeRecord(record.session.sessionId, `\r\n\u001b[2m[终端${payload?.error?.message ? `异常结束：${payload.error.message}` : "已关闭"}]\u001b[0m\r\n`);
+      }
+    });
+    subscriptionsRef.current.set(record.session.sessionId, unsubscribe);
+  }, [appendRemoteOutput, runtime.realtime, updateSession, writeRecord]);
+
+  const createSession = useCallback(async (discard?: () => boolean) => {
+    setCreating(true);
+    setError(null);
+    try {
+      const created = await runtime.api.post<TerminalSession>(`/api/servers/${encodeURIComponent(serverId)}/terminal`, {
+        term: "xterm-256color",
+        cols: terminalRef.current?.cols || 100,
+        rows: terminalRef.current?.rows || 30,
+        cwd: workspacePath,
+        scopeKey: cacheScope,
+      }, { idempotencyKey: commandId("terminal-create") });
+      if (discard?.() || !mountedRef.current) {
+        await runtime.api.delete(`/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(created.data.sessionId)}`).catch(() => undefined);
+        return null;
+      }
+      const group = groupRef.current;
+      const record = createRecord(created.data, `终端 ${group.nextOrdinal++}`);
+      group.records.set(created.data.sessionId, record);
+      refreshSessionList();
+      subscribeSession(record);
+      selectSession(created.data.sessionId);
+      return created.data;
+    } finally {
+      if (mountedRef.current) setCreating(false);
+    }
+  }, [cacheScope, refreshSessionList, runtime.api, selectSession, serverId, subscribeSession, workspacePath]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const subscriptions = subscriptionsRef.current;
+    const group = groupRef.current;
     let disposed = false;
-    closeRequested.current = false;
     const attach = async () => {
-      setStatus("creating");
       setError(null);
       try {
-        let current = cachedSessions.get(cacheKey) || null;
-        if (current) {
-          try {
-            const inspected = await runtime.api.get<TerminalSession>(`/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(current.sessionId)}`);
-            current = { ...inspected.data, output: current.output };
-            if (current.status === "open" && !current.attached && resumeAvailable) {
-              const resumed = await runtime.api.post<TerminalSession>(`/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(current.sessionId)}/resume`, {}, { idempotencyKey: commandId("terminal-resume") });
-              current = { ...resumed.data, output: current.output };
-            }
-          } catch {
-            cachedSessions.delete(cacheKey);
-            current = null;
+        const listed = await runtime.api.get<TerminalSession[]>(`/api/servers/${encodeURIComponent(serverId)}/terminal?scopeKey=${encodeURIComponent(cacheScope)}`);
+        const liveIds = new Set(listed.data.map((session) => session.sessionId));
+        for (const session of listed.data) {
+          const existing = group.records.get(session.sessionId);
+          if (existing) {
+            existing.session = session;
+            existing.output = decodeBase64Text(session.outputBase64);
+          } else {
+            group.records.set(session.sessionId, createRecord(session, `终端 ${group.nextOrdinal++}`));
           }
         }
-        if (!current || current.status !== "open") {
+        for (const sessionId of [...group.records.keys()]) {
+          if (!liveIds.has(sessionId)) group.records.delete(sessionId);
+        }
+        if (disposed) return;
+        for (const record of group.records.values()) subscribeSession(record);
+        refreshSessionList();
+        const openRecords = [...group.records.values()].filter((record) => record.session.status === "open");
+        if (!openRecords.length) {
           await createSession(() => disposed);
           return;
         }
-        if (disposed) return;
-        outputRef.current = current.output;
-        terminalRef.current?.reset();
-        if (current.output) terminalRef.current?.write(current.output);
-        updateSession(current);
-        subscribe(current);
+        const preferred = group.activeSessionId ? group.records.get(group.activeSessionId) : null;
+        selectSession(preferred?.session.status === "open" ? preferred.session.sessionId : openRecords[0].session.sessionId);
+        setCreating(false);
       } catch (reason) {
         if (!disposed) {
-          setStatus("failed");
+          setCreating(false);
           setError(reason instanceof Error ? reason.message : "终端创建失败");
         }
       }
@@ -261,71 +451,56 @@ export default function TerminalPane({ serverId, resumeAvailable, cacheScope }: 
     void attach();
     return () => {
       disposed = true;
-      unsubscribeRef.current?.();
-      unsubscribeRef.current = null;
-      const current = sessionRef.current;
-      if (!closeRequested.current && current?.status === "open" && current.attached && resumeAvailable) {
-        void runtime.api.post<TerminalSession>(`/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(current.sessionId)}/detach`, {}, { idempotencyKey: commandId("terminal-detach") }).then((result) => {
-          cachedSessions.set(cacheKey, { ...result.data, output: cachedSessions.get(cacheKey)?.output || outputRef.current });
-        }).catch(() => undefined);
-      }
+      mountedRef.current = false;
+      for (const unsubscribe of subscriptions.values()) unsubscribe();
+      subscriptions.clear();
+      cachedTerminalGroups.set(cacheKey, group);
     };
-  }, [cacheKey, createSession, resumeAvailable, runtime.api, serverId, subscribe, updateSession]);
+  }, [cacheKey, cacheScope, createSession, refreshSessionList, runtime.api, selectSession, serverId, subscribeSession]);
 
-  const detach = async () => {
-    const current = sessionRef.current;
-    if (!current || !resumeAvailable) return;
-    try {
-      const result = await runtime.api.post<TerminalSession>(`/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(current.sessionId)}/detach`, {}, { idempotencyKey: commandId("terminal-detach") });
-      updateSession(result.data);
-      unsubscribeRef.current?.();
-      unsubscribeRef.current = null;
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法分离终端"); }
-  };
+  useEffect(() => {
+    if (!switcherOpen) return undefined;
+    const close = (event: PointerEvent) => {
+      if (!switcherRoot.current?.contains(event.target as Node)) setSwitcherOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") setSwitcherOpen(false); };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", escape);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", escape);
+    };
+  }, [switcherOpen]);
 
-  const resume = async () => {
-    const current = sessionRef.current;
-    if (!current || !resumeAvailable) return;
-    try {
-      const result = await runtime.api.post<TerminalSession>(`/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(current.sessionId)}/resume`, {}, { idempotencyKey: commandId("terminal-resume") });
-      updateSession(result.data);
-      subscribe(result.data);
-      terminalRef.current?.focus();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "无法恢复终端"); }
-  };
-
-  const close = async () => {
-    const current = sessionRef.current;
-    if (!current) return;
-    closeRequested.current = true;
-    try {
-      const result = await runtime.api.delete<TerminalSession>(`/api/servers/${encodeURIComponent(serverId)}/terminal/${encodeURIComponent(current.sessionId)}`);
-      updateSession(result.data);
-      cachedSessions.delete(cacheKey);
-      unsubscribeRef.current?.();
-      unsubscribeRef.current = null;
-    } catch (reason) {
-      closeRequested.current = false;
-      setError(reason instanceof Error ? reason.message : "无法关闭终端");
-    }
-  };
+  const activeView = sessionList.find((candidate) => candidate.session.sessionId === activeSessionId) || null;
+  const activeSession = activeView?.session || null;
+  const status = creating && !activeSession ? "creating" : activeSession?.status === "closed" ? "closed" : activeSession?.attached ? "open" : activeSession ? "detached" : error ? "failed" : "creating";
 
   return <div className={`${styles.pane} ${styles.terminalPane}`}>
     <div className={styles.terminalToolbar}>
       <span className={`${styles.sessionStatus} ${styles[`session_${status}`] || ""}`}><i />{statusText[status] || status}</span>
-      <span className={styles.terminalMeta}>{session ? `${session.cols} × ${session.rows}` : "PTY"}</span>
+      <div className={styles.terminalSwitcher} ref={switcherRoot}>
+        <button type="button" className={styles.terminalSwitcherButton} aria-haspopup="menu" aria-expanded={switcherOpen} onClick={() => setSwitcherOpen((open) => !open)}><SquareTerminal size={14} /><span>{activeView?.label || "终端"}</span><ChevronDown size={13} /></button>
+        {switcherOpen ? <div className={styles.terminalSwitcherMenu} role="menu" aria-label="终端会话">
+          {sessionList.map(({ session, label }) => <button type="button" role="menuitemradio" aria-checked={session.sessionId === activeSessionId} key={session.sessionId} onClick={() => selectSession(session.sessionId)}><span className={`${styles.terminalSessionDot} ${styles[`session_${session.status === "open" ? session.attached ? "open" : "detached" : session.status}`] || ""}`}><i /></span><span>{label}</span><small>{statusText[session.status === "open" && !session.attached ? "detached" : session.status] || session.status}</small>{session.sessionId === activeSessionId ? <Check size={14} /> : null}</button>)}
+          <span className={styles.terminalSwitcherSeparator} />
+          <button type="button" className={styles.newTerminalButton} disabled={creating} onClick={() => void createSession().catch((reason) => setError(reason instanceof Error ? reason.message : "终端创建失败"))}>{creating ? <LoaderCircle className={styles.spin} size={14} /> : <Plus size={14} />}新增终端</button>
+        </div> : null}
+      </div>
+      <span className={styles.terminalMeta}>{activeSession ? `${activeSession.cols} × ${activeSession.rows}` : "PTY"}</span>
       <span className={styles.spacer} />
-      {searchOpen ? <label className={styles.terminalSearch}><Search size={14} aria-hidden="true" /><input autoFocus aria-label="在终端中搜索" value={searchTerm} onChange={(event) => { setSearchTerm(event.target.value); searchAddonRef.current?.findNext(event.target.value, { incremental: true }); }} onKeyDown={(event) => { if (event.key === "Enter") searchAddonRef.current?.findNext(searchTerm); if (event.key === "Escape") { setSearchOpen(false); terminalRef.current?.focus(); } }} /><button aria-label="关闭搜索" onClick={() => { setSearchOpen(false); terminalRef.current?.focus(); }}><X size={14} /></button></label> : <Button compact iconOnly variant="ghost" aria-label="搜索终端输出" icon={<Search size={15} />} onClick={() => setSearchOpen(true)} />}
-      {status === "open" && resumeAvailable ? <Button compact variant="ghost" icon={<CirclePause size={15} />} onClick={() => void detach()}>分离</Button> : null}
-      {status === "detached" ? <Button compact variant="secondary" icon={<Play size={15} />} onClick={() => void resume()}>恢复</Button> : null}
-      {["closed", "failed"].includes(status) ? <Button compact variant="secondary" icon={<Play size={15} />} onClick={() => void createSession().catch((reason) => { setStatus("failed"); setError(reason instanceof Error ? reason.message : "终端创建失败"); })}>新建会话</Button> : null}
-      {status === "open" ? <Button compact variant="ghost" icon={<RotateCcw size={14} />} onClick={() => void send("\u0003")}>Ctrl C</Button> : null}
-      <Button compact iconOnly variant="ghost" aria-label="清空终端" icon={<Trash2 size={15} />} onClick={() => { terminalRef.current?.clear(); outputRef.current = ""; const current = sessionRef.current; if (current) cachedSessions.set(cacheKey, { ...current, output: "" }); }} />
-      <Button compact iconOnly variant="danger" aria-label="关闭终端会话" icon={<Power size={15} />} disabled={!session || status === "closed"} onClick={() => void close()} />
+      {searchOpen ? <label className={styles.terminalSearch}><Search size={14} aria-hidden="true" /><input autoFocus aria-label="在终端中搜索" value={searchTerm} onChange={(event) => { setSearchTerm(event.target.value); searchAddonRef.current?.findNext(event.target.value, { incremental: true }); }} onKeyDown={(event) => { if (event.key === "Enter") searchAddonRef.current?.findNext(searchTerm); if (event.key === "Escape") { setSearchOpen(false); terminalRef.current?.focus(); } }} /><button type="button" aria-label="关闭搜索" onClick={() => { setSearchOpen(false); terminalRef.current?.focus(); }}><X size={14} /></button></label> : <Button compact variant="ghost" icon={<Search size={15} />} onClick={() => setSearchOpen(true)}>搜索</Button>}
+      <Button compact variant="ghost" icon={<Trash2 size={15} />} onClick={() => {
+        terminalRef.current?.reset();
+        const record = groupRef.current.records.get(activeSessionIdRef.current || "");
+        if (!record) return;
+        record.output = "";
+        void sendToSession(record.session.sessionId, "\u000c");
+      }}>清除</Button>
     </div>
     <div className={styles.terminalStage}>
-      {status === "creating" ? <div className={styles.terminalOverlay}><LoaderCircle className={styles.spin} size={21} />正在创建 PTY</div> : null}
-      {status === "detached" ? <div className={styles.terminalDetached}>终端已分离，恢复后可继续原会话</div> : null}
+      {creating && !activeSession ? <div className={styles.terminalOverlay}><LoaderCircle className={styles.spin} size={21} />正在创建 PTY</div> : null}
+      {status === "detached" ? <div className={styles.terminalDetached}>终端暂时不可输入，重新打开工作台后会自动恢复</div> : null}
       {error ? <div className={styles.terminalError} role="alert">{error}</div> : null}
       <div ref={terminalNode} className={styles.xtermHost} aria-label="远程终端" />
     </div>

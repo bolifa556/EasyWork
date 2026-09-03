@@ -1,36 +1,50 @@
 import { invariant } from "../errors.mjs";
 import { AtomicJsonRepository } from "../repository.mjs";
+import { durableMemoryCandidate } from "./policy.mjs";
 
-const LEVELS = new Set(["user", "project", "conversation", "workspace", "task"]);
+// EasyWork has three memory layers: account-wide memory shared between Web
+// conversations, project memory, and the current Web conversation's memory.
+// Workspace and remote Task identity belong to routing/versioning and must not
+// become semantic-memory scopes merely because two projects share a cwd.
+const LEVELS = Object.freeze(["user", "project", "conversation"]);
+const LEVEL_SET = new Set(LEVELS);
+const TOOL_LEVEL = Object.freeze(Object.fromEntries(LEVELS.map((level) => [`remember_${level}`, level])));
 const PORTABILITY = Object.freeze({
   user: "universal",
   project: "project-bound",
   conversation: "universal",
-  workspace: "workspace-bound",
-  task: "task-bound",
 });
 
-function unwrapJson(value) {
-  const text = String(value || "").trim();
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(text);
-  return fenced ? fenced[1].trim() : text;
+function normalizedSemanticKey(value) {
+  return String(value || "").normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-export function parseMemoryCandidates(value) {
-  let parsed;
-  try { parsed = JSON.parse(unwrapJson(value)); } catch { return []; }
-  const candidates = Array.isArray(parsed) ? parsed : parsed?.memories;
-  if (!Array.isArray(candidates)) return [];
-  return candidates.flatMap((candidate) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
-    if (!Object.keys(candidate).every((key) => ["level", "semanticKey", "content", "confidence"].includes(key))) return [];
-    const level = String(candidate.level || "");
-    const semanticKey = String(candidate.semanticKey || "").trim();
-    const content = String(candidate.content || "").trim();
-    const confidence = Number(candidate.confidence ?? 0.5);
-    if (!LEVELS.has(level) || !semanticKey || semanticKey.length > 512 || !content || content.length > 20_000) return [];
-    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return [];
-    return [{ level, semanticKey, content, confidence }];
+function normalizedObservedKnowledge(values) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : []).flatMap((value) => {
+    const knowledge = value?.knowledge && typeof value.knowledge === "object" ? value.knowledge : value;
+    const content = String(knowledge?.content || "").trim();
+    if (!content) return [];
+    const key = String(knowledge?.key || "").trim().slice(0, 1_024);
+    const version = String(knowledge?.version || "").trim().slice(0, 1_024);
+    const identity = `${key}\0${version}\0${content}`;
+    if (seen.has(identity)) return [];
+    seen.add(identity);
+    return [{ ...(key ? { key } : {}), ...(version ? { version } : {}), content: content.slice(0, 48_000) }];
+  }).slice(0, 128);
+}
+
+export function parseMemoryToolCalls(value, available = LEVELS) {
+  const allowed = new Set((Array.isArray(available) ? available : []).filter((level) => LEVEL_SET.has(level)));
+  return (Array.isArray(value) ? value : []).flatMap((call) => {
+    const level = TOOL_LEVEL[String(call?.name || "")];
+    const input = call?.input;
+    if (!level || !allowed.has(level) || !input || typeof input !== "object" || Array.isArray(input)) return [];
+    if (!Object.keys(input).every((key) => ["subject", "content"].includes(key))) return [];
+    const semanticKey = normalizedSemanticKey(input.subject);
+    const content = String(input.content || "").trim();
+    if (!semanticKey || semanticKey.length > 512 || !content || content.length > 20_000) return [];
+    return [{ level, semanticKey, content }];
   });
 }
 
@@ -38,27 +52,54 @@ function scopeId(scope, level) {
   if (level === "user") return scope.actorId;
   if (level === "project") return scope.projectId;
   if (level === "conversation") return scope.conversationId;
-  if (level === "workspace") return scope.workspaceId;
-  if (level === "task") return scope.taskId;
   return null;
 }
 
 function availableLevels(scope) {
-  return ["user", "project", "conversation", "workspace", "task"].filter((level) => {
+  return LEVELS.filter((level) => {
     if (level === "user" && scope.memoryMode !== "global") return false;
     return Boolean(scopeId(scope, level));
   });
 }
 
+const branchKey = (conversationId, branchId) => `${String(conversationId)}:${String(branchId)}`;
+
+function branchFamily(branches, conversationId, branchId) {
+  const graph = new Map();
+  const connect = (left, right) => {
+    if (!graph.has(left)) graph.set(left, new Set());
+    if (!graph.has(right)) graph.set(right, new Set());
+    graph.get(left).add(right);
+    graph.get(right).add(left);
+  };
+  for (const descriptor of Object.values(branches || {})) {
+    connect(
+      branchKey(descriptor.sourceConversationId, descriptor.sourceBranchId),
+      branchKey(descriptor.conversationId, descriptor.branchId),
+    );
+  }
+  const start = branchKey(conversationId, branchId);
+  const family = new Set([start]);
+  const queue = [start];
+  while (queue.length) {
+    const current = queue.shift();
+    for (const adjacent of graph.get(current) || []) {
+      if (family.has(adjacent)) continue;
+      family.add(adjacent);
+      queue.push(adjacent);
+    }
+  }
+  return family;
+}
+
 export class MemoryCoordinator {
   #inflight = new Map();
 
-  constructor({ memory, extractor, prompt, dataRoot = null, actor = null, queue = null, clock = () => new Date() }) {
+  constructor({ memory, extractor, dataRoot = null, actor = null, queue = null, clock = () => new Date() }) {
     invariant(memory && typeof memory.append === "function" && typeof memory.find === "function" && typeof memory.snapshot === "function" && typeof memory.select === "function", "MEMORY_COORDINATOR_INVALID", "MemoryCoordinator 缺少 Memory service", { status: 500, expose: false });
     invariant(typeof extractor === "function", "MEMORY_EXTRACTOR_INVALID", "MemoryCoordinator 缺少候选提取器", { status: 500, expose: false });
     this.memory = memory;
     this.extractor = extractor;
-    this.prompt = String(prompt || "").trim();
     this.dataRoot = dataRoot;
     this.actor = actor;
     this.queue = queue;
@@ -72,11 +113,12 @@ export class MemoryCoordinator {
       actor: this.actor,
       relativePath: ["memory", "coordinator.json"],
       schemaVersion: 2,
-      defaultData: () => ({ completed: {}, tasks: {}, branches: {} }),
+      defaultData: () => ({ completed: {}, tasks: {}, branches: {}, deletions: {} }),
       validate: (data) => Boolean(data && typeof data === "object" && !Array.isArray(data)
         && data.completed && typeof data.completed === "object" && !Array.isArray(data.completed)
         && data.tasks && typeof data.tasks === "object" && !Array.isArray(data.tasks)
-        && data.branches && typeof data.branches === "object" && !Array.isArray(data.branches)),
+        && data.branches && typeof data.branches === "object" && !Array.isArray(data.branches)
+        && data.deletions && typeof data.deletions === "object" && !Array.isArray(data.deletions)),
       queue: this.queue,
     });
   }
@@ -97,7 +139,8 @@ export class MemoryCoordinator {
     const canonicalScope = { ...scope, memoryBaselineSequence: null, memorySnapshotSequence: 0, memorySnapshotVersionIds: [] };
     const live = await this.memory.snapshot(canonicalScope);
     const ledger = await this.#repository().read();
-    const branch = ledger.data.branches[`${scope.conversationId}:${scope.branchId}`] || null;
+    const currentBranchKey = branchKey(scope.conversationId, scope.branchId);
+    const branch = ledger.data.branches[currentBranchKey] || null;
     if (!branch) {
       return Object.freeze({
         ...scope,
@@ -113,10 +156,15 @@ export class MemoryCoordinator {
     });
     const pinnedVersionIds = baseline.entries.map((entry) => entry.version.id);
     const allowed = new Set(pinnedVersionIds);
+    const family = branchFamily(ledger.data.branches, scope.conversationId, scope.branchId);
     for (const completed of Object.values(ledger.data.completed)) {
       const origin = completed?.origin;
       if (!origin || Number(completed.memorySequence || 0) <= branch.memorySequence) continue;
-      if (origin.conversationId === scope.conversationId && origin.branchId !== scope.branchId) continue;
+      const originBranchKey = branchKey(origin.conversationId, origin.branchId);
+      // Branch relatives share the exact pre-fork snapshot, then advance only
+      // from their own turns. Independent conversations still contribute
+      // project memory according to the normal scope rules.
+      if (family.has(originBranchKey) && originBranchKey !== currentBranchKey) continue;
       for (const versionId of completed.result?.storedVersionIds || []) allowed.add(String(versionId));
     }
     const selected = await this.memory.select({
@@ -136,40 +184,61 @@ export class MemoryCoordinator {
     });
   }
 
-  async registerBranch({ conversationId, sourceBranchId, branchId, sourceMessageIds }) {
+  async registerBranch({ conversationId, sourceConversationId = conversationId, sourceBranchId, branchId, sourceMessageIds }) {
     const key = `${String(conversationId)}:${String(branchId)}`;
+    const sourceKey = branchKey(sourceConversationId, sourceBranchId);
     const included = new Set((sourceMessageIds || []).map(String));
-    invariant(conversationId && sourceBranchId && branchId && included.size > 0, "MEMORY_BRANCH_DESCRIPTOR_INVALID", "分支记忆边界不完整", { status: 500, expose: false });
+    invariant(conversationId && sourceConversationId && sourceBranchId && branchId && included.size > 0, "MEMORY_BRANCH_DESCRIPTOR_INVALID", "分支记忆边界不完整", { status: 500, expose: false });
     await this.#update((data) => {
       const current = data.branches[key];
       if (current) {
-        invariant(current.sourceBranchId === String(sourceBranchId), "MEMORY_BRANCH_DESCRIPTOR_CONFLICT", "分支已绑定其他记忆边界", { status: 409 });
+        invariant(current.sourceConversationId === String(sourceConversationId) && current.sourceBranchId === String(sourceBranchId), "MEMORY_BRANCH_DESCRIPTOR_CONFLICT", "分支已绑定其他记忆边界", { status: 409 });
         return;
       }
-      const parent = data.branches[`${conversationId}:${sourceBranchId}`] || null;
+      const parent = data.branches[sourceKey] || null;
       let memorySequence = Number(parent?.memorySequence || 0);
       for (const completed of Object.values(data.completed)) {
         const origin = completed?.origin;
-        if (origin?.conversationId !== String(conversationId) || origin.branchId !== String(sourceBranchId)) continue;
+        if (origin?.conversationId !== String(sourceConversationId) || origin.branchId !== String(sourceBranchId)) continue;
         if (!included.has(String(origin.sourceId || "")) && !included.has(String(origin.parentMessageId || ""))) continue;
         memorySequence = Math.max(memorySequence, Number(completed.memorySequence || 0));
       }
+      const createdAt = this.clock().toISOString();
+      if (!parent) {
+        data.branches[sourceKey] = {
+          conversationId: String(sourceConversationId),
+          sourceConversationId: String(sourceConversationId),
+          sourceBranchId: String(sourceBranchId),
+          branchId: String(sourceBranchId),
+          memorySequence,
+          sourceMessageIds: [...included],
+          createdAt,
+        };
+      }
       const descriptor = {
         conversationId: String(conversationId),
+        sourceConversationId: String(sourceConversationId),
         sourceBranchId: String(sourceBranchId),
         branchId: String(branchId),
         memorySequence,
         sourceMessageIds: [...included],
-        createdAt: this.clock().toISOString(),
+        createdAt,
       };
       data.branches[key] = descriptor;
     });
     return { conversationId: String(conversationId), branchId: String(branchId), registered: true };
   }
 
-  async registerTask({ taskId, scope, providerId, modelId, mode = "work", sourceMessageId = null }) {
+  forkConversationScope(input) {
+    invariant(typeof this.memory.forkConversationScope === "function", "MEMORY_FORK_UNAVAILABLE", "Memory service 不支持派生对话", { status: 500, expose: false });
+    return this.memory.forkConversationScope(input);
+  }
+
+  async registerTask({ taskId, scope, providerId, modelId, mode = "work", sourceMessageId, userMessage, observedKnowledge = [] }) {
     const id = String(taskId || "");
-    invariant(id && providerId && modelId, "MEMORY_TASK_DESCRIPTOR_INVALID", "Task 记忆提取描述不完整", { status: 500, expose: false });
+    const sourceId = String(sourceMessageId || "");
+    const originalUserMessage = String(userMessage || "").trim();
+    invariant(id && sourceId && providerId && modelId && originalUserMessage, "MEMORY_TASK_DESCRIPTOR_INVALID", "Task 记忆提取描述不完整", { status: 500, expose: false });
     await this.#update((data) => {
       const descriptor = {
         taskId: id,
@@ -177,11 +246,18 @@ export class MemoryCoordinator {
         providerId: String(providerId),
         modelId: String(modelId),
         mode: String(mode),
-        sourceMessageId: sourceMessageId == null ? null : String(sourceMessageId),
+        sourceMessageId: sourceId,
+        userMessage: originalUserMessage,
+        observedKnowledge: normalizedObservedKnowledge(observedKnowledge),
         registeredAt: this.clock().toISOString(),
       };
       const current = data.tasks[id];
-      invariant(!current || (current.providerId === descriptor.providerId && current.modelId === descriptor.modelId), "MEMORY_TASK_DESCRIPTOR_CONFLICT", "Task 已绑定其他记忆提取模型", { status: 409 });
+      invariant(!current || (
+        current.providerId === descriptor.providerId
+        && current.modelId === descriptor.modelId
+        && current.sourceMessageId === descriptor.sourceMessageId
+        && current.userMessage === descriptor.userMessage
+      ), "MEMORY_TASK_DESCRIPTOR_CONFLICT", "Task 已绑定其他记忆提取上下文", { status: 409 });
       data.tasks[id] = current || descriptor;
     });
     return { taskId: id, registered: true };
@@ -199,12 +275,88 @@ export class MemoryCoordinator {
     return this.memory.invalidateSources({ sourceIds, reason, source });
   }
 
+  async forgottenConversationIds() {
+    const state = await this.#repository().read();
+    return Object.keys(state.data.deletions);
+  }
+
+  async excludeConversationEntries(entries, conversationId, branchId = null) {
+    if (!Array.isArray(entries) || !entries.length || !conversationId) return entries;
+    const state = await this.#repository().read();
+    const excludedVersionIds = new Set();
+    const branch = branchId == null ? null : state.data.branches[branchKey(conversationId, branchId)] || null;
+    const visibleSourceIds = new Set((branch?.sourceMessageIds || []).map(String));
+    for (const completed of Object.values(state.data.completed)) {
+      const origin = completed?.origin;
+      const fromCurrentConversation = origin?.conversationId === String(conversationId);
+      const representedByBranchHistory = visibleSourceIds.has(String(origin?.sourceId || ""))
+        || visibleSourceIds.has(String(origin?.parentMessageId || ""));
+      if (!fromCurrentConversation && !representedByBranchHistory) continue;
+      for (const versionId of completed.result?.storedVersionIds || []) excludedVersionIds.add(String(versionId));
+    }
+    if (!excludedVersionIds.size) return entries;
+    return entries.filter((entry) => !excludedVersionIds.has(String(entry?.id || "")));
+  }
+
+  async forgetConversation({ conversationId, taskIds = [], sourceIds: explicitSourceIds = [], reason = "deleted conversation", source }) {
+    const id = String(conversationId || "");
+    invariant(id, "MEMORY_CONVERSATION_ID_REQUIRED", "删除对话记忆时缺少 conversationId", { status: 500, expose: false });
+    const before = await this.#repository().read();
+    const prior = before.data.deletions?.[id];
+    if (prior) return { ...structuredClone(prior), duplicate: true };
+
+    const relatedCompleted = Object.values(before.data.completed).filter((entry) => entry?.origin?.conversationId === id);
+    const relatedTaskIds = new Set([
+      ...(Array.isArray(taskIds) ? taskIds : []),
+      ...relatedCompleted.map((entry) => entry?.origin?.taskId),
+      ...Object.values(before.data.tasks)
+        .filter((entry) => entry?.scope?.conversationId === id)
+        .map((entry) => entry?.taskId),
+    ].map(String).filter(Boolean));
+    const sourceIds = new Set([
+      ...(Array.isArray(explicitSourceIds) ? explicitSourceIds : []),
+      ...relatedCompleted.map((entry) => entry?.origin?.sourceId),
+      ...relatedTaskIds,
+    ].map(String).filter(Boolean));
+    const sourceResult = sourceIds.size
+      ? await this.memory.invalidateSources({ sourceIds: [...sourceIds], reason, source })
+      : { invalidated: 0 };
+    const scopeResult = await this.memory.invalidateScopes({
+      scopes: [
+        { level: "conversation", id },
+        ...[...relatedTaskIds].map((taskId) => ({ level: "task", id: taskId })),
+      ],
+      reason,
+      source,
+    });
+    const result = {
+      conversationId: id,
+      invalidated: Number(sourceResult.invalidated || 0) + Number(scopeResult.invalidated || 0),
+      sourceCount: sourceIds.size,
+      taskCount: relatedTaskIds.size,
+      completedAt: this.clock().toISOString(),
+    };
+    await this.#update((data) => {
+      for (const [key, entry] of Object.entries(data.completed)) {
+        if (entry?.origin?.conversationId === id) delete data.completed[key];
+      }
+      for (const [key, entry] of Object.entries(data.tasks)) {
+        if (entry?.scope?.conversationId === id || relatedTaskIds.has(String(entry?.taskId))) delete data.tasks[key];
+      }
+      for (const [key, entry] of Object.entries(data.branches)) {
+        if (entry?.conversationId === id || key.startsWith(`${id}:`)) delete data.branches[key];
+      }
+      data.deletions[id] = structuredClone(result);
+    });
+    return result;
+  }
+
   async recordTaskFinal({ task, assistantMessage, source }) {
     const descriptor = await this.taskDescriptor(task?.id);
     if (!descriptor) return { extracted: 0, stored: [], skipped: "descriptor-unavailable" };
     return this.recordExchange({
       scope: descriptor.scope,
-      userMessage: task.goal,
+      userMessage: descriptor.userMessage,
       assistantMessage,
       source: source || { type: "remote-task", id: task.id, version: String(task.revision) },
       authority: "agent-observed",
@@ -212,6 +364,7 @@ export class MemoryCoordinator {
       modelId: descriptor.modelId,
       mode: descriptor.mode,
       parentMessageId: descriptor.sourceMessageId,
+      observedKnowledge: descriptor.observedKnowledge || [],
       dedupeKey: `task:${task.id}`,
     });
   }
@@ -228,24 +381,24 @@ export class MemoryCoordinator {
     return promise;
   }
 
-  async #recordExchange({ scope, userMessage, assistantMessage, source, authority = "model-inferred", providerId, modelId, mode = "chat", parentMessageId = null, dedupeKey }) {
+  async #recordExchange({ scope, userMessage, assistantMessage, source, authority = "model-inferred", providerId, modelId, mode = "chat", parentMessageId = null, observedKnowledge = [], dedupeKey }) {
     const before = await this.#repository().read();
     if (before.data.completed[dedupeKey]) return { ...structuredClone(before.data.completed[dedupeKey].result), duplicate: true };
     const levels = availableLevels(scope);
     if (!levels.length) return { extracted: 0, stored: [] };
     const output = await this.extractor({
-      system: this.prompt,
       providerId: String(providerId || ""),
       modelId: String(modelId || ""),
       mode,
       input: {
         availableLevels: levels,
-        scopeIds: Object.fromEntries(levels.map((level) => [level, scopeId(scope, level)])),
         userMessage: String(userMessage || ""),
         assistantMessage: String(assistantMessage || ""),
       },
     });
-    const candidates = parseMemoryCandidates(output);
+    const knowledgeEvidence = normalizedObservedKnowledge(observedKnowledge);
+    const candidates = parseMemoryToolCalls(output, levels)
+      .filter((candidate) => durableMemoryCandidate(candidate, { userMessage, observedKnowledge: knowledgeEvidence, mode }));
     const stored = [];
     for (const candidate of candidates) {
       if (!levels.includes(candidate.level)) continue;
@@ -253,14 +406,17 @@ export class MemoryCoordinator {
       for (;;) {
         const existing = await this.memory.find({ scope: memoryScope, semanticKey: candidate.semanticKey });
         const latest = existing?.versions?.at(-1);
-        if (latest?.content === candidate.content && latest?.source?.id === String(source?.id || scope.conversationId)) break;
+        // Identical semantic content is already durable. A new message source
+        // must not create a no-op version that is then retrieved as a second
+        // copy on a later turn.
+        if (latest?.content === candidate.content) break;
         try {
           const result = await this.memory.append({
             scope: memoryScope,
             semanticKey: candidate.semanticKey,
             content: candidate.content,
             authority,
-            confidence: candidate.confidence,
+            confidence: authority === "agent-observed" ? 1 : 0.9,
             sensitivity: "private",
             portability: PORTABILITY[candidate.level],
             source: {

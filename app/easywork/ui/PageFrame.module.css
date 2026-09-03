@@ -11,4 +11,15 @@
 .surface { border: 1px solid rgba(64,65,55,.12); border-radius: 18px; background: rgba(255,254,250,.45); }
 .empty { display: grid; min-height: 280px; place-content: center; justify-items: center; gap: 9px; color: var(--ew-ink-muted); text-align: center; }
 .empty strong { color: var(--ew-ink-soft); font-size: .98rem; }
-@media (max-width: 680px) { .page { padding: 64px 13px 32px; } .header { padding-inline: 3px; } .title { font-size: 1.25rem; } }
+@media (max-width: 719px) {
+  .page { padding: max(68px, calc(env(safe-area-inset-top) + 60px)) 13px max(32px, env(safe-area-inset-bottom)); }
+  .header { min-height: 44px; gap: 10px; margin-bottom: 18px; padding-inline: 3px; }
+  .title { font-size: var(--ew-mobile-title); }
+  .toolbar { gap: 9px; }
+  .search { min-height: var(--ew-mobile-touch); }
+}
+
+@media (max-width: 430px) {
+  .toolbar { align-items: stretch; }
+  .search { min-width: 0; flex: 1 1 190px; }
+}

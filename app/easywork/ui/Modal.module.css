@@ -35,17 +35,26 @@
   border-bottom: 1px solid var(--ew-line);
 }
 .heading { min-width: 0; }
+.headerActions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 8px; }
 .heading h2 { margin: 0; font-family: var(--ew-display); font-size: 1.12rem; font-weight: 650; letter-spacing: -0.015em; }
 .heading p { margin: 3px 0 0; color: var(--ew-ink-muted); font-size: 0.82rem; }
 .body { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 22px; }
+.floatingBackdrop { padding:24px; background:rgb(0 0 0 / 32%); backdrop-filter:blur(2px); }
+.floatingPanel { max-height:min(840px,calc(100dvh - 40px)); border:0; border-radius:16px; outline:0; background:#fff; box-shadow:0 22px 70px rgb(0 0 0 / 22%); }
+.floatingHeader { min-height:64px; padding:0 18px 0 22px; border-color:#e8e8e8; }
+.floatingHeader .heading h2 { font-size:19px; font-weight:600; letter-spacing:-.01em; }
+.floatingHeader .headerActions > button { width:34px; height:34px; min-height:34px; border:0; border-radius:10px; background:transparent; color:#504d43; box-shadow:none; }
+.floatingHeader .headerActions > button:hover { background:rgb(79 73 59 / 7%); }
 
 @keyframes fadeIn { from { opacity: 0; } }
 @keyframes riseIn { from { opacity: 0; transform: translateY(10px) scale(.985); } }
 
-@media (max-width: 680px) {
+@media (max-width: 719px) {
   .backdrop { align-items: end; padding: 0; }
   .panel,
   .compact,
   .wide { width: 100%; max-height: min(88dvh, 820px); border-radius: 22px 22px 0 0; }
+  .header { min-height: 60px; padding: 10px 12px 9px 18px; }
+  .heading h2 { font-size: 1.08rem; }
   .body { padding: 18px 16px max(20px, env(safe-area-inset-bottom)); }
 }

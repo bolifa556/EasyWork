@@ -33,6 +33,7 @@ export class PbsSchedulerAdapter {
   accessiblePartitions() { return schedulerUnsupported(this.type, "accessiblePartitions", REASON); }
   resourceSummary() { return schedulerUnsupported(this.type, "resourceSummary", REASON); }
   userJobs() { return schedulerUnsupported(this.type, "userJobs", REASON); }
+  jobHistory() { return schedulerUnsupported(this.type, "jobHistory", REASON); }
   inspectJob() { return schedulerUnsupported(this.type, "inspectJob", REASON); }
   jobOutput() { return schedulerUnsupported(this.type, "jobOutput", REASON); }
   submit() { return schedulerUnsupported(this.type, "submit", REASON); }

@@ -6,6 +6,8 @@ export type RealtimeEventKind =
   | "tool_result"
   | "approval_request"
   | "approval_response"
+  | "input_request"
+  | "input_response"
   | "file_change"
   | "job_status"
   | "artifact"

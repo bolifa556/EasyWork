@@ -11,13 +11,18 @@ type Props = {
   subtitle?: string;
   size?: "compact" | "normal" | "wide";
   panelClassName?: string;
+  bodyClassName?: string;
+  headerAction?: ReactNode;
+  floating?: boolean;
   onClose: () => void;
   children: ReactNode;
 };
 
-export function Modal({ title, subtitle, size = "normal", panelClassName = "", onClose, children }: Props) {
+export function Modal({ title, subtitle, size = "normal", panelClassName = "", bodyClassName = "", headerAction, floating = false, onClose, children }: Props) {
   const panelRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
   useEffect(() => {
     const handle = window.setTimeout(() => setPortalTarget(document.body), 0);
     return () => window.clearTimeout(handle);
@@ -28,9 +33,13 @@ export function Modal({ title, subtitle, size = "normal", panelClassName = "", o
     const panel = panelRef.current;
     const focusable = () => [...(panel?.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])') ?? [])]
       .filter((element) => element.offsetParent !== null);
-    window.setTimeout(() => focusable()[0]?.focus(), 0);
+    const focusHandle = !floating ? window.setTimeout(() => {
+      const autofocus = panel?.querySelector<HTMLElement>("[autofocus]");
+      const active = document.activeElement instanceof HTMLElement && panel?.contains(document.activeElement) ? document.activeElement : null;
+      (autofocus && autofocus.offsetParent !== null ? autofocus : active && active.offsetParent !== null ? active : focusable()[0])?.focus();
+    }, 0) : null;
     const handleKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") { event.preventDefault(); onClose(); return; }
+      if (event.key === "Escape") { event.preventDefault(); onCloseRef.current(); return; }
       if (event.key !== "Tab") return;
       const items = focusable();
       if (!items.length) { event.preventDefault(); panel?.focus(); return; }
@@ -40,17 +49,21 @@ export function Modal({ title, subtitle, size = "normal", panelClassName = "", o
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     window.addEventListener("keydown", handleKey);
-    return () => { window.removeEventListener("keydown", handleKey); previous?.focus(); };
-  }, [onClose, portalTarget]);
+    return () => {
+      if (focusHandle !== null) window.clearTimeout(focusHandle);
+      window.removeEventListener("keydown", handleKey);
+      previous?.focus();
+    };
+  }, [floating, portalTarget]);
   if (!portalTarget) return null;
   return createPortal(
-    <div className={styles.backdrop} role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
-      <section ref={panelRef} tabIndex={-1} className={`${styles.panel} ${size !== "normal" ? styles[size] : ""} ${panelClassName}`} role="dialog" aria-modal="true" aria-label={title}>
-        <header className={styles.header}>
+    <div className={`${styles.backdrop} ${floating ? styles.floatingBackdrop : ""}`} role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
+      <section ref={panelRef} tabIndex={-1} className={`${styles.panel} ${size !== "normal" ? styles[size] : ""} ${floating ? styles.floatingPanel : ""} ${panelClassName}`} role="dialog" aria-modal="true" aria-label={title}>
+        <header className={`${styles.header} ${floating ? styles.floatingHeader : ""}`}>
           <div className={styles.heading}><h2>{title}</h2>{subtitle ? <p>{subtitle}</p> : null}</div>
-          <Button variant="ghost" iconOnly aria-label="关闭" onClick={onClose} icon={<X size={18} />} />
+          <div className={styles.headerActions}>{headerAction}<Button variant="ghost" iconOnly aria-label="关闭" onClick={onClose} icon={<X size={18} />} /></div>
         </header>
-        <div className={styles.body}>{children}</div>
+        <div className={`${styles.body} ${bodyClassName}`}>{children}</div>
       </section>
     </div>,
     portalTarget,

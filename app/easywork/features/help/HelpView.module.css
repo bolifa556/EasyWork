@@ -69,3 +69,20 @@
 .unavailable button { min-height: 36px; padding: 6px 13px; border: 1px solid var(--ew-line); border-radius: 9px; background: rgba(255,255,255,.55); color: var(--ew-ink-soft); cursor: pointer; }
 @keyframes documentIn { from { opacity: 0; transform: translateY(4px); } }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 720px) {
+  .page { padding: max(70px, calc(env(safe-area-inset-top) + 62px)) 16px max(40px, env(safe-area-inset-bottom)); }
+  .document { font-size: 15.5px; line-height: 1.78; }
+  .document h1 { padding-bottom: 12px; font-size: 22px; line-height: 1.3; }
+  .document h1 + p { padding-left: 12px; font-size: 15px; line-height: 1.7; }
+  .document h2 { margin-top: 1.45rem; padding-left: 12px; font-size: 18px; }
+  .document h3 { font-size: 16.5px; }
+  .document h4 { font-size: 16px; }
+  .document ul,
+  .document ol { gap: .42rem; padding-left: 1.15rem; }
+  .document blockquote { margin: 15px 0; padding: 9px 12px; }
+  .document pre { margin: 14px 0; border-radius: 11px; }
+  .document pre code { padding: 12px 13px; font-size: .78rem; }
+  .document table { display: block; max-width: 100%; overflow-x: auto; font-size: .82rem; white-space: nowrap; }
+  .unavailable button { min-height: var(--ew-mobile-touch); }
+}

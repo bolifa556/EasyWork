@@ -6,7 +6,7 @@ import { assertNoSensitiveFields, invariant } from "../errors.mjs";
 import { resolveActorPath } from "../paths.mjs";
 import { AtomicJsonRepository } from "../repository.mjs";
 import { TASK_COMMAND_STATUSES, TASK_COMMAND_TYPES, assertCommandId } from "./contract.mjs";
-import { validateTask } from "../entities/task.mjs";
+import { TASK_STATUSES, validateTask } from "../entities/task.mjs";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const COMMAND_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
@@ -46,8 +46,15 @@ function taskSummary(task) {
     id: task.id,
     conversationId: task.conversationId,
     branchId: task.branchId,
+    sourceMessageId: task.sourceMessageId,
+    conversationRunId: task.conversationRunId,
+    goal: task.goal,
     status: task.status,
     route: clone(task.route),
+    agentBindingId: task.agentBindingId,
+    taskEventSequence: task.taskEventSequence,
+    plan: clone(task.plan),
+    failure: clone(task.failure),
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     startedAt: task.startedAt,
@@ -56,9 +63,38 @@ function taskSummary(task) {
   };
 }
 
+const TASK_SUMMARY_KEYS = Object.freeze([
+  "id", "conversationId", "branchId", "sourceMessageId", "conversationRunId", "goal", "status", "route", "agentBindingId", "taskEventSequence",
+  "plan", "failure", "createdAt", "updatedAt", "startedAt", "completedAt", "revision",
+]);
+
+function validateTaskSummary(summary, id) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) return false;
+  const keys = Object.keys(summary);
+  if (keys.length !== TASK_SUMMARY_KEYS.length || keys.some((key) => !TASK_SUMMARY_KEYS.includes(key))) return false;
+  return summary.id === id
+    && ID_PATTERN.test(id)
+    && ID_PATTERN.test(String(summary.conversationId || ""))
+    && ID_PATTERN.test(String(summary.branchId || ""))
+    && ID_PATTERN.test(String(summary.sourceMessageId || ""))
+    && ID_PATTERN.test(String(summary.conversationRunId || ""))
+    && typeof summary.goal === "string"
+    && TASK_STATUSES.includes(summary.status)
+    && summary.route && typeof summary.route === "object" && !Array.isArray(summary.route)
+    && ID_PATTERN.test(String(summary.agentBindingId || ""))
+    && Number.isSafeInteger(summary.taskEventSequence) && summary.taskEventSequence >= 0
+    && Array.isArray(summary.plan)
+    && (summary.failure === null || (typeof summary.failure === "object" && !Array.isArray(summary.failure)))
+    && typeof summary.createdAt === "string"
+    && typeof summary.updatedAt === "string"
+    && (summary.startedAt === null || typeof summary.startedAt === "string")
+    && (summary.completedAt === null || typeof summary.completedAt === "string")
+    && Number.isSafeInteger(summary.revision) && summary.revision >= 0;
+}
+
 function validateIndex(data) {
   if (!data || typeof data !== "object" || Array.isArray(data) || !data.tasks || typeof data.tasks !== "object" || Array.isArray(data.tasks)) return false;
-  return Object.entries(data.tasks).every(([id, summary]) => summary?.id === id && ID_PATTERN.test(id) && Number.isSafeInteger(summary.revision));
+  return Object.entries(data.tasks).every(([id, summary]) => validateTaskSummary(summary, id));
 }
 
 export class FileTaskStore {
@@ -224,10 +260,10 @@ export class FileTaskStore {
     const state = await this.#indexRepository().read();
     const statuses = options.statuses ? new Set(options.statuses.map(String)) : null;
     const conversationId = options.conversationId ? String(options.conversationId) : null;
-    return Object.values(state.data.tasks)
+    const indexed = Object.values(state.data.tasks)
       .filter((task) => (!statuses || statuses.has(task.status)) && (!conversationId || task.conversationId === conversationId))
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id))
-      .map(clone);
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
+    return indexed.map(clone);
   }
 }
 
@@ -271,7 +307,7 @@ export class DetachedTaskRuntime {
       if (this.#jobs.get(key) === promise) this.#jobs.delete(key);
     }).catch(() => undefined);
     promise.catch(() => undefined);
-    return { accepted: true, key };
+    return { accepted: true, key, promise };
   }
 
   async loadBinding(bindingId) {
@@ -292,12 +328,39 @@ export class DetachedTaskRuntime {
     }
   }
 
+  async clearBindings(bindingIds) {
+    const ids = [...new Set((Array.isArray(bindingIds) ? bindingIds : []).map(String).filter(Boolean))];
+    for (const id of ids) {
+      const repository = this.#bindingRepository(id);
+      for (;;) {
+        const current = await repository.read();
+        if (current.data.binding === null) break;
+        try {
+          await repository.replace({ binding: null }, { expectedRevision: current.revision, clock: this.clock });
+          break;
+        } catch (error) {
+          if (error?.code !== "REVISION_CONFLICT") throw error;
+        }
+      }
+    }
+    return { cleared: ids.length };
+  }
+
   isRunning(key) {
     return this.#jobs.has(String(key));
   }
 
   activeKeys() {
     return [...this.#jobs.keys()];
+  }
+
+  async waitForKeys(keys) {
+    const requested = new Set((Array.isArray(keys) ? keys : []).map(String).filter(Boolean));
+    for (;;) {
+      const pending = [...requested].map((key) => this.#jobs.get(key)).filter(Boolean);
+      if (!pending.length) return;
+      await Promise.allSettled(pending);
+    }
   }
 
   async waitForIdle() {
@@ -397,6 +460,35 @@ export class PersistentWebInteractionStore {
       .map(clone);
   }
 
+  async listResumable() {
+    return Object.values((await this.repository.read()).data.runs)
+      .filter((record) => (
+        !record.assistantMessageId
+        && record.taskIds.length > 0
+        && (
+          (record.status === "completed" && ["waiting_approval", "waiting_input"].includes(record.result?.taskStatus))
+          || record.status === "failed"
+        )
+      ))
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt) || left.runId.localeCompare(right.runId))
+      .map(clone);
+  }
+
+  async listFailed() {
+    return Object.values((await this.repository.read()).data.runs)
+      .filter((record) => record.status === "failed")
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt) || left.runId.localeCompare(right.runId))
+      .map(clone);
+  }
+
+  async listFailedForConversation(conversationId) {
+    const id = assertId(conversationId, "conversationId");
+    return Object.values((await this.repository.read()).data.runs)
+      .filter((record) => record.status === "failed" && record.input?.conversationId === id)
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt) || left.runId.localeCompare(right.runId))
+      .map(clone);
+  }
+
   async listCompleted() {
     return Object.values((await this.repository.read()).data.runs)
       .filter((record) => record.status === "completed" && record.assistantMessageId)
@@ -412,6 +504,43 @@ export class PersistentWebInteractionStore {
       .map(clone);
   }
 
+  async findByMessage(conversationId, messageId) {
+    const conversation = assertId(conversationId, "conversationId");
+    const message = assertId(messageId, "messageId");
+    return Object.values((await this.repository.read()).data.runs)
+      .filter((record) => record.input?.conversationId === conversation && record.input?.messageId === message)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.runId.localeCompare(left.runId))
+      .map(clone);
+  }
+
+  async listByConversation(conversationId) {
+    const id = assertId(conversationId, "conversationId");
+    return Object.values((await this.repository.read()).data.runs)
+      .filter((record) => record.input?.conversationId === id)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.runId.localeCompare(right.runId))
+      .map(clone);
+  }
+
+  async forgetConversation(conversationId) {
+    const id = String(conversationId || "");
+    invariant(id, "WEB_RUN_CONVERSATION_REQUIRED", "清理网页 Agent 运行记录时缺少 conversationId", { status: 500, expose: false });
+    for (;;) {
+      const current = await this.repository.read();
+      const runIds = Object.values(current.data.runs)
+        .filter((record) => record.input?.conversationId === id)
+        .map((record) => record.runId);
+      if (!runIds.length) return { conversationId: id, removed: 0 };
+      try {
+        await this.repository.update((data) => {
+          for (const runId of runIds) delete data.runs[runId];
+        }, { expectedRevision: current.revision, clock: this.clock });
+        return { conversationId: id, removed: runIds.length };
+      } catch (error) {
+        if (error?.code !== "REVISION_CONFLICT") throw error;
+      }
+    }
+  }
+
   async addTask(runId, taskId) {
     return this.#update(runId, (record) => {
       if (!record.taskIds.includes(taskId)) record.taskIds.push(String(taskId));
@@ -421,8 +550,16 @@ export class PersistentWebInteractionStore {
   async complete(runId, { assistantMessageId, result }) {
     return this.#update(runId, (record) => {
       record.status = "completed";
-      record.assistantMessageId = String(assistantMessageId);
+      record.assistantMessageId = assistantMessageId == null ? null : String(assistantMessageId);
       record.result = clone(result || {});
+      record.failure = null;
+    });
+  }
+
+  async reopen(runId) {
+    return this.#update(runId, (record) => {
+      invariant(!record.assistantMessageId, "WEB_RUN_ALREADY_PERSISTED", "网页 Agent 回复已经落盘，不能重新打开", { status: 409 });
+      record.status = "running";
       record.failure = null;
     });
   }

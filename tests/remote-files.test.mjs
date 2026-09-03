@@ -4,7 +4,7 @@ import { Readable, Writable } from "node:stream";
 import test from "node:test";
 
 import { createGatewayServer } from "../gateway/core/server.mjs";
-import { SshRemoteFiles } from "../gateway/core/runtime/remote.mjs";
+import { SshRemoteArtifactSource, SshRemoteFiles } from "../gateway/core/runtime/remote.mjs";
 
 function missing() {
   return Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -120,7 +120,7 @@ function memoryRemote() {
       return { code: 0, stdout: "", stderr: "" };
     },
   };
-  return { files, directories, symlinks, executor };
+  return { files, directories, symlinks, executor, sftp };
 }
 
 function remoteFilesFixture(actorId = "alice") {
@@ -145,6 +145,98 @@ function remoteFilesFixture(actorId = "alice") {
   return { ...remote, workspace, service };
 }
 
+test("Remote Files reports the workspace Git branch, changes and path-scoped commit history", async () => {
+  const fixture = remoteFilesFixture();
+  const fallback = fixture.executor.exec.bind(fixture.executor);
+  const commands = [];
+  const oid = "a".repeat(40);
+  const authoredAt = "2026-08-31T10:20:30.000Z";
+  const authoredSeconds = Math.floor(Date.parse(authoredAt) / 1_000);
+  fixture.executor.exec = async (command, options) => {
+    commands.push(command);
+    if (command.includes("rev-parse --show-toplevel")) return { code: 0, stdout: "/work/root\n", stderr: "" };
+    if (command.includes(" status --porcelain ")) {
+      return {
+        code: 0,
+        stderr: "",
+        stdout: [
+          "## main...origin/main [ahead 2, behind 1]",
+          "M  src/staged.js",
+          " M README.md",
+          "?? notes/new file.txt",
+          "UU conflict.txt",
+          "R  src/new-name.ts",
+          "src/old-name.ts",
+          "# easywork.end",
+          "",
+        ].join("\0"),
+      };
+    }
+    if (command.includes(" log -n 50 ")) {
+      return {
+        code: 0,
+        stderr: "",
+        stdout: `${oid}\x1f${oid.slice(0, 8)}\x1fAlice\x1f${authoredSeconds}\x1f (HEAD -> main)\x1fPrepare CPU baseline\x1e\n`,
+      };
+    }
+    if (command.includes("rev-parse --verify HEAD")) return { code: 0, stdout: `${oid}\n`, stderr: "" };
+    return fallback(command, options);
+  };
+
+  const status = await fixture.service.gitStatus({ workspaceId: fixture.workspace.id });
+  assert.equal(status.repository, true);
+  assert.equal(status.workspaceAtRepositoryRoot, true);
+  assert.deepEqual(status.branch, {
+    name: "main",
+    detached: false,
+    unborn: false,
+    oid,
+    upstream: "origin/main",
+    ahead: 2,
+    behind: 1,
+  });
+  assert.deepEqual(status.counts, { staged: 2, unstaged: 1, untracked: 1, conflicted: 1 });
+  assert.equal(status.clean, false);
+  assert.equal(status.changesTruncated, false);
+  assert.equal(status.changes.length, 5);
+  assert.deepEqual(status.changes.find((entry) => entry.path === "src/new-name.ts")?.previousPath, "src/old-name.ts");
+  assert.deepEqual(status.commits, [{
+    id: oid,
+    shortId: oid.slice(0, 8),
+    author: "Alice",
+    authoredAt,
+    decorations: "HEAD -> main",
+    subject: "Prepare CPU baseline",
+  }]);
+  assert.ok(commands.some((command) => command.includes("--untracked-files=all -- .")));
+  assert.ok(commands.some((command) => command.includes("--format=") && command.endsWith("-- .")));
+  assert.ok(commands.every((command) => !command.includes("git -C")));
+});
+
+test("Remote Files distinguishes an uninitialized workspace from an unavailable Git executable", async () => {
+  const notRepository = remoteFilesFixture();
+  const notRepositoryFallback = notRepository.executor.exec.bind(notRepository.executor);
+  notRepository.executor.exec = async (command, options) => command.includes("rev-parse --show-toplevel")
+    ? { code: 128, stdout: "", stderr: "fatal: not a git repository" }
+    : notRepositoryFallback(command, options);
+  assert.deepEqual(await notRepository.service.gitStatus({ workspaceId: notRepository.workspace.id }), {
+    workspaceId: "workspace_a",
+    available: true,
+    repository: false,
+  });
+
+  const unavailable = remoteFilesFixture();
+  const unavailableFallback = unavailable.executor.exec.bind(unavailable.executor);
+  unavailable.executor.exec = async (command, options) => command.includes("rev-parse --show-toplevel")
+    ? { code: 127, stdout: "", stderr: "sh: git: command not found" }
+    : unavailableFallback(command, options);
+  assert.deepEqual(await unavailable.service.gitStatus({ workspaceId: unavailable.workspace.id }), {
+    workspaceId: "workspace_a",
+    available: false,
+    repository: false,
+  });
+});
+
 test("Remote Files streams files larger than 2 MB and serves exact byte ranges", async () => {
   const fixture = remoteFilesFixture();
   await fixture.service.mkdir({ workspaceId: fixture.workspace.id, path: "datasets" });
@@ -165,11 +257,79 @@ test("Remote Files streams files larger than 2 MB and serves exact byte ranges",
   assert.deepEqual(Buffer.concat(chunks), original.subarray(1024, 8193));
 });
 
-test("Remote Files rejects traversal, symlink targets, hash mismatches, and foreign Actor workspaces", async () => {
+test("Remote preview returns an empty stream for a zero-byte file without opening an invalid SFTP range", async () => {
+  const source = new SshRemoteArtifactSource({
+    executor: {
+      serverId: "server_a",
+      worker: { async withSession() { throw new Error("SFTP must not be opened for an empty range"); } },
+    },
+    container: {},
+    serverId: "server_a",
+    serverIdentity: "ssh_identity_a",
+  });
+  const chunks = [];
+  for await (const chunk of await source.openReadStream({
+    canonicalPath: "/work/root/empty.txt",
+    range: { start: 0, endExclusive: 0 },
+  })) chunks.push(Buffer.from(chunk));
+  assert.equal(Buffer.concat(chunks).length, 0);
+});
+
+test("Remote Files safely replaces an existing file on SFTP servers whose standard rename cannot overwrite", async () => {
   const fixture = remoteFilesFixture();
+  await fixture.service.uploadStream({
+    workspaceId: fixture.workspace.id,
+    path: "report.txt",
+    source: Readable.from(Buffer.from("old")),
+    expectedSize: 3,
+  });
+  await fixture.service.uploadStream({
+    workspaceId: fixture.workspace.id,
+    path: "report.txt",
+    source: Readable.from(Buffer.from("updated")),
+    expectedSize: 7,
+  });
+  assert.equal(fixture.files.get("/work/root/report.txt").toString(), "updated");
+  assert.deepEqual([...fixture.files.keys()].filter((entry) => entry.includes(".easywork-")), []);
+});
+
+test("Remote Files restores the original when a replacement commit fails", async () => {
+  const fixture = remoteFilesFixture();
+  await fixture.service.uploadStream({
+    workspaceId: fixture.workspace.id,
+    path: "report.txt",
+    source: Readable.from(Buffer.from("original")),
+    expectedSize: 8,
+  });
+  const rename = fixture.sftp.rename.bind(fixture.sftp);
+  fixture.sftp.rename = (from, to, callback) => {
+    if (from.includes(".easywork-upload-") && to === "/work/root/report.txt") {
+      callback(Object.assign(new Error("commit failed"), { code: 4 }));
+      return;
+    }
+    rename(from, to, callback);
+  };
+  await assert.rejects(() => fixture.service.uploadStream({
+    workspaceId: fixture.workspace.id,
+    path: "report.txt",
+    source: Readable.from(Buffer.from("replacement")),
+    expectedSize: 11,
+  }), (error) => error?.code === 4);
+  assert.equal(fixture.files.get("/work/root/report.txt").toString(), "original");
+  assert.deepEqual([...fixture.files.keys()].filter((entry) => entry.includes(".easywork-")), []);
+});
+
+test("Remote Files accepts safe file symlinks but rejects traversal, escaping symlinks, hash mismatches, and foreign Actor workspaces", async () => {
+  const fixture = remoteFilesFixture();
+  fixture.files.set("/work/root/README", Buffer.from("extensionless file"));
+  fixture.symlinks.set("/work/root/latest", "/work/root/README");
   fixture.symlinks.set("/work/root/outside", "/etc/passwd");
+  const listed = await fixture.service.list({ workspaceId: fixture.workspace.id, path: "" });
+  assert.equal(listed.items.find((entry) => entry.name === "README")?.kind, "file");
+  const linked = await fixture.service.inspectDownload({ workspaceId: fixture.workspace.id, path: "latest" });
+  assert.equal(linked.canonicalPath, "/work/root/README");
   await assert.rejects(() => fixture.service.list({ workspaceId: fixture.workspace.id, path: "../outside" }), (error) => error?.code === "REMOTE_PATH_INVALID");
-  await assert.rejects(() => fixture.service.inspectDownload({ workspaceId: fixture.workspace.id, path: "outside" }), (error) => error?.code === "REMOTE_FILE_SYMLINK_FORBIDDEN");
+  await assert.rejects(() => fixture.service.inspectDownload({ workspaceId: fixture.workspace.id, path: "outside" }), (error) => error?.code === "REMOTE_FILE_OUTSIDE_WORKSPACE");
   await assert.rejects(() => fixture.service.uploadStream({
     workspaceId: fixture.workspace.id,
     path: "bad.bin",
@@ -209,6 +369,10 @@ test("Bearer HTTP endpoints keep raw bytes out of JSON and enforce Actor ownersh
   const runtime = {
     allowedOrigins: [],
     auth: { async resolveSession(token) { assert.ok(actors[token]); return { actor: actors[token] }; } },
+    resolveRemoteFileDownloadToken(token) {
+      assert.equal(token, "download-ticket");
+      return { actor: actors.owner, serverId: "server_a", workspaceId: "workspace_a", path: "large.bin" };
+    },
     async servicesForActor(actor) {
       return {
         audit: { async append(event) { audits.push({ actorId: actor.actorId, ...event }); } },
@@ -247,11 +411,16 @@ test("Bearer HTTP endpoints keep raw bytes out of JSON and enforce Actor ownersh
   assert.equal(range.status, 206);
   assert.equal(range.headers.get("content-range"), `bytes 100-999/${original.length}`);
   assert.deepEqual(Buffer.from(await range.arrayBuffer()), original.subarray(100, 1000));
+  const ticketDownload = await fetch(`${base}?downloadToken=download-ticket`);
+  assert.equal(ticketDownload.status, 200);
+  assert.deepEqual(Buffer.from(await ticketDownload.arrayBuffer()), original);
   const forbidden = await fetch(`${base}?path=${encodeURIComponent("large.bin")}`, { headers: { authorization: "Bearer intruder" } });
   assert.equal(forbidden.status, 403);
   assert.deepEqual(audits.filter((entry) => entry.actorId === "alice").map((entry) => `${entry.action}:${entry.status}`), [
     "remote-file.upload:attempted",
     "remote-file.upload:success",
+    "remote-file.download:attempted",
+    "remote-file.download:success",
     "remote-file.download:attempted",
     "remote-file.download:success",
   ]);

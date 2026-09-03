@@ -28,48 +28,6 @@ export type OpenPreview = {
   Viewer: ComponentType<ViewerProps>;
 };
 
-export type PreviewSource =
-  | { kind: "remote"; serverId: string; workspaceId: string; relativePath: string }
-  | { kind: "artifact"; artifactId: string };
-
-export type OpenPreviewRequest = {
-  source: PreviewSource;
-  fallbackName: string;
-  fallbackMime?: string;
-  fallbackSize?: number;
-};
-
-export type VersionSnapshot = { exists: boolean; sha256: string | null; size: number };
-export type VersionChange = { path: string; before: VersionSnapshot; after: VersionSnapshot };
-export type VersionCheckpoint = {
-  id: string;
-  sequence: number;
-  conversationId: string;
-  logicalBranchId: string;
-  parentCheckpointId: string | null;
-  status: "retained" | "rewound";
-  message: string;
-  createdAt: string;
-};
-export type VersionBranch = {
-  id: string;
-  conversationId: string;
-  fromCheckpointId: string | null;
-  headCheckpointId: string | null;
-  createdAt: string;
-};
-export type VersionStatus = {
-  workspace: { id: string; canonicalPath: string; kind: string };
-  versioned: boolean;
-  versionDomainId?: string;
-  revision?: number;
-  headCheckpointId: string | null;
-  counts: { added: number; modified: number; deleted: number };
-  changes: VersionChange[];
-  branches?: VersionBranch[];
-  checkpoints?: VersionCheckpoint[];
-};
-
 export type ResourceBreakdown = {
   idle: number;
   allocated: number;
@@ -83,7 +41,6 @@ export type SchedulerSummary = {
   nodes: ResourceBreakdown;
   cpuCores: ResourceBreakdown;
   accelerators: ResourceBreakdown & { unit: "device" };
-  currentUserJobs: { running: number; pending: number };
   sampledAt: string;
 };
 
@@ -110,17 +67,33 @@ export type SchedulerJob = {
   nodes?: number;
   cpuCores?: number;
   locationOrReason?: string;
+  startedAt?: string | null;
+  submittedAt?: string | null;
+  endedAt?: string | null;
+  expectedEndAt?: string | null;
 };
 
-export type ArtifactSummary = {
-  id: string;
-  name: string;
-  kind: string;
-  mime?: string;
-  size: number | null;
-  createdAt: string;
-  lifecycle: string;
-  pinned?: boolean;
-  taskId?: string;
-  conversationId?: string;
+export type SchedulerResourceSnapshot = {
+  scheduler: string;
+  partitions: SchedulerPartition[];
+  summary: SchedulerSummary | null;
+  sampledAt: string;
+};
+
+export type SchedulerDashboard = {
+  scheduler: string;
+  partitions: SchedulerPartition[];
+  summary: SchedulerSummary | null;
+  jobs: SchedulerJob[];
+  history: SchedulerJob[];
+  sampledAt: string;
+};
+
+export type SystemMonitorSnapshot = {
+  kind: "standard";
+  cpu: { usagePercent: number; cores: number };
+  memory: { usedBytes: number; availableBytes: number; totalBytes: number; usagePercent: number };
+  gpus: Array<{ index: number; name: string; utilizationPercent: number; memoryUsedBytes: number; memoryTotalBytes: number }>;
+  processes: Array<{ pid: number; user: string; cpuPercent: number; memoryPercent: number; state: string; command: string }>;
+  sampledAt: string;
 };

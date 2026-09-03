@@ -7,5 +7,6 @@ export {
   canonicalWorkspacePath,
   createWorkspaceBindingKey,
   createWorkspaceId,
+  createVirtualWorkspaceId,
 } from "./contract.mjs";
 export { WorkspaceService } from "./service.mjs";

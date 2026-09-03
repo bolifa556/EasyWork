@@ -1,0 +1,8 @@
+{
+  "separator": "\n\n",
+  "roles": {
+    "user": "用户：{{CONTENT}}",
+    "assistant": "助手：{{CONTENT}}",
+    "message": "消息：{{CONTENT}}"
+  }
+}

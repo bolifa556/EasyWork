@@ -20,10 +20,10 @@ function fakeModelFactory() {
   return {
     async complete({ messages, onDelta }) {
       const system = String(messages?.[0]?.content || "");
-      if (system.includes("# 可复用记忆提取")) return { content: JSON.stringify({ memories: [] }), reasoning: "", toolCalls: [], usage: { prompt_tokens: 2, completion_tokens: 1 } };
-      if (system.includes("# 对话上下文检查点")) {
+      if (system.includes("# 可复用记忆提取")) return { content: "", reasoning: "", toolCalls: [], usage: { prompt_tokens: 2, completion_tokens: 1 } };
+      if (system.includes("# 对话上下文压缩")) {
         return {
-          content: JSON.stringify({ goal: "完成组合运行时测试", currentFocus: "验证压缩", importantFacts: ["压缩由同一模型完成"] }),
+          content: "## 目标\n- 完成组合运行时测试\n\n## 重要信息\n- 压缩由同一模型完成\n\n## 工作状态\n### 已完成\n- 无\n\n### 进行中\n- 验证压缩\n\n### 阻塞\n- 无\n\n## 下一步\n1. 继续验证\n\n## 相关文件\n- 无",
           reasoning: "",
           toolCalls: [],
           usage: { prompt_tokens: 8, completion_tokens: 4 },
@@ -49,7 +49,7 @@ function titleFailureModelFactory() {
     async complete({ messages, onDelta }) {
       const system = String(messages?.[0]?.content || "");
       if (system.includes("不超过 14 个汉字")) throw Object.assign(new Error("title unavailable"), { code: "MODEL_UNAVAILABLE", status: 502 });
-      if (system.includes("# 可复用记忆提取")) return { content: JSON.stringify({ memories: [] }), reasoning: "", toolCalls: [], usage: {} };
+      if (system.includes("# 可复用记忆提取")) return { content: "", reasoning: "", toolCalls: [], usage: {} };
       await onDelta?.({ kind: "content", content: "主回复正常完成。" });
       return { content: "主回复正常完成。", reasoning: "", toolCalls: [], usage: {} };
     },
@@ -163,7 +163,12 @@ test("组合 Gateway 完成注册、严格 bootstrap、项目、流式对话并�
   const context = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/context`, { token });
   assert.equal(context.response.status, 200);
   assert.deepEqual(context.payload.data.config, { maxTokens: 200_000, autoCompactThreshold: 0.95 });
-  assert.ok(context.payload.data.usage.usedTokens > 0);
+  assert.equal(context.payload.data.usage.usedTokens, 8);
+  assert.equal(context.payload.data.usage.source, "native");
+  assert.deepEqual(context.payload.data.usage.parts, [
+    { kind: "model_input", tokens: 3, source: "native" },
+    { kind: "model_output", tokens: 5, source: "native" },
+  ]);
   const configuredContext = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/context`, {
     token,
     method: "PATCH",
@@ -198,11 +203,12 @@ test("组合 Gateway 完成注册、严格 bootstrap、项目、流式对话并�
     token, method: "DELETE", headers: { "idempotency-key": "runtime-delete-compact", "if-match": `"${compactDetail.payload.data.summary.revision}"` },
   });
   const afterReply = await requestJson(active.baseUrl, "/api/bootstrap", { token });
-  assert.deepEqual(Object.keys(afterReply.payload.data.recentConversations[0]).sort(), [
-    "id", "lastMessageAt", "mode", "pinned", "projectId", "revision", "runningTaskId", "title", "updatedAt",
-  ]);
-  assert.equal(afterReply.payload.data.recentConversations[0].mode, "chat");
-  assert.equal(afterReply.payload.data.recentConversations[0].runningTaskId, null);
+  assert.deepEqual(afterReply.payload.data.recentConversations, []);
+  assert.equal(afterReply.payload.data.projects[0].conversationCount, 1);
+  const projectConversationPage = await requestJson(active.baseUrl, `/api/conversations?projectId=${project.payload.data.id}&limit=4`, { token });
+  assert.equal(projectConversationPage.payload.data.items.length, 1);
+  assert.equal(projectConversationPage.payload.data.items[0].id, conversationId);
+  assert.equal(projectConversationPage.payload.data.items[0].projectId, project.payload.data.id);
 
   const retried = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/actions`, {
     token,
@@ -212,7 +218,7 @@ test("组合 Gateway 完成注册、严格 bootstrap、项目、流式对话并�
       action: "retry",
       branchId: messages.payload.data.items[0].branchId,
       messageId: messages.payload.data.items[1].id,
-      expectedRevision: afterReply.payload.data.recentConversations[0].revision,
+      expectedRevision: projectConversationPage.payload.data.items[0].revision,
       response: { providerId: "platform-web", modelId: "fake-model", scope: {} },
     },
   });
@@ -220,32 +226,28 @@ test("组合 Gateway 完成注册、严格 bootstrap、项目、流式对话并�
   await services.interactions.waitFor(retried.payload.data.response.runId);
   const afterRetry = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/messages`, { token });
   assert.notEqual(afterRetry.payload.data.items[1].id, messages.payload.data.items[1].id);
+  const afterRetryDetail = await requestJson(active.baseUrl, `/api/conversations/${conversationId}`, { token });
 
-  const retrySummary = await requestJson(active.baseUrl, `/api/conversations/${conversationId}`, { token });
-  const edited = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/actions`, {
+  const removedEditAction = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/actions`, {
     token,
     method: "POST",
-    headers: { "idempotency-key": "runtime-edit-0001" },
+    headers: { "idempotency-key": "runtime-removed-edit-action" },
     body: {
       action: "edit-latest",
-      branchId: afterRetry.payload.data.items[0].branchId,
-      messageId: afterRetry.payload.data.items[0].id,
-      content: "修改后的问题",
-      expectedRevision: retrySummary.payload.data.summary.revision,
-      response: { providerId: "platform-web", modelId: "fake-model", scope: {} },
+      expectedRevision: afterRetryDetail.payload.data.summary.revision,
     },
   });
-  assert.equal(edited.response.status, 200);
-  await services.interactions.waitFor(edited.payload.data.response.runId);
-  const afterEdit = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/messages`, { token });
-  assert.equal(afterEdit.payload.data.items[0].content, "修改后的问题");
+  assert.equal(removedEditAction.response.status, 400);
+  assert.equal(removedEditAction.payload.error.code, "CONVERSATION_ACTION_INVALID");
 
   await active.gateway.close();
   active = await startGateway({ dataRoot, helpFile, webModelFactory: fakeModelFactory });
   const restored = await requestJson(active.baseUrl, "/api/bootstrap", { token });
   assert.equal(restored.response.status, 200);
   assert.equal(restored.payload.data.projects[0].id, project.payload.data.id);
-  assert.equal(restored.payload.data.recentConversations[0].id, conversationId);
+  assert.deepEqual(restored.payload.data.recentConversations, []);
+  const restoredProjectConversationPage = await requestJson(active.baseUrl, `/api/conversations?projectId=${project.payload.data.id}&limit=4`, { token });
+  assert.equal(restoredProjectConversationPage.payload.data.items[0].id, conversationId);
   const restoredMessages = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/messages`, { token });
   assert.equal(restoredMessages.payload.data.items.length, 2);
 });
@@ -343,6 +345,10 @@ test("首轮标题生成失败不影响主回复并保留首问截断标题", as
   await services.taskRuntime.waitForIdle();
   const detail = await requestJson(active.baseUrl, `/api/conversations/${created.payload.data.conversation.id}`, { token });
   const messages = await requestJson(active.baseUrl, `/api/conversations/${created.payload.data.conversation.id}/messages`, { token });
+  const context = await requestJson(active.baseUrl, `/api/conversations/${created.payload.data.conversation.id}/context`, { token });
   assert.equal(detail.payload.data.summary.title, firstQuestion);
   assert.equal(messages.payload.data.items.at(-1).content, "主回复正常完成。");
+  assert.equal(context.payload.data.usage.source, "estimated");
+  assert.ok(context.payload.data.usage.usedTokens >= firstQuestion.length);
+  assert.ok(context.payload.data.usage.parts.every((part) => part.source === "estimated"));
 });

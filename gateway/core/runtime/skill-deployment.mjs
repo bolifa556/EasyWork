@@ -35,23 +35,43 @@ export class SshSkillDeployment {
     this.homePath = null;
     this.root = null;
     this.indexPath = null;
+    this.initialization = null;
   }
 
   async initialize() {
-    this.homePath = path.posix.normalize(await this.executor.home()).replace(/\/$/, "");
-    invariant(path.posix.isAbsolute(this.homePath) && this.homePath !== "/", "REMOTE_SKILL_HOME_INVALID", "远端 HOME 无效", { status: 502 });
-    this.root = `${this.homePath}/.easywork/skills`;
-    this.indexPath = `${this.root}/deployments.json`;
-    const result = await this.executor.exec(`mkdir -p -- '${this.root.replace(/'/g, `'"'"'`)}' && chmod 0700 -- '${this.root.replace(/'/g, `'"'"'`)}'`, { maxOutputBytes: 16 * 1024 });
-    invariant(result.code === 0, "REMOTE_SKILL_ROOT_FAILED", "无法创建远端 Skill 目录", { status: 502 });
-    return this;
+    if (this.root) return this;
+    if (this.initialization) return this.initialization;
+    this.initialization = (async () => {
+      this.homePath = path.posix.normalize(await this.executor.home()).replace(/\/$/, "");
+      invariant(path.posix.isAbsolute(this.homePath) && this.homePath !== "/", "REMOTE_SKILL_HOME_INVALID", "远端 HOME 无效", { status: 502 });
+      this.root = `${this.homePath}/.easywork/skills`;
+      this.indexPath = `${this.root}/deployments.json`;
+      const result = await this.executor.exec(`mkdir -p -- '${this.root.replace(/'/g, `'"'"'`)}' && chmod 0700 -- '${this.root.replace(/'/g, `'"'"'`)}'`, { maxOutputBytes: 16 * 1024 });
+      invariant(result.code === 0, "REMOTE_SKILL_ROOT_FAILED", "无法创建远端 Skill 目录", { status: 502 });
+      return this;
+    })();
+    try { return await this.initialization; }
+    catch (error) {
+      this.homePath = null;
+      this.root = null;
+      this.indexPath = null;
+      throw error;
+    } finally {
+      this.initialization = null;
+    }
   }
 
   async ensure(plan) {
     if (plan === null || plan === undefined) return [];
-    if (Array.isArray(plan)) return this.#validateRefs(plan);
+    if (Array.isArray(plan)) {
+      if (plan.length === 0) return [];
+      await this.initialize();
+      return this.#validateRefs(plan);
+    }
     const value = exactObject(plan, ["schemaVersion", "taskId", "actorId", "remoteBase", "skills", "agentSkillRefs"], "Skill deployment plan");
     invariant(value.schemaVersion === 1 && value.actorId === this.actor.actorId && value.remoteBase === "~/.easywork/skills" && Array.isArray(value.skills), "REMOTE_SKILL_PLAN_SCOPE_MISMATCH", "Skill deployment plan 不属于当前 Actor 或远端目录", { status: 403 });
+    if (value.skills.length === 0) return [];
+    await this.initialize();
     const index = await this.#readIndex();
     const results = [];
     for (const skill of value.skills) {
@@ -110,6 +130,7 @@ export class SshSkillDeployment {
   }
 
   async inspect() {
+    await this.initialize();
     const index = await this.#readIndex();
     return {
       serverId: this.serverId,

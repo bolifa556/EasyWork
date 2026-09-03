@@ -86,9 +86,10 @@ test("Provider reveal API 只审计目标标识，不把 Key 写入普通响应�
 
 test("EasyWork API keeps bootstrap summary-only and requires idempotency for a first message", async () => {
   const sent = [];
+  const listed = [];
   const services = {
     conversations: {
-      async listConversations() { return { items: [{ id: "conv_a" }], nextCursor: "next" }; },
+      async listConversations(input) { listed.push(input); return { items: [{ id: "conv_a" }], nextCursor: "next" }; },
       async sendMessage(input) { sent.push(input); return { conversation: { id: input.conversationId } }; },
     },
     projects: { async list() { return []; } },
@@ -100,11 +101,79 @@ test("EasyWork API keeps bootstrap summary-only and requires idempotency for a f
   const headers = { authorization: "Bearer valid-token" };
   const bootstrap = await api.dispatch({ method: "GET", url: "/api/bootstrap", headers });
   assert.deepEqual(Object.keys(bootstrap.body.data).sort(), ["actor", "conversationCursor", "device", "featureFlags", "projects", "providers", "recentConversations", "runningTasks", "servers"].sort());
+  assert.deepEqual(listed[0], { limit: 8, projectId: null });
+  const unassigned = await api.dispatch({ method: "GET", url: "/api/conversations?unassigned=true&limit=8", headers });
+  assert.equal(unassigned.status, 200);
+  assert.equal(listed[1].limit, 8);
+  assert.equal(listed[1].projectId, null);
   const rejected = await api.dispatch({ method: "POST", url: "/api/conversations", headers, body: { mode: "chat", content: "hello", expectedRevision: 0 } });
   assert.equal(rejected.status, 428);
   const accepted = await api.dispatch({ method: "POST", url: "/api/conversations", headers: { ...headers, "idempotency-key": "send-1" }, body: { mode: "chat", content: "hello", expectedRevision: 0 } });
   assert.equal(accepted.status, 200);
   assert.equal(sent[0].commandId, "send-1");
+});
+
+test("Conversation connection can be disabled and restored without losing its server binding", async () => {
+  let enabled = true;
+  const services = {
+    conversations: { async getConversation() { return { summary: { mode: "work" } }; } },
+    servers: {
+      async findConversationBinding(conversationId) { return { conversationId, serverId: "server_a" }; },
+      async isConversationConnectionEnabled() { return enabled; },
+      async bindConversation(serverId, conversationId) { assert.equal(serverId, "server_a"); assert.equal(conversationId, "conversation_a"); enabled = true; },
+      async disableConversation(conversationId) { assert.equal(conversationId, "conversation_a"); enabled = false; return { conversationId, serverId: "server_a" }; },
+    },
+  };
+  const api = createApi({ auth, servicesForActor: async () => services });
+  const headers = { authorization: "Bearer valid-token" };
+  const initial = await api.dispatch({ method: "GET", url: "/api/conversations/conversation_a/server-binding", headers });
+  assert.deepEqual(initial.body.data, { conversationId: "conversation_a", serverId: "server_a", connectionEnabled: true });
+  const disabled = await api.dispatch({ method: "DELETE", url: "/api/conversations/conversation_a/server-binding", headers, body: {} });
+  assert.deepEqual(disabled.body.data, { conversationId: "conversation_a", serverId: "server_a", connectionEnabled: false });
+  const restored = await api.dispatch({ method: "POST", url: "/api/conversations/conversation_a/server-binding", headers, body: { serverId: "server_a" } });
+  assert.deepEqual(restored.body.data, { conversationId: "conversation_a", serverId: "server_a", connectionEnabled: true });
+});
+
+test("Conversation PATCH rejects mode changes before any metadata or server-binding mutation", async () => {
+  let renamed = 0;
+  let unbound = 0;
+  const api = createApi({ auth, servicesForActor: async () => ({
+    conversations: { async rename() { renamed += 1; return {}; } },
+    servers: { async unbindConversationEverywhere() { unbound += 1; } },
+  }) });
+  const headers = { authorization: "Bearer valid-token", "idempotency-key": "immutable-mode" };
+  for (const body of [{ mode: "chat" }, { mode: "work" }, { mode: "chat", title: "不能绕过" }]) {
+    const result = await api.dispatch({ method: "PATCH", url: "/api/conversations/conversation_a", headers, body: { ...body, expectedRevision: 1 } });
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.code, "CONVERSATION_MODE_FIXED");
+  }
+  assert.equal(renamed, 0);
+  assert.equal(unbound, 0);
+  const renamedResult = await api.dispatch({ method: "PATCH", url: "/api/conversations/conversation_a", headers, body: { title: "正常重命名", expectedRevision: 1 } });
+  assert.equal(renamedResult.status, 200);
+  assert.equal(renamed, 1);
+});
+
+test("Server list resolves bound conversation ids to readable titles", async () => {
+  const services = {
+    servers: {
+      async list() {
+        return [{ profile: { id: "server_a" }, conversationIds: ["conversation_a", "conversation_missing"] }];
+      },
+    },
+    conversations: {
+      async getConversationSummaries(conversationIds) {
+        return conversationIds.includes("conversation_a") ? [{ id: "conversation_a", title: "部署生产环境" }] : [];
+      },
+    },
+  };
+  const api = createApi({ auth, servicesForActor: async () => services });
+  const response = await api.dispatch({ method: "GET", url: "/api/servers", headers: { authorization: "Bearer valid-token" } });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body.data[0].conversations, [
+    { id: "conversation_a", title: "部署生产环境" },
+    { id: "conversation_missing", title: "未命名对话" },
+  ]);
 });
 
 test("Profile PATCH cannot replace the authenticated Bearer token through its JSON body", async () => {

@@ -5,7 +5,8 @@ import { invariant } from "../errors.mjs";
 function embeddingEndpoint(baseUrl) {
   const normalized = String(baseUrl || "").trim().replace(/\/+$/, "");
   invariant(/^https?:\/\//i.test(normalized), "EMBEDDING_URL_INVALID", "Embedding API URL 无效", { status: 400 });
-  return /\/embeddings$/i.test(normalized) ? normalized : `${normalized}/v1/embeddings`;
+  if (/\/embeddings$/i.test(normalized)) return normalized;
+  return /\/v1$/i.test(normalized) ? `${normalized}/embeddings` : `${normalized}/v1/embeddings`;
 }
 
 function cosine(left, right) {
@@ -24,8 +25,29 @@ function cosine(left, right) {
   return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
 }
 
+function lexicalTokens(value) {
+  const text = String(value || "").normalize("NFKC").toLowerCase();
+  const words = text.match(/[\p{L}\p{N}_-]+/gu) || [];
+  const han = [...text.replace(/[^\p{Script=Han}]/gu, "")];
+  return new Set([...words, ...han, ...han.slice(0, -1).map((character, index) => character + han[index + 1])]);
+}
+
+function lexicalScore(query, text) {
+  const expected = lexicalTokens(query);
+  if (!expected.size) return 0;
+  const actual = lexicalTokens(text);
+  let matched = 0;
+  let possible = 0;
+  for (const token of expected) {
+    const weight = token.length > 1 ? 2 : 1;
+    possible += weight;
+    if (actual.has(token)) matched += weight;
+  }
+  return possible ? matched / possible : 0;
+}
+
 export class OpenAIEmbeddingAdapter {
-  constructor({ baseUrl, apiKey, model, fetchImpl = fetch, batchSize = 32, dimensions = null, profileId = null }) {
+  constructor({ baseUrl, apiKey, model, fetchImpl = fetch, batchSize = 32, dimensions = null, profileId = null, hybridEnabled = true }) {
     invariant(typeof apiKey === "string" && apiKey.length > 0, "EMBEDDING_API_KEY_REQUIRED", "Embedding API Key 未配置", { status: 503, retryable: true });
     invariant(typeof model === "string" && model.trim(), "EMBEDDING_MODEL_REQUIRED", "Embedding 模型未配置", { status: 503, retryable: true });
     invariant(Number.isSafeInteger(batchSize) && batchSize >= 1 && batchSize <= 256, "EMBEDDING_BATCH_SIZE_INVALID", "Embedding 批量大小无效", { status: 500, expose: false });
@@ -36,6 +58,7 @@ export class OpenAIEmbeddingAdapter {
     this.batchSize = batchSize;
     this.dimensions = dimensions;
     this.profileId = profileId || `embedding_${crypto.createHash("sha256").update(`${this.url}\0${this.model}\0${dimensions || "auto"}`).digest("hex").slice(0, 24)}`;
+    this.hybridEnabled = hybridEnabled !== false;
   }
 
   async #vectors(inputs) {
@@ -77,11 +100,12 @@ export class OpenAIEmbeddingAdapter {
     const scored = [];
     for (const candidate of candidates) {
       for (const chunk of candidate.vectorReference?.chunks || []) {
+        const vectorScore = cosine(queryVector, chunk.vector);
         scored.push({
           resourceVersionId: candidate.resourceVersionId,
           chunkId: chunk.chunkId,
           text: chunk.text,
-          score: cosine(queryVector, chunk.vector),
+          score: vectorScore + (this.hybridEnabled ? lexicalScore(query, chunk.text) * 0.2 : 0),
         });
       }
     }
@@ -89,4 +113,4 @@ export class OpenAIEmbeddingAdapter {
   }
 }
 
-export { cosine, embeddingEndpoint };
+export { cosine, embeddingEndpoint, lexicalScore };

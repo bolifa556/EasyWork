@@ -46,6 +46,12 @@ function assertDeviceId(value) {
   return value;
 }
 
+function assertUserId(value) {
+  const userId = String(value || "");
+  invariant(/^usr_[A-Za-z0-9-]+$/.test(userId), "USER_ID_INVALID", "用户 ID 无效", { status: 400 });
+  return userId;
+}
+
 function assertExactInput(input, keys, name) {
   invariant(input && typeof input === "object" && !Array.isArray(input), "AUTH_INPUT_INVALID", `${name} 参数无效`, { status: 400 });
   const allowed = new Set(keys);
@@ -871,6 +877,113 @@ export class AuthDeviceService {
         items.push({ userId: profile.userId, username: profile.username });
       }
       return items.sort((left, right) => left.username.localeCompare(right.username, "zh-CN"));
+    });
+  }
+
+  async pageUsersForAdmin(actor, input = {}) {
+    invariant(actor?.roles?.includes("admin"), "ADMIN_REQUIRED", "需要管理员权限", { status: 403 });
+    const query = String(input.query || "").normalize("NFKC").trim().toLocaleLowerCase("und");
+    const page = Number(input.page ?? 1);
+    const limit = Number(input.limit ?? 30);
+    invariant(Number.isSafeInteger(page) && page > 0, "ADMIN_USER_PAGE_INVALID", "用户页码无效", { status: 400 });
+    invariant(Number.isSafeInteger(limit) && limit > 0 && limit <= 100, "ADMIN_USER_LIMIT_INVALID", "用户分页大小无效", { status: 400 });
+    return runRootMutation(this.dataRoot, async () => {
+      await this.#recoverProfileUpdate();
+      const accounts = validateAccounts(await readJson(this.accountsPath, defaultAccounts()));
+      const adminKeys = new Set(adminLines(await this.#readAdminText())
+        .map((line) => {
+          try { return normalizeUsername(line.trim()).key; } catch { return null; }
+        })
+        .filter(Boolean));
+      const filtered = Object.entries(accounts.accounts)
+        .filter(([key, account]) => !query || key.includes(query) || account.userId.toLocaleLowerCase("und").includes(query))
+        .sort(([, left], [, right]) => left.username.localeCompare(right.username, "zh-CN"));
+      const offset = (page - 1) * limit;
+      const selected = filtered.slice(offset, offset + limit);
+      const now = this.clock().getTime();
+      const items = await Promise.all(selected.map(async ([key, account]) => {
+        const paths = this.#profilePaths("user", account.userId);
+        const [profile, devices, sessions] = await Promise.all([
+          readJson(paths.profile, null),
+          readJson(paths.devices, defaultDevices()),
+          readJson(paths.sessions, defaultSessions()),
+        ]);
+        validateProfile(profile, account.userId);
+        assertCollectionEnvelope(devices, "devices", "AUTH_DEVICES_CORRUPT");
+        assertCollectionEnvelope(sessions, "sessions", "AUTH_SESSIONS_CORRUPT");
+        const activeSessions = sessions.sessions.filter((session) => session.revokedAt === null && Date.parse(session.expiresAt) > now);
+        const activity = [profile.updatedAt, profile.createdAt, ...devices.devices.map((device) => device.lastSeenAt), ...sessions.sessions.map((session) => session.lastSeenAt)]
+          .map((value) => Date.parse(value || 0))
+          .filter(Number.isFinite);
+        return {
+          userId: profile.userId,
+          username: profile.username,
+          admin: adminKeys.has(key),
+          createdAt: profile.createdAt,
+          lastActiveAt: activity.length ? new Date(Math.max(...activity)).toISOString() : null,
+          deviceCount: devices.devices.length,
+          activeSessionCount: activeSessions.length,
+        };
+      }));
+      return {
+        items,
+        page,
+        limit,
+        total: filtered.length,
+        hasMore: offset + items.length < filtered.length,
+      };
+    });
+  }
+
+  async getUserForAdmin(actor, userIdValue) {
+    invariant(actor?.roles?.includes("admin"), "ADMIN_REQUIRED", "需要管理员权限", { status: 403 });
+    const userId = assertUserId(userIdValue);
+    const page = await this.pageUsersForAdmin(actor, { query: userId, page: 1, limit: 2 });
+    const user = page.items.find((item) => item.userId === userId);
+    invariant(user, "ADMIN_USER_NOT_FOUND", "用户不存在", { status: 404 });
+    return user;
+  }
+
+  async deleteUserForAdmin(actor, userIdValue) {
+    invariant(actor?.roles?.includes("admin"), "ADMIN_REQUIRED", "需要管理员权限", { status: 403 });
+    const userId = assertUserId(userIdValue);
+    invariant(actor.actorId !== userId, "ADMIN_DELETE_SELF_FORBIDDEN", "不能删除当前登录的管理员", { status: 409 });
+    return runRootMutation(this.dataRoot, async () => {
+      await this.#recoverProfileUpdate();
+      const accounts = validateAccounts(await readJson(this.accountsPath, defaultAccounts()));
+      const accountEntry = Object.entries(accounts.accounts).find(([, account]) => account.userId === userId);
+      invariant(accountEntry, "ADMIN_USER_NOT_FOUND", "用户不存在", { status: 404 });
+      const [accountKey, account] = accountEntry;
+      const previousAccounts = clone(accounts);
+      const previousAdminText = await this.#readAdminText();
+      const adminAccountKeys = new Set(adminLines(previousAdminText)
+        .map((line) => {
+          try { return normalizeUsername(line.trim()).key; } catch { return null; }
+        })
+        .filter((key) => key && accounts.accounts[key]));
+      invariant(!adminAccountKeys.has(accountKey) || adminAccountKeys.size > 1, "ADMIN_DELETE_LAST_ADMIN_FORBIDDEN", "不能删除平台最后一个管理员", { status: 409 });
+
+      const userRoot = actorDataRoot(this.dataRoot, { actorType: "user", actorId: userId });
+      const usersRoot = path.dirname(userRoot);
+      const deletingRoot = assertWithin(usersRoot, path.join(usersRoot, `.deleting-${userId}-${crypto.randomUUID()}`));
+      await fs.rename(userRoot, deletingRoot);
+      const now = iso(this.clock);
+      delete accounts.accounts[accountKey];
+      accounts.revision += 1;
+      accounts.updatedAt = now;
+      const nextAdminLines = adminLines(previousAdminText).filter((line) => !isAdminLine(line, accountKey));
+      const nextAdminText = nextAdminLines.join("\n").replace(/\n+$/, "");
+      try {
+        await writeJson(this.accountsPath, accounts);
+        await atomicWrite(this.adminListPath, nextAdminText ? `${nextAdminText}\n` : "");
+        await fs.rm(deletingRoot, { recursive: true, force: true });
+      } catch (error) {
+        await writeJson(this.accountsPath, previousAccounts).catch(() => undefined);
+        await atomicWrite(this.adminListPath, previousAdminText).catch(() => undefined);
+        await fs.rename(deletingRoot, userRoot).catch(() => undefined);
+        throw error;
+      }
+      return { userId, username: account.username, deleted: true, deletedAt: now };
     });
   }
 }

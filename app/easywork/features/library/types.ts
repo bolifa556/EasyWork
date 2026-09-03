@@ -27,4 +27,5 @@ export type LibraryPageProps = {
   onDeleteCollection: (collectionId: string) => void | Promise<void>;
   onUploadFiles: (collectionId: string, directory: string, files: File[]) => void | Promise<void>;
   onRetryIndex: (collectionId: string, fileId: string) => void | Promise<void>;
+  onPreviewFile: (file: LibraryFile) => void;
 };

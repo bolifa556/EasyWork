@@ -1,0 +1,97 @@
+{
+  "tools": {
+    "memory_search": {
+      "description": "查找与当前问题相关的长期记忆",
+      "inputSchema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "resource_search": {
+      "description": "使用 Embedding 全面检索当前可用文件中与问题相关的正文；未配置 Embedding 时改用 resource_read 直接读取概览中的文件",
+      "inputSchema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "resource_read": {
+      "description": "不使用 Embedding，按文件概览中的精确文件名直接读取正文；长文件根据返回的下一读取位置继续读取，图片会同时提供给支持多模态的网页模型",
+      "inputSchema": {
+        "type": "object",
+        "required": ["filename"],
+        "properties": {
+          "filename": { "type": "string" },
+          "start": { "type": "integer" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "conversation_search": {
+      "description": "查找当前网页对话中与问题相关的既有消息原文",
+      "inputSchema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string" },
+          "roles": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["system", "user", "assistant"] }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "skill_search": {
+      "description": "读取 skill_list 中一个名称完全一致的 Skill 正文；每次调用读取一个候选，存在多个相关候选时分别调用且同名不重复",
+      "inputSchema": {
+        "type": "object",
+        "required": ["name", "query"],
+        "properties": {
+          "name": { "type": "string" },
+          "query": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "skill_list": {
+      "description": "查看已安装 Skill 的名称和简介；需要具体说明时再按一个完全一致的名称调用 skill_search",
+      "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+    },
+    "context_get_state": {
+      "description": "读取当前任务可能需要的对话标题、项目名、服务器连接状态与调度器类型、工作区路径和 Agent 名称",
+      "inputSchema": {
+        "type": "object",
+        "required": ["fields"],
+        "properties": {
+          "fields": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["conversation", "project", "server", "workspace", "agent"] }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "handoff_submit": {
+      "description": "结束 Work 网页上下文选择，并提交远端 Agent 确实缺少且会直接影响本轮执行的候选 ID；仅主题相近或远端可从当前工作区自行读取的不提交，无需补充时提交空数组",
+      "inputSchema": {
+        "type": "object",
+        "required": ["candidateIds"],
+        "properties": {
+          "candidateIds": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

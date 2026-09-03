@@ -82,6 +82,11 @@ test("EffectiveContextScope 由服务端身份构建并形成完整 Agent bindin
   assert.deepEqual(scope.capabilities, ["resource.read", "task.run"]);
   const key = createAgentBindingKey(scope, "codex");
   assert.match(key, /^abk_/);
+  assert.equal(key, createAgentBindingKey({ ...scope, taskId: "task-2" }, "codex"));
+  assert.notEqual(key, createAgentBindingKey({ ...scope, conversationId: "conversation-2" }, "codex"));
+  assert.notEqual(key, createAgentBindingKey({ ...scope, branchId: "branch-2" }, "codex"));
+  assert.notEqual(key, createAgentBindingKey({ ...scope, workspaceId: "workspace-2" }, "codex"));
+  assert.notEqual(key, createAgentBindingKey({ ...scope, serverIdentity: `ssh_${"z".repeat(43)}` }, "codex"));
   assert.notEqual(key, createAgentBindingKey({ ...scope, contextEpoch: 4 }, "codex"));
   assert.notEqual(key, createAgentBindingKey(scope, "claude-code"));
 });
@@ -162,21 +167,66 @@ test("Realtime journal 为每个 topic 分配单调序号并支持 replay", asyn
     kind: "status",
     conversationId: "legacy",
     payload: {},
-  }), (error) => error.code === "REALTIME_LEGACY_FIELD_FORBIDDEN");
+  }), (error) => error.code === "REALTIME_RESERVED_FIELD_FORBIDDEN");
 }));
 
-test("Realtime retention 明确拒绝已超出窗口的 replay", async () => withDataRoot(async (dataRoot) => {
+test("Realtime retention 从零游标返回保留窗口，并拒绝非零过期游标", async () => withDataRoot(async (dataRoot) => {
   const journal = new RealtimeEventJournal({ dataRoot, actor, maxEventsPerTopic: 2 });
-  for (let index = 0; index < 3; index += 1) {
+  for (let index = 0; index < 4; index += 1) {
     await journal.append("task:one", { kind: "status", payload: { index } });
   }
-  await assert.rejects(journal.replay("task:one", { afterSequence: 0 }), (error) => {
+  const initial = await journal.replay("task:one", { afterSequence: 0 });
+  assert.deepEqual(initial.events.map((event) => event.sequence), [3, 4]);
+  await assert.rejects(journal.replay("task:one", { afterSequence: 1 }), (error) => {
     assert.equal(error.code, "REALTIME_REPLAY_EXPIRED");
-    assert.equal(error.details.firstAvailableSequence, 2);
+    assert.equal(error.details.firstAvailableSequence, 3);
     return true;
   });
-  const replay = await journal.replay("task:one", { afterSequence: 1 });
-  assert.deepEqual(replay.events.map((event) => event.sequence), [2, 3]);
+  const replay = await journal.replay("task:one", { afterSequence: 2 });
+  assert.deepEqual(replay.events.map((event) => event.sequence), [3, 4]);
+}));
+
+test("Realtime journal 合并同一 Agent token 流并保持可续传游标", async () => withDataRoot(async (dataRoot) => {
+  const journal = new RealtimeEventJournal({ dataRoot, actor, maxEventsPerTopic: 100 });
+  const base = {
+    producer: "agent:codex",
+    kind: "message",
+    status: "updated",
+    ids: { taskId: "task-stream" },
+  };
+  const first = await journal.append("task:stream", {
+    ...base,
+    payload: { source: { itemId: "message-1" }, event: { text: "你", delta: true } },
+  });
+  const second = await journal.append("task:stream", {
+    ...base,
+    payload: { source: { itemId: "message-1" }, event: { text: "好", delta: true } },
+  });
+  assert.equal(first.sequence, 1);
+  assert.equal(second.sequence, 2);
+  assert.notEqual(second.eventId, first.eventId);
+  assert.equal(second.payload.event.text, "你好");
+  assert.ok(second.payload.realtimeStreamKey);
+  assert.equal(second.payload.realtimeStreamKey, first.payload.realtimeStreamKey);
+
+  const retained = await journal.replay("task:stream", { afterSequence: 0 });
+  assert.equal(retained.events.length, 1);
+  assert.equal(retained.events[0].sequence, 2);
+  assert.equal(retained.events[0].payload.event.text, "你好");
+  const resumed = await journal.replay("task:stream", { afterSequence: 1 });
+  assert.deepEqual(resumed.events.map((event) => event.sequence), [2]);
+}));
+
+test("网页思考在正文事件之后继续时获得独立段标识，回放不丢失前一段", async () => withDataRoot(async (dataRoot) => {
+  const journal = new RealtimeEventJournal({ dataRoot, actor });
+  const append = (kind, content) => journal.append("conversation:thought", {
+    producer: "web-agent", kind, ids: { runId: "thought-one", conversationId: "thought" }, payload: { iteration: 0, content },
+  });
+  const first = await append("run.reasoning.delta", "需要简短回答。");
+  await append("run.output.delta", "你好。");
+  const tail = await append("run.reasoning.delta", "\n");
+  assert.notEqual(first.payload.realtimeStreamKey, tail.payload.realtimeStreamKey);
+  assert.deepEqual((await journal.replay("conversation:thought")).events.map((event) => event.payload.content), ["需要简短回答。", "你好。", "\n"]);
 }));
 
 test("Realtime journal 并发 append 仍产生连续且不重复的 topic sequence", async () => withDataRoot(async (dataRoot) => {

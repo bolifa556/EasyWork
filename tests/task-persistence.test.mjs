@@ -13,6 +13,7 @@ import { computeServerIdentity } from "../gateway/core/scope.mjs";
 const actor = createActorContext({ actorType: "user", actorId: "user_a", deviceId: "device_a", sessionId: "session_a", roles: [] });
 const taskInput = {
   id: "task_a", actorId: "user_a", conversationId: "conversation_a", branchId: "main", goal: "inspect",
+  sourceMessageId: "message_a", conversationRunId: "run_a",
   route: { serverId: "server_a", serverIdentity: computeServerIdentity({ host: "server.example", port: 22, hostKeyFingerprint: "SHA256:00112233445566778899" }).serverIdentity, workspaceId: "workspace_a", agentId: "opencode", providerId: "provider_agent", modelId: "model-agent-1" },
   contextSessionId: "context_a", agentBindingId: "binding_a", skillPins: [], resourceBindingSnapshotId: "resource_snapshot_a",
   versionCheckpointId: null, budgets: { maxWallTimeMs: 1000, maxInputTokens: 1000, maxOutputTokens: 1000, maxToolCalls: 10 }, idempotencyKey: "command_create",
@@ -37,7 +38,12 @@ test("FileTaskStore shards tasks and commands while enforcing revisions and idem
     const preparing = transitionTask(task, "preparing", { expectedRevision: 0 });
     await store.saveTask(preparing, { expectedRevision: 0 });
     await assert.rejects(() => store.saveTask(preparing, { expectedRevision: 0 }), (error) => error?.code === "TASK_REVISION_CONFLICT");
-    assert.equal((await store.listTasks({ statuses: ["preparing"] }))[0].id, task.id);
+    const listed = (await store.listTasks({ statuses: ["preparing"] }))[0];
+    assert.equal(listed.id, task.id);
+    assert.equal(listed.agentBindingId, task.agentBindingId);
+    assert.equal(listed.goal, task.goal);
+    assert.equal(listed.taskEventSequence, preparing.taskEventSequence);
+    assert.deepEqual(listed.plan, preparing.plan);
   } finally {
     await rm(dataRoot, { recursive: true, force: true });
   }

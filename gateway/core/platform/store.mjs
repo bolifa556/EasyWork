@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { invariant } from "../errors.mjs";
 import { defaultActorMutationQueue } from "../mutation-queue.mjs";
+import { replaceFileWithRetry } from "../repository.mjs";
 import { assertExpectedRevision } from "../revision.mjs";
 
 const PLATFORM_ACTOR = Object.freeze({ actorType: "platform", actorId: "global" });
@@ -45,7 +46,7 @@ export async function atomicWritePlatformJson(filePath, value) {
     await handle.close();
   }
   try {
-    await fs.rename(temporaryPath, filePath);
+    await replaceFileWithRetry(temporaryPath, filePath);
     await fsyncDirectory(directory);
   } catch (error) {
     await fs.rm(temporaryPath, { force: true }).catch(() => undefined);

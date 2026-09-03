@@ -91,6 +91,12 @@ export default defineConfig(async () => {
       port: publicPort,
       strictPort: true,
       hmr: false,
+      watch: {
+        ignored: ["**/.cache/**"],
+        ...(isCodexSeatbeltSandbox
+          ? { useFsEvents: false, usePolling: true }
+          : {}),
+      },
       proxy: {
         "/api": {
           target: gatewayTarget,
@@ -102,9 +108,6 @@ export default defineConfig(async () => {
           ws: true,
         },
       },
-      ...(isCodexSeatbeltSandbox
-        ? { watch: { useFsEvents: false, usePolling: true } }
-        : {}),
     },
     plugins: [
       websocketTunnel,

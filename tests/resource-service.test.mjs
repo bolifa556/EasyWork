@@ -6,6 +6,7 @@ import { Readable } from "node:stream";
 import test from "node:test";
 
 import { createActorContext } from "../gateway/core/actor.mjs";
+import { ApiError } from "../gateway/core/errors.mjs";
 import { actorDataRoot } from "../gateway/core/paths.mjs";
 import { ResourceService } from "../gateway/core/resources/index.mjs";
 
@@ -213,6 +214,77 @@ test("解析或 Embedding 失败会持久化失败状态，并可按 expectedRev
   });
 });
 
+test("缺少 OCR 时图片在保存前失败，扫描文档解析阶段也把明确错误返回上传端", async () => {
+  await temporaryFixture(async (dataRoot) => {
+    const currentActor = actor();
+    const preflightOptions = fixtureOptions(dataRoot, currentActor, {
+      extractor: {
+        async preflight() { throw new ApiError("RESOURCE_OCR_NOT_CONFIGURED", "管理员尚未配置 OCR 工具，无法解析图片或扫描 PDF", { status: 409 }); },
+        async extract() { throw new Error("不应执行"); },
+      },
+    });
+    const preflightService = new ResourceService(preflightOptions);
+    await assert.rejects(() => preflightService.ingest({
+      content: Buffer.from([1, 2, 3]),
+      filename: "scan.png",
+      mime: "image/png",
+      binding: { ownerType: "collection", ownerId: "collection_a" },
+      expectedRevision: 0,
+    }), (error) => error?.code === "RESOURCE_OCR_NOT_CONFIGURED" && error?.status === 409);
+    assert.deepEqual((await preflightService.inspect()).data, { blobs: [], versions: [], bindings: [] });
+  });
+
+  await temporaryFixture(async (dataRoot) => {
+    const options = fixtureOptions(dataRoot, actor(), {
+      extractor: {
+        async extract() { throw new ApiError("RESOURCE_OCR_NOT_CONFIGURED", "管理员尚未配置 OCR 工具，无法解析图片或扫描 PDF", { status: 409 }); },
+      },
+    });
+    const service = new ResourceService(options);
+    await assert.rejects(() => service.ingest({
+      content: Buffer.from("scanned-pdf"),
+      filename: "scan.pdf",
+      mime: "application/pdf",
+      binding: { ownerType: "collection", ownerId: "collection_a" },
+      expectedRevision: 0,
+    }), (error) => error?.code === "RESOURCE_OCR_NOT_CONFIGURED");
+    const state = await service.inspect();
+    assert.equal(state.data.versions.length, 1);
+    assert.equal(state.data.versions[0].parseStatus, "failed");
+    assert.match(state.data.versions[0].parseError, /管理员尚未配置 OCR 工具/);
+  });
+});
+
+test("Embedding 不可用不阻止解析与直接读取，图片原件只在网页 Agent 读取结果中临时提供", async () => {
+  await temporaryFixture(async (dataRoot) => {
+    const options = fixtureOptions(dataRoot, actor(), {
+      extractor: {
+        async preflight() {},
+        async extract() { return { text: "图片中的设备编号是 EW-2048", metadata: { title: "设备标签", summary: "设备编号标签", keywords: ["EW-2048"] } }; },
+      },
+      embedder: {
+        async embed() { throw new ApiError("RESOURCE_EMBEDDING_NOT_CONFIGURED", "Embedding 未配置", { status: 409 }); },
+        async search() { throw new Error("不应搜索"); },
+      },
+    });
+    const service = new ResourceService(options);
+    const uploaded = await service.ingest({
+      content: Buffer.from([1, 2, 3, 4]),
+      filename: "label.png",
+      mime: "image/png",
+      binding: { ownerType: "collection", ownerId: "collection_a" },
+      expectedRevision: 0,
+    });
+    assert.equal(uploaded.version.parseStatus, "ready");
+    assert.equal(uploaded.version.embeddingStatus, "failed");
+    const catalog = await service.catalog({ scope: { selectedCollectionIds: ["collection_a"] } });
+    assert.deepEqual(catalog.items.map((entry) => entry.filename), ["label.png"]);
+    const direct = await service.read({ scope: { selectedCollectionIds: ["collection_a"] }, filename: "label.png" });
+    assert.equal(direct.results[0].text, "图片中的设备编号是 EW-2048");
+    assert.match(direct.modelImages[0].dataUrl, /^data:image\/png;base64,/);
+  });
+});
+
 test("检索只向 Embedding 适配器提供已授权 Scope 内且 ready 的去重候选", async () => {
   await temporaryFixture(async (dataRoot) => {
     const currentActor = actor();
@@ -260,6 +332,16 @@ test("检索只向 Embedding 适配器提供已授权 Scope 内且 ready 的去�
     assert.equal(combined.results.length, 2);
     assert.deepEqual(new Set(combined.results.map((entry) => entry.resourceVersionId)), new Set([first.version.id, second.version.id]));
     assert.equal(searchCalls[1].candidates.length, 2);
+    const catalog = await service.catalog({
+      scope: { selectedCollectionIds: ["collection_a"], projectId: "project_a", conversationId: "conversation_a" },
+    });
+    assert.deepEqual(new Set(catalog.items.map((entry) => entry.filename)), new Set(["collection.txt", "conversation.txt"]));
+    assert.ok(catalog.items.every((entry) => entry.title && entry.summary && entry.bindings.length > 0));
+    const read = await service.read({
+      scope: { selectedCollectionIds: ["collection_a"], projectId: "project_a", conversationId: "conversation_a" },
+      filename: "collection.txt",
+    });
+    assert.equal(read.results[0].text, "collection content");
     await assert.rejects(() => service.search({ query: "query", scope: { collectionIds: ["collection_forbidden"] } }), (error) => error?.code === "RESOURCE_OWNER_FORBIDDEN");
     await assert.rejects(() => service.search({ query: "query", scope: {} }), (error) => error?.code === "RESOURCE_SCOPE_EMPTY");
   });
@@ -324,5 +406,53 @@ test("同一服务的并发写入严格串行，过期 expectedRevision 不会�
     const state = await service.inspect();
     assert.equal(state.data.versions.length, 1);
     assert.equal(state.data.versions[0].filename, "first.txt");
+  });
+});
+
+test("带精确文件名和作业号的资源查询不会把无关文件送入 Embedding", async () => {
+  await temporaryFixture(async (dataRoot) => {
+    const currentActor = actor();
+    const searchCalls = [];
+    const options = fixtureOptions(dataRoot, currentActor);
+    options.embedder = {
+      ...options.embedder,
+      search: async (input) => {
+        searchCalls.push(input);
+        return input.candidates.map((candidate) => ({
+          resourceVersionId: candidate.resourceVersionId,
+          score: 0.8,
+          text: candidate.parsed.text,
+        }));
+      },
+    };
+    const service = new ResourceService(options);
+    const unrelated = await service.ingest({
+      content: "CycloneDX cryptographic asset inventory",
+      filename: "algorithm-bom.json",
+      mime: "application/json",
+      binding: { ownerType: "project", ownerId: "project_a" },
+      expectedRevision: 0,
+    });
+    await service.ingest({
+      content: "S07 job 5332845 does not request GPU resources",
+      filename: "p6_cpu_verify.sbatch",
+      mime: "text/plain",
+      binding: { ownerType: "project", ownerId: "project_a" },
+      expectedRevision: unrelated.revision,
+    });
+
+    const result = await service.search({
+      query: "p6_cpu_verify.sbatch GPU 正式作业 5332845",
+      scope: { projectId: "project_a" },
+    });
+    assert.deepEqual(result.results.map((entry) => entry.filename), ["p6_cpu_verify.sbatch"]);
+    assert.deepEqual(searchCalls[0].candidates.map((entry) => entry.filename), ["p6_cpu_verify.sbatch"]);
+
+    const none = await service.search({
+      query: "missing_job_998877.sbatch GPU",
+      scope: { projectId: "project_a" },
+    });
+    assert.deepEqual(none.results, []);
+    assert.equal(searchCalls.length, 1);
   });
 });

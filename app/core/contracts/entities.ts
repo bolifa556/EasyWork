@@ -72,6 +72,25 @@ export type ConversationMessage = {
   attachments?: MessageAttachment[];
 };
 
+export type ArtifactSummary = EntityRevision & {
+  id: string;
+  taskId: string;
+  conversationId: string;
+  workspaceId: string;
+  projectId: string | null;
+  name: string;
+  kind: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  source: "host" | "remote";
+  contentLocation: "host-small-file" | "remote-reference" | string;
+  lifecycle: "active" | "pinned" | "deleted" | "expired";
+  expiresAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type ConversationBranch = {
   id: string;
   parentBranchId: string | null;
@@ -109,6 +128,7 @@ export type ServerSummary = EntityRevision & {
   username: string;
   serverIdentity?: string | null;
   status: "connected" | "connecting" | "disconnected";
+  connectionGeneration?: number;
   activeConversationCount: number;
   capabilityStatus: "unknown" | "detecting" | "ready" | "partial" | "error";
 };
@@ -119,6 +139,7 @@ export type TaskStatus =
   | "delivering_context"
   | "running"
   | "waiting_approval"
+  | "waiting_input"
   | "waiting_append"
   | "interrupting"
   | "interrupted"
@@ -132,6 +153,8 @@ export type TaskSummary = EntityRevision & {
   id: string;
   conversationId: string;
   branchId: string;
+  sourceMessageId: string;
+  conversationRunId: string;
   goal: string;
   route: {
     serverId: string;
@@ -156,7 +179,7 @@ export type CollectionSummary = EntityRevision & {
   failedCount: number;
 };
 
-export type ResourceStatus = "pending" | "extracting" | "embedding" | "ready" | "error";
+export type ResourceStatus = "pending" | "extracting" | "embedding" | "readable" | "ready" | "error";
 
 export type ResourceFile = EntityRevision & {
   id: string;
@@ -179,13 +202,29 @@ export type AgentSummary = {
   managed: boolean;
   source?: "managed" | "user";
   version?: string | null;
+  configured?: boolean;
+  model?: string | null;
+  configuration?: {
+    agentId: string;
+    configScope?: string;
+    source: "managed" | "user";
+    managed: boolean;
+    writable: boolean;
+    inherited?: boolean;
+    path?: string;
+    revision: number | null;
+    updatedAt?: string | null;
+    fields: Array<{ key: string; label: string; type: "string" | "enum" | "number"; nativeKey: string; min?: number; max?: number; step?: number; options?: Array<{ value: string; label: string }> }>;
+    values: Record<string, string>;
+    reason?: string;
+  } | null;
   status: "not-installed" | "ready" | "broken";
   capabilities: {
     install: "available" | "unavailable";
     update: "available" | "unavailable";
     uninstall: "available" | "unavailable";
   };
-  runtimeCapabilities?: Record<"start" | "append" | "interrupt" | "resume" | "compact" | "contextUsage", {
+  runtimeCapabilities?: Record<"start" | "append" | "interrupt" | "resume" | "respondApproval" | "respondInput" | "compact" | "contextUsage" | "fork" | "revert", {
     availability: "available" | "unavailable";
     mode: string;
     reason?: string;
@@ -196,10 +235,9 @@ export type WorkspaceSummary = EntityRevision & {
   id: string;
   actorId: string;
   serverIdentity: string;
-  kind: "virtual" | "user" | "dynamic";
+  kind: "virtual" | "user";
   canonicalPath: string;
   remoteRef: string;
-  versionDomainId: string | null;
 };
 
 export type WorkDraftSelection = {

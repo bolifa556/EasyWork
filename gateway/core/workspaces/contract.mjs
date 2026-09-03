@@ -4,8 +4,8 @@ import path from "node:path";
 import { invariant } from "../errors.mjs";
 import { assertExactKeys, assertId, assertIsoTimestamp, assertServerIdentity } from "../entities/common.mjs";
 
-export const WORKSPACE_SCHEMA_VERSION = 1;
-export const WORKSPACE_KINDS = Object.freeze(["virtual", "user", "dynamic"]);
+export const WORKSPACE_SCHEMA_VERSION = 2;
+export const WORKSPACE_KINDS = Object.freeze(["virtual", "user"]);
 export const WORKSPACE_BINDING_STATUSES = Object.freeze(["active", "stale"]);
 export const EASYWORK_WORKSPACE_ROOT = "~/.easywork/workspaces";
 export const EASYWORK_WORKSPACE_BINDING_ROOT = "~/.easywork/bindings/workspaces";
@@ -56,6 +56,11 @@ export function createWorkspaceId({ actorId, serverIdentity, canonicalPath, kind
   return `ws_${digest}`;
 }
 
+export function createVirtualWorkspaceId({ actorId, serverIdentity, conversationId, branchId }) {
+  const seed = `virtual:${assertId(actorId, "actorId")}:${assertServerIdentity(serverIdentity)}:${assertId(conversationId, "conversationId")}:${assertId(branchId || "main", "branchId")}`;
+  return `ws_${crypto.createHash("sha256").update(seed).digest("hex").slice(0, 24)}`;
+}
+
 export function createWorkspaceBindingKey(input) {
   const values = [
     assertId(input?.actorId, "actorId"),
@@ -92,7 +97,7 @@ export function assertWorkspaceDependencies(dependencies) {
   for (const method of ["canonicalize", "resolveEasyWork", "ensureDirectory", "writeJsonAtomic"]) {
     invariant(typeof dependencies?.remoteControl?.[method] === "function", "WORKSPACE_REMOTE_CONTROL_INVALID", `remoteControl.${method} 无效`, { status: 500, expose: false });
   }
-  for (const method of ["assessWorkspace", "openDomain", "resolveDynamicWrite"]) {
+  for (const method of ["openDomain", "ensureConversationDomain"]) {
     invariant(typeof dependencies?.versioning?.[method] === "function", "WORKSPACE_VERSIONING_INVALID", `versioning.${method} 无效`, { status: 500, expose: false });
   }
   invariant(typeof dependencies?.authorizeConversation === "function", "WORKSPACE_CONVERSATION_AUTHORIZER_REQUIRED", "缺少对话鉴权器", { status: 500, expose: false });
@@ -106,7 +111,7 @@ export function assertWorkspaceStore(data, actorId) {
   const workspaceScopes = new Set();
   for (const workspace of data.workspaces) {
     assertExactKeys(workspace, [
-      "schemaVersion", "id", "actorId", "serverIdentity", "kind", "canonicalPath", "remoteRef", "versionDomainId",
+      "schemaVersion", "id", "actorId", "serverIdentity", "kind", "canonicalPath", "remoteRef",
       "revision", "createdAt", "updatedAt",
     ], "Workspace");
     invariant(workspace?.schemaVersion === WORKSPACE_SCHEMA_VERSION && workspace.actorId === actorId, "WORKSPACE_STORE_SCOPE_MISMATCH", "工作区不属于当前 Actor", { status: 500, expose: false });
@@ -122,8 +127,6 @@ export function assertWorkspaceStore(data, actorId) {
     if (workspace.kind === "virtual") invariant(workspace.canonicalPath.includes("/.easywork/workspaces/"), "WORKSPACE_VIRTUAL_PATH_INVALID", "虚拟工作区必须位于远端 .easywork/workspaces", { status: 500, expose: false });
     assertEasyWorkRemoteReference(workspace.remoteRef, "Workspace.remoteRef");
     invariant(Number.isSafeInteger(workspace.revision) && workspace.revision >= 0, "WORKSPACE_REVISION_INVALID", "Workspace revision 无效", { status: 500, expose: false });
-    invariant(workspace.kind === "virtual" ? workspace.versionDomainId === null : typeof workspace.versionDomainId === "string", "WORKSPACE_VERSION_DOMAIN_INVALID", "Workspace versionDomainId 无效", { status: 500, expose: false });
-    if (workspace.versionDomainId !== null) assertId(workspace.versionDomainId, "Workspace.versionDomainId");
     assertIsoTimestamp(workspace.createdAt, "Workspace.createdAt");
     assertIsoTimestamp(workspace.updatedAt, "Workspace.updatedAt");
   }
@@ -142,7 +145,8 @@ export function assertWorkspaceStore(data, actorId) {
     bindingKeys.add(binding.bindingKey);
     invariant(workspaceIds.has(binding.workspaceId), "WORKSPACE_BINDING_WORKSPACE_MISSING", "工作区 Binding 引用了不存在的 Workspace", { status: 500, expose: false });
     const workspace = data.workspaces.find((entry) => entry.id === binding.workspaceId);
-    invariant(workspace.serverIdentity === binding.serverIdentity && workspace.versionDomainId === binding.versionDomainId, "WORKSPACE_BINDING_SCOPE_MISMATCH", "工作区 Binding 与 Workspace 范围不一致", { status: 500, expose: false });
+    invariant(workspace.serverIdentity === binding.serverIdentity, "WORKSPACE_BINDING_SCOPE_MISMATCH", "工作区 Binding 与 Workspace 服务器范围不一致", { status: 500, expose: false });
+    assertId(binding.versionDomainId, "WorkspaceBinding.versionDomainId");
     assertServerIdentity(binding.serverIdentity);
     assertId(binding.conversationId, "WorkspaceBinding.conversationId");
     assertId(binding.branchId, "WorkspaceBinding.branchId");

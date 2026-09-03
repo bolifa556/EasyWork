@@ -22,12 +22,16 @@ async function fixture(options = {}) {
   const transportFactory = {
     async connect(request) {
       connections.push(request);
+      if (options.connectImpl) return options.connectImpl(request);
       if (options.failConnect) throw Object.assign(new Error("authentication rejected"), { code: "SSH_AUTH_FAILED" });
       const runtime = { commands: [], keepAliveCount: 0, closed: false };
       return {
         fingerprint: "SHA256:00112233445566778899aabbccddeeff",
         async exec(command) { runtime.commands.push(command); return { stdout: "ok", stderr: "", code: 0 }; },
-        async keepAlive() { runtime.keepAliveCount += 1; },
+        async keepAlive() {
+          runtime.keepAliveCount += 1;
+          if (options.failKeepAlive) throw Object.assign(new Error("keepalive failed"), { code: "SSH_KEEPALIVE_FAILED" });
+        },
         async isAlive() { return !runtime.closed; },
         async close() { runtime.closed = true; },
         runtime,
@@ -74,6 +78,106 @@ test("Different devices share one per-user worker and reuse each server connecti
   }
 });
 
+test("Gateway startup clears stale SSH intent and waits for an explicit user connection", async () => {
+  const ctx = await fixture();
+  try {
+    const registry = ctx.registryFactory(ctx.actor);
+    await registry.create({ id: "server_a", host: "example.internal", port: 22, username: "alice", authMethod: "password", credential: { password: "value" } });
+    const before = await registry.get("server_a");
+    await registry.setConnection("server_a", {
+      ...before.connection,
+      status: "connected",
+      desiredConnection: true,
+      connectedAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    });
+    const restored = await ctx.pool.workerFor(ctx.actor).restore();
+    assert.equal(ctx.connections.length, 0);
+    assert.deepEqual(restored.map((entry) => ({ serverId: entry.serverId, status: entry.status })), [{ serverId: "server_a", status: "disconnected" }]);
+    const after = (await registry.get("server_a")).connection;
+    assert.equal(after.status, "disconnected");
+    assert.equal(after.desiredConnection, false);
+  } finally {
+    await ctx.pool.stop();
+    await rm(ctx.dataRoot, { recursive: true, force: true });
+  }
+});
+
+test("A user 2FA attempt retries after an overlapping background restore without a code", async () => {
+  let rejectBackground;
+  let markBackgroundStarted;
+  const backgroundStarted = new Promise((resolve) => { markBackgroundStarted = resolve; });
+  const backgroundFailure = new Promise((resolve, reject) => { rejectBackground = reject; });
+  const ctx = await fixture({
+    connectImpl: async (request) => {
+      if (!request.twoFactorCode) {
+        markBackgroundStarted();
+        return backgroundFailure;
+      }
+      return {
+        fingerprint: "SHA256:00112233445566778899aabbccddeeff",
+        async exec() { return { stdout: "ok", stderr: "", code: 0 }; },
+        async isAlive() { return true; },
+        async close() {},
+      };
+    },
+  });
+  try {
+    const registry = ctx.registryFactory(ctx.actor);
+    await registry.create({ id: "server_a", host: "example.internal", port: 22, username: "alice", authMethod: "password", credential: { password: "value" } });
+    const worker = ctx.pool.workerFor(ctx.actor);
+    const restoring = worker.connect("server_a", { acceptedFingerprint: "SHA256:00112233445566778899aabbccddeeff" });
+    restoring.catch(() => undefined);
+    await backgroundStarted;
+    const interactive = worker.connect("server_a", {
+      acceptedFingerprint: "SHA256:00112233445566778899aabbccddeeff",
+      twoFactorCode: "123456",
+    });
+    rejectBackground(Object.assign(new Error("authentication rejected"), { code: "SSH_AUTH_FAILED" }));
+    await assert.rejects(restoring, (error) => error?.code === "SSH_AUTH_FAILED");
+    const connected = await interactive;
+    assert.equal(connected.status, "connected");
+    assert.deepEqual(ctx.connections.map((request) => request.twoFactorCode), [null, "123456"]);
+    assert.equal((await registry.get("server_a")).connection.lastError, null);
+  } finally {
+    await ctx.pool.stop();
+    await rm(ctx.dataRoot, { recursive: true, force: true });
+  }
+});
+
+test("A delayed close event from an old SSH session cannot mark its replacement failed", async () => {
+  const sessions = [];
+  const ctx = await fixture({
+    connectImpl: async () => {
+      const runtime = { alive: true, closeListener: null };
+      const session = {
+        fingerprint: "SHA256:00112233445566778899aabbccddeeff",
+        async exec() { return { stdout: "ok", stderr: "", code: 0 }; },
+        async isAlive() { return runtime.alive; },
+        async close() { runtime.alive = false; },
+        onClose(listener) { runtime.closeListener = listener; },
+        runtime,
+      };
+      sessions.push(session);
+      return session;
+    },
+  });
+  try {
+    const registry = ctx.registryFactory(ctx.actor);
+    await registry.create({ id: "server_a", host: "example.internal", port: 22, username: "alice", authMethod: "password", credential: { password: "value" } });
+    const worker = ctx.pool.workerFor(ctx.actor);
+    await worker.connect("server_a", { acceptedFingerprint: "SHA256:00112233445566778899aabbccddeeff" });
+    await worker.disconnect("server_a");
+    await worker.connect("server_a");
+    await sessions[0].runtime.closeListener(Object.assign(new Error("old session closed"), { code: "SSH_CONNECTION_LOST" }));
+    assert.equal((await registry.get("server_a")).connection.status, "connected");
+    assert.equal((await worker.execute("server_a", "pwd")).stdout, "ok");
+  } finally {
+    await ctx.pool.stop();
+    await rm(ctx.dataRoot, { recursive: true, force: true });
+  }
+});
+
 test("A conversation is permanently bound to its first server until explicitly removed", async () => {
   const ctx = await fixture();
   try {
@@ -89,6 +193,16 @@ test("A conversation is permanently bound to its first server until explicitly r
     );
     assert.deepEqual((await registry.get("server_a")).conversationIds, ["conversation_a"]);
     assert.deepEqual((await registry.get("server_b")).conversationIds, []);
+    assert.equal(await registry.isConversationConnectionEnabled("conversation_a"), true);
+    await registry.disableConversation("conversation_a");
+    assert.equal(await registry.isConversationConnectionEnabled("conversation_a"), false);
+    assert.deepEqual(await registry.findConversationBinding("conversation_a"), { conversationId: "conversation_a", serverId: "server_a" });
+    assert.deepEqual((await registry.get("server_a")).conversationIds, ["conversation_a"]);
+    assert.deepEqual((await registry.get("server_a")).activeConversationIds, []);
+    await registry.bindConversation("server_a", "conversation_a");
+    assert.equal(await registry.isConversationConnectionEnabled("conversation_a"), true);
+    assert.deepEqual((await registry.get("server_a")).conversationIds, ["conversation_a"]);
+    assert.deepEqual((await registry.get("server_a")).activeConversationIds, ["conversation_a"]);
     await registry.unbindConversationEverywhere("conversation_a");
     assert.deepEqual(await registry.findConversationBinding("conversation_a"), { conversationId: "conversation_a", serverId: null });
   } finally {
@@ -97,7 +211,7 @@ test("A conversation is permanently bound to its first server until explicitly r
   }
 });
 
-test("withSession exposes only a live Actor-owned session and records active use", async () => {
+test("withSession exposes only a live Actor-owned session while only explicit activity renews the idle lease", async () => {
   const ctx = await fixture();
   try {
     const registry = ctx.registryFactory(ctx.actor);
@@ -113,6 +227,8 @@ test("withSession exposes only a live Actor-owned session and records active use
     }));
     assert.equal(result.username, "alice");
     assert.equal(result.output.stdout, "ok");
+    assert.equal((await registry.get("server_a")).connection.lastActiveAt, before);
+    await worker.touch("server_a");
     assert.notEqual((await registry.get("server_a")).connection.lastActiveAt, before);
   } finally {
     await ctx.pool.stop();
@@ -134,6 +250,27 @@ test("Keepalive does not refresh user activity and idle connections expire", asy
     ctx.advance(9_000);
     assert.deepEqual(await ctx.pool.maintain(), [{ serverId: "server_a", action: "expired" }]);
     assert.equal((await registry.get("server_a")).connection.status, "disconnected");
+  } finally {
+    await ctx.pool.stop();
+    await rm(ctx.dataRoot, { recursive: true, force: true });
+  }
+});
+
+test("A keepalive failure closes the exact live session and persists the loss", async () => {
+  const ctx = await fixture({ failKeepAlive: true });
+  try {
+    const registry = ctx.registryFactory(ctx.actor);
+    await registry.create({ id: "server_a", host: "example.internal", port: 22, username: "alice", authMethod: "password", credential: { password: "value" } });
+    const worker = ctx.pool.workerFor(ctx.actor);
+    await worker.connect("server_a", { acceptedFingerprint: "SHA256:00112233445566778899aabbccddeeff" });
+    ctx.advance(2_000);
+    assert.deepEqual(await ctx.pool.maintain(), [{ serverId: "server_a", action: "lost" }]);
+    const connection = (await registry.get("server_a")).connection;
+    assert.equal(connection.status, "failed");
+    assert.equal(connection.desiredConnection, true);
+    assert.deepEqual(connection.lastError, { code: "SSH_KEEPALIVE_FAILED", message: "keepalive failed" });
+    assert.equal((await worker.execute("server_a", "pwd")).stdout, "ok");
+    assert.equal(ctx.connections.length, 2);
   } finally {
     await ctx.pool.stop();
     await rm(ctx.dataRoot, { recursive: true, force: true });

@@ -14,6 +14,7 @@ import {
   defaultSshPolicy,
   normalizeBaseUrl,
   normalizeEmbeddingSettings,
+  normalizeOcrSettings,
   normalizeProtocol,
   normalizeProviderName,
   normalizeSshPolicy,
@@ -58,11 +59,12 @@ function platformProvider(purpose) {
     id: PLATFORM_PROVIDER_IDS[purpose],
     scope: "platform",
     purpose,
-    name: purpose === "web" ? "网页公共 API" : purpose === "agent" ? "Agent 公共 API" : "Embedding API",
+    name: purpose === "web" ? "网页公共 API" : purpose === "agent" ? "Agent 公共 API" : purpose === "embedding" ? "Embedding API" : "OCR API",
     baseUrl: "",
-    protocol: purpose === "embedding" ? "openai-embeddings" : "auto",
+    protocol: purpose === "embedding" ? "openai-embeddings" : purpose === "ocr" ? "chat-completions" : "auto",
     sealedKey: null,
     embedding: purpose === "embedding" ? clone(normalizeEmbeddingSettings()) : null,
+    ocr: purpose === "ocr" ? clone(normalizeOcrSettings()) : null,
     updatedAt: null,
   };
 }
@@ -73,6 +75,7 @@ function defaultPlatformData() {
       web: platformProvider("web"),
       agent: platformProvider("agent"),
       embedding: platformProvider("embedding"),
+      ocr: platformProvider("ocr"),
     },
     ssh: defaultSshPolicy(),
     commands: {},
@@ -99,6 +102,16 @@ function validatePlatformData(value) {
       status: 500,
       expose: false,
     });
+    normalizeProtocol(provider.protocol, purpose);
+  }
+  if (value.providers.ocr) {
+    const provider = value.providers.ocr;
+    invariant(provider.id === PLATFORM_PROVIDER_IDS.ocr && provider.scope === "platform" && provider.purpose === "ocr" && validSealed(provider.sealedKey), "PLATFORM_STORE_INVALID", "平台 OCR Provider 结构无效", {
+      status: 500,
+      expose: false,
+    });
+    normalizeProtocol(provider.protocol, "ocr");
+    normalizeOcrSettings(provider.ocr);
   }
   normalizeSshPolicy(value.ssh);
   return true;
@@ -106,7 +119,7 @@ function validatePlatformData(value) {
 
 function providerConfigured(record, apiKey) {
   if (!record.baseUrl || !apiKey) return false;
-  return record.purpose !== "embedding" || Boolean(record.embedding?.model);
+  return !["embedding", "ocr"].includes(record.purpose) || Boolean(record[record.purpose]?.model);
 }
 
 function providerPublic(record, vault, revision) {
@@ -132,7 +145,12 @@ function providerPublic(record, vault, revision) {
       ? `emb_${stableFingerprint({ baseUrl: record.baseUrl, protocol: record.protocol, ...record.embedding }).slice(0, 24)}`
       : null;
   }
+  if (record.purpose === "ocr") result.ocr = clone(record.ocr);
   return Object.freeze(result);
+}
+
+function platformRecord(data, purpose) {
+  return data.providers[purpose] || platformProvider(purpose);
 }
 
 function commandFingerprint(operation, payload) {
@@ -173,9 +191,9 @@ export class PlatformConfigurationService {
       schemaVersion: PLATFORM_SCHEMA_VERSION,
       revision: envelope.revision,
       updatedAt: envelope.updatedAt,
-      providers: Object.fromEntries(["web", "agent", "embedding"].map((purpose) => [
+      providers: Object.fromEntries(["web", "agent", "embedding", "ocr"].map((purpose) => [
         purpose,
-        providerPublic(envelope.data.providers[purpose], this.vault, envelope.revision),
+        providerPublic(platformRecord(envelope.data, purpose), this.vault, envelope.revision),
       ])),
       ssh: clone(normalizeSshPolicy(envelope.data.ssh)),
     };
@@ -189,19 +207,19 @@ export class PlatformConfigurationService {
   async publicProvider(purposeInput) {
     const purpose = assertProviderPurpose(purposeInput);
     const envelope = await this.repository.read();
-    return providerPublic(envelope.data.providers[purpose], this.vault, envelope.revision);
+    return providerPublic(platformRecord(envelope.data, purpose), this.vault, envelope.revision);
   }
 
   async publicProviders(purposeInput = null) {
-    const purposes = purposeInput === null ? ["web", "agent", "embedding"] : [assertProviderPurpose(purposeInput)];
+    const purposes = purposeInput === null ? ["web", "agent", "embedding", "ocr"] : [assertProviderPurpose(purposeInput)];
     const envelope = await this.repository.read();
-    return purposes.map((purpose) => providerPublic(envelope.data.providers[purpose], this.vault, envelope.revision));
+    return purposes.map((purpose) => providerPublic(platformRecord(envelope.data, purpose), this.vault, envelope.revision));
   }
 
   async resolveProvider(purposeInput) {
     const purpose = assertProviderPurpose(purposeInput);
     const envelope = await this.repository.read();
-    const record = envelope.data.providers[purpose];
+    const record = platformRecord(envelope.data, purpose);
     const apiKey = record.sealedKey ? this.vault.open(record.sealedKey, record.id) : "";
     invariant(providerConfigured(record, apiKey), "PLATFORM_PROVIDER_NOT_CONFIGURED", `平台 ${purpose} Provider 尚未配置`, { status: 409 });
     return Object.freeze({
@@ -214,7 +232,7 @@ export class PlatformConfigurationService {
     requireRole(actor, "admin");
     const purpose = assertProviderPurpose(purposeInput);
     const envelope = await this.repository.read();
-    const record = envelope.data.providers[purpose];
+    const record = platformRecord(envelope.data, purpose);
     invariant(record?.sealedKey, "PROVIDER_API_KEY_NOT_CONFIGURED", "当前平台 API 尚未保存 Key", { status: 409 });
     const apiKey = this.vault.open(record.sealedKey, record.id);
     return Object.freeze({
@@ -233,7 +251,9 @@ export class PlatformConfigurationService {
     const patch = input.patch || {};
     const allowedPatch = purpose === "embedding"
       ? ["name", "baseUrl", "protocol", "model", "dimensions", "chunkStrategy", "chunkSize", "chunkOverlap", "batchSize", "hybridEnabled"]
-      : ["name", "baseUrl", "protocol"];
+      : purpose === "ocr"
+        ? ["name", "baseUrl", "protocol", "model", "maxOutputTokens"]
+        : ["name", "baseUrl", "protocol"];
     exactKeys(patch, allowedPatch, "更新平台 Provider patch");
     const secretDigest = Object.hasOwn(input, "apiKey") ? stableFingerprint(normalizeApiKey(input.apiKey)) : null;
     const fingerprint = commandFingerprint(`provider:${purpose}`, { patch, secretDigest, clearApiKey: Boolean(input.clearApiKey) });
@@ -244,7 +264,7 @@ export class PlatformConfigurationService {
       const envelope = await this.repository.update((data, transaction) => {
         const duplicate = existingCommand(data.commands, commandId, fingerprint);
         if (duplicate) return data;
-        const current = data.providers[purpose];
+        const current = platformRecord(data, purpose);
         const baseUrl = Object.hasOwn(patch, "baseUrl")
           ? (String(patch.baseUrl || "").trim() ? normalizeBaseUrl(patch.baseUrl) : "")
           : current.baseUrl;
@@ -259,6 +279,7 @@ export class PlatformConfigurationService {
           updatedAt: nowIso(this.clock),
         };
         if (purpose === "embedding") next.embedding = clone(normalizeEmbeddingSettings({ ...current.embedding, ...patch }));
+        if (purpose === "ocr") next.ocr = clone(normalizeOcrSettings({ ...current.ocr, ...patch }));
         data.providers[purpose] = next;
         const result = {
           revision: transaction.nextRevision,
@@ -330,7 +351,7 @@ function validateUserProviders(value) {
 }
 
 function userProviderPurposeCompatible(provider, purpose) {
-  return purpose !== "embedding" && provider.scope === "actor";
+  return !["embedding", "ocr"].includes(purpose) && provider.scope === "actor";
 }
 
 function deterministicProviderId(actor, commandId) {
@@ -349,7 +370,7 @@ function normalizeUserProviderPatch(patch, current = null) {
 }
 
 export class ProviderService {
-  constructor({ dataRoot, masterSecret, platform, detector, clock = () => new Date(), idFactory, queue } = {}) {
+  constructor({ dataRoot, masterSecret, platform, detector, clock = () => new Date(), idFactory, queue, detectionCacheTtlMs = 2 * 60_000 } = {}) {
     invariant(path.isAbsolute(dataRoot || "") && platform instanceof PlatformConfigurationService, "PROVIDER_SERVICE_DEPENDENCY_INVALID", "ProviderService 缺少平台配置依赖", {
       status: 500,
       expose: false,
@@ -361,6 +382,27 @@ export class ProviderService {
     this.clock = clock;
     this.idFactory = idFactory || deterministicProviderId;
     this.queue = queue;
+    this.detectionCacheTtlMs = Math.max(0, Number(detectionCacheTtlMs) || 0);
+    this.detectionCache = new Map();
+  }
+
+  async #detect({ baseUrl, apiKey, purpose, signal }) {
+    const key = stableFingerprint({ baseUrl, apiKey, purpose });
+    const now = this.clock().getTime();
+    const cached = this.detectionCache.get(key);
+    if (cached && cached.expiresAt > now) return clone(await cached.promise);
+    if (cached) this.detectionCache.delete(key);
+
+    const promise = Promise.resolve(this.detector.detect({ baseUrl, apiKey, purpose, signal }));
+    this.detectionCache.set(key, { expiresAt: now + this.detectionCacheTtlMs, promise });
+    while (this.detectionCache.size > 64) this.detectionCache.delete(this.detectionCache.keys().next().value);
+    try {
+      const detected = await promise;
+      return clone(detected);
+    } catch (error) {
+      if (this.detectionCache.get(key)?.promise === promise) this.detectionCache.delete(key);
+      throw error;
+    }
   }
 
   #vault(actor) {
@@ -543,8 +585,8 @@ export class ProviderService {
 
   async listAvailableProviders(actor, purposeInput) {
     const purpose = assertProviderPurpose(purposeInput);
-    if (purpose === "embedding") {
-      const provider = await this.platform.publicProvider("embedding");
+    if (["embedding", "ocr"].includes(purpose)) {
+      const provider = await this.platform.publicProvider(purpose);
       return provider.configured ? [provider] : [];
     }
     const platform = await this.platform.publicProvider(purpose);
@@ -562,11 +604,12 @@ export class ProviderService {
     if (Object.values(PLATFORM_PROVIDER_IDS).includes(providerId)) {
       invariant(providerId === PLATFORM_PROVIDER_IDS[purpose], "PROVIDER_PURPOSE_MISMATCH", "平台 Provider 与用途不匹配", { status: 409 });
       const access = await this.platform.resolveProvider(purpose);
-      const model = purpose === "embedding" ? access.provider.embedding.model : modelId;
+      const model = ["embedding", "ocr"].includes(purpose) ? access.provider[purpose].model : modelId;
       invariant(!input.requireModel || model, "PROVIDER_MODEL_REQUIRED", "请选择模型", { status: 409 });
       return Object.freeze({ ...access, model });
     }
     invariant(purpose !== "embedding", "EMBEDDING_PLATFORM_ONLY", "Embedding 只能使用管理员配置", { status: 403 });
+    invariant(purpose !== "ocr", "OCR_PLATFORM_ONLY", "OCR 只能使用管理员配置", { status: 403 });
     requireAuthenticatedActor(actor);
     const repository = this.#repository(actor);
     const envelope = await repository.read();
@@ -586,9 +629,9 @@ export class ProviderService {
   async detectModels(actor, input) {
     exactKeys(input, ["providerId", "purpose", "signal"], "检测 Provider 模型");
     const purpose = assertProviderPurpose(input.purpose);
-    if (purpose === "embedding") requireRole(actor, "admin");
+    if (["embedding", "ocr"].includes(purpose)) requireRole(actor, "admin");
     const access = await this.resolve(actor, { providerId: input.providerId, purpose, modelId: "", requireModel: false });
-    const detected = await this.detector.detect({
+    const detected = await this.#detect({
       baseUrl: access.credential.baseUrl,
       apiKey: access.credential.apiKey,
       purpose,
@@ -605,7 +648,7 @@ export class ProviderService {
     exactKeys(input, ["purpose", "baseUrl", "apiKey", "signal"], "检测未保存 Provider 模型");
     const purpose = assertProviderPurpose(input.purpose);
     requireRole(actor, "admin");
-    const detected = await this.detector.detect({
+    const detected = await this.#detect({
       baseUrl: normalizeBaseUrl(input.baseUrl),
       apiKey: normalizeApiKey(input.apiKey),
       purpose,
@@ -633,7 +676,11 @@ function modelPurposes(model) {
   const embedding = model.capabilities?.embeddings === true || /(^|[-_.])(embed|embedding|bge|e5|gte|nomic|jina)([-_.]|$)/i.test(id) || type.includes("embedding");
   if (embedding) return ["embedding"];
   const nonText = /(image|audio|whisper|tts|moderation|realtime|transcri)/i.test(`${id} ${type}`);
-  return nonText ? [] : ["web", "agent"];
+  if (nonText) return [];
+  const purposes = ["web", "agent"];
+  const vision = model.capabilities?.vision === true || model.supports_vision === true || /(^|[-_.])(vision|ocr|vl|gpt-4o|gemini|claude)([-_.]|$)/i.test(id);
+  if (vision) purposes.push("ocr");
+  return purposes;
 }
 
 function normalizeModelDescriptor(model) {
@@ -669,34 +716,76 @@ function normalizedDetectedModels(detected, purpose) {
 }
 
 export class OpenAICompatibleModelDetector {
-  constructor({ fetchImpl = globalThis.fetch } = {}) {
+  constructor({ fetchImpl = globalThis.fetch, timeoutMs = 10_000 } = {}) {
     invariant(typeof fetchImpl === "function", "PROVIDER_FETCH_UNAVAILABLE", "模型检测需要 fetch 实现", { status: 500, expose: false });
+    invariant(Number.isSafeInteger(timeoutMs) && timeoutMs > 0, "PROVIDER_DETECTION_TIMEOUT_INVALID", "模型检测超时时间无效", { status: 500, expose: false });
     this.fetchImpl = fetchImpl;
+    this.timeoutMs = timeoutMs;
   }
 
   async detect({ baseUrl, apiKey, signal }) {
     const normalizedUrl = normalizeBaseUrl(baseUrl);
-    const target = new URL(normalizedUrl);
-    if (!target.pathname.endsWith("/models")) target.pathname = `${target.pathname.replace(/\/$/, "")}/models`;
-    let response;
-    try {
-      response = await this.fetchImpl(target, {
-        method: "GET",
-        headers: { accept: "application/json", authorization: `Bearer ${normalizeApiKey(apiKey)}` },
-        signal,
-      });
-    } catch (error) {
-      throw new ApiError("PROVIDER_DETECTION_UNREACHABLE", "无法连接模型 API", { status: 502, cause: error });
+    const source = new URL(normalizedUrl);
+    const pathname = source.pathname.replace(/\/+$/, "");
+    const candidatePaths = pathname.endsWith("/models")
+      ? [pathname]
+      : /\/v1$/i.test(pathname)
+        ? [`${pathname}/models`]
+        : pathname === ""
+          // Most OpenAI-compatible servers (including vLLM) expose models at
+          // /v1/models even when users paste only the service origin. Keep the
+          // legacy /models route as a narrow 404/405 fallback.
+          ? ["/v1/models", "/models"]
+          : [`${pathname}/models`, `${pathname}/v1/models`];
+    let response = null;
+    let target = null;
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    for (const [index, candidatePath] of [...new Set(candidatePaths)].entries()) {
+      target = new URL(source);
+      target.pathname = candidatePath.replace(/^\/?/, "/");
+      try {
+        response = await this.fetchImpl(target, {
+          method: "GET",
+          headers: { accept: "application/json", authorization: `Bearer ${normalizeApiKey(apiKey)}` },
+          signal: requestSignal,
+        });
+      } catch (error) {
+        const timedOut = timeoutSignal.aborted && !signal?.aborted;
+        throw new ApiError(timedOut ? "PROVIDER_DETECTION_TIMEOUT" : "PROVIDER_DETECTION_UNREACHABLE", timedOut
+          ? "模型 API 响应超时，请检查地址、网络或服务状态"
+          : "无法连接模型 API，请检查地址和网络", {
+          status: 502,
+          expose: true,
+          cause: error,
+        });
+      }
+      if (response?.ok) break;
+      const routeMissing = [404, 405].includes(Number(response?.status));
+      if (!routeMissing || index === candidatePaths.length - 1) break;
     }
-    invariant(response?.ok, "PROVIDER_DETECTION_FAILED", "模型列表接口返回错误", { status: 502, details: { upstreamStatus: response?.status ?? null } });
+    if (!response?.ok) {
+      const upstreamStatus = Number(response?.status) || null;
+      const authenticationFailed = [401, 403].includes(upstreamStatus);
+      const routeMissing = [404, 405].includes(upstreamStatus);
+      throw new ApiError("PROVIDER_DETECTION_FAILED", authenticationFailed
+        ? "模型 API 认证失败，请检查 API Key"
+        : routeMissing
+          ? "未找到模型列表接口，请确认 API URL（通常填写服务根地址或 /v1）"
+          : `模型列表接口返回错误${upstreamStatus ? `（HTTP ${upstreamStatus}）` : ""}`, {
+        status: 502,
+        expose: true,
+        details: { upstreamStatus, endpoint: target?.pathname || null },
+      });
+    }
     let body;
     try {
       body = await response.json();
     } catch (error) {
-      throw new ApiError("PROVIDER_DETECTION_INVALID_RESPONSE", "模型列表接口未返回 JSON", { status: 502, cause: error });
+      throw new ApiError("PROVIDER_DETECTION_INVALID_RESPONSE", "模型列表接口未返回有效 JSON", { status: 502, expose: true, cause: error });
     }
     const models = Array.isArray(body) ? body : body?.data;
-    invariant(Array.isArray(models), "PROVIDER_DETECTION_INVALID_RESPONSE", "模型列表接口结构无效", { status: 502 });
+    invariant(Array.isArray(models), "PROVIDER_DETECTION_INVALID_RESPONSE", "模型列表接口结构无效", { status: 502, expose: true });
     return [...new Map(models.map(normalizeModelDescriptor).map((descriptor) => [descriptor.id, descriptor])).values()]
       .sort((left, right) => left.name.localeCompare(right.name));
   }

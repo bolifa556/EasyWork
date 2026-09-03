@@ -35,11 +35,14 @@ Windows 可使用 `frp\start.cmd` 启动主服务、内部网页渲染器和可�
 app/easywork/       页面 Shell 与按需加载功能模块
 app/core/           前端合同、网关客户端和能力注册表
 gateway/core/       账户、资源、记忆、SSH、Agent 与任务服务
-prompts/            网页模型、Agent 和记忆提示词
+prompts/            所有模型提示词、工具定义与上下文组装模板
+doc/                三份唯一机制规范：SSH、网页 Agent、远端版本与 Agent
 data/               用户与访客运行数据（Git 忽略）
 tests/              当前架构的领域、HTTP 与集成测试
 scripts/            当前构建与启动工具
 ```
+
+机制说明只维护在 [SSH机制](doc/SSH机制.md)、[网页Agent机制](doc/网页Agent机制.md) 和 [远端文件版本与Agent机制](doc/远端文件版本与Agent机制.md) 三份文档中。
 
 ## 验证
 

@@ -5,6 +5,7 @@ import { invariant } from "../errors.mjs";
 import { defaultActorMutationQueue } from "../mutation-queue.mjs";
 import { AtomicJsonRepository } from "../repository.mjs";
 import { assertServerIdentity } from "../entities/common.mjs";
+import { SchedulerSubmissionLedger } from "./submissions.mjs";
 import {
   SCHEDULER_SCHEMA_VERSION,
   SCHEDULER_FEATURES,
@@ -20,6 +21,21 @@ import {
 
 const clone = (value) => structuredClone(value);
 const inlineQueue = Object.freeze({ run: async (_actor, operation) => operation() });
+const DEFAULT_JOB_HISTORY_LOOKBACK_DAYS = 30;
+const TERMINAL_JOB_STATES = new Set(["completed", "failed", "cancelled", "timeout"]);
+
+function remoteOutputNotCreated(error) {
+  const code = String(error?.code ?? "").toUpperCase();
+  const message = String(error?.message || "");
+  return code === "ENOENT" || code === "2" || /no such file/i.test(message);
+}
+
+function isoDate(value, field) {
+  const source = String(value || "");
+  const parsed = Date.parse(`${source}T00:00:00Z`);
+  invariant(/^\d{4}-\d{2}-\d{2}$/.test(source) && Number.isFinite(parsed), "SCHEDULER_HISTORY_RANGE_INVALID", `${field} 无效`, { status: 400 });
+  return { source, parsed };
+}
 
 function now(clock) {
   const value = (clock || (() => new Date()))();
@@ -88,7 +104,14 @@ export class SchedulerService {
     this.authorizeServer = options.authorizeServer;
     this.queue = options.queue || defaultActorMutationQueue;
     this.clock = options.clock;
+    this.submissions = options.submissionLedger || new SchedulerSubmissionLedger(options);
+    this.onSubmitted = options.onSubmitted || null;
+    this.submissionStatusCache = new Map();
     this.capabilityTtlMs = options.capabilityTtlMs ?? 10 * 60 * 1000;
+    this.dashboardCache = null;
+    this.dashboardPending = null;
+    this.resourceCache = null;
+    this.resourcePending = null;
     invariant(Number.isSafeInteger(this.capabilityTtlMs) && this.capabilityTtlMs > 0, "SCHEDULER_CAPABILITY_TTL_INVALID", "Scheduler capability TTL 无效", { status: 500, expose: false });
     this.repository = new AtomicJsonRepository({
       dataRoot: this.dataRoot,
@@ -108,10 +131,11 @@ export class SchedulerService {
     let profile;
     if (typeof this.adapter.capabilityProbeDescriptors === "function") {
       const commandResults = {};
-      for (const descriptor of this.adapter.capabilityProbeDescriptors()) {
-        const result = await this.#execute(descriptor, { allowFailure: true });
-        commandResults[descriptor.executable] = result;
-      }
+      const probes = await Promise.all(this.adapter.capabilityProbeDescriptors().map(async (descriptor) => ({
+        executable: descriptor.executable,
+        result: await this.#execute(descriptor, { allowFailure: true }),
+      })));
+      for (const probe of probes) commandResults[probe.executable] = probe.result;
       profile = this.adapter.inspectCapabilities({ serverIdentity: this.serverIdentity, commandResults, detectedAt, expiresAt });
     } else {
       profile = this.adapter.inspectCapabilities({ serverIdentity: this.serverIdentity, commandResults: {}, detectedAt, expiresAt });
@@ -144,16 +168,9 @@ export class SchedulerService {
     const requested = input.partitions?.length ? [...new Set(input.partitions.map((entry) => assertPartitionName(entry)))] : [...allowed];
     invariant(requested.length > 0 && requested.every((partition) => allowed.has(partition)), "SCHEDULER_SCOPE_VIOLATION", "请求包含当前 SSH 用户不可访问的分区", { status: 403 });
     const plan = this.adapter.resourceSummary({ partitions: requested });
-    const [output, jobs] = await Promise.all([
-      this.#execute(plan.descriptor),
-      this.userJobs(),
-    ]);
+    const output = await this.#execute(plan.descriptor);
     return {
       ...clone(plan.parse(output.stdout)),
-      currentUserJobs: {
-        running: jobs.filter((job) => job.state === "running").length,
-        pending: jobs.filter((job) => job.state === "pending").length,
-      },
       sampledAt: now(this.clock).toISOString(),
     };
   }
@@ -162,7 +179,179 @@ export class SchedulerService {
     await this.#requireFeature("userJobs");
     const plan = this.adapter.userJobs({ username: this.username });
     const output = await this.#execute(plan.descriptor);
-    return clone(plan.parse(output.stdout));
+    const jobs = clone(plan.parse(output.stdout));
+    await this.submissions.updateJobs(jobs);
+    return jobs;
+  }
+
+  async inspectSubmittedJob(jobId) {
+    await this.#authorize("read");
+    const profile = await this.getCapabilities();
+    if (!profile.commands.scontrol) return null;
+    const plan = this.adapter.inspectJob({ jobId: assertJobId(jobId) });
+    const output = await this.#execute(plan.descriptor);
+    const detail = plan.parse(output.stdout);
+    if (detail.owner !== this.username) return null;
+    const { jobId: id, stdoutPath: _stdout, stderrPath: _stderr, ...fields } = detail;
+    return { ...fields, id, scheduler: this.adapter.type };
+  }
+
+  async jobHistory(input = {}) {
+    const profile = await this.#requireFeature("jobHistory");
+    const sampledAt = now(this.clock);
+    const utcOffsetMinutes = Number(input.utcOffsetMinutes ?? 0);
+    invariant(Number.isInteger(utcOffsetMinutes) && Math.abs(utcOffsetMinutes) <= 14 * 60, "SCHEDULER_HISTORY_RANGE_INVALID", "历史作业时区无效", { status: 400 });
+    const defaultStart = new Date(sampledAt.valueOf() - DEFAULT_JOB_HISTORY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+    const start = isoDate(input.startDate || defaultStart.toISOString().slice(0, 10), "历史作业开始日期");
+    const end = isoDate(input.endDate || sampledAt.toISOString().slice(0, 10), "历史作业结束日期");
+    invariant(start.parsed <= end.parsed, "SCHEDULER_HISTORY_RANGE_INVALID", "历史作业开始日期不能晚于结束日期", { status: 400 });
+    const plan = this.adapter.jobHistory({
+      username: this.username,
+      // Use an absolute ISO date. Older Slurm releases do not consistently
+      // accept relative expressions such as `now-30days`.
+      startTime: start.source,
+      endTime: `${end.source}T23:59:59`,
+    });
+    const submissions = await this.submissions.list({ startDate: start.source, endDate: end.source, utcOffsetMinutes });
+    let schedulerHistory = [];
+    try {
+      const output = await this.#execute(plan.descriptor);
+      schedulerHistory = clone(plan.parse(output.stdout));
+    } catch (error) {
+      if (!submissions.length) throw error;
+    }
+    if (!submissions.length) return schedulerHistory;
+    let active = [];
+    if (profile.features.userJobs?.available) {
+      try {
+        const currentPlan = this.adapter.userJobs({ username: this.username });
+        const currentOutput = await this.#execute(currentPlan.descriptor);
+        active = currentPlan.parse(currentOutput.stdout);
+      } catch {
+        // Stored submission receipts remain useful during a queue outage.
+      }
+    }
+    const activeIds = new Set(active.map((job) => job.id));
+    const nativeIds = new Set(schedulerHistory.map((job) => job.id));
+    const inspected = [];
+    // Some sites have an incomplete accounting database. Ask the controller
+    // directly while it still retains the completed job, independently of any
+    // Agent query. Bound both query count and refresh frequency.
+    if (profile.commands.scontrol) {
+      const missing = [...new Map(submissions.filter((job) => !nativeIds.has(job.id) && !activeIds.has(job.id) && !TERMINAL_JOB_STATES.has(job.state)).map((job) => [job.id, job])).values()];
+      const pending = [];
+      for (const receipt of missing) {
+        const cached = this.submissionStatusCache.get(receipt.id);
+        if (cached && sampledAt.valueOf() - cached.at < 60_000) {
+          if (cached.job) inspected.push(cached.job);
+          continue;
+        }
+        pending.push(receipt);
+      }
+      // Least-recently inspected first, so a large set does not repeatedly
+      // spend the whole query budget on the same retired jobs.
+      pending.sort((left, right) => (this.submissionStatusCache.get(left.id)?.at || 0) - (this.submissionStatusCache.get(right.id)?.at || 0));
+      const inspect = async (receipt) => {
+        let job = null;
+        try {
+          const inspection = this.adapter.inspectJob({ jobId: receipt.id });
+          const result = await this.#execute(inspection.descriptor);
+          const detail = inspection.parse(result.stdout);
+          if (detail.owner === this.username) {
+            job = { ...receipt, ...detail, id: detail.jobId, submittedAt: receipt.submittedAt };
+            delete job.jobId;
+            delete job.stdoutPath;
+            delete job.stderrPath;
+            inspected.push(job);
+          }
+        } catch { /* The controller may already have retired this job. */ }
+        this.submissionStatusCache.set(receipt.id, { at: sampledAt.valueOf(), job });
+      };
+      for (let offset = 0; offset < Math.min(pending.length, 20); offset += 4) {
+        await Promise.all(pending.slice(offset, Math.min(offset + 4, 20)).map(inspect));
+      }
+      if (this.submissionStatusCache.size > 1000) {
+        const oldest = [...this.submissionStatusCache].sort((left, right) => left[1].at - right[1].at);
+        for (const [jobId] of oldest.slice(0, this.submissionStatusCache.size - 1000)) this.submissionStatusCache.delete(jobId);
+      }
+    }
+    for (const job of inspected) if (["pending", "running"].includes(job.state)) activeIds.add(job.id);
+    await this.submissions.updateJobs([...active, ...inspected, ...schedulerHistory]);
+    const snapshots = new Map(inspected.map((job) => [job.id, job]));
+    const merged = new Map();
+    for (const receipt of submissions) {
+      if (activeIds.has(receipt.id)) continue;
+      const candidate = clone(snapshots.get(receipt.id) || receipt);
+      if (!TERMINAL_JOB_STATES.has(candidate.state)) {
+        candidate.state = "unknown";
+        candidate.endedAt = null;
+        candidate.expectedEndAt = null;
+        candidate.locationOrReason = "EasyWork 已记录提交；调度器尚未返回终态";
+      }
+      merged.set(candidate.id, candidate);
+    }
+    for (const job of schedulerHistory) merged.set(job.id, job);
+    return [...merged.values()].sort((left, right) => {
+      const leftAt = Date.parse(left.endedAt || left.startedAt || left.submittedAt || "") || 0;
+      const rightAt = Date.parse(right.endedAt || right.startedAt || right.submittedAt || "") || 0;
+      return rightAt - leftAt || String(right.id).localeCompare(String(left.id));
+    });
+  }
+
+  async resources({ refresh = false } = {}) {
+    await this.#authorize("read");
+    if (!refresh && this.resourceCache) return clone(this.resourceCache);
+    if (this.resourcePending) return clone(await this.resourcePending);
+    this.resourcePending = this.#readResources().then((snapshot) => {
+      this.resourceCache = snapshot;
+      return snapshot;
+    }).finally(() => { this.resourcePending = null; });
+    return clone(await this.resourcePending);
+  }
+
+  async #readResources() {
+    const profile = await this.getCapabilities();
+    invariant(profile.scheduler === this.adapter.type, "SCHEDULER_CAPABILITY_UNAVAILABLE", "当前服务器没有可用的调度器", { status: 409 });
+    const partitions = profile.features.accessiblePartitions.available ? await this.accessiblePartitions() : [];
+    let summary = null;
+    if (profile.features.resourceSummary.available && partitions.length) {
+      const requested = partitions.map((entry) => entry.id);
+      const plan = this.adapter.resourceSummary({ partitions: requested });
+      const output = await this.#execute(plan.descriptor);
+      summary = { ...clone(plan.parse(output.stdout)), sampledAt: now(this.clock).toISOString() };
+    }
+    return {
+      scheduler: profile.scheduler,
+      capability: clone(profile),
+      partitions: clone(partitions),
+      summary,
+      sampledAt: summary?.sampledAt || now(this.clock).toISOString(),
+    };
+  }
+
+  async dashboard({ refresh = false } = {}) {
+    await this.#authorize("read");
+    if (!refresh && this.dashboardCache) return clone(this.dashboardCache);
+    if (this.dashboardPending) return clone(await this.dashboardPending);
+    this.dashboardPending = this.#readDashboard({ refresh }).then((snapshot) => {
+      this.dashboardCache = snapshot;
+      return snapshot;
+    }).finally(() => { this.dashboardPending = null; });
+    return clone(await this.dashboardPending);
+  }
+
+  async #readDashboard({ refresh = false } = {}) {
+    const resources = await this.resources({ refresh });
+    const profile = resources.capability;
+    const [jobs, history] = await Promise.all([
+      profile.features.userJobs.available ? this.userJobs() : [],
+      profile.features.jobHistory.available ? this.jobHistory() : [],
+    ]);
+    return {
+      ...resources,
+      jobs: clone(jobs),
+      history: clone(history),
+    };
   }
 
   async jobOutput(input) {
@@ -179,7 +368,18 @@ export class SchedulerService {
       offset: input?.offset,
       maxBytes: input?.maxBytes,
     });
-    const result = await this.executor.readRange(descriptor);
+    let result;
+    try {
+      result = await this.executor.readRange(descriptor);
+    } catch (error) {
+      // Slurm/PBS commonly publish the configured output path before the batch
+      // process has created the file.  That is a normal empty state while a job
+      // is pending or just starting, not a scheduler/API failure.  Once the job
+      // is terminal, keep surfacing a missing file because it may indicate a
+      // real script or filesystem problem.
+      if (!remoteOutputNotCreated(error) || !["pending", "running"].includes(job.state)) throw error;
+      result = { bytes: Buffer.alloc(0), nextOffset: descriptor.offset, eof: true };
+    }
     invariant(result && Buffer.isBuffer(result.bytes) && Number.isSafeInteger(result.nextOffset), "SCHEDULER_OUTPUT_RESULT_INVALID", "Job output 读取结果无效", { status: 500, expose: false });
     invariant(result.bytes.length <= descriptor.maxBytes && result.nextOffset === descriptor.offset + result.bytes.length, "SCHEDULER_OUTPUT_RESULT_INVALID", "Job output cursor 无效", { status: 500, expose: false });
     return {
@@ -199,11 +399,14 @@ export class SchedulerService {
     const allowed = new Set((await this.accessiblePartitions()).map((entry) => entry.id));
     invariant(allowed.has(partition), "SCHEDULER_SCOPE_VIOLATION", "不能向当前 SSH 用户不可访问的分区提交作业", { status: 403 });
     const commandInput = { partition, scriptPath: String(input?.scriptPath || ""), args: clone(input?.args || []) };
-    return this.#mutation("scheduler.submit", commandId, commandInput, async () => {
+    const result = await this.#mutation("scheduler.submit", commandId, commandInput, async () => {
       const plan = this.adapter.submit(commandInput);
       const output = await this.#execute(plan.descriptor);
       return plan.parse(output.stdout);
     });
+    await this.submissions.record([{ jobId: result.jobId, partition, name: path.posix.basename(commandInput.scriptPath) }], { commandId });
+    if (this.onSubmitted) void Promise.resolve().then(() => this.onSubmitted([result.jobId])).catch(() => undefined);
+    return result;
   }
 
   async cancelJob(input) {

@@ -49,12 +49,15 @@ export function createApi(options) {
   router.route("GET", "/api/bootstrap", async (request) => {
     if (options.bootstrap) return options.bootstrap(request);
     const { conversations, projects, servers, providers, taskStore } = request.services;
+    const conversationOverview = typeof conversations.bootstrapOverview === "function"
+      ? conversations.bootstrapOverview({ limit: 8, projectId: null })
+      : conversations.listConversations({ limit: 8, projectId: null });
     const [conversationPage, projectItems, serverItems, providerItems, runningTasks] = await Promise.all([
-      conversations.listConversations({ limit: 20 }),
+      conversationOverview,
       projects.list(),
       servers.list(),
       providers?.listAvailableProviders?.(request.session.actor, "web") || [],
-      taskStore?.listTasks?.({ statuses: ["queued", "preparing", "running", "waiting_approval", "interrupted", "resuming"], limit: 100 }) || [],
+      taskStore?.listTasks?.({ statuses: ["queued", "preparing", "running", "waiting_approval", "waiting_input", "interrupted", "resuming"], limit: 100 }) || [],
     ]);
     return {
       actor: request.session.profile,
@@ -82,7 +85,7 @@ export function createApi(options) {
   router.route("GET", "/api/conversations", (request) => request.services.conversations.listConversations({
     cursor: request.query.cursor,
     limit: request.query.limit ? Number(request.query.limit) : undefined,
-    projectId: request.query.projectId,
+    projectId: request.query.unassigned === "true" ? null : request.query.projectId,
   }));
   router.route("POST", "/api/conversations", (request) => {
     const body = requiredBody(request);
@@ -97,44 +100,43 @@ export function createApi(options) {
   }));
   router.route("GET", "/api/conversations/:id/server-binding", async (request) => {
     await request.services.conversations.getConversation(request.params.id);
-    return request.services.servers.findConversationBinding(request.params.id);
+    const binding = await request.services.servers.findConversationBinding(request.params.id);
+    return { ...binding, connectionEnabled: binding.serverId ? await request.services.servers.isConversationConnectionEnabled(request.params.id) : false };
   });
   router.route("POST", "/api/conversations/:id/server-binding", async (request) => {
     const body = exactBody(request, ["serverId"], ["serverId"], "绑定对话服务器");
     const conversation = await request.services.conversations.getConversation(request.params.id);
     invariant(conversation.summary.mode === "work", "CONVERSATION_SERVER_BINDING_MODE_INVALID", "只有工作对话可以绑定服务器", { status: 409 });
     await request.services.servers.bindConversation(body.serverId, request.params.id);
-    return request.services.servers.findConversationBinding(request.params.id);
+    return { ...(await request.services.servers.findConversationBinding(request.params.id)), connectionEnabled: true };
+  });
+  router.route("DELETE", "/api/conversations/:id/server-binding", async (request) => {
+    exactBody(request, [], [], "断开对话服务器");
+    await request.services.conversations.getConversation(request.params.id);
+    const binding = await request.services.servers.disableConversation(request.params.id);
+    return { ...binding, connectionEnabled: false };
   });
   router.route("POST", "/api/conversations/:id/messages", (request) => request.services.conversations.sendMessage({
     ...requiredBody(request), conversationId: request.params.id, expectedRevision: expectedRevision(request), commandId: commandId(request), role: requiredBody(request).role || "user",
   }));
   router.route("PATCH", "/api/conversations/:id", async (request) => {
     const body = withRevision(request);
+    invariant(body.mode === undefined, "CONVERSATION_MODE_FIXED", "对话类型在创建后不可修改", { status: 400 });
     const base = { conversationId: request.params.id, expectedRevision: body.expectedRevision, commandId: commandId(request) };
     if (body.title !== undefined) return request.services.conversations.rename({ ...base, title: body.title });
     if (body.projectId !== undefined) return request.services.conversations.moveToProject({ ...base, projectId: body.projectId });
     if (body.pinned !== undefined) return request.services.conversations.setPinned({ ...base, pinned: body.pinned });
-    if (body.mode !== undefined) {
-      const result = await request.services.conversations.convertMode({ ...base, mode: body.mode });
-      if (body.mode === "chat") await request.services.servers.unbindConversationEverywhere(request.params.id);
-      return result;
-    }
     invariant(false, "CONVERSATION_PATCH_EMPTY", "没有可修改的对话字段", { status: 400 });
   });
   router.route("DELETE", "/api/conversations/:id", async (request) => {
-    const result = await request.services.conversations.delete({ conversationId: request.params.id, expectedRevision: expectedRevision(request), commandId: commandId(request) });
-    await request.services.servers.unbindConversationEverywhere(request.params.id);
-    return result;
+    return request.services.conversations.delete({ conversationId: request.params.id, expectedRevision: expectedRevision(request), commandId: commandId(request) });
   });
   router.route("POST", "/api/conversations/:id/actions", (request) => {
     const body = requiredBody(request);
     const base = { ...body, conversationId: request.params.id, expectedRevision: expectedRevision(request), commandId: commandId(request) };
     const actions = {
       branch: "branch",
-      "edit-latest": "editLatestUserMessage",
       retry: "retry",
-      reset: "retry",
       rewind: "rewind",
     };
     const method = actions[body.action];
@@ -160,7 +162,16 @@ export function createApi(options) {
   router.route("POST", "/api/resources/:id/reindex", (request) => request.services.resources.retryIndexing({ versionId: request.params.id, expectedRevision: expectedRevision(request) }));
   router.route("DELETE", "/api/resource-bindings/:id", (request) => request.services.resources.removeBinding({ bindingId: request.params.id, expectedRevision: expectedRevision(request) }));
 
-  router.route("GET", "/api/servers", (request) => request.services.servers.list());
+  router.route("GET", "/api/servers", async (request) => {
+    const servers = await request.services.servers.list();
+    const conversationIds = [...new Set(servers.flatMap((server) => server.conversationIds || []))];
+    const titles = new Map((await request.services.conversations.getConversationSummaries(conversationIds))
+      .map((conversation) => [conversation.id, conversation.title]));
+    return servers.map((server) => ({
+      ...server,
+      conversations: (server.conversationIds || []).map((id) => ({ id, title: titles.get(id) || "未命名对话" })),
+    }));
+  });
   router.route("POST", "/api/servers", (request) => request.services.servers.create(requiredBody(request)));
   router.route("GET", "/api/servers/:id", (request) => request.services.servers.get(request.params.id));
   router.route("PATCH", "/api/servers/:id", (request) => request.services.servers.update(request.params.id, withRevision(request)));
@@ -169,28 +180,80 @@ export function createApi(options) {
     auditAction: "ssh.credential.revealed",
     auditTarget: ({ params }) => ({ serverId: params.id }),
   });
-  router.route("POST", "/api/servers/:id/connect", (request) => request.services.sshWorker.connect(request.params.id, requiredBody(request)));
+  router.route("POST", "/api/servers/:id/connect", (request) => request.services.connectSsh(request.params.id, requiredBody(request)));
   router.route("POST", "/api/servers/:id/disconnect", (request) => request.services.sshWorker.disconnect(request.params.id));
 
-  router.route("GET", "/api/tasks", (request) => request.services.taskStore.listTasks({
-    statuses: request.query.status ? request.query.status.split(",") : undefined,
-    conversationId: request.query.conversationId || undefined,
-    limit: request.query.limit ? Number(request.query.limit) : undefined,
-    cursor: request.query.cursor,
-  }));
+  router.route("GET", "/api/tasks", (request) => {
+    const conversationId = String(request.query.conversationId || "").trim();
+    invariant(conversationId, "TASK_CONVERSATION_REQUIRED", "读取任务需要指定对话", { status: 400 });
+    return request.services.taskStore.listTasks({
+      conversationId,
+      limit: request.query.limit ? Number(request.query.limit) : undefined,
+    });
+  });
   router.route("POST", "/api/tasks", async (request) => {
     const body = requiredBody(request);
-    const task = await request.services.orchestrator.create(body, { commandId: commandId(request) });
-    return body.start === false ? task : request.services.orchestrator.start(task.id, { commandId: `${commandId(request)}:start` });
+    const { start = true, ...input } = body;
+    const created = await request.services.orchestrator.create(input, { commandId: commandId(request) });
+    return start === false ? created : request.services.orchestrator.start(created.task.id, { commandId: `${commandId(request)}:start` });
   });
   router.route("GET", "/api/tasks/:id", (request) => request.services.orchestrator.getTask(request.params.id));
   router.route("GET", "/api/tasks/:id/report", (request) => request.services.taskReports.get(request.params.id));
   for (const [path, method] of [["append", "append"], ["interrupt", "interrupt"], ["resume", "resume"]]) {
     router.route("POST", `/api/tasks/:id/${path}`, (request) => request.services.orchestrator[method](request.params.id, { ...requiredBody(request), commandId: commandId(request) }));
   }
+  router.route("POST", "/api/tasks/:id/approval", async (request) => {
+    const result = await request.services.orchestrator.respondApproval(request.params.id, { ...requiredBody(request), commandId: commandId(request) });
+    await request.services.interactions?.resumeTask(request.params.id);
+    return result;
+  });
+  router.route("POST", "/api/tasks/:id/input", async (request) => {
+    const result = await request.services.orchestrator.respondInput(request.params.id, { ...requiredBody(request), commandId: commandId(request) });
+    await request.services.interactions?.resumeTask(request.params.id);
+    return result;
+  });
 
   router.route("GET", "/api/skills", (request) => request.services.skills.inspect());
   router.route("POST", "/api/skills", (request) => request.services.skills.uploadVersion({ ...requiredBody(request), commandId: commandId(request) }));
+  router.route("GET", "/api/skill-center/installed", (request) => request.services.skills.listInstalled());
+  router.route("GET", "/api/skill-center/installed/:skillId", (request) => request.services.skills.getInstalledDetail(request.params.skillId));
+  router.route("PATCH", "/api/skill-center/installed/:skillId/applicability", (request) => request.services.skills.updateApplicability(request.params.skillId, requiredBody(request)));
+  router.route("DELETE", "/api/skill-center/installed/:skillId", (request) => request.services.skills.uninstall({
+    skillId: request.params.skillId,
+    expectedRevision: expectedRevision(request),
+  }));
+  router.route("GET", "/api/skill-center/market", async (request) => {
+    const installed = await request.services.skills.listInstalled();
+    return request.services.skillMarketplace.listMarket({ installedSkillIds: installed.items.map((item) => item.skillId) });
+  });
+  router.route("GET", "/api/skill-center/market/:id", async (request) => {
+    const installed = await request.services.skills.listInstalled();
+    return request.services.skillMarketplace.getMarket(request.params.id, { installedSkillIds: installed.items.map((item) => item.skillId) });
+  });
+  router.route("POST", "/api/skill-center/market/:id/install", (request) => request.services.skillMarketplace.install(
+    request.session.actor,
+    request.services.skills,
+    request.params.id,
+  ));
+  router.route("PATCH", "/api/skill-center/market/:id", (request) => request.services.skillMarketplace.updateMarket(request.session.actor, request.params.id, {
+    ...requiredBody(request),
+    expectedRevision: expectedRevision(request),
+  }), { admin: true });
+  router.route("DELETE", "/api/skill-center/market/:id", (request) => request.services.skillMarketplace.deleteMarket(request.session.actor, request.params.id, {
+    expectedRevision: expectedRevision(request),
+  }), { admin: true });
+  router.route("GET", "/api/skill-center/uploads", (request) => request.services.skillMarketplace.listSubmissions(request.session.actor, {
+    status: request.query.status,
+  }));
+  router.route("POST", "/api/skill-center/uploads", (request) => request.services.skillMarketplace.submit(request.session.actor, {
+    ...requiredBody(request),
+    commandId: commandId(request),
+  }));
+  router.route("GET", "/api/skill-center/uploads/:id", (request) => request.services.skillMarketplace.getSubmission(request.session.actor, request.params.id));
+  router.route("POST", "/api/skill-center/uploads/:id/review", (request) => request.services.skillMarketplace.review(request.session.actor, request.params.id, {
+    ...requiredBody(request),
+    expectedRevision: expectedRevision(request),
+  }), { admin: true });
 
   router.route("GET", "/api/providers", (request) => request.services.providers.listAvailableProviders(request.session.actor, request.query.purpose || "web"));
   router.route("POST", "/api/providers", (request) => request.services.providers.createUserProvider(request.session.actor, { ...requiredBody(request), commandId: commandId(request) }));

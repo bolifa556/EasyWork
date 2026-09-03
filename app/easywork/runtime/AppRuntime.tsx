@@ -12,7 +12,7 @@ import {
 import { GatewayClient } from "@/app/core/gateway/client";
 import { randomIdentifier } from "@/app/core/identifiers";
 import { RealtimeClient } from "@/app/core/realtime/client";
-import { GatewayError, type BootstrapResponse, type SessionResponse } from "@/app/core/contracts";
+import { GatewayError, type BootstrapResponse, type ServerCapabilityProfile, type SessionResponse } from "@/app/core/contracts";
 
 const SESSION_KEY = "easywork.session";
 const DEVICE_KEY = "easywork.device";
@@ -36,15 +36,38 @@ export type AppView =
   | { kind: "home"; projectId?: string; mode?: "chat" | "work" }
   | { kind: "help" }
   | { kind: "library"; collectionId?: string }
-  | { kind: "skills" }
+  | {
+      kind: "skills";
+      tab?: "installed" | "market" | "uploads";
+      detailId?: string;
+      detailSource?: "installed" | "market" | "upload";
+      reviewTab?: "pending" | "reviewed";
+    }
   | { kind: "servers" }
   | { kind: "admin" }
-  | { kind: "tasks" }
-  | { kind: "artifacts" }
   | { kind: "project"; projectId: string }
   | { kind: "conversation"; conversationId: string; panel?: ConversationPanel };
 
 type Toast = { id: string; tone: "neutral" | "success" | "error"; message: string };
+
+export type WorkspaceSidebarSession = {
+  conversationId: string;
+  serverId: string;
+  workspaceId: string;
+  workspacePath: string;
+  branchId?: string;
+  capabilities: ServerCapabilityProfile;
+};
+
+export type WorkspacePreviewTab = {
+  id: string;
+  conversationId: string;
+  serverId: string;
+  workspaceId: string;
+  relativePath: string;
+  name: string;
+  size: number;
+};
 
 type RuntimeValue = {
   api: GatewayClient;
@@ -56,10 +79,18 @@ type RuntimeValue = {
   view: AppView;
   sidebarOpen: boolean;
   rightRailOpen: boolean;
+  workspaceSidebar: WorkspaceSidebarSession | null;
+  workspacePreviewTabs: WorkspacePreviewTab[];
+  activeWorkspacePreviewTabId: string | null;
   toasts: Toast[];
   navigate: (view: AppView, options?: { replace?: boolean }) => void;
   setSidebarOpen: (open: boolean) => void;
   setRightRailOpen: (open: boolean) => void;
+  setWorkspaceSidebar: (session: WorkspaceSidebarSession | null) => void;
+  openWorkspacePreview: (tab: Omit<WorkspacePreviewTab, "id">) => void;
+  selectWorkspacePreview: (id: string) => void;
+  closeWorkspacePreview: (id: string) => void;
+  closeWorkspacePreviews: (conversationId?: string) => void;
   refreshBootstrap: () => Promise<void>;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string) => Promise<void>;
@@ -112,6 +143,13 @@ function routeFor(view: AppView) {
     return `/c/${encodeURIComponent(view.conversationId)}${suffix}`;
   }
   if (view.kind === "library" && view.collectionId) return `/library/${encodeURIComponent(view.collectionId)}`;
+  if (view.kind === "skills") {
+    const tab = view.tab || (view.detailSource === "market" ? "market" : view.detailSource === "upload" ? "uploads" : "installed");
+    const query = new URLSearchParams();
+    if (view.reviewTab) query.set("review", view.reviewTab);
+    const detail = view.detailId && view.detailSource ? `/${encodeURIComponent(view.detailId)}` : "";
+    return `/skills/${tab}${detail}${query.size ? `?${query}` : ""}`;
+  }
   return `/${view.kind}`;
 }
 
@@ -133,7 +171,19 @@ function parseRoute(pathname: string, search = ""): AppView {
     return { kind: "conversation", conversationId: parts[1], panel };
   }
   if (parts[0] === "library") return { kind: "library", collectionId: parts[1] };
-  if (["help", "skills", "servers", "admin", "tasks", "artifacts"].includes(parts[0])) return { kind: parts[0] as Exclude<AppView["kind"], "home" | "project" | "conversation" | "library"> };
+  if (parts[0] === "skills") {
+    const tab = ["installed", "market", "uploads"].includes(parts[1]) ? parts[1] as "installed" | "market" | "uploads" : "installed";
+    const detailSource = parts[2] ? tab === "market" ? "market" as const : tab === "uploads" ? "upload" as const : "installed" as const : undefined;
+    const query = new URLSearchParams(search);
+    const review = query.get("review");
+    return {
+      kind: "skills",
+      tab,
+      ...(detailSource && parts[2] ? { detailSource, detailId: parts[2] } : {}),
+      ...(review === "pending" || review === "reviewed" ? { reviewTab: review } : {}),
+    };
+  }
+  if (["help", "servers", "admin"].includes(parts[0])) return { kind: parts[0] as Exclude<AppView["kind"], "home" | "project" | "conversation" | "library" | "skills"> };
   const query = new URLSearchParams(search);
   const projectId = query.get("project") || undefined;
   const requestedMode = query.get("mode");
@@ -174,6 +224,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     : parseRoute(window.location.pathname, window.location.search));
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightRailOpen, setRightRailOpen] = useState(false);
+  const [workspaceSidebar, setWorkspaceSidebarState] = useState<WorkspaceSidebarSession | null>(null);
+  const [workspacePreviewTabs, setWorkspacePreviewTabs] = useState<WorkspacePreviewTab[]>([]);
+  const [activeWorkspacePreviewTabId, setActiveWorkspacePreviewTabId] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [api] = useState(() => new GatewayClient("", sessionSource.read));
   const [realtime] = useState(() => new RealtimeClient(websocketUrl, sessionSource.read));
@@ -190,6 +243,58 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     setToasts((current) => [...current, { id, tone, message }]);
     window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), tone === "error" ? 7000 : 3600);
   }, [setToasts]);
+
+  const openWorkspacePreview = useCallback((input: Omit<WorkspacePreviewTab, "id">) => {
+    const id = `${input.conversationId}:${input.serverId}:${input.workspaceId}:${input.relativePath}`;
+    setWorkspacePreviewTabs((current) => {
+      const existing = current.find((entry) => entry.id === id);
+      if (existing) return current.map((entry) => entry.id === id ? { ...entry, ...input } : entry);
+      return [...current, { ...input, id }].slice(-14);
+    });
+    setActiveWorkspacePreviewTabId(id);
+  }, []);
+
+  const selectWorkspacePreview = useCallback((id: string) => {
+    setActiveWorkspacePreviewTabId(id);
+  }, []);
+
+  const closeWorkspacePreview = useCallback((id: string) => {
+    setWorkspacePreviewTabs((current) => {
+      const index = current.findIndex((entry) => entry.id === id);
+      const next = current.filter((entry) => entry.id !== id);
+      setActiveWorkspacePreviewTabId((active) => {
+        if (active !== id) return active;
+        return next[Math.min(Math.max(0, index), next.length - 1)]?.id ?? null;
+      });
+      return next;
+    });
+  }, []);
+
+  const closeWorkspacePreviews = useCallback((conversationId?: string) => {
+    setWorkspacePreviewTabs((current) => {
+      const next = conversationId ? current.filter((entry) => entry.conversationId !== conversationId) : [];
+      setActiveWorkspacePreviewTabId((active) => active && next.some((entry) => entry.id === active) ? active : next.at(-1)?.id ?? null);
+      return next;
+    });
+  }, []);
+
+  const setWorkspaceSidebar = useCallback((next: WorkspaceSidebarSession | null) => {
+    const apply = () => setWorkspaceSidebarState(next);
+    const changesSidebarMode = Boolean(workspaceSidebar) !== Boolean(next);
+    if (!changesSidebarMode || typeof document === "undefined" || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      apply();
+      return;
+    }
+    const transitionDocument = document as Document & {
+      startViewTransition?: (update: () => void) => { finished: Promise<void> };
+    };
+    if (typeof transitionDocument.startViewTransition === "function") {
+      document.documentElement.dataset.easyworkSidebarTransition = "true";
+      const transition = transitionDocument.startViewTransition(apply);
+      const cleanup = () => { delete document.documentElement.dataset.easyworkSidebarTransition; };
+      void transition.finished.then(cleanup, cleanup);
+    } else apply();
+  }, [workspaceSidebar]);
 
   const refreshBootstrap = useCallback(async () => {
     if (!sessionSource.read()) return;
@@ -218,15 +323,16 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!token) return;
+    let lastRefreshAt = Date.now();
     const synchronizeVisibleState = () => {
       if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastRefreshAt < 5 * 60_000) return;
+      lastRefreshAt = Date.now();
       void refreshBootstrap().catch(() => undefined);
     };
-    const interval = window.setInterval(synchronizeVisibleState, 30_000);
     window.addEventListener("focus", synchronizeVisibleState);
     document.addEventListener("visibilitychange", synchronizeVisibleState);
     return () => {
-      window.clearInterval(interval);
       window.removeEventListener("focus", synchronizeVisibleState);
       document.removeEventListener("visibilitychange", synchronizeVisibleState);
     };
@@ -243,7 +349,12 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   }, [api, storeSession]);
 
   useEffect(() => {
-    const pop = () => setView(parseRoute(window.location.pathname, window.location.search));
+    const pop = () => {
+      setWorkspaceSidebarState(null);
+      setWorkspacePreviewTabs([]);
+      setActiveWorkspacePreviewTabId(null);
+      setView(parseRoute(window.location.pathname, window.location.search));
+    };
     window.addEventListener("popstate", pop);
     return () => window.removeEventListener("popstate", pop);
   }, []);
@@ -351,11 +462,17 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
 
   const navigate = useCallback((next: AppView, options?: { replace?: boolean }) => {
     localStorage.removeItem(DEVICE_INTRO_AUTO_KEY);
+    const keepsWorkspace = next.kind === "conversation" && workspaceSidebar?.conversationId === next.conversationId;
+    if (!keepsWorkspace) {
+      setWorkspaceSidebarState(null);
+      setWorkspacePreviewTabs([]);
+      setActiveWorkspacePreviewTabId(null);
+    }
     setView(next);
     setSidebarOpen(false);
     const method = options?.replace ? "replaceState" : "pushState";
     window.history[method](null, "", routeFor(next));
-  }, [setSidebarOpen, setView]);
+  }, [setSidebarOpen, setView, workspaceSidebar?.conversationId]);
 
   const value = useMemo<RuntimeValue>(() => ({
     api,
@@ -367,16 +484,24 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     view,
     sidebarOpen,
     rightRailOpen,
+    workspaceSidebar,
+    workspacePreviewTabs,
+    activeWorkspacePreviewTabId,
     toasts,
     navigate,
     setSidebarOpen,
     setRightRailOpen,
+    setWorkspaceSidebar,
+    openWorkspacePreview,
+    selectWorkspacePreview,
+    closeWorkspacePreview,
+    closeWorkspacePreviews,
     refreshBootstrap,
     login: (username, password) => authenticate("login", username, password),
     register: (username, password) => authenticate("register", username, password),
     logout,
     notify,
-  }), [api, authenticate, bootstrap, error, loading, logout, navigate, notify, realtime, refreshBootstrap, rightRailOpen, sidebarOpen, toasts, token, view]);
+  }), [activeWorkspacePreviewTabId, api, authenticate, bootstrap, closeWorkspacePreview, closeWorkspacePreviews, error, loading, logout, navigate, notify, openWorkspacePreview, realtime, refreshBootstrap, rightRailOpen, selectWorkspacePreview, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspacePreviewTabs, workspaceSidebar]);
 
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
