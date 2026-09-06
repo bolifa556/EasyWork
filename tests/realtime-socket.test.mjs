@@ -28,8 +28,10 @@ test("summary subscriptions replay headings but preserve full live reasoning", a
     socket.message({ type: "subscribe", topics: ["task:one"], resume: {}, replayView: "summary" });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(socket.sent.find((v) => v.type === "event").event.payload.event.text, "");
+    assert.equal(socket.sent.find((v) => v.type === "event").replay, true);
     await broker.append("task:one", { eventId: "new", producer: "agent:codex", kind: "reasoning", payload: { event: { text: "正在产生的思考" } } });
     assert.equal(socket.sent.filter((v) => v.type === "event").at(-1).event.payload.event.text, "正在产生的思考");
+    assert.equal(socket.sent.filter((v) => v.type === "event").at(-1).replay, undefined);
   } finally { cleanup(); }
 });
 

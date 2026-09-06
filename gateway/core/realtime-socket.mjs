@@ -116,9 +116,9 @@ export class RealtimeSocketServer {
             let bufferedBytes = 0;
             let cursor = afterSequence;
             const buffer = [];
-            const deliver = (event, summary = false) => {
+            const deliver = (event, summary = false, replay = false) => {
               if (state.closed || event.sequence <= cursor) return;
-              send(socket, { type: "event", event: { ...(summary ? summarizeTimelineEvent(event) : event), topic } }, this.maxBufferedBytes);
+              send(socket, { type: "event", ...(replay ? { replay: true } : {}), event: { ...(summary ? summarizeTimelineEvent(event) : event), topic } }, this.maxBufferedBytes);
               cursor = event.sequence;
             };
             const unsubscribe = state.broker.subscribe(brokerTopic, (event) => {
@@ -138,7 +138,7 @@ export class RealtimeSocketServer {
                 if (state.closed) return;
                 upperBound ??= replay.lastSequence ?? replay.events.at(-1)?.sequence ?? cursor;
                 const before = cursor;
-                for (const event of replay.events) if (event.sequence <= upperBound) deliver(event, message.replayView === "summary");
+                for (const event of replay.events) if (event.sequence <= upperBound) deliver(event, message.replayView === "summary", true);
                 if (!replay.hasMore || cursor >= upperBound || cursor === before) break;
               }
               for (const event of buffer.sort((a, b) => a.sequence - b.sequence)) deliver(event);

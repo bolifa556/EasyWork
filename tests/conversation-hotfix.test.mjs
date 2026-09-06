@@ -17,6 +17,34 @@ const definitions = timeline.statements.filter((node) => ts.isFunctionDeclaratio
 const { classifyConversationOutput } = await importTypeScript(definitions.map((node) => node.getText(timeline)).join("\n"));
 const event = (sequence, kind, payload = {}) => ({ eventId: `event-${sequence}`, sequence, occurredAt: "2026-09-06T00:00:00Z", topic: "conversation:one", producer: "web-agent", ids: { runId: "run-one" }, kind, payload });
 
+test("opening a conversation distinguishes history from live messages and reconnect catch-up", async () => {
+  const source = ts.createSourceFile("client.ts", await readFile(new URL("../app/core/realtime/client.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  const declaration = source.statements.find(ts.isClassDeclaration).getText(source);
+  const { RealtimeClient } = await importTypeScript(`const WebSocket = { OPEN: 1 }; const randomRequestId = () => "test-request"; ${declaration}`);
+  const client = new RealtimeClient(() => "ws://localhost", () => "token");
+  client.state = "open";
+  client.authenticated = true;
+  client.socket = { readyState: 1, send() {} };
+  const received = [];
+  const listener = (item, context) => received.push({ sequence: item.sequence, ...context });
+  const unsubscribe = client.subscribe("conversation:one", listener);
+  const receive = (sequence, replay) => client.receive(JSON.stringify({ type: "event", replay, event: event(sequence, "run.persisted") }));
+  receive(1, true);
+  client.receive(JSON.stringify({ type: "subscribed", topics: ["conversation:one"] }));
+  receive(2, false);
+  client.receive(JSON.stringify({ type: "authenticated" }));
+  receive(3, true);
+  unsubscribe();
+  client.subscribe("conversation:one", listener);
+  receive(4, true);
+  assert.deepEqual(received, [
+    { sequence: 1, initialReplay: true },
+    { sequence: 2, initialReplay: false },
+    { sequence: 3, initialReplay: false },
+    { sequence: 4, initialReplay: true },
+  ]);
+});
+
 test("chat exposes each output delta before the final commit", () => {
   let events = [event(1, "run.started")];
   for (const [index, content] of ["你", "你好", "你好，世界"].entries()) {

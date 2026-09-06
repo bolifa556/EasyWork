@@ -293,8 +293,8 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!token || !bootstrap?.actor.id) return;
     let timer: number | undefined;
-    const unsubscribe = realtime.subscribe(`conversations:${bootstrap.actor.id}`, (event) => {
-      if (event.kind !== "conversation.title.updated" || !event.ids.conversationId) return;
+    const unsubscribe = realtime.subscribe(`conversations:${bootstrap.actor.id}`, (event, { initialReplay }) => {
+      if (initialReplay || event.kind !== "conversation.title.updated" || !event.ids.conversationId) return;
       // Coalesce replayed metadata into one list refresh. Each window receives
       // this account-scoped stream, so it needs no additional tab broadcast.
       window.clearTimeout(timer);

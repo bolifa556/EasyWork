@@ -6,7 +6,7 @@ import type {
 } from "../contracts";
 import { prefixedIdentifier } from "../identifiers";
 
-type EventListener = (event: RealtimeEnvelope) => void;
+type EventListener = (event: RealtimeEnvelope, context: { initialReplay: boolean }) => void;
 type StateListener = (state: "connecting" | "open" | "closed") => void;
 
 const randomRequestId = () => prefixedIdentifier("req");
@@ -18,6 +18,7 @@ export class RealtimeClient {
   private readonly stateListeners = new Set<StateListener>();
   private readonly lastSequence = new Map<string, number>();
   private readonly seenEventIds = new Set<string>();
+  private readonly initialReplayTopics = new Set<string>();
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
   private explicitlyClosed = false;
@@ -77,6 +78,7 @@ export class RealtimeClient {
   subscribe(topic: string, listener: EventListener) {
     const topicListeners = this.listeners.get(topic) ?? new Set<EventListener>();
     const first = topicListeners.size === 0;
+    if (first) this.initialReplayTopics.add(topic);
     topicListeners.add(listener);
     this.listeners.set(topic, topicListeners);
     if (first && this.state === "open" && this.authenticated) this.sendSubscription([topic]);
@@ -101,6 +103,7 @@ export class RealtimeClient {
     topicListeners.delete(listener);
     if (topicListeners.size) return;
     this.listeners.delete(topic);
+    this.initialReplayTopics.delete(topic);
     if (this.socket?.readyState === WebSocket.OPEN) {
       const message: RealtimeUnsubscribe = { type: "unsubscribe", requestId: randomRequestId(), topics: [topic] };
       this.socket.send(JSON.stringify(message));
@@ -122,7 +125,7 @@ export class RealtimeClient {
 
   private receive(raw: unknown) {
     if (typeof raw !== "string") return;
-    let message: { type?: string; event?: RealtimeEnvelope };
+    let message: { type?: string; event?: RealtimeEnvelope; replay?: boolean; topics?: string[] };
     try {
       message = JSON.parse(raw) as { type?: string; event?: RealtimeEnvelope };
     } catch {
@@ -132,6 +135,10 @@ export class RealtimeClient {
       this.authenticated = true;
       this.setState("open");
       this.sendSubscription([...this.listeners.keys()]);
+      return;
+    }
+    if (message.type === "subscribed") {
+      for (const topic of message.topics || []) this.initialReplayTopics.delete(topic);
       return;
     }
     if (message.type !== "event" || !message.event) return;
@@ -148,7 +155,10 @@ export class RealtimeClient {
     this.seenEventIds.add(event.eventId);
     if (this.seenEventIds.size > 20_000) this.seenEventIds.clear();
     this.lastSequence.set(event.topic, event.sequence);
-    for (const listener of this.listeners.get(event.topic) ?? []) listener(event);
+    // Opening a topic replays history; reconnecting an existing topic catches
+    // up on new changes and must retain their normal refresh side effects.
+    const context = { initialReplay: Boolean(message.replay && this.initialReplayTopics.has(event.topic)) };
+    for (const listener of this.listeners.get(event.topic) ?? []) listener(event, context);
   }
 
   private scheduleReconnect() {

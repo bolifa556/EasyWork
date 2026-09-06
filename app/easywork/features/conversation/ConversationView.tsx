@@ -1389,8 +1389,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   }, [actorId, api, conversationId, initialProjectId, mode, notify, runtime.bootstrap?.actor.id, runtime.bootstrap?.servers]);
   useEffect(() => {
     if (!conversationId || !realtime) return;
-    return realtime.subscribe(`conversation:${conversationId}`, (event) => {
+    return realtime.subscribe(`conversation:${conversationId}`, (event, { initialReplay }) => {
       mergeEvents([event]);
+      if (initialReplay) return;
       if (event.kind === "run.handoff.dispatched") setAgentConfigAgentId(null);
       if (event.kind === "run.persisted" || event.kind === "message.created") {
         announceConversationsChanged({ conversationId, kind: "updated" });
@@ -1418,8 +1419,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     .join("\n");
   useEffect(() => {
     if (!liveTaskIdsKey || !realtime) return;
-    const unsubscribes = liveTaskIdsKey.split("\n").map((taskId) => realtime.subscribe(`task:${taskId}`, (event) => {
+    const unsubscribes = liveTaskIdsKey.split("\n").map((taskId) => realtime.subscribe(`task:${taskId}`, (event, { initialReplay }) => {
       mergeEvents([event]);
+      if (initialReplay) return;
       if (["status", "command", "plan_state"].includes(event.kind)) {
         void refreshBootstrap().catch(() => undefined);
         void api.get<TaskSummary>(`/api/tasks/${encodeURIComponent(taskId)}`)
