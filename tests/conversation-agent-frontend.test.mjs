@@ -332,7 +332,7 @@ test("对话最终内容原子交接，历史读取和滚动恢复不会随消�
   assert.match(view, /visibleStreamingFinal/);
   assert.match(view, /followConversationScroll[\s\S]+?\[conversationId, initialPanel, loading\]/);
   assert.match(view, /mergeConversationEvents\(current, incoming\)/);
-  assert.match(view, /!eventsHydrated \|\| !realtime/);
+  assert.doesNotMatch(view, /!eventsHydrated \|\| !realtime/);
   assert.doesNotMatch(view, /\[conversationId, messages\.length\]/);
   assert.match(view, /if \(!conversationId \|\| loadedConversationId !== conversationId \|\| activeMode !== "work"\) return;/);
   assert.match(view, /retainConversationEvents\(current, nextMessages, conversationId, tasksRef\.current\)/);
@@ -982,7 +982,7 @@ test("运行中发送槽位在原生终止与追加发送之间切换，并锁�
   assert.match(view, /const liveTaskIdsKey = \[\.\.\.new Set\(\[\.\.\.handedOffTaskIds, activeTaskId\]/);
   assert.match(view, /liveTaskIdsKey\.split\("\\n"\)\.map\(\(taskId\) => realtime\.subscribe\(`task:\$\{taskId\}`/);
   assert.match(view, /const taskReplayCursors = useRef\(new Map<string, number>\(\)\)/);
-  assert.match(view, /\/events\?view=summary&after=\$\{after\}&limit=500/);
+  assert.match(view, /\/events\?after=\$\{after\}&limit=500/);
   assert.match(view, /timer = window\.setTimeout\(\(\) => void poll\(\), 5_000\)/);
   assert.match(view, /\["run\.handoff\.dispatched", "run\.persisted", "run\.suspended", "run\.failed", "run\.superseded"\][\s\S]+?api\.get<TaskSummary>/);
   assert.doesNotMatch(view, /<button className=\{styles\.stop\}[^>]+中断当前任务/);

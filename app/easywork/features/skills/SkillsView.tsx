@@ -151,6 +151,7 @@ function ApplicabilityFields({ value, onChange }: { value: SkillApplicability; o
   const chatOnly = value.mode === "chat";
   return <div className={styles.scopeFields}>
     <label><span>适用模式</span><select value={value.mode} onChange={(event) => onChange({ ...value, mode: event.target.value as SkillApplicability["mode"], forceEnabled: event.target.value !== "chat" && value.forceEnabled })}><option value="all">全部模式</option><option value="chat">聊天模式</option><option value="work">工作模式</option></select></label>
+    <small>服务器类型、白名单和黑名单仅限制工作模式；聊天模式只按适用模式筛选。</small>
     <fieldset disabled={chatOnly} className={styles.serverScopeFields}>
       <label><span>适用服务器</span><select value={value.serverKind} onChange={(event) => onChange({ ...value, serverKind: event.target.value as SkillApplicability["serverKind"] })}><option value="all">全部服务器</option><option value="standard">普通服务器</option><option value="compute">算力服务器</option></select></label>
       <label><span>仅允许</span><input value={allowText} placeholder="留空表示不限制；可填服务器 ID、名称或主机名" onChange={(event) => { setAllowText(event.target.value); onChange({ ...value, allowServers: splitServerRules(event.target.value) }); }} /></label>

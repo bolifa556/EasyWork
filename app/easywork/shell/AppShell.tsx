@@ -219,20 +219,31 @@ export function AppShell() {
   const activeConversation = navigation?.conversation ?? null;
   const activeProjectId = activeConversation?.projectId ?? (runtime.view.kind === "project" ? runtime.view.projectId : null);
   const expansionKey = actorId || "guest";
-  const bootstrapConversationKey = `${actorId || "guest"}:${conversationCacheGeneration}:${runtime.bootstrap?.conversationCursor || "end"}:${conversations.map((item) => `${item.id}:${item.revision}`).join(",")}:${projects.map((project) => `${project.id}:${project.revision}:${project.conversationCount}`).join(",")}:${navigation?.projectConversations?.items.map((item) => `${item.id}:${item.revision}`).join(",") || ""}`;
+  const bootstrapConversationKey = `${actorId || "guest"}:${conversationCacheGeneration}:${runtime.bootstrap?.conversationCursor || "end"}:${conversations.map((item) => `${item.id}:${item.revision}`).join(",")}:${projects.map((project) => `${project.id}:${project.revision}:${project.conversationCount}`).join(",")}`;
   const searchConversationKey = `${bootstrapConversationKey}\n${normalizedQuery}`;
+  const navigationPage = runtime.bootstrap?.conversationNavigation?.projectConversations;
+  useEffect(() => {
+    if (!navigationPage) return;
+    setProjectConversationCache((cache) => {
+      const pages = cache.key === bootstrapConversationKey ? cache.pages : {};
+      if (pages[navigationPage.projectId]?.loaded) return cache;
+      return { key: bootstrapConversationKey, pages: { ...pages, [navigationPage.projectId]: {
+        items: navigationPage.items, nextCursor: navigationPage.nextCursor, loaded: true, loading: false, error: null,
+      } } };
+    });
+  }, [bootstrapConversationKey, navigationPage]);
   const expandedProjects = expandedProjectsCache.key === expansionKey ? expandedProjectsCache.items : new Set(activeProjectId ? [activeProjectId] : []);
   const expandedProjectLists = expandedProjectListsCache.key === expansionKey ? expandedProjectListsCache.items : EMPTY_PROJECT_IDS;
   const showAllChats = showAllChatsCache.key === bootstrapConversationKey && showAllChatsCache.value;
   const allStandaloneChats = standaloneChatsCache?.key === bootstrapConversationKey ? standaloneChatsCache.items : null;
   const loadingAllChats = loadingAllChatsKey === bootstrapConversationKey;
   const projectConversationPages = useMemo(() => {
-    const page = navigation?.projectConversations;
+    const page = navigationPage;
     const seed: Record<string, ProjectConversationPage> = page ? {
       [page.projectId]: { items: page.items, nextCursor: page.nextCursor, loaded: true, loading: false, error: null },
     } : {};
     return { ...seed, ...(projectConversationCache.key === bootstrapConversationKey ? projectConversationCache.pages : EMPTY_PROJECT_PAGES) };
-  }, [navigation, projectConversationCache, bootstrapConversationKey]);
+  }, [navigationPage, projectConversationCache, bootstrapConversationKey]);
   const searchResults = searchConversationCache.key === searchConversationKey ? searchConversationCache.items : [];
   const searchLoading = Boolean(normalizedQuery) && (searchConversationCache.key !== searchConversationKey || searchConversationCache.loading);
   const searchError = searchConversationCache.key === searchConversationKey ? searchConversationCache.error : null;

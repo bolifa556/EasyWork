@@ -183,7 +183,10 @@ export function classifyConversationOutput(events: RealtimeEnvelope[]) {
   const recoveredFinal = latestRunFailed && !committedFinals.length
     ? ordered.filter((segment) => !segment.committed && segment.content && segment.target === "final" && (!latestStartedRunId || segment.runId === latestStartedRunId)).at(-1)
     : null;
-  const finalSegments = recoveredFinal ? [recoveredFinal] : committedFinals;
+  const liveFinal = !runEvents.some((event) => TERMINAL_WEB_KINDS.has(event.kind))
+    ? ordered.filter((segment) => !segment.committed && segment.content && segment.target === "final" && (!latestStartedRunId || segment.runId === latestStartedRunId)).at(-1)
+    : null;
+  const finalSegments = liveFinal ? [...committedFinals, liveFinal] : recoveredFinal ? [recoveredFinal] : committedFinals;
   const latestFinal = finalSegments.at(-1);
   const streamingSegments = latestFinal
     ? finalSegments.filter((segment) => segment.runId === latestFinal.runId)

@@ -14,7 +14,7 @@ import { GatewayClient } from "@/app/core/gateway/client";
 import { randomIdentifier } from "@/app/core/identifiers";
 import { isActiveTask, mergeTaskSnapshots } from "@/app/core/task-snapshots";
 import { RealtimeClient } from "@/app/core/realtime/client";
-import { GatewayError, type BootstrapResponse, type ServerCapabilityProfile, type SessionResponse } from "@/app/core/contracts";
+import { GatewayError, type BootstrapResponse, type ConversationSummary, type ServerCapabilityProfile, type SessionResponse } from "@/app/core/contracts";
 import { preloadFeature } from "./feature-loaders";
 import { prefetchRouteData } from "./startup-data";
 import { startupDestination } from "./startup-route";
@@ -85,6 +85,7 @@ type RuntimeValue = ReturnType<typeof useFilePreviewTabs> & {
   setRightRailOpen: (open: boolean) => void;
   setWorkspaceSidebar: (session: WorkspaceSidebarSession | null) => void;
   refreshBootstrap: () => Promise<void>;
+  updateConversationNavigation: (conversation: Omit<ConversationSummary, "runningTaskId">) => void;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -276,7 +277,19 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     setError(null);
   }, [api, sessionSource, setBootstrap]);
 
-  const activeConversationId = view.kind === "conversation" ? view.conversationId : null;
+  const updateConversationNavigation = useCallback((conversation: Omit<ConversationSummary, "runningTaskId">) => {
+    const route = parseRoute(window.location.pathname, window.location.search);
+    if (route.kind !== "conversation" || route.conversationId !== conversation.id) return;
+    setBootstrap((current) => {
+      if (!current) return current;
+      const page = current.conversationNavigation?.projectConversations;
+      return { ...current, conversationNavigation: {
+        conversationId: conversation.id,
+        conversation: { ...conversation, runningTaskId: current.runningTasks.find((task) => task.conversationId === conversation.id)?.id ?? null },
+        projectConversations: page?.projectId === conversation.projectId ? page : null,
+      } };
+    });
+  }, [setBootstrap]);
   useEffect(() => {
     if (!token || !bootstrap?.actor.id) return;
     let timer: number | undefined;
@@ -291,11 +304,6 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     });
     return () => { window.clearTimeout(timer); unsubscribe(); };
   }, [token, bootstrap?.actor.id, realtime]);
-
-  useEffect(() => {
-    if (loading || !bootstrap || !activeConversationId || bootstrap.conversationNavigation?.conversationId === activeConversationId) return;
-    void refreshBootstrap().catch(() => undefined);
-  }, [activeConversationId, loading, bootstrap?.actor.id, bootstrap?.conversationNavigation?.conversationId, refreshBootstrap]);
 
   useEffect(() => {
     if (loading) return;
@@ -519,11 +527,12 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     setRightRailOpen,
     setWorkspaceSidebar,
     refreshBootstrap,
+    updateConversationNavigation,
     login: (username, password) => authenticate("login", username, password),
     register: (username, password) => authenticate("register", username, password),
     logout,
     notify,
-  }), [api, authenticate, bootstrap, error, filePreviews, loading, logout, navigate, notify, realtime, refreshBootstrap, rightRailOpen, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspaceSidebar]);
+  }), [api, authenticate, bootstrap, error, filePreviews, loading, logout, navigate, notify, realtime, refreshBootstrap, updateConversationNavigation, rightRailOpen, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspaceSidebar]);
 
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

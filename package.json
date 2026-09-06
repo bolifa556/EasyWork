@@ -1,6 +1,6 @@
 {
   "name": "easywork",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A conversational workspace for AI, remote servers, files and coding agents.",
   "private": true,
   "engines": {

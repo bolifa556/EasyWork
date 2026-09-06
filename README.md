@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.0-17786B?style=flat-square" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.1.1-17786B?style=flat-square" alt="Version 0.1.1">
   <img src="https://img.shields.io/badge/platforms-Windows%20%2F%20Linux-17786B?style=flat-square" alt="Windows and Linux">
   <img src="https://img.shields.io/badge/architecture-x64-17786B?style=flat-square" alt="64-bit x86">
   <img src="https://img.shields.io/badge/deployment-self--hosted-17786B?style=flat-square" alt="Self-hosted">
@@ -63,9 +63,9 @@ Only **x86-64 / AMD64** packages are provided. Windows 10 and 11 share one archi
 
 | Host system | Package | Runtime |
 | --- | --- | --- |
-| Windows 10 / 11, x64 | `easywork-0.1.0-windows-x64.zip` | Bundled Node.js |
-| Ubuntu 22.04+, x64 | `easywork-0.1.0-linux-x64.tar.gz` | Bundled Node.js |
-| CentOS 7.9, x64 | `easywork-0.1.0-linux-centos7-x64.tar.gz` | Bundled glibc 2.17 compatible Node.js |
+| Windows 10 / 11, x64 | `easywork-0.1.1-windows-x64.zip` | Bundled Node.js |
+| Ubuntu 22.04+, x64 | `easywork-0.1.1-linux-x64.tar.gz` | Bundled Node.js |
+| CentOS 7.9, x64 | `easywork-0.1.1-linux-centos7-x64.tar.gz` | Bundled glibc 2.17 compatible Node.js |
 
 Release assets belong on the repository's [Releases page](../../releases). Local builds are written to `releases/`, together with `SHA256SUMS.txt`.
 
@@ -99,21 +99,21 @@ Agents currently run on **remote Linux x64 servers**, so the Windows package als
 
 ### Windows
 
-Extract `easywork-0.1.0-windows-x64.zip` and double-click **`start.cmd`** inside the extracted folder. Keep its window open while using EasyWork.
+Extract `easywork-0.1.1-windows-x64.zip` and double-click **`start.cmd`** inside the extracted folder. Keep its window open while using EasyWork.
 
 ### Ubuntu
 
 ```bash
-tar -xzf easywork-0.1.0-linux-x64.tar.gz
-cd easywork-0.1.0-linux-x64
+tar -xzf easywork-0.1.1-linux-x64.tar.gz
+cd easywork-0.1.1-linux-x64
 ./start.sh
 ```
 
 ### CentOS 7
 
 ```bash
-tar -xzf easywork-0.1.0-linux-centos7-x64.tar.gz
-cd easywork-0.1.0-linux-centos7-x64
+tar -xzf easywork-0.1.1-linux-centos7-x64.tar.gz
+cd easywork-0.1.1-linux-centos7-x64
 ./start.sh
 ```
 

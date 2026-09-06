@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.0-17786B?style=flat-square" alt="版本 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.1.1-17786B?style=flat-square" alt="版本 0.1.1">
   <img src="https://img.shields.io/badge/platforms-Windows%20%2F%20Linux-17786B?style=flat-square" alt="Windows 和 Linux">
   <img src="https://img.shields.io/badge/architecture-x64-17786B?style=flat-square" alt="64 位 x86">
   <img src="https://img.shields.io/badge/deployment-self--hosted-17786B?style=flat-square" alt="自主部署">
@@ -63,9 +63,9 @@
 
 | 部署主机 | 发布包 | 运行环境 |
 | --- | --- | --- |
-| Windows 10 / 11，x64 | `easywork-0.1.0-windows-x64.zip` | 内置 Node.js |
-| Ubuntu 22.04 及以上，x64 | `easywork-0.1.0-linux-x64.tar.gz` | 内置 Node.js |
-| CentOS 7.9，x64 | `easywork-0.1.0-linux-centos7-x64.tar.gz` | 内置兼容 glibc 2.17 的 Node.js |
+| Windows 10 / 11，x64 | `easywork-0.1.1-windows-x64.zip` | 内置 Node.js |
+| Ubuntu 22.04 及以上，x64 | `easywork-0.1.1-linux-x64.tar.gz` | 内置 Node.js |
+| CentOS 7.9，x64 | `easywork-0.1.1-linux-centos7-x64.tar.gz` | 内置兼容 glibc 2.17 的 Node.js |
 
 发布文件可放到仓库的 [Releases 页面](../../releases)。本地构建结果位于 `releases/`，同时提供 `SHA256SUMS.txt` 用于校验文件完整性。
 
@@ -99,21 +99,21 @@ Agent 目前运行在**远端 Linux x64 服务器**上，Windows 发布包也包
 
 ### Windows
 
-解压 `easywork-0.1.0-windows-x64.zip`，进入解压后的文件夹，双击 **`start.cmd`**。使用期间请保持启动窗口运行。
+解压 `easywork-0.1.1-windows-x64.zip`，进入解压后的文件夹，双击 **`start.cmd`**。使用期间请保持启动窗口运行。
 
 ### Ubuntu
 
 ```bash
-tar -xzf easywork-0.1.0-linux-x64.tar.gz
-cd easywork-0.1.0-linux-x64
+tar -xzf easywork-0.1.1-linux-x64.tar.gz
+cd easywork-0.1.1-linux-x64
 ./start.sh
 ```
 
 ### CentOS 7
 
 ```bash
-tar -xzf easywork-0.1.0-linux-centos7-x64.tar.gz
-cd easywork-0.1.0-linux-centos7-x64
+tar -xzf easywork-0.1.1-linux-centos7-x64.tar.gz
+cd easywork-0.1.1-linux-centos7-x64
 ./start.sh
 ```
 

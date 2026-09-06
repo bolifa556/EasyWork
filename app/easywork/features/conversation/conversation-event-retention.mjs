@@ -28,9 +28,10 @@ export function mergeConversationEvents(current, incoming) {
     // A stream key identifies a contiguous cumulative segment, not an entire
     // turn. Do not let a late newline erase reasoning before an output event.
     if (key && key === previousKey && previous.ids?.runId === event.ids?.runId) {
-      const text = event.payload.content ?? event.payload.event?.text;
-      const priorText = previous.payload.content ?? previous.payload.event?.text;
-      if (typeof text === "string" && typeof priorText === "string" && text.startsWith(priorText)) retained.delete(previous.eventId);
+      // A live cumulative snapshot includes the entire segment. An outline
+      // arriving from history must neither blank it nor make it lazy again.
+      if (event.payload.timelineDetailIds?.length && !previous.payload.timelineDetailIds?.length) continue;
+      retained.delete(previous.eventId);
     }
     retained.set(event.eventId, event);
     previousByTopic.set(event.topic, event);

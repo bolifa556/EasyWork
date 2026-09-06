@@ -815,7 +815,7 @@ function ManualAgentDialog({ serverId, agents, onClose, onAdded }: { serverId: s
 
 function ConversationScreen({ conversationId, initialProjectId, initialMode, initialPanel }: Props) {
   const runtime = useAppRuntime();
-  const { api, notify, realtime, refreshBootstrap } = runtime;
+  const { api, notify, realtime, refreshBootstrap, updateConversationNavigation } = runtime;
   const searchTargetMessageId = runtime.view.kind === "conversation" && runtime.view.conversationId === conversationId
     ? runtime.view.messageId
     : undefined;
@@ -1132,6 +1132,10 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     setEvents((current) => mergeConversationEvents(current, incoming));
   }, []);
 
+  useEffect(() => {
+    if (detail && detail.summary.id === conversationId) updateConversationNavigation(detail.summary);
+  }, [conversationId, detail, updateConversationNavigation]);
+
   const fetchTaskSummary = useCallback(async (taskId: string, refresh = false) => {
     const cached = tasksRef.current[taskId];
     if (cached && !refresh) return cached;
@@ -1205,26 +1209,43 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   }, [api, conversationId]);
   const referencedTaskIdsKey = [...new Set(messages.map((message) => message.taskId).filter((value): value is string => Boolean(value)))].join("\n");
 
-  const fetchConversation = useCallback(async (onFirstPage?: (snapshot: { messages: ConversationMessage[]; detail: ConversationDetail }) => void) => {
-    if (!conversationId) return { messages: [] as ConversationMessage[], detail: null as ConversationDetail | null };
+  const fetchConversation = useCallback(async (onFirstPage?: (snapshot: { messages: ConversationMessage[]; detail: ConversationDetail; events: RealtimeEnvelope[] }) => void) => {
+    if (!conversationId) return { messages: [] as ConversationMessage[], detail: null as ConversationDetail | null, events: [] as RealtimeEnvelope[] };
     const conversationRequest = api.get<ConversationDetail>(`/api/conversations/${conversationId}`);
+    const contentRequest = Promise.all([conversationRequest, conversationRequest.then(async ({ data }) => {
+      if (data.summary.mode !== "chat") return [] as RealtimeEnvelope[];
+      const history: RealtimeEnvelope[] = [];
+      let after = 0;
+      let upperBound: number | undefined;
+      for (;;) {
+        const result = await api.get<{ events: RealtimeEnvelope[]; hasMore: boolean; lastSequence: number; nextAfterSequence: number }>(`/api/conversations/${encodeURIComponent(conversationId)}/events?limit=2000${after ? `&after=${after}` : ""}`);
+        upperBound ??= result.data.lastSequence;
+        history.push(...result.data.events.filter((event) => event.sequence <= upperBound!));
+        const next = result.data.nextAfterSequence;
+        if (!result.data.hasMore || next >= upperBound || next <= after) break;
+        after = next;
+      }
+      return history;
+    })]);
     const items: ConversationMessage[] = [];
     let cursor: string | null = null;
     let first = true;
     do {
       const query = new URLSearchParams({ limit: "100" });
       if (cursor) query.set("cursor", cursor);
-      const result = await api.get<{ items: ConversationMessage[]; nextCursor?: string | null }>(`/api/conversations/${conversationId}/messages?${query}`);
+      const [result, [conversation, history]] = await Promise.all([
+        api.get<{ items: ConversationMessage[]; nextCursor?: string | null }>(`/api/conversations/${conversationId}/messages?${query}`),
+        contentRequest,
+      ]);
       items.push(...result.data.items);
       cursor = result.data.nextCursor ?? result.meta.nextCursor ?? null;
       if (first && onFirstPage) {
-        const conversation = await conversationRequest;
-        onFirstPage({ messages: [...items], detail: conversation.data });
+        onFirstPage({ messages: [...items], detail: conversation.data, events: history });
       }
       first = false;
     } while (cursor);
-    const conversation = await conversationRequest;
-    return { messages: items, detail: conversation.data };
+    const [conversation, history] = await contentRequest;
+    return { messages: items, detail: conversation.data, events: history };
   }, [api, conversationId]);
 
   const fetchConversationArtifacts = useCallback(async (signal?: AbortSignal) => {
@@ -1246,12 +1267,13 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     const [next, nextArtifacts] = await Promise.all([fetchConversation(), fetchConversationArtifacts()]);
     if (request !== conversationLoadRevision.current) return;
     retainEventsForMessages(next.messages);
+    mergeEvents(next.events);
     setMessages(next.messages);
     setDetail(next.detail);
     setArtifacts(nextArtifacts);
     setLoading(false);
     void refreshBootstrap().catch(() => undefined);
-  }, [fetchConversation, fetchConversationArtifacts, refreshBootstrap, retainEventsForMessages]);
+  }, [fetchConversation, fetchConversationArtifacts, mergeEvents, refreshBootstrap, retainEventsForMessages]);
 
   useEffect(() => {
     const request = ++conversationLoadRevision.current;
@@ -1259,11 +1281,13 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     void fetchConversation(initialConversationCache ? undefined : (first) => {
       if (!active || request !== conversationLoadRevision.current) return;
       retainEventsForMessages(first.messages);
+      mergeEvents(first.events);
+      if (first.detail.summary.mode === "chat") setEventsHydrated(true);
       setMessages(first.messages);
       setDetail(first.detail);
       setLoading(false);
     }).then(
-      (next) => { if (active && request === conversationLoadRevision.current) { retainEventsForMessages(next.messages); setMessages(next.messages); setDetail(next.detail); setLoading(false); } },
+      (next) => { if (active && request === conversationLoadRevision.current) { retainEventsForMessages(next.messages); mergeEvents(next.events); if (next.detail?.summary.mode === "chat") setEventsHydrated(true); setMessages(next.messages); setDetail(next.detail); setLoading(false); } },
       (error: Error) => {
         if (!active || request !== conversationLoadRevision.current) return;
         setLoading(false);
@@ -1271,7 +1295,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       },
     );
     return () => { active = false; };
-  }, [fetchConversation, initialConversationCache, notify, recoverMissingConversation, retainEventsForMessages]);
+  }, [fetchConversation, initialConversationCache, mergeEvents, notify, recoverMissingConversation, retainEventsForMessages]);
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId) return;
     const controller = new AbortController();
@@ -1284,7 +1308,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return () => controller.abort();
   }, [conversationId, fetchConversationArtifacts, loadedConversationId, notify, recoverMissingConversation]);
   useEffect(() => {
-    if (!conversationId || loadedConversationId !== conversationId) return;
+    if (!conversationId || loadedConversationId !== conversationId || activeMode === "chat") return;
     const controller = new AbortController();
     void api.get<{ events: RealtimeEnvelope[] }>(`/api/conversations/${encodeURIComponent(conversationId)}/events?view=summary&limit=2000`, controller.signal)
       .then((result) => mergeEvents(result.data.events))
@@ -1293,7 +1317,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       })
       .finally(() => { if (!controller.signal.aborted) setEventsHydrated(true); });
     return () => controller.abort();
-  }, [api, conversationId, loadedConversationId, mergeEvents, notify, recoverMissingConversation]);
+  }, [activeMode, api, conversationId, loadedConversationId, mergeEvents, notify, recoverMissingConversation]);
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId || activeMode !== "work") return;
     const controller = new AbortController();
@@ -1364,7 +1388,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return () => { active = false; };
   }, [actorId, api, conversationId, initialProjectId, mode, notify, runtime.bootstrap?.actor.id, runtime.bootstrap?.servers]);
   useEffect(() => {
-    if (!conversationId || !eventsHydrated || !realtime) return;
+    if (!conversationId || !realtime) return;
     return realtime.subscribe(`conversation:${conversationId}`, (event) => {
       mergeEvents([event]);
       if (event.kind === "run.handoff.dispatched") setAgentConfigAgentId(null);
@@ -1387,7 +1411,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         void refreshBootstrap().catch(() => undefined);
       }
     });
-  }, [api, conversationId, eventsHydrated, mergeEvents, notify, realtime, refreshBootstrap, reload]);
+  }, [api, conversationId, mergeEvents, notify, realtime, refreshBootstrap, reload]);
   const activeTaskId = activeTask?.id;
   const liveTaskIdsKey = [...new Set([...handedOffTaskIds, activeTaskId].filter((value): value is string => Boolean(value)))]
     .filter((taskId) => !["completed", "failed", "cancelled", "interrupted"].includes(tasks[taskId]?.status || ""))
@@ -1415,7 +1439,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         const after = taskReplayCursors.current.get(taskId) ?? 0;
         const [task, replay] = await Promise.all([
           api.get<TaskSummary>(`/api/tasks/${encodeURIComponent(taskId)}`),
-          api.get<{ events: RealtimeEnvelope[] }>(`/api/tasks/${encodeURIComponent(taskId)}/events?view=summary&after=${after}&limit=500`),
+          api.get<{ events: RealtimeEnvelope[] }>(`/api/tasks/${encodeURIComponent(taskId)}/events?after=${after}&limit=500`),
         ]);
         return { task: task.data, events: replay.data.events, after };
       }));

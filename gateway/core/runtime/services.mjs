@@ -4325,7 +4325,7 @@ export class ActorServiceContainer {
     if (selected.has("skills")) {
       const installed = await this.skills.listInstalledKnowledge();
       let eligible = installed.items.filter((skill) => isSkillApplicableToMode({ skill, mode }));
-      if (filterSkillsByServer) {
+      if (mode === "work" && filterSkillsByServer) {
         const automaticallyApplicable = await this.filterSkillCatalogForServer(scope.serverId, installed.items);
         const applicableIds = new Set(automaticallyApplicable.map((entry) => String(entry.skillId)));
         eligible = eligible.filter((entry) => applicableIds.has(String(entry.skillId)));
