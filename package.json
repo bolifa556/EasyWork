@@ -17,6 +17,7 @@
     "pretest:gateway": "node scripts/patch-pdfjs-worker.mjs",
     "release": "node scripts/build-release.mjs",
     "agents:download": "node scripts/download-agent-app.mjs",
+    "agents:update": "node agent-app/update-agent-app.mjs --latest",
     "test:gateway": "node --test --test-reporter=spec tests/*.test.mjs",
     "test": "npm run build && npm run test:gateway",
     "lint": "eslint ."

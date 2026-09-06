@@ -73,6 +73,28 @@ The CentOS 7 package uses the Node.js project's [unofficial glibc 2.17 build](ht
 
 These archives start a web service. Open it in a browser; no desktop application or separate Node.js installation is required. AI services and remote SSH servers must be reachable for the corresponding features.
 
+### Install & update agents
+
+**All three release packages include the Linux x64 applications for OpenCode, Codex and Claude Code**, with glibc and musl variants. After extraction, EasyWork can install them on your connected remote servers.
+
+The source repository provides the installer catalog and update scripts; download the applications yourself when deploying from source or restoring missing files. Run the script for your host from the project or installation directory:
+
+```powershell
+# Windows 10 / 11
+.\agent-app\update-agent-app.cmd
+```
+
+```bash
+# Ubuntu / CentOS 7
+sh agent-app/update-agent-app.sh
+```
+
+By default, the scripts download the pinned versions and verify SHA-256 hashes, skipping valid local files. Add `--latest` to download the latest versions, or `--check` to verify local files without downloading. Use `--agent codex` to select one agent. Windows also provides `update-agent-app.ps1`, with `-Latest`, `-Check` and `-Agent codex` parameters. Release packages use their bundled Node.js; source deployments require Node.js 22.13+.
+
+Once the files are ready, connect SSH in Work mode, open the agent selector and click **安装** (Install). For an existing managed agent, click **更新** (Update) to check for and install a newer version, then configure its model API. The scripts prepare installers on the host; the web interface deploys them to the remote server.
+
+Agents currently run on **remote Linux x64 servers**, so the Windows package also includes these remote applications. Each agent has its own system requirements; running the EasyWork host on CentOS 7 does not guarantee that every agent runs on a CentOS 7 remote server.
+
 ## Quick Start
 
 ### Windows
@@ -97,6 +119,12 @@ cd easywork-0.1.0-linux-centos7-x64
 
 Open **[http://127.0.0.1:8001](http://127.0.0.1:8001)** on the host. Other devices can use `http://HOST_IP:8001` when the network and firewall permit access. Press `Ctrl+C` in the launcher terminal to stop the service.
 
+### Administrator setup
+
+There is no preset administrator account or password. **The first registered account automatically becomes the administrator.** Register before opening a fresh deployment to other users. After signing in, open **管理员面板** (Admin panel) in the sidebar to configure shared models, embeddings and OCR.
+
+To add an administrator, have the user register first, then edit `admins/adminList` inside your data directory (default: `data/admins/adminList`). Save it as UTF-8 text with one registered username per line; remove a line to revoke that user's administrator access. Ask the user to sign in again to refresh the interface, and keep at least one administrator. If you set `EASYWORK_DATA_ROOT`, edit the file under that directory instead.
+
 ### Your first task
 
 1. **Create an account.** The first registered user becomes the administrator; complete this step before exposing a fresh deployment to other users.
@@ -105,24 +133,6 @@ Open **[http://127.0.0.1:8001](http://127.0.0.1:8001)** on the host. Other devic
 4. **Try Work mode.** Connect an SSH server, configure an agent and select a workspace, then describe your task.
 
 The detailed [user guide](help/help.md) follows the current Chinese interface.
-
-### Optional agent installers
-
-The host archives include the installer catalog. To enable EasyWork's **managed agent installation** on remote Linux x64 servers, copy the `agent-app` directory from `easywork-0.1.0-agent-assets-linux-x64.tar.gz` into your EasyWork installation. This optional archive is shared by all three host platforms.
-
-Alternatively, download the pinned installers directly:
-
-```bash
-# Linux host
-./runtime/bin/node scripts/download-agent-app.mjs
-```
-
-```powershell
-# Windows host
-.\runtime\node.exe scripts\download-agent-app.mjs
-```
-
-Downloads are checked against the catalog's SHA-256 hashes. You can also select an agent already installed on your remote server. Each agent has its own system and model requirements; installing the EasyWork host on CentOS 7 does not guarantee that every agent runs on a CentOS 7 remote server.
 
 ## Configuration & Data
 
@@ -158,7 +168,7 @@ npm start
 
 For development, run `npm run gateway` and `npm run dev` in separate terminals. Run the test suite with `npm run test:gateway` and check code with `npm run lint`.
 
-Build all three release archives with `npm run release` (also requires Python 3.9+ and `tar`). After downloading the agent installers, use `npm run release -- --agents` to include the optional agent archive. Runtime versions and checksums are pinned in `scripts/release-targets.json`.
+Run `npm run agents:download` to prepare the agent applications, then `npm run release` to build all three complete packages. Building also requires Python 3.9+ and `tar`. Every package includes the agent applications and update scripts for its host system.
 
 ```text
 app/          Browser interface
@@ -170,5 +180,3 @@ doc/          Mechanism and agent documentation
 scripts/      Build, startup and release tools
 tests/        Automated tests
 ```
-
-For implementation details, see the [SSH](doc/SSH机制.md), [web agent](doc/网页Agent机制.md) and [remote files & agents](doc/远端文件版本与Agent机制.md) documentation. Local data, environments, FRP, synchronization settings, caches and release archives are excluded from Git.

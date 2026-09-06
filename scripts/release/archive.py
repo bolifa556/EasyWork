@@ -20,7 +20,7 @@ def portable(info):
     info.uid = info.gid = 0
     info.uname = info.gname = ""
     info.mtime = build_epoch
-    info.mode = 0o755 if info.isdir() or info.name.endswith(("/start.sh", "/runtime/bin/node")) else 0o644
+    info.mode = 0o755 if info.isdir() or info.name.endswith(("/start.sh", "/runtime/bin/node", "/update-agent-app.sh")) else 0o644
     return info
 
 

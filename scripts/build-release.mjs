@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { nodeFileTrace } from "@vercel/nft";
 import { digest, downloadVerified } from "./artifact-download.mjs";
+import { agentIds, artifactPath, platforms as agentPlatforms } from "../agent-app/update-agent-app.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pkg = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
@@ -13,13 +14,13 @@ const cache = path.join(root, ".cache", "releases", pkg.version);
 const downloads = path.join(root, ".cache", "release-downloads");
 const output = path.join(root, "releases");
 const args = process.argv.slice(2);
-const knownFlags = new Set(["--skip-build", "--agents", "--help"]);
+const knownFlags = new Set(["--skip-build", "--help"]);
 const targets = args.filter((arg) => !arg.startsWith("--"));
 if (args.some((arg) => arg.startsWith("--") && !knownFlags.has(arg)) || targets.some((target) => !config.targets[target])) {
-  throw new Error(`Usage: npm run release -- [--skip-build] [--agents] [${Object.keys(config.targets).join(" | ")}]`);
+  throw new Error(`Usage: npm run release -- [--skip-build] [${Object.keys(config.targets).join(" | ")}]`);
 }
 if (args.includes("--help")) {
-  console.log("Build x64 release archives with pinned Node.js runtimes. Requires Node.js, Python 3.9+ and tar.\nOptions: --skip-build, --agents (also package downloaded x64 agent installers).\nTargets: " + Object.keys(config.targets).join(", "));
+  console.log("Build x64 releases with pinned Node.js runtimes and all Linux x64 agent installers. Requires Node.js, Python 3.9+ and tar.\nRun npm run agents:download first.\nOptions: --skip-build.\nTargets: " + Object.keys(config.targets).join(", "));
   process.exit(0);
 }
 if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pkg.version)) throw new Error("Invalid release version");
@@ -77,9 +78,35 @@ const dependencies = [...trace.fileList].map((entry) => entry.replaceAll("\\", "
 
 const common = path.join(cache, "common");
 await resetStage(common);
-for (const entry of ["dist", "gateway", "shared", "prompts", "help", "public", "doc", "assets", "README.md", "README_zh.md", ".env.example", "agent-app/manifest.json"]) {
+for (const entry of ["dist", "gateway", "shared", "prompts", "help", "public", "doc", "assets", "README.md", "README_zh.md", ".env.example", "agent-app/update-agent-app.mjs"]) {
   await copyRelative(entry, common);
 }
+// The host may be Windows or Linux; managed agents run on remote Linux servers.
+// Include only the verified x64 catalog, never the whole local agent-app folder.
+const agentRoot = await realpath(path.join(root, "agent-app"));
+const sourceCatalog = JSON.parse(await readFile(path.join(agentRoot, "manifest.json"), "utf8"));
+if (sourceCatalog.schemaVersion !== 1) throw new Error("Unsupported agent catalog schema");
+const agentCatalog = { schemaVersion: 1, updatedAt: sourceCatalog.updatedAt, agents: {} };
+const includedAgents = new Set();
+for (const agentId of agentIds) {
+  const agent = sourceCatalog.agents?.[agentId];
+  if (!agent?.version) throw new Error("Missing agent: " + agentId);
+  agentCatalog.agents[agentId] = { ...agent, artifacts: {} };
+  for (const platform of agentPlatforms) {
+    const artifact = agent.artifacts?.[platform];
+    if (!artifact) throw new Error("Missing agent platform: " + agentId + "/" + platform);
+    const file = await artifactPath(agentRoot, agentId, artifact);
+    if (!includedAgents.has(file)) {
+      const info = await stat(file).catch(() => { throw new Error("Missing agent installer. Run npm run agents:download first: " + file); });
+      if (!info.isFile() || info.size !== artifact.size || await digest(file) !== artifact.sha256) throw new Error("Agent integrity check failed. Run npm run agents:download: " + file);
+      await copyRelative("agent-app/" + artifact.file, common);
+      includedAgents.add(file);
+    }
+    agentCatalog.agents[agentId].artifacts[platform] = artifact;
+  }
+}
+await writeFile(path.join(common, "agent-app", "manifest.json"), JSON.stringify(agentCatalog, null, 2) + "\n");
+console.log("[release] Bundling " + includedAgents.size + " verified Linux x64 agent files in every host archive");
 for (const entry of ["serve-easywork.mjs", "start-renderer.mjs", "static-assets.mjs", "download-agent-app.mjs", "artifact-download.mjs"]) {
   await copyRelative(`scripts/${entry}`, common);
 }
@@ -137,29 +164,17 @@ for (const targetName of targets.length ? targets : Object.keys(config.targets))
   const launcher = target.platform === "win32" ? "start.cmd" : "start.sh";
   const launcherText = await readFile(path.join(root, "scripts", "release", launcher), "utf8");
   await writeFile(path.join(stage, launcher), launcherText.replace(/\r?\n/g, target.platform === "win32" ? "\r\n" : "\n"));
-  await writeFile(path.join(stage, "release.json"), JSON.stringify({ name: pkg.name, version: pkg.version, target: targetName, arch: "x64", systems: target.systems, nodeVersion: config.nodeVersion, runtimeUrl: target.url, runtimeSha256: target.sha256, runtimeNote: target.runtimeNote, lockfileSha256: await digest(path.join(root, "package-lock.json")) }, null, 2) + "\n");
+  for (const entry of target.platform === "win32" ? ["update-agent-app.cmd", "update-agent-app.ps1"] : ["update-agent-app.sh"]) {
+    const text = await readFile(path.join(agentRoot, entry), "utf8");
+    await writeFile(path.join(stage, "agent-app", entry), text.replace(/\r?\n/g, target.platform === "win32" ? "\r\n" : "\n"));
+  }
+  await writeFile(path.join(stage, "release.json"), JSON.stringify({ name: pkg.name, version: pkg.version, target: targetName, arch: "x64", systems: target.systems, nodeVersion: config.nodeVersion, runtimeUrl: target.url, runtimeSha256: target.sha256, runtimeNote: target.runtimeNote, lockfileSha256: await digest(path.join(root, "package-lock.json")), agentPlatforms, agents: Object.fromEntries(Object.entries(agentCatalog.agents).map(([id, agent]) => [id, agent.version])) }, null, 2) + "\n");
   await run(python, ["scripts/release/archive.py", stage, path.join(output, `${name}${target.platform === "win32" ? ".zip" : ".tar.gz"}`)]);
 }
 
-if (args.includes("--agents")) {
-  const agentStage = path.join(cache, `easywork-${pkg.version}-agent-assets-linux-x64`);
-  await resetStage(agentStage);
-  const manifest = JSON.parse(await readFile(path.join(root, "agent-app", "manifest.json"), "utf8"));
-  const included = new Set();
-  for (const agent of Object.values(manifest.agents)) {
-    agent.artifacts = Object.fromEntries(Object.entries(agent.artifacts).filter(([platform]) => ["linux-x64", "linux-x64-musl"].includes(platform)));
-    for (const artifact of Object.values(agent.artifacts)) {
-      const file = `agent-app/${artifact.file}`;
-      if (included.has(file)) continue;
-      if (await digest(path.join(root, file)) !== artifact.sha256) throw new Error(`Agent checksum mismatch: ${file}. Run npm run agents:download first.`);
-      await copyRelative(file, agentStage);
-      included.add(file);
-    }
-  }
-  await writeFile(path.join(agentStage, "agent-app", "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
-  await writeFile(path.join(agentStage, "README.txt"), "Copy the agent-app directory into your EasyWork installation to enable managed agent deployment to Linux x64 servers. It works with all three host packages.\n将 agent-app 目录复制到 EasyWork 安装目录，启用远端 Linux x64 Agent 托管安装。三个主机平台共用此包。\nBinaries are unmodified third-party distributions; upstream license and usage terms apply.\n二进制来自各 Agent 官方发行渠道，适用各自的许可和使用条款。\n");
-  await run(python, ["scripts/release/archive.py", agentStage, path.join(output, `easywork-${pkg.version}-agent-assets-linux-x64.tar.gz`)]);
-}
+// Older local builds used a separate optional agent archive. All host archives
+// now include those files; remove only that exact obsolete output file.
+await rm(path.join(output, "easywork-" + pkg.version + "-agent-assets-linux-x64.tar.gz"), { force: true });
 
 const artifacts = (await readdir(output)).filter((entry) => entry.startsWith(`easywork-${pkg.version}-`) && /\.(zip|tar\.gz)$/.test(entry)).sort();
 const checksums = [];

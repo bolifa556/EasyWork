@@ -18,7 +18,7 @@ const eslintConfig = defineConfig([
     "outputs/**",
     "work/**",
     "data/**",
-    "agent-app/**",
+    "agent-app/*/**",
     "frp/**",
     "sync/**",
     "releases/**",

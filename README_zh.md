@@ -73,6 +73,28 @@ CentOS 7 包使用 Node.js 项目的 [glibc 2.17 社区构建](https://github.co
 
 解压后启动的是网页服务，使用浏览器访问即可，无需安装桌面客户端或单独安装 Node.js。使用模型和远程功能时，需要能够访问对应的模型服务与 SSH 服务器。
 
+### Agent 安装与更新
+
+**三个发布包均已内置 OpenCode、Codex 和 Claude Code 的 Linux x64 应用**，包括 glibc 与 musl 版本。解压后即可在 EasyWork 中为已连接的远端服务器安装 Agent。
+
+源码仓库提供安装清单和更新脚本，应用文件由用户自行下载。使用源码部署或需要补装时，在项目或安装目录下运行对应脚本：
+
+```powershell
+# Windows 10 / 11
+.\agent-app\update-agent-app.cmd
+```
+
+```bash
+# Ubuntu / CentOS 7
+sh agent-app/update-agent-app.sh
+```
+
+默认按清单下载固定版本并校验 SHA-256，已有完整文件会跳过下载。加 `--latest` 下载最新版本，或加 `--check` 仅检查本地文件；可用 `--agent codex` 单独选择一个 Agent。Windows 也提供 `update-agent-app.ps1`，对应参数为 `-Latest`、`-Check` 和 `-Agent codex`。发布包使用内置 Node.js；源码部署需先准备 Node.js 22.13 或更高版本。
+
+文件就绪后，在工作模式连接 SSH，打开 Agent 选择面板，点击「安装」；已有托管 Agent 可点击「更新」检查并安装新版，再配置模型 API。脚本负责准备主机上的安装文件，网页中的操作将 Agent 安装到远端服务器。
+
+Agent 目前运行在**远端 Linux x64 服务器**上，Windows 发布包也包含这些远端应用。各 Agent 的系统要求不同；EasyWork 主机可运行 CentOS 7，不代表所有 Agent 均可在 CentOS 7 远端运行。
+
 ## 快速上手
 
 ### Windows
@@ -97,6 +119,12 @@ cd easywork-0.1.0-linux-centos7-x64
 
 在部署主机打开 **[http://127.0.0.1:8001](http://127.0.0.1:8001)**。网络和防火墙允许时，其他设备可通过 `http://主机IP:8001` 访问。在启动终端按 `Ctrl+C` 可停止服务。
 
+### 管理员设置
+
+首次部署没有预设管理员账号或密码，**第一个注册的账号自动成为管理员**。请先完成注册，再将服务开放给其他用户；登录后可在侧栏进入「管理员面板」配置共享模型、Embedding 和 OCR 服务。
+
+需要增加管理员时，先让该用户注册，再编辑数据目录中的 `admins/adminList`（默认路径为 `data/admins/adminList`）。使用 UTF-8 文本，每行填写一个已注册的用户名；删除对应行即可撤销管理员权限。修改后让用户重新登录以刷新界面，并至少保留一个管理员。设置了 `EASYWORK_DATA_ROOT` 时，请修改该目录下的同名文件。
+
 ### 开始第一个任务
 
 1. **注册账号**：首个注册用户会成为管理员，新部署请先完成注册，再开放给其他用户。
@@ -105,24 +133,6 @@ cd easywork-0.1.0-linux-centos7-x64
 4. **尝试工作模式**：连接 SSH 服务器，配置 Agent，选择工作区，然后描述要完成的任务。
 
 更详细的操作说明见 [使用帮助](help/help.md)。
-
-### 可选：Agent 安装包
-
-主程序包内含 Agent 安装清单。需要使用 EasyWork 的**远端 Agent 托管安装**时，将 `easywork-0.1.0-agent-assets-linux-x64.tar.gz` 中的 `agent-app` 文件夹复制到 EasyWork 安装目录。该可选包面向远端 Linux x64 服务器，三个主机平台共用。
-
-也可以直接下载清单中固定版本的安装文件：
-
-```bash
-# Linux 主机
-./runtime/bin/node scripts/download-agent-app.mjs
-```
-
-```powershell
-# Windows 主机
-.\runtime\node.exe scripts\download-agent-app.mjs
-```
-
-下载后会校验清单中的 SHA-256。您也可以选择远端服务器上已有的 Agent。各 Agent 有自己的系统与模型要求；EasyWork 主机能在 CentOS 7 上运行，并不代表所有 Agent 都能在 CentOS 7 远端运行。
 
 ## 配置与数据
 
@@ -158,7 +168,7 @@ npm start
 
 开发时，在两个终端分别运行 `npm run gateway` 与 `npm run dev`。`npm run test:gateway` 运行测试，`npm run lint` 检查代码。
 
-执行 `npm run release` 可生成三个平台的发布包，构建时还需要 Python 3.9+ 和 `tar`。下载 Agent 安装文件后，使用 `npm run release -- --agents` 可同时生成可选 Agent 包。Node.js 版本与校验值固定在 `scripts/release-targets.json` 中。
+先执行 `npm run agents:download` 准备 Agent 应用，再运行 `npm run release` 生成三个平台的完整发布包。构建还需要 Python 3.9+ 和 `tar`；每个发布包都会包含 Agent 应用及对应系统的更新脚本。
 
 ```text
 app/          网页界面
@@ -170,5 +180,3 @@ doc/          机制与 Agent 说明
 scripts/      构建、启动和发布工具
 tests/        自动化测试
 ```
-
-实现细节见 [SSH 机制](doc/SSH机制.md)、[网页 Agent 机制](doc/网页Agent机制.md) 与 [远端文件与 Agent 机制](doc/远端文件版本与Agent机制.md)。运行数据、环境、FRP、设备同步配置、缓存和发布包均不纳入 Git。

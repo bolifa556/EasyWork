@@ -55,6 +55,10 @@ next-env.d.ts
 /frp/
 /agent-app/*
 !/agent-app/manifest.json
+!/agent-app/update-agent-app.mjs
+!/agent-app/update-agent-app.ps1
+!/agent-app/update-agent-app.cmd
+!/agent-app/update-agent-app.sh
 
 # Device synchronization settings
 /sync/

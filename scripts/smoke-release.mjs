@@ -14,6 +14,31 @@ const root = path.resolve(process.argv[2] || ".");
 const metadata = JSON.parse(await readFile(path.join(root, "release.json"), "utf8"));
 assert.equal(process.arch, "x64");
 assert.equal(process.versions.node, metadata.nodeVersion);
+assert.deepEqual(metadata.agentPlatforms, ["linux-x64", "linux-x64-musl"]);
+const agentRoot = path.join(root, "agent-app");
+const agentManifest = JSON.parse(await readFile(path.join(agentRoot, "manifest.json"), "utf8"));
+assert.deepEqual(Object.keys(agentManifest.agents).sort(), ["claudecode", "codex", "opencode"]);
+const { HostAgentArtifactCatalog } = await import(pathToFileURL(path.join(root, "gateway/core/agent-runtime/manifest.mjs")));
+const catalog = new HostAgentArtifactCatalog({ root: agentRoot });
+for (const [id, agent] of Object.entries(agentManifest.agents)) {
+  assert.equal(agent.version, metadata.agents[id]);
+  assert.deepEqual(Object.keys(agent.artifacts).sort(), [...metadata.agentPlatforms].sort(), "Only x64 agent platforms");
+  for (const platform of metadata.agentPlatforms) await catalog.resolve(id === "claudecode" ? "claude-code" : id, platform, { verify: false });
+}
+async function runUpdater(command, args) {
+  const updater = spawn(command, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  for (const stream of [updater.stdout, updater.stderr]) stream.on("data", (chunk) => { output += chunk; });
+  const [code] = await once(updater, "exit");
+  assert.equal(code, 0, output);
+  assert.ok(output.includes("Agent packages verified and ready"), output);
+}
+if (process.platform === "win32") {
+  await runUpdater(process.env.ComSpec || "cmd.exe", ["/d", "/c", "agent-app\\update-agent-app.cmd", "--check"]);
+  await runUpdater("powershell.exe", ["-NoProfile", "-File", path.join(agentRoot, "update-agent-app.ps1"), "-Check", "-Agent", "codex"]);
+} else {
+  await runUpdater("sh", [path.join(agentRoot, "update-agent-app.sh"), "--check"]);
+}
 const requirePackage = createRequire(path.join(root, "package.json"));
 const { createCanvas } = requirePackage("@napi-rs/canvas");
 const canvas = createCanvas(32, 32);
@@ -111,7 +136,7 @@ try {
     clearTimeout(timeout);
     socket.close();
   }
-  console.log(JSON.stringify({ target: metadata.target, os: `${os.type()} ${os.release()}`, node: process.versions.node, arch: process.arch, checks: ["native canvas", "PDF extraction", "Word extraction", "SSH library", "home page", `${assets.length} static assets`, "registration", "clean data", "authenticated API", "WebSocket"] }, null, 2));
+  console.log(JSON.stringify({ target: metadata.target, os: `${os.type()} ${os.release()}`, node: process.versions.node, arch: process.arch, agents: metadata.agents, checks: ["bundled x64 agent catalog", "native updater scripts and SHA-256 verification", "native canvas", "PDF extraction", "Word extraction", "SSH library", "home page", `${assets.length} static assets`, "registration", "clean data", "authenticated API", "WebSocket"] }, null, 2));
 } catch (error) {
   console.error(logs);
   throw error;
