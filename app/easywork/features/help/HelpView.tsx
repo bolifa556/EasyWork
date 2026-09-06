@@ -7,10 +7,8 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { useAppRuntime } from "../../runtime/AppRuntime";
+import { cachedHelpDocument, loadHelpDocument } from "./help-document";
 import styles from "./HelpView.module.css";
-
-type HelpPayload = { content: string; mediaType: string; etag: string; lastModified: string };
-let helpCache: HelpPayload | null = null;
 
 function keywordTone(value: string) {
   if (/EasyWork/i.test(value)) return styles.product;
@@ -24,6 +22,7 @@ function keywordTone(value: string) {
 
 export default function HelpView() {
   const runtime = useAppRuntime();
+  const helpCache = cachedHelpDocument();
   const [content, setContent] = useState(() => helpCache?.content || "");
   const [loading, setLoading] = useState(() => !helpCache);
   const [error, setError] = useState<string | null>(null);
@@ -31,32 +30,31 @@ export default function HelpView() {
   const mounted = useRef(true);
 
   const load = useCallback(async (signal?: AbortSignal) => {
-    const result = await runtime.api.get<HelpPayload>("/api/help", signal);
-    const nextContent = result.data.content;
-    if (!nextContent.trim()) throw new Error("帮助内容为空");
-    if (result.data.etag === etag.current) return false;
+    const result = await loadHelpDocument();
+    if (signal?.aborted) return false;
+    const nextContent = result.content;
     if (mounted.current) {
       setContent(nextContent);
       setError(null);
-      etag.current = result.data.etag;
-      helpCache = result.data;
+      etag.current = result.etag;
     }
     return true;
-  }, [runtime.api]);
+  }, []);
 
   useEffect(() => {
     mounted.current = true;
-    if (helpCache) {
-      void runtime.api.post("/api/auth/help-seen", {}).catch(() => undefined);
-      return () => { mounted.current = false; };
-    }
     const initial = new AbortController();
-    void load(initial.signal).then(() => runtime.api.post("/api/auth/help-seen", {}).catch(() => undefined)).catch((reason) => { if (mounted.current) setError(reason instanceof Error ? reason.message : "帮助读取失败"); }).finally(() => { if (mounted.current) setLoading(false); });
+    void load(initial.signal).catch((reason) => { if (mounted.current) setError(reason instanceof Error ? reason.message : "帮助读取失败"); }).finally(() => { if (mounted.current) setLoading(false); });
     return () => { mounted.current = false; initial.abort(); };
-  }, [load, runtime.api]);
+  }, [load]);
+
+  useEffect(() => {
+    if (runtime.loading || !runtime.bootstrap) return;
+    void runtime.api.post("/api/auth/help-seen", {}).catch(() => undefined);
+  }, [runtime.api, runtime.loading, runtime.bootstrap?.actor.id]);
 
   return <section className={styles.page}>
-    {loading ? <div className={styles.loading} role="status"><span className={styles.loadingRing} /><span>正在读取帮助</span></div> : error ? <section className={styles.unavailable}><TriangleAlert size={24} /><strong>{error}</strong><button type="button" onClick={() => void load().catch((reason) => setError(reason instanceof Error ? reason.message : "帮助读取失败"))}>重新读取</button></section> : <article className={styles.document}><ReactMarkdown
+    {loading ? <div className={styles.loading} role="status"><span className={styles.loadingRing} data-loading-spinner="" aria-hidden="true" /><span>正在读取帮助</span></div> : error ? <section className={styles.unavailable}><TriangleAlert size={24} /><strong>{error}</strong><button type="button" onClick={() => void load().catch((reason) => setError(reason instanceof Error ? reason.message : "帮助读取失败"))}>重新读取</button></section> : <article className={styles.document}><ReactMarkdown
       remarkPlugins={[remarkGfm, remarkMath]}
       rehypePlugins={[rehypeKatex]}
       components={{

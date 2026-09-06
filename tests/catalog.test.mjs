@@ -118,6 +118,44 @@ test("project delete saga retries after a crash, moves conversations out, detach
   }
 });
 
+test("project delete can permanently delete every conversation instead of moving them out", async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-catalog-"));
+  let injected = false;
+  try {
+    const fixture = catalogFixture(dataRoot, {
+      faultInjector: ({ step }) => {
+        if (!injected && step === "delete-conversations") {
+          injected = true;
+          throw Object.assign(new Error("simulated crash"), { code: "FAULT_INJECTED" });
+        }
+      },
+    });
+    const project = await fixture.projects.create({ id: "project_delete_all", name: "整组删除" });
+    const first = await fixture.conversations.sendMessage({ mode: "chat", projectId: project.id, role: "user", content: "first", expectedRevision: 0, commandId: "create_first" });
+    const second = await fixture.conversations.sendMessage({ mode: "work", projectId: project.id, role: "user", content: "second", expectedRevision: 0, commandId: "create_second" });
+
+    const deletion = {
+      projectId: project.id,
+      expectedRevision: 0,
+      commandId: "delete_project_and_conversations",
+      conversationPolicy: "delete",
+    };
+    await assert.rejects(() => fixture.projects.delete(deletion), (error) => error?.code === "FAULT_INJECTED");
+    await assert.rejects(() => fixture.conversations.getConversation(first.conversation.id), (error) => error?.code === "CONVERSATION_NOT_FOUND");
+    await assert.rejects(() => fixture.conversations.getConversation(second.conversation.id), (error) => error?.code === "CONVERSATION_NOT_FOUND");
+    assert.equal((await fixture.projects.get(project.id)).id, project.id);
+
+    const completed = await fixture.projects.delete(deletion);
+
+    assert.equal(completed.conversationPolicy, "delete");
+    assert.deepEqual(new Set(completed.deletedConversationIds), new Set([first.conversation.id, second.conversation.id]));
+    assert.deepEqual(completed.movedConversationIds, []);
+    await assert.rejects(() => fixture.projects.get(project.id), (error) => error?.code === "PROJECT_NOT_FOUND");
+  } finally {
+    await rm(dataRoot, { recursive: true, force: true });
+  }
+});
+
 test("collection delete saga unlinks every project and garbage-collects only unreferenced resource entities", async () => {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-catalog-"));
   let injected = false;
@@ -153,5 +191,27 @@ test("collection delete saga unlinks every project and garbage-collects only unr
     assert.equal(resources.data.blobs.length, 0);
   } finally {
     await rm(dataRoot, { recursive: true, force: true });
+  }
+});
+
+
+test("catalog create and update recover an interrupted index publication on read and idempotent retry", async (t) => {
+  const dataRoot=await mkdtemp(path.join(os.tmpdir(),"easywork-catalog-repair-"));t.after(()=>rm(dataRoot,{recursive:true,force:true}));
+  const fixture=catalogFixture(dataRoot);
+  for (const kind of ["collection","project"]) {
+    const service=kind==="collection"?fixture.collections:fixture.projects;
+    const create={id:kind+"_recovery",name:"before"};const original=service.updateIndex;
+    service.updateIndex=async()=>{throw Object.assign(new Error("disk fault"),{code:"TEST_INDEX_FAULT"});};
+    await assert.rejects(()=>service.create(create),{code:"TEST_INDEX_FAULT"});
+    service.updateIndex=original;
+    const fresh=catalogFixture(dataRoot);const recovered=kind==="collection"?fresh.collections:fresh.projects;
+    assert.equal((await recovered.list()).find((item)=>item.id===create.id)?.name,"before");
+    assert.equal((await recovered.create(create)).id,create.id);
+    const update={ [kind+"Id"]:create.id,name:"after",expectedRevision:0};const method=kind==="collection"?"rename":"update";
+    const write=recovered.updateIndex;recovered.updateIndex=async()=>{throw Object.assign(new Error("disk fault"),{code:"TEST_INDEX_FAULT"});};
+    await assert.rejects(()=>recovered[method](update),{code:"TEST_INDEX_FAULT"});recovered.updateIndex=write;
+    assert.equal((await recovered.get(create.id)).name,"after");
+    assert.equal((await recovered.list()).find((item)=>item.id===create.id)?.name,"after");
+    assert.equal((await recovered[method](update)).revision,1);
   }
 });

@@ -9,6 +9,8 @@ import { createActorContext } from "../gateway/core/actor.mjs";
 import { ArtifactService } from "../gateway/core/artifacts/index.mjs";
 import { createTask } from "../gateway/core/entities/task.mjs";
 import { actorDataRoot } from "../gateway/core/paths.mjs";
+import { PreviewService } from "../gateway/core/previews/index.mjs";
+import { ActorServiceContainer } from "../gateway/core/runtime/services.mjs";
 
 const TOKEN_SECRET = "artifact-tests-use-a-dedicated-opaque-secret-2026";
 const SERVER_IDENTITY = `ssh_${"a".repeat(43)}`;
@@ -127,6 +129,40 @@ async function streamText(stream) {
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks).toString("utf8");
 }
+
+test("远端文件与文件卡片预览提供实际服务器名称，文件库和主机文件不带服务器标签", async () => {
+  await fixture(async (dataRoot) => {
+    const currentActor = actor();
+    const time = clockFixture();
+    const server = { profile: { id: "server_a", serverIdentity: SERVER_IDENTITY, name: "计算服务器" } };
+    const remoteSource = { inspect: async () => ({ authorized: true, resolved: true, withinAllowedRoot: true, symlinkSafe: true, canonicalPath: "/srv/work/private/run/report.bin", serverIdentity: SERVER_IDENTITY, workspaceId: "workspace_a", size: 4096, sha256: "b".repeat(64), mime: "application/octet-stream", name: "report.bin" }) };
+    const artifacts = new ArtifactService(serviceOptions(dataRoot, currentActor, time.clock, { remoteSource }));
+    const remote = await artifacts.capture({ task: task(currentActor, time.clock), event: remoteEvent(1) });
+    const local = await artifacts.capture({ task: task(currentActor, time.clock), event: hostEvent(2) });
+    const container = {
+      artifacts,
+      servers: { list: async () => [server], get: async () => server },
+      workspaceFor: async () => ({ getWorkspace: async () => ({ canonicalPath: "/srv/work/private/run" }) }),
+      remoteArtifactSource: async () => remoteSource,
+      resources: { inspect: async () => ({ data: { versions: [{ id: "resource_a", filename: "notes.txt", revision: 1, blobId: "blob_a" }], blobs: [{ id: "blob_a", size: 12, mime: "text/plain" }] } }) },
+    };
+    container.previews = new PreviewService({ actor: currentActor, hostSource: ActorServiceContainer.prototype.previewHostSource.call(container), remoteSource: ActorServiceContainer.prototype.previewRemoteSource.call(container) });
+    for (const source of [{ kind: "artifact", artifactId: remote.artifact.id }, { kind: "remote", serverId: "server_a", workspaceId: "workspace_a", relativePath: "report.bin" }]) {
+      const descriptor = await ActorServiceContainer.prototype.createPreview.call(container, { source });
+      assert.equal(descriptor.metadata.serverId, server.profile.id);
+      assert.equal(descriptor.metadata.serverName, server.profile.name);
+      assert.equal(JSON.stringify(descriptor).includes(SERVER_IDENTITY), false);
+      assert.equal(JSON.stringify(descriptor).includes("/srv/work/private"), false);
+    }
+    for (const source of [{ kind: "artifact", artifactId: local.artifact.id }, { kind: "resource", resourceVersionId: "resource_a" }]) {
+      const descriptor = await ActorServiceContainer.prototype.createPreview.call(container, { source });
+      assert.equal(descriptor.metadata.serverName, undefined);
+    }
+    assert.equal(JSON.stringify(await artifacts.get({ artifactId: remote.artifact.id })).includes(SERVER_IDENTITY), false);
+    const other = new ArtifactService(serviceOptions(dataRoot, actor("user", "other_actor"), time.clock));
+    await assert.rejects(() => other.getSourceServerIdentity({ artifactId: remote.artifact.id }), (error) => error?.code === "ARTIFACT_NOT_FOUND");
+  });
+});
 
 test("主机小文件按 Actor 隔离保存内容 hash，capture commandId 幂等且 opaque id 不携带文件信息", async () => {
   await fixture(async (dataRoot) => {

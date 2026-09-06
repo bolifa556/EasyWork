@@ -43,7 +43,7 @@ const TRANSITIONS = Object.freeze({
   waiting_approval: Object.freeze(["running", "interrupting", "recovering", "failed", "cancelled"]),
   waiting_input: Object.freeze(["running", "interrupting", "recovering", "failed", "cancelled"]),
   waiting_append: Object.freeze(["running", "interrupting", "recovering", "finalizing", "failed", "cancelled"]),
-  interrupting: Object.freeze(["interrupted", "failed"]),
+  interrupting: Object.freeze(["interrupted", "running", "waiting_approval", "waiting_input", "waiting_append", "recovering", "failed"]),
   interrupted: Object.freeze(["recovering", "cancelled"]),
   recovering: Object.freeze(["running", "interrupting", "failed", "cancelled"]),
   finalizing: Object.freeze(["completed", "failed", "cancelled"]),

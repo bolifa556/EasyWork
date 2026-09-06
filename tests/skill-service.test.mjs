@@ -10,6 +10,18 @@ import { actorDataRoot } from "../gateway/core/paths.mjs";
 import { isAutomaticSkillApplicable } from "../gateway/core/skills/applicability.mjs";
 import { SkillService } from "../gateway/core/skills/index.mjs";
 
+test("cached Skill choices resolve the exact selected package after a newer version is installed", async () => {
+  await fixture(async (dataRoot) => {
+    const service = new SkillService(serviceOptions(dataRoot, actor()));
+    const one = await service.uploadVersion(skillInput());
+    const selected = { knowledge: { key: "skill:shell-helper", version: `semantic-v1:1.0.0:${one.version.sha256}` } };
+    const two = await service.uploadVersion(skillInput({ version: "2.0.0", expectedRevision: one.revision }));
+    assert.deepEqual(await service.resolveKnowledgePins([selected]), [{ skillId: "shell-helper", version: "1.0.0", sha256: one.version.sha256 }]);
+    await assert.rejects(() => service.resolveKnowledgePins([selected, { knowledge: { key: "skill:shell-helper", version: `semantic-v1:2.0.0:${two.version.sha256}` } }]), { code: "SKILL_SELECTED_VERSION_CONFLICT" });
+    await assert.rejects(() => service.resolveKnowledgePins([{ knowledge: { key: "skill:shell-helper", version: `semantic-v1:1.0.0:${"0".repeat(64)}` } }]), { code: "SKILL_SELECTED_VERSION_UNAVAILABLE" });
+  });
+});
+
 function actor(actorType = "user", actorId = "skill_owner") {
   return createActorContext({
     actorType,
@@ -98,7 +110,7 @@ test("上传 Skill 会在 Actor skills 目录保存不可变版本，并登记�
       assert.equal(await readFile(path.join(packageRoot, "files", "README.md"), "utf8"), "# Shell Helper\n");
       const descriptor = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
       assert.equal(descriptor.sha256, uploaded.version.sha256);
-      assert.equal(descriptor.files.length, 2);
+      assert.deepEqual(descriptor.files.map((file) => file.path), ["README.md", "scripts/main.mjs"]);
       assert.match(packageRoot, currentActor.actorType === "user" ? /[\\/]users[\\/]same_skill[\\/]/ : /[\\/]guests[\\/]same_skill[\\/]/);
       const catalog = await service.listInstalledKnowledge();
       assert.equal(Object.hasOwn(catalog.items[0], "applicability"), false);

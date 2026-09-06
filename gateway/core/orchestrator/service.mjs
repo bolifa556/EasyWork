@@ -155,6 +155,37 @@ export class TaskOrchestrator {
     }
   }
 
+  async monitorActiveRuns({ quietForMs = 120_000 } = {}) {
+    const threshold = Math.max(10_000, Number(quietForMs) || 120_000);
+    const now = this.clock().getTime();
+    const tasks = await this.taskStore.scanTasks({ statuses: ["running", "waiting_approval", "waiting_input", "waiting_append", "recovering"] });
+    const outcomes = [];
+    for (const summary of tasks) {
+      if (now - Date.parse(summary.updatedAt) < threshold) continue;
+      const task = await this.getTask(summary.id);
+      const binding = await this.runtime.loadBinding(task.agentBindingId);
+      const runId = String(binding?.activeRunId || task.remoteRunId || "").trim();
+      if (runId && this.runtime.isRunning(`run:${task.id}:${runId}`)) {
+        outcomes.push({ taskId: task.id, status: task.status, running: true });
+        continue;
+      }
+      const error = new Error("远端 Agent 已停止运行，EasyWork 没有收到最终回复；请检查服务器或重新发送本轮请求");
+      error.code = "REMOTE_AGENT_NOT_RUNNING";
+      error.retryable = true;
+      const failure = failureFrom(error);
+      await this.#publishTask(task, "error", "failed", { source: "watchdog", failure });
+      const commandId = `watchdog_interrupt_${crypto.createHash("sha256").update(`${task.id}:${task.revision}`).digest("hex").slice(0, 32)}`;
+      try {
+        await this.interrupt(task.id, { commandId });
+        outcomes.push({ taskId: task.id, status: task.status, running: false, failure });
+      } catch (reason) {
+        const failed = await this.#failTask(task.id, error, task.activeCommandId);
+        outcomes.push({ taskId: task.id, status: failed?.status || "failed", running: false, failure: failureFrom(reason || error) });
+      }
+    }
+    return outcomes;
+  }
+
   async #recoverPendingOnce() {
     const nonterminal = await this.taskStore.scanTasks({
       statuses: [
@@ -385,7 +416,7 @@ export class TaskOrchestrator {
 
   async interrupt(taskId, options = {}) {
     return this.#submit("interrupt", taskId, options, () => this.#interruptTask(String(taskId), options.commandId), {
-      shouldFailTask: (task) => task.status === "interrupting",
+      shouldFailTask: () => false,
     });
   }
 
@@ -455,8 +486,21 @@ export class TaskOrchestrator {
           await this.#publishCommand(taskId, type, "completed", { commandId, result: clone(result || {}) });
         } catch (error) {
           const task = await this.taskStore.getTask(taskId);
-          if (task && policy.shouldFailTask(task)) await this.#failTask(taskId, error, commandId);
           const failure = failureFrom(error);
+          if (task?.status === "interrupting" && type !== "interrupt") {
+            // A startup/append worker can fail only after an accepted
+            // interrupt (for example when an Agent readiness probe reaches
+            // its timeout).  Leaving the Task in interrupting here makes the
+            // composer spin forever even though no native turn was admitted.
+            // Close the version boundary and publish the real warning.
+            await this.#settleInterruptedTask(taskId, {
+              operation: type,
+              phase: "worker_failed_after_interrupt",
+              warning: failure,
+            });
+          } else if (task && policy.shouldFailTask(task)) {
+            await this.#failTask(taskId, error, commandId);
+          }
           await this.taskStore.updateCommand(taskId, commandId, { status: "failed", failure, updatedAt: this.clock().toISOString() });
           await this.#publishCommand(taskId, type, "failed", { commandId, failure });
         }
@@ -739,6 +783,7 @@ export class TaskOrchestrator {
 
   async #interruptTask(taskId, commandId) {
     let task = await this.getTask(taskId);
+    if (["interrupted", ...TERMINAL_TASK_STATUSES].includes(task.status)) return { taskId, runId: task.remoteRunId, status: task.status, duplicate: true };
     invariant(["queued", "preparing", "delivering_context", "running", "waiting_approval", "waiting_input", "waiting_append", "recovering"].includes(task.status), "TASK_INTERRUPT_STATE_INVALID", `当前状态不能 interrupt: ${task.status}`, { status: 409 });
     if (["queued", "preparing", "delivering_context"].includes(task.status)) {
       const startupStatus = task.status;
@@ -756,6 +801,8 @@ export class TaskOrchestrator {
     const adapter = adapterFromRegistry(this.adapters, task.route.agentId);
     let binding = await this.#loadBinding(task, adapter);
     const descriptor = adapter.operation("interrupt", operationInput(binding, { commandId }));
+    const previousStatus = task.status;
+    const previousCommandId = task.activeCommandId;
     task = await this.#transition(taskId, "interrupting", { activeCommandId: commandId }, { operation: "interrupt", commandId });
     let run;
     try {
@@ -763,13 +810,10 @@ export class TaskOrchestrator {
     } catch (error) {
       const current = await this.getTask(taskId);
       if (current.status === "interrupting") {
-        task = await this.#settleInterruptedTask(taskId, {
-          operation: "interrupt",
-          commandId,
-          warning: failureFrom(error),
-        });
+        await this.#transition(taskId, previousStatus, { activeCommandId: previousCommandId }, { operation: "interrupt", commandId, failure: failureFrom(error) });
       }
-      return { taskId, runId: task.remoteRunId, status: task.status, warning: failureFrom(error) };
+      if (TERMINAL_TASK_STATUSES.includes(current.status)) return { taskId, runId: current.remoteRunId, status: current.status };
+      throw error;
     }
     binding = await this.#saveTransportBinding(task, adapter, binding, run, null);
     task = await this.#settleInterruptedTask(taskId, { operation: "interrupt", commandId });
@@ -798,6 +842,8 @@ export class TaskOrchestrator {
           operation: "startup-interrupt-cleanup",
           failure: failureFrom(error),
         }).catch(() => undefined);
+        await this.#transition(taskId, "running", {}, { operation: "interrupt", failure: failureFrom(error) });
+        return false;
       }
     }
     // An interrupt can arrive after a slow startup phase (workspace/version/
@@ -957,10 +1003,11 @@ export class TaskOrchestrator {
     await this.runtime.launch(`run:${taskId}:${normalizeRunId(run.runId)}`, async () => {
       try {
         let sawFinal = false;
+        const failedArtifacts = new Set();
         let receiptAcknowledged = Boolean(acknowledged);
         for await (const frame of run.frames) {
-          const beforeReduce = await this.getTask(taskId);
-          if (["interrupting", "interrupted", ...TERMINAL_TASK_STATUSES].includes(beforeReduce.status)) break;
+          const beforeReduce = await this.#afterInterrupt(taskId);
+          if (["interrupted", ...TERMINAL_TASK_STATUSES].includes(beforeReduce.status)) break;
           // A native append/resume installs a fresh run id on the same Agent
           // session.  The replaced stream can still flush an abort/error frame
           // after that swap; never let it mutate the new run's binding or
@@ -978,13 +1025,15 @@ export class TaskOrchestrator {
           });
           const activeRun = await this.#isActiveRun(taskId, run.runId);
           for (const event of events) {
-            await this.#handleAgentEvent(taskId, event, { activeRun, runId: run.runId });
+            const settled = await this.#afterInterrupt(taskId);
+            if (["interrupted", ...TERMINAL_TASK_STATUSES].includes(settled.status)) break;
+            await this.#handleAgentEvent(taskId, event, { activeRun, runId: run.runId, failedArtifacts });
             if (event.kind === "final") sawFinal = true;
           }
-          const current = await this.getTask(taskId);
+          const current = await this.#afterInterrupt(taskId);
           if (["interrupting", "interrupted", ...TERMINAL_TASK_STATUSES].includes(current.status)) break;
         }
-        const current = await this.getTask(taskId);
+        const current = await this.#afterInterrupt(taskId);
         const activeRun = await this.#isActiveRun(taskId, run.runId);
         if (!sawFinal && activeRun && !["waiting_append", "interrupted", "interrupting", ...TERMINAL_TASK_STATUSES].includes(current.status)) {
           // A native stream ending is not a successful answer. Intermediate
@@ -1053,8 +1102,8 @@ export class TaskOrchestrator {
       // activity rows. A compact task-level signal below refreshes the two
       // dedicated plan surfaces without journaling repeated "执行计划" blocks.
       for (const event of events) {
-        if (!["plan", "artifact"].includes(event.kind) && event.payload?.visibility !== "internal") await this.#publishAgentEvent(liveTask, event);
-        if (event.kind === "tool_result" && ["completed", "failed"].includes(event.phase) && this.submissionRecorder) {
+        if (!["plan", "artifact", "final"].includes(event.kind) && event.payload?.visibility !== "internal") await this.#publishAgentEvent(liveTask, event);
+        if (event.kind === "tool_result" && ["updated", "completed", "failed"].includes(event.phase) && this.submissionRecorder) {
           try { await this.submissionRecorder({ task: liveTask, event, binding: nextBinding }); }
           catch (error) {
             // A bookkeeping failure must not interrupt a job that the remote
@@ -1068,6 +1117,17 @@ export class TaskOrchestrator {
     });
   }
 
+  async #afterInterrupt(taskId) {
+    let task = await this.getTask(taskId);
+    // Keep the native reader attached until the interrupt has a confirmed
+    // outcome. A rejected stop must not discard the remaining answer stream.
+    while (task.status === "interrupting") {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      task = await this.getTask(taskId);
+    }
+    return task;
+  }
+
   async #handleAgentEvent(taskId, event, options = {}) {
     if (event.kind === "plan") {
       const plan = normalizedPlan(event.payload.items);
@@ -1075,7 +1135,13 @@ export class TaskOrchestrator {
       if (updated) await this.#publishTask(updated, "plan_state", "updated", { plan });
     } else if (event.kind === "artifact") {
       const task = await this.getTask(taskId);
-      const captured = await this.artifactService.capture({ task, event: clone(event) });
+      let captured;
+      try { captured = await this.artifactService.capture({ task, event: clone(event) }); }
+      catch (error) {
+        options.failedArtifacts?.add(event.payload.path);
+        await this.#publishAgentEvent(task, { ...event, phase: "failed", payload: { ...event.payload, failure: failureFrom(error) } });
+        return;
+      }
       const artifactId = captured?.artifact?.id;
       if (artifactId) {
         await this.#addArtifact(taskId, String(artifactId));
@@ -1134,6 +1200,13 @@ export class TaskOrchestrator {
       });
     } else if (event.kind === "final") {
       if (!options.activeRun) return;
+      const task = await this.getTask(taskId);
+      if (options.failedArtifacts?.size) {
+        const binding = await this.runtime.loadBinding(task.agentBindingId);
+        const original = binding?.state?.items?.["easywork:linked-final"]?.original;
+        if (original) event = { ...event, payload: { ...event.payload, text: original } };
+      }
+      await this.#publishAgentEvent(task, event);
       const completed = await this.#completeTask(taskId, { expectedRunId: options.runId });
       let finalizer = null;
       if (completed?.status === "completed" && this.taskFinalizer) {
@@ -1175,6 +1248,20 @@ export class TaskOrchestrator {
   }
 
   async #finalizeVersionBoundary(task) {
+    try {
+      if (task.agentBindingId && this.transport.captureSkillSnapshot) {
+        await this.#withLock(`binding:${task.agentBindingId}`, async () => {
+          const binding = await this.runtime.loadBinding(task.agentBindingId);
+          if (!binding || binding.native?.skillCheckpoints?.[task.id]) return;
+          const snapshot = await this.transport.captureSkillSnapshot({ task: clone(task), binding: clone(binding) });
+          if (snapshot) await this.runtime.saveBinding(task.agentBindingId, { ...binding, native: { ...binding.native, skillCheckpoints: { ...binding.native?.skillCheckpoints, [task.id]: snapshot } } });
+        });
+      }
+    } catch (error) {
+      await this.#publishTask(task, "error", "failed", {
+        failure: failureFrom(error), operation: "skill-snapshot",
+      }).catch(() => undefined);
+    }
     try {
       const version = await this.versionService.finalize({ task: clone(task) });
       await this.workspaceService.finalize({ task: clone(task) });

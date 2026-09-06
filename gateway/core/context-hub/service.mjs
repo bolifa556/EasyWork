@@ -223,7 +223,10 @@ function selectWithinBudget(entries, budget) {
   const selected = [];
   let used = 0;
   for (const entry of ordered) {
-    if (used + entry.tokenEstimate > available) {
+    // Native transcript continuity cannot be silently truncated by a retrieval
+    // budget. The remote Agent owns its context window and compaction; keep all
+    // missing historical turns together, and budget optional knowledge normally.
+    if (used + entry.tokenEstimate > available && entry.source.type !== "conversation") {
       invariant(!entry.required, "CONTEXT_REQUIRED_ENTRY_EXCEEDS_BUDGET", "必要上下文超过 ContextSession 预算", {
         status: 409,
         details: { entryId: entry.id, tokenEstimate: entry.tokenEstimate, availableTokens: available - used },
@@ -596,6 +599,7 @@ export class ContextHub {
           ...(!existing.nativeBoundary?.sessionId && nativeBoundary?.sessionId ? { sessionId: String(nativeBoundary.sessionId) } : {}),
           ...(sameBoundarySession && nativeBoundary?.turnId ? { turnId: String(nativeBoundary.turnId) } : {}),
           ...(sameBoundarySession && nativeBoundary?.rolloutPath ? { rolloutPath: String(nativeBoundary.rolloutPath) } : {}),
+          ...(!existing.nativeBoundary?.skillSnapshot && nativeBoundary?.skillSnapshot ? { skillSnapshot: structuredClone(nativeBoundary.skillSnapshot) } : {}),
         };
         data.bindings[String(bindingKey)] = receipt;
         saved = structuredClone(existing);
@@ -613,6 +617,7 @@ export class ContextHub {
           ...(nativeBoundary?.sessionId ? { sessionId: String(nativeBoundary.sessionId) } : {}),
           ...(nativeBoundary?.turnId ? { turnId: String(nativeBoundary.turnId) } : {}),
           ...(nativeBoundary?.rolloutPath ? { rolloutPath: String(nativeBoundary.rolloutPath) } : {}),
+          ...(nativeBoundary?.skillSnapshot ? { skillSnapshot: structuredClone(nativeBoundary.skillSnapshot) } : {}),
         },
         createdAt: new Date().toISOString(),
       };

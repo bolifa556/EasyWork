@@ -4,6 +4,7 @@ import { Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { ViewerProps } from "@/app/core/registry/viewers";
 import { Button } from "../../ui/Button";
+import { MarkdownCodeBlock } from "../conversation/MarkdownContent";
 import { usePreview } from "./usePreview";
 import { ViewerLoading, ViewerToolbar } from "./ViewerChrome";
 import styles from "./Viewer.module.css";
@@ -24,6 +25,6 @@ export default function TextViewer({ descriptor, previewId }: ViewerProps) {
       {search ? <span className={styles.matchCount}>{matches.length} 处</span> : null}
       {truncated ? <span className={styles.truncatedBadge}>仅显示部分内容</span> : null}
     </ViewerToolbar>
-    {loading ? <ViewerLoading /> : error ? <div className={styles.empty}>{error}</div> : <div className={styles.codeViewport}>{lines.map((line, index) => <div id={`line-${index + 1}`} className={`${styles.codeLine} ${matches.includes(index) ? styles.matchedLine : ""}`} key={index}><a href={`#line-${index + 1}`} aria-label={`第 ${index + 1} 行`}>{index + 1}</a><code>{line || " "}</code></div>)}</div>}
+    {loading ? <ViewerLoading /> : error ? <div className={styles.empty}>{error}</div> : <div className={`${styles.content} ${styles.codePreview}`}><MarkdownCodeBlock source={value} copy={false} viewportClassName={styles.fileCode}><code>{lines.map((line, index) => <span id={`${previewId}-line-${index + 1}`} className={`${styles.codeLine} ${matches.includes(index) ? styles.matchedLine : ""}`} key={index}><a href={`#${previewId}-line-${index + 1}`} aria-label={`第 ${index + 1} 行`}>{index + 1}</a><span>{line || " "}</span></span>)}</code></MarkdownCodeBlock></div>}
   </div>;
 }

@@ -3,6 +3,47 @@ import test from "node:test";
 
 import { ApiError } from "../gateway/core/errors.mjs";
 import { TaskOrchestrator } from "../gateway/core/orchestrator/index.mjs";
+import { createCodexAdapter } from "../gateway/core/agents/codex.mjs";
+
+test("one failed remote file preserves a real native final answer and the other download", async () => {
+  const f = dependencies(); f.deps.adapters = { codex: createCodexAdapter() };
+  const captured = [];
+  f.deps.artifactService.capture = async (input) => {
+    if (input.event.payload.path === "/work/missing.txt") throw new ApiError("ARTIFACT_REMOTE_DELETED", "missing", { status: 410 });
+    captured.push(input); return { artifact: { id: "artifact-good" } };
+  };
+  const orchestrator = new TaskOrchestrator(f.deps);
+  const task = taskInput("task-native-files", "codex");
+  await orchestrator.create(task, { commandId: "create-native-files" });
+  await orchestrator.start(task.id, { commandId: "start-native-files" });
+  await waitUntil(async () => (await orchestrator.getTask(task.id)).status === "running");
+  const final = "正文仍然保留。\n\n[缺失文件](file:///work/missing.txt)\n\n[有效文件](file:///work/good.txt)";
+  const queue = f.transport.queues[0];
+  queue.push({ method: "turn/started", params: { threadId: "native-session-1", turn: { id: "turn-1" } } });
+  queue.push({ method: "item/completed", params: { threadId: "native-session-1", turnId: "turn-1", item: { id: "answer-1", type: "agentMessage", text: final } } });
+  queue.push({ method: "turn/completed", params: { threadId: "native-session-1", turn: { id: "turn-1", status: "completed" } } });
+  queue.close(); await f.runtime.waitForIdle();
+  const result = await orchestrator.getTask(task.id);
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.artifactIds, ["artifact-good"]);
+  assert.equal(captured.length, 1);
+  const finalEvent = f.events.findLast((event) => event.producer === "agent:codex" && event.kind === "final");
+  assert.equal(finalEvent.payload.event.text, final);
+  assert.ok(f.events.some((event) => event.kind === "artifact" && event.payload.event?.failure?.code === "ARTIFACT_REMOTE_DELETED"));
+});
+
+test("Skill snapshot failure reports an auxiliary error and still finalizes file versions", async () => {
+  const f = dependencies(); let finalized = 0;
+  f.deps.transport.captureSkillSnapshot = async () => { throw new ApiError("AGENT_SKILL_SNAPSHOT_FAILED", "snapshot failed"); };
+  f.deps.versionService.finalize = async () => { finalized += 1; return {}; };
+  const orchestrator = new TaskOrchestrator(f.deps);
+  await createAndStart(orchestrator, "task-skill-snapshot-failed");
+  f.transport.queues[0].push({ kind: "final", phase: "completed", payload: { text: "saved" } });
+  f.transport.queues[0].close(); await f.runtime.waitForIdle();
+  assert.equal((await orchestrator.getTask("task-skill-snapshot-failed")).status, "completed");
+  assert.equal(finalized, 1);
+  assert.ok(f.events.some((event) => event.payload.operation === "skill-snapshot"));
+});
 
 const copy = (value) => value === undefined ? undefined : structuredClone(value);
 
@@ -379,7 +420,7 @@ test("start 脱离浏览器请求后继续消费原始帧并按序完成 Task", 
   assert.equal(fixture.events.some((event) => event.producer === "task-orchestrator" && event.kind === "plan_state"), true);
 });
 
-test("作业记账只消费工具终态，记账失败不会中断或重发远端执行", async () => {
+test("作业检测收到流式结果与工具终态，记账失败不会中断或重发远端执行", async () => {
   const fixture = dependencies();
   const receipts = [];
   fixture.deps.submissionRecorder = async (record) => {
@@ -396,9 +437,9 @@ test("作业记账只消费工具终态，记账失败不会中断或重发远�
   queue.push({ kind: "final", phase: "completed", payload: { text: "submitted" } });
   queue.close();
   await fixture.runtime.waitForIdle();
-  assert.equal(receipts.length, 1);
+  assert.equal(receipts.length, 2);
   assert.equal(receipts[0].task.id, "task-submission-record");
-  assert.equal(receipts[0].event.phase, "completed");
+  assert.deepEqual(receipts.map((receipt) => receipt.event.phase), ["updated", "completed"]);
   assert.equal(receipts[0].binding.state.sessionId, "native-submission-session");
   assert.equal((await orchestrator.getTask("task-submission-record")).status, "completed");
   assert.equal(fixture.transport.calls.filter((call) => call.operation === "start").length, 1);
@@ -667,21 +708,23 @@ test("interrupt 后 resume 复用原 Agent binding 与 native session", async ()
   assert.equal((await orchestrator.getTask("task-resume")).status, "completed");
 });
 
-test("interrupt transport 失败也会收敛为 interrupted，不把页面永久留在 interrupting", async () => {
+test("interrupt failure preserves the active native stream and allows a confirmed retry", async () => {
   const fixture = dependencies();
   const orchestrator = new TaskOrchestrator(fixture.deps);
   await createAndStart(orchestrator, "task-interrupt-failure");
   fixture.transport.failOperation = "interrupt";
 
   await orchestrator.interrupt("task-interrupt-failure", { commandId: "interrupt-failure" });
-  const task = await waitUntil(async () => {
-    const current = await orchestrator.getTask("task-interrupt-failure");
-    return current.status === "interrupted" ? current : null;
-  }, "failed interrupt convergence");
-  const command = await orchestrator.getCommand("task-interrupt-failure", "interrupt-failure");
-  assert.equal(task.status, "interrupted");
-  assert.equal(command.status, "completed");
-  assert.equal(command.result.warning.code, "TRANSPORT_FAILED");
+  const command = await waitUntil(async () => {
+    const current = await orchestrator.getCommand("task-interrupt-failure", "interrupt-failure");
+    return current.status === "failed" ? current : null;
+  }, "failed interrupt receipt");
+  assert.equal((await orchestrator.getTask("task-interrupt-failure")).status, "running");
+  assert.equal(command.failure.code, "TRANSPORT_FAILED");
+  fixture.transport.queues[0].push({ kind: "message", phase: "completed", payload: { text: "still running" } });
+  fixture.transport.failOperation = null;
+  await orchestrator.interrupt("task-interrupt-failure", { commandId: "interrupt-retry" });
+  await waitUntil(async () => (await orchestrator.getTask("task-interrupt-failure")).status === "interrupted", "confirmed retry");
   fixture.transport.queues[0].close();
   await fixture.runtime.waitForIdle();
 });
@@ -740,6 +783,36 @@ test("preparing 阶段可以中断，且解除准备阻塞后不会再启动远�
   assert.equal((await orchestrator.getTask("task-startup-interrupt")).status, "interrupted");
   assert.equal(fixture.transport.calls.some((call) => call.operation === "start"), false);
   assert.equal((await orchestrator.getCommand("task-startup-interrupt", "start-startup-interrupt")).status, "completed");
+});
+
+test("preparing 阶段在中断后发生就绪超时也会收敛，不永久停在 interrupting", async () => {
+  const fixture = dependencies();
+  let enteredPrepare;
+  let rejectPrepare;
+  const prepareEntered = new Promise((resolve) => { enteredPrepare = resolve; });
+  fixture.deps.versionService.prepare = async () => {
+    enteredPrepare();
+    return new Promise((_, reject) => { rejectPrepare = reject; });
+  };
+  const orchestrator = new TaskOrchestrator(fixture.deps);
+  await orchestrator.create(taskInput("task-startup-interrupt-timeout"), { commandId: "create-startup-interrupt-timeout" });
+  await orchestrator.start("task-startup-interrupt-timeout", { commandId: "start-startup-interrupt-timeout" });
+  await prepareEntered;
+
+  await orchestrator.interrupt("task-startup-interrupt-timeout", { commandId: "interrupt-startup-timeout" });
+  await waitUntil(async () => (await orchestrator.getTask("task-startup-interrupt-timeout")).status === "interrupting", "startup timeout interrupting");
+  rejectPrepare(Object.assign(new Error("OpenCode 服务就绪检查超时"), { code: "AGENT_SERVICE_START_FAILED", retryable: true }));
+
+  const task = await waitUntil(async () => {
+    const current = await orchestrator.getTask("task-startup-interrupt-timeout");
+    return current.status === "interrupted" ? current : null;
+  }, "startup timeout interrupted");
+  assert.equal(task.status, "interrupted");
+  const startCommand = await orchestrator.getCommand("task-startup-interrupt-timeout", "start-startup-interrupt-timeout");
+  assert.equal(startCommand.status, "failed");
+  assert.equal(startCommand.failure.code, "AGENT_SERVICE_START_FAILED");
+  assert.equal(fixture.transport.calls.some((call) => call.operation === "start"), false);
+  await fixture.runtime.waitForIdle();
 });
 
 test("start 状态推进与 interrupt 并发时不会把已中断 Task 改成失败", async () => {

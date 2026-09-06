@@ -46,10 +46,11 @@ function safeFilename(value) {
   return String(value || "artifact").replace(/[\r\n"\\]/g, "_").slice(0, 255);
 }
 
-function attachmentDisposition(value) {
-  const filename = safeFilename(value);
+function contentDisposition(value, disposition = "attachment") {
+  const filename = safeFilename(value).toWellFormed();
   const ascii = filename.replace(/[^\x20-\x7e]/g, "_");
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+  const encoded = encodeURIComponent(filename).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${disposition}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
 function remoteFileAuditTarget(serverId, workspaceId, relativePath) {
@@ -128,19 +129,18 @@ export async function createGatewayServer(options = {}) {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/help") {
-        await runtime.auth.resolveSession(bearer(request));
         const document = await runtime.helpDocument();
         if (String(request.headers["if-none-match"] || "") === document.etag) {
-          response.writeHead(304, { ...cors, etag: document.etag, "last-modified": document.lastModified, "x-request-id": id });
+          response.writeHead(304, { ...cors, "cache-control": "public, no-cache", etag: document.etag, "last-modified": document.lastModified, "x-request-id": id });
           response.end();
           return;
         }
-        const result = apiSuccess({ content: document.content, mediaType: document.mediaType }, { requestId: id });
+        const result = apiSuccess(document, { requestId: id });
         writeJson(response, {
           ...result,
           headers: {
             "content-type": "application/json; charset=utf-8",
-            "cache-control": "private, no-cache",
+            "cache-control": "public, no-cache",
             etag: document.etag,
             "last-modified": document.lastModified,
             "x-request-id": id,
@@ -281,7 +281,7 @@ export async function createGatewayServer(options = {}) {
           "accept-ranges": "bytes",
           "content-type": "application/octet-stream",
           "content-length": range.endExclusive - range.start,
-          "content-disposition": attachmentDisposition(descriptor.name),
+          "content-disposition": contentDisposition(descriptor.name),
           ...(partial ? { "content-range": `bytes ${range.start}-${range.endExclusive - 1}/${descriptor.size}` } : {}),
           "etag": `"sha256:${descriptor.sha256}"`,
           "x-content-sha256": descriptor.sha256,
@@ -315,7 +315,7 @@ export async function createGatewayServer(options = {}) {
           "accept-ranges": "bytes",
           "content-type": opened.mime || "application/octet-stream",
           "content-length": opened.contentLength,
-          "content-disposition": attachmentDisposition(opened.filename),
+          "content-disposition": contentDisposition(opened.filename),
           ...(partial ? { "content-range": `bytes ${opened.range.start}-${opened.range.endExclusive - 1}/${opened.size}` } : {}),
           "cache-control": "private, no-store",
           "x-request-id": id,
@@ -362,7 +362,7 @@ export async function createGatewayServer(options = {}) {
           ...(descriptor.delivery.acceptsRange ? { "accept-ranges": "bytes" } : {}),
           "content-type": opened.contentType || "application/octet-stream",
           "content-length": opened.contentLength,
-          "content-disposition": `inline; filename="${safeFilename(descriptor.name)}"`,
+          "content-disposition": contentDisposition(descriptor.name, "inline"),
           ...(partial ? { "content-range": `bytes ${opened.contentRange.start}-${opened.contentRange.endExclusive - 1}/${opened.contentRange.total}` } : {}),
           "x-preview-revision": descriptor.revision,
           "x-preview-source-size": descriptor.size,

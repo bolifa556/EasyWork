@@ -6,13 +6,22 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import { GatewayClient } from "@/app/core/gateway/client";
 import { randomIdentifier } from "@/app/core/identifiers";
+import { isActiveTask, mergeTaskSnapshots } from "@/app/core/task-snapshots";
 import { RealtimeClient } from "@/app/core/realtime/client";
 import { GatewayError, type BootstrapResponse, type ServerCapabilityProfile, type SessionResponse } from "@/app/core/contracts";
+import { preloadFeature } from "./feature-loaders";
+import { prefetchRouteData } from "./startup-data";
+import { startupDestination } from "./startup-route";
+import { prefetchHelpDocument } from "../features/help/help-document";
+import { useFilePreviewTabs } from "./useFilePreviewTabs";
+import { announceConversationsChanged } from "./cacheEvents";
+export type { WorkspacePreviewTab } from "./useFilePreviewTabs";
 
 const SESSION_KEY = "easywork.session";
 const DEVICE_KEY = "easywork.device";
@@ -46,7 +55,7 @@ export type AppView =
   | { kind: "servers" }
   | { kind: "admin" }
   | { kind: "project"; projectId: string }
-  | { kind: "conversation"; conversationId: string; panel?: ConversationPanel };
+  | { kind: "conversation"; conversationId: string; panel?: ConversationPanel; messageId?: string };
 
 type Toast = { id: string; tone: "neutral" | "success" | "error"; message: string };
 
@@ -59,17 +68,7 @@ export type WorkspaceSidebarSession = {
   capabilities: ServerCapabilityProfile;
 };
 
-export type WorkspacePreviewTab = {
-  id: string;
-  conversationId: string;
-  serverId: string;
-  workspaceId: string;
-  relativePath: string;
-  name: string;
-  size: number;
-};
-
-type RuntimeValue = {
+type RuntimeValue = ReturnType<typeof useFilePreviewTabs> & {
   api: GatewayClient;
   realtime: RealtimeClient | null;
   token: string | null;
@@ -80,17 +79,11 @@ type RuntimeValue = {
   sidebarOpen: boolean;
   rightRailOpen: boolean;
   workspaceSidebar: WorkspaceSidebarSession | null;
-  workspacePreviewTabs: WorkspacePreviewTab[];
-  activeWorkspacePreviewTabId: string | null;
   toasts: Toast[];
   navigate: (view: AppView, options?: { replace?: boolean }) => void;
   setSidebarOpen: (open: boolean) => void;
   setRightRailOpen: (open: boolean) => void;
   setWorkspaceSidebar: (session: WorkspaceSidebarSession | null) => void;
-  openWorkspacePreview: (tab: Omit<WorkspacePreviewTab, "id">) => void;
-  selectWorkspacePreview: (id: string) => void;
-  closeWorkspacePreview: (id: string) => void;
-  closeWorkspacePreviews: (conversationId?: string) => void;
   refreshBootstrap: () => Promise<void>;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string) => Promise<void>;
@@ -139,6 +132,7 @@ function routeFor(view: AppView) {
     if (view.panel?.kind === "task") { query.set("view", "task"); query.set("task", view.panel.taskId); }
     if (view.panel?.kind === "artifact") { query.set("view", "artifact"); query.set("artifact", view.panel.artifactId); }
     if (view.panel?.kind === "diff") { query.set("view", "diff"); query.set("change", view.panel.changeId); }
+    if (view.messageId) query.set("message", view.messageId);
     const suffix = query.size ? `?${query}` : "";
     return `/c/${encodeURIComponent(view.conversationId)}${suffix}`;
   }
@@ -168,7 +162,8 @@ function parseRoute(pathname: string, search = ""): AppView {
           : requestedView === "diff" && query.get("change")
             ? { kind: "diff" as const, changeId: query.get("change") as string }
             : undefined;
-    return { kind: "conversation", conversationId: parts[1], panel };
+    const messageId = query.get("message") || undefined;
+    return { kind: "conversation", conversationId: parts[1], panel, messageId };
   }
   if (parts[0] === "library") return { kind: "library", collectionId: parts[1] };
   if (parts[0] === "skills") {
@@ -217,6 +212,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const [sessionSource] = useState(() => new SessionSource(sessionToken()));
   const [token, setToken] = useState<string | null>(() => sessionSource.read());
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
+  const bootstrapGeneration = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<AppView>(() => typeof window === "undefined"
@@ -225,58 +221,25 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightRailOpen, setRightRailOpen] = useState(false);
   const [workspaceSidebar, setWorkspaceSidebarState] = useState<WorkspaceSidebarSession | null>(null);
-  const [workspacePreviewTabs, setWorkspacePreviewTabs] = useState<WorkspacePreviewTab[]>([]);
-  const [activeWorkspacePreviewTabId, setActiveWorkspacePreviewTabId] = useState<string | null>(null);
+  const filePreviews = useFilePreviewTabs();
+  const { closeWorkspacePreviews, hideFilePreview } = filePreviews;
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [api] = useState(() => new GatewayClient("", sessionSource.read));
   const [realtime] = useState(() => new RealtimeClient(websocketUrl, sessionSource.read));
 
   const storeSession = useCallback((next: string | null) => {
+    if (sessionSource.read() !== next) closeWorkspacePreviews();
     sessionSource.write(next);
     setToken(next);
     if (next) localStorage.setItem(SESSION_KEY, next);
     else localStorage.removeItem(SESSION_KEY);
-  }, [sessionSource, setToken]);
+  }, [closeWorkspacePreviews, sessionSource, setToken]);
 
   const notify = useCallback((message: string, tone: Toast["tone"] = "neutral") => {
     const id = randomIdentifier();
     setToasts((current) => [...current, { id, tone, message }]);
     window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), tone === "error" ? 7000 : 3600);
   }, [setToasts]);
-
-  const openWorkspacePreview = useCallback((input: Omit<WorkspacePreviewTab, "id">) => {
-    const id = `${input.conversationId}:${input.serverId}:${input.workspaceId}:${input.relativePath}`;
-    setWorkspacePreviewTabs((current) => {
-      const existing = current.find((entry) => entry.id === id);
-      if (existing) return current.map((entry) => entry.id === id ? { ...entry, ...input } : entry);
-      return [...current, { ...input, id }].slice(-14);
-    });
-    setActiveWorkspacePreviewTabId(id);
-  }, []);
-
-  const selectWorkspacePreview = useCallback((id: string) => {
-    setActiveWorkspacePreviewTabId(id);
-  }, []);
-
-  const closeWorkspacePreview = useCallback((id: string) => {
-    setWorkspacePreviewTabs((current) => {
-      const index = current.findIndex((entry) => entry.id === id);
-      const next = current.filter((entry) => entry.id !== id);
-      setActiveWorkspacePreviewTabId((active) => {
-        if (active !== id) return active;
-        return next[Math.min(Math.max(0, index), next.length - 1)]?.id ?? null;
-      });
-      return next;
-    });
-  }, []);
-
-  const closeWorkspacePreviews = useCallback((conversationId?: string) => {
-    setWorkspacePreviewTabs((current) => {
-      const next = conversationId ? current.filter((entry) => entry.conversationId !== conversationId) : [];
-      setActiveWorkspacePreviewTabId((active) => active && next.some((entry) => entry.id === active) ? active : next.at(-1)?.id ?? null);
-      return next;
-    });
-  }, []);
 
   const setWorkspaceSidebar = useCallback((next: WorkspaceSidebarSession | null) => {
     const apply = () => setWorkspaceSidebarState(next);
@@ -297,29 +260,69 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   }, [workspaceSidebar]);
 
   const refreshBootstrap = useCallback(async () => {
-    if (!sessionSource.read()) return;
-    const result = await retryGateway(() => api.get<BootstrapResponse>("/api/bootstrap"));
-    setBootstrap(result.data);
+    const requestedSession = sessionSource.read();
+    if (!requestedSession) return;
+    const generation = ++bootstrapGeneration.current;
+    const route = parseRoute(window.location.pathname, window.location.search);
+    const query = route.kind === "conversation" ? `?conversationId=${encodeURIComponent(route.conversationId)}` : "";
+    const result = await retryGateway(() => api.get<BootstrapResponse>(`/api/bootstrap${query}`));
+    if (requestedSession !== sessionSource.read() || generation !== bootstrapGeneration.current) return;
+    setBootstrap((current) => {
+      if (!current || current.actor.id !== result.data.actor.id) return result.data;
+      const incomingIds = new Set(result.data.runningTasks.map((task) => task.id));
+      return { ...result.data, runningTasks: mergeTaskSnapshots(current.runningTasks, result.data.runningTasks)
+        .filter((task) => incomingIds.has(task.id) && isActiveTask(task)) };
+    });
     setError(null);
   }, [api, sessionSource, setBootstrap]);
+
+  const activeConversationId = view.kind === "conversation" ? view.conversationId : null;
+  useEffect(() => {
+    if (!token || !bootstrap?.actor.id) return;
+    let timer: number | undefined;
+    const unsubscribe = realtime.subscribe(`conversations:${bootstrap.actor.id}`, (event) => {
+      if (event.kind !== "conversation.title.updated" || !event.ids.conversationId) return;
+      // Coalesce replayed metadata into one list refresh. Each window receives
+      // this account-scoped stream, so it needs no additional tab broadcast.
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        announceConversationsChanged({ conversationId: event.ids.conversationId!, kind: "renamed" }, { broadcast: false });
+      }, 100);
+    });
+    return () => { window.clearTimeout(timer); unsubscribe(); };
+  }, [token, bootstrap?.actor.id, realtime]);
+
+  useEffect(() => {
+    if (loading || !bootstrap || !activeConversationId || bootstrap.conversationNavigation?.conversationId === activeConversationId) return;
+    void refreshBootstrap().catch(() => undefined);
+  }, [activeConversationId, loading, bootstrap?.actor.id, bootstrap?.conversationNavigation?.conversationId, refreshBootstrap]);
+
+  useEffect(() => {
+    if (loading) return;
+    preloadFeature(view.kind);
+    if (view.kind === "help") prefetchHelpDocument();
+  }, [api, view, loading]);
 
   useEffect(() => {
     const synchronizeSession = (event: StorageEvent) => {
       if (event.key !== SESSION_KEY || event.newValue === sessionSource.read()) return;
+      api.beginSessionTransition();
+      closeWorkspacePreviews();
       sessionSource.write(event.newValue);
       setToken(event.newValue);
-      realtime.reconnectIfSubscribed();
       if (event.newValue) {
+        realtime.reconnectIfSubscribed();
         void refreshBootstrap().catch((reason) => {
           setError(reason instanceof Error ? reason.message : "登录会话同步失败");
         });
       } else {
+        realtime.close();
         setBootstrap(null);
       }
     };
     window.addEventListener("storage", synchronizeSession);
     return () => window.removeEventListener("storage", synchronizeSession);
-  }, [realtime, refreshBootstrap, sessionSource]);
+  }, [api, closeWorkspacePreviews, realtime, refreshBootstrap, sessionSource]);
 
   useEffect(() => {
     if (!token) return;
@@ -351,16 +354,31 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const pop = () => {
       setWorkspaceSidebarState(null);
-      setWorkspacePreviewTabs([]);
-      setActiveWorkspacePreviewTabId(null);
-      setView(parseRoute(window.location.pathname, window.location.search));
+      hideFilePreview();
+      const next = parseRoute(window.location.pathname, window.location.search);
+      preloadFeature(next.kind);
+      prefetchRouteData(api, next);
+      setView(next);
     };
     window.addEventListener("popstate", pop);
     return () => window.removeEventListener("popstate", pop);
-  }, []);
+  }, [api, hideFilePreview]);
 
   useEffect(() => {
     let cancelled = false;
+    // Decide the destination before starting page requests. A first device
+    // loads help directly; repeat visits keep the requested route.
+    const firstDeviceVisit = localStorage.getItem(DEVICE_INTRO_KEY) !== "1";
+    const destination = startupDestination(window.location.pathname, window.location.search, firstDeviceVisit, localStorage.getItem(DEVICE_INTRO_AUTO_KEY) === "1");
+    const initialUrl = new URL(destination, window.location.origin);
+    const initialView = parseRoute(initialUrl.pathname, initialUrl.search);
+    if (!firstDeviceVisit) localStorage.removeItem(DEVICE_INTRO_AUTO_KEY);
+    if (destination !== window.location.pathname + window.location.search) {
+      setView(initialView);
+      window.history.replaceState(null, "", destination);
+    }
+    preloadFeature(initialView.kind);
+    if (initialView.kind === "help") prefetchHelpDocument();
     void (async () => {
       setLoading(true);
       try {
@@ -377,14 +395,15 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
               authenticated: false,
             }));
             const session = result.data;
+            if (cancelled || sessionSource.read()) return;
             sessionSource.write(session.token);
             setToken(session.token);
             localStorage.setItem(SESSION_KEY, session.token);
             activeToken = session.token;
           }
-          const result = await retryGateway(() => api.get<BootstrapResponse>("/api/bootstrap"));
-          if (cancelled) return;
-          setBootstrap(result.data);
+          prefetchRouteData(api, initialView);
+          await refreshBootstrap();
+          if (cancelled || sessionSource.read() !== activeToken) return;
           if (consumeFirstDeviceVisit()) {
             setView({ kind: "help" });
             window.history.replaceState(null, "", "/help");
@@ -393,7 +412,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
             window.history.replaceState(null, "", "/");
           }
         } catch (reason) {
+          if (cancelled || sessionSource.read() !== activeToken) return;
           if (activeToken && reason instanceof GatewayError && (reason.status === 401 || reason.status === 403)) {
+            api.beginSessionTransition();
             sessionSource.write(null);
             setToken(null);
             localStorage.removeItem(SESSION_KEY);
@@ -403,12 +424,14 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
               authenticated: false,
             }));
             const session = guest.data;
+            if (cancelled || sessionSource.read()) return;
             sessionSource.write(session.token);
             setToken(session.token);
             localStorage.setItem(SESSION_KEY, session.token);
-            const result = await retryGateway(() => api.get<BootstrapResponse>("/api/bootstrap"));
-            if (cancelled) return;
-            setBootstrap(result.data);
+            activeToken = session.token;
+            prefetchRouteData(api, initialView);
+            await refreshBootstrap();
+            if (cancelled || sessionSource.read() !== activeToken) return;
             if (consumeFirstDeviceVisit()) {
               setView({ kind: "help" });
               window.history.replaceState(null, "", "/help");
@@ -426,7 +449,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       }
     })();
     return () => { cancelled = true; };
-  }, [api, sessionSource]);
+  }, [api, refreshBootstrap, sessionSource]);
 
   useEffect(() => () => realtime.close(), [realtime]);
 
@@ -438,6 +461,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       authenticated: false,
     });
     if (previousToken) await api.post("/api/auth/logout").catch(() => undefined);
+    api.beginSessionTransition();
     storeSession(result.data.token);
     realtime.reconnectIfSubscribed();
     await refreshBootstrap();
@@ -449,6 +473,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(async () => {
     if (sessionSource.read()) await api.post("/api/auth/logout").catch(() => undefined);
+    api.beginSessionTransition();
     realtime.close();
     storeSession(null);
     const session = await establishGuest();
@@ -462,17 +487,19 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
 
   const navigate = useCallback((next: AppView, options?: { replace?: boolean }) => {
     localStorage.removeItem(DEVICE_INTRO_AUTO_KEY);
+    preloadFeature(next.kind);
+    prefetchRouteData(api, next);
+    if (next.kind === "help") prefetchHelpDocument();
     const keepsWorkspace = next.kind === "conversation" && workspaceSidebar?.conversationId === next.conversationId;
     if (!keepsWorkspace) {
       setWorkspaceSidebarState(null);
-      setWorkspacePreviewTabs([]);
-      setActiveWorkspacePreviewTabId(null);
     }
+    hideFilePreview();
     setView(next);
     setSidebarOpen(false);
     const method = options?.replace ? "replaceState" : "pushState";
     window.history[method](null, "", routeFor(next));
-  }, [setSidebarOpen, setView, workspaceSidebar?.conversationId]);
+  }, [api, hideFilePreview, setSidebarOpen, setView, workspaceSidebar?.conversationId]);
 
   const value = useMemo<RuntimeValue>(() => ({
     api,
@@ -485,23 +512,18 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     sidebarOpen,
     rightRailOpen,
     workspaceSidebar,
-    workspacePreviewTabs,
-    activeWorkspacePreviewTabId,
+    ...filePreviews,
     toasts,
     navigate,
     setSidebarOpen,
     setRightRailOpen,
     setWorkspaceSidebar,
-    openWorkspacePreview,
-    selectWorkspacePreview,
-    closeWorkspacePreview,
-    closeWorkspacePreviews,
     refreshBootstrap,
     login: (username, password) => authenticate("login", username, password),
     register: (username, password) => authenticate("register", username, password),
     logout,
     notify,
-  }), [activeWorkspacePreviewTabId, api, authenticate, bootstrap, closeWorkspacePreview, closeWorkspacePreviews, error, loading, logout, navigate, notify, openWorkspacePreview, realtime, refreshBootstrap, rightRailOpen, selectWorkspacePreview, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspacePreviewTabs, workspaceSidebar]);
+  }), [api, authenticate, bootstrap, error, filePreviews, loading, logout, navigate, notify, realtime, refreshBootstrap, rightRailOpen, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspaceSidebar]);
 
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

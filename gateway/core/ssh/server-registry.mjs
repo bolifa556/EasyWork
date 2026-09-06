@@ -137,6 +137,32 @@ export class SshServerRegistry {
     }));
   }
 
+  async removeConversationBindings(conversationIds) {
+    invariant(Array.isArray(conversationIds), "CONVERSATION_IDS_INVALID", "对话 ID 列表无效", { status: 400 });
+    const targets = new Set(conversationIds.map((value) => String(value || "")).filter(Boolean));
+    if (!targets.size) return Object.freeze({ removedConversationIds: [], removedCount: 0 });
+    const repository = this.#repository();
+    for (;;) {
+      const current = await repository.read();
+      const removed = [...new Set(Object.values(current.data.bindings)
+        .flat()
+        .filter((conversationId) => targets.has(conversationId)))];
+      if (!removed.length) return Object.freeze({ removedConversationIds: [], removedCount: 0 });
+      const removedSet = new Set(removed);
+      try {
+        await repository.update((data) => {
+          for (const serverId of Object.keys(data.bindings)) {
+            data.bindings[serverId] = data.bindings[serverId].filter((conversationId) => !removedSet.has(conversationId));
+          }
+          data.disabledBindings = (data.disabledBindings || []).filter((conversationId) => !removedSet.has(conversationId));
+        }, { expectedRevision: current.revision, clock: () => clockDate(this.clock) });
+        return Object.freeze({ removedConversationIds: removed, removedCount: removed.length });
+      } catch (error) {
+        if (error?.code !== "REVISION_CONFLICT") throw error;
+      }
+    }
+  }
+
   async revealCredential(serverId) {
     const id = validateServerId(serverId);
     const { profile } = await this.get(id);

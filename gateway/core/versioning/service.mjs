@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { invariant } from "../errors.mjs";
+import { withVersionScope, inVersionScope, versionScopeEpoch, bumpVersionScopeEpoch, versionScopeKey } from "./publication-gate.mjs";
 import {
   WORKSPACE_MODES,
   assertServerIdentity,
@@ -437,6 +438,8 @@ export class VersioningService {
   #registryCache = new Map();
   #materializationCache = new Map();
   #lineageCache = new Map();
+  #scopeEpochs = new Map();
+  #pendingRecovery = new Set();
 
   constructor(dependencies) {
     assertVersioningDependencies(dependencies);
@@ -518,6 +521,10 @@ export class VersioningService {
 
   async getDomain(input) {
     const locator = normalizeLocator(input);
+    return this.#withScope(locator, () => this.#getDomain(locator), false);
+  }
+
+  async #getDomain(locator) {
     const cacheKey = this.#domainCacheKey(locator);
     const cached = this.#domainCache.get(cacheKey);
     if (cached) return clone(cached);
@@ -945,6 +952,7 @@ export class VersioningService {
           const conflict = conflicts.length === 1 ? conflicts[0] : { code: "VERSION_SWITCH_BATCH_CONFLICT", message: "至少一个路径无法安全切换，所有文件均保持不变", paths: conflicts };
           return { applied: false, conflict, results: assessments.map((assessment, index) => ({ applied: false, conflict: assessment.conflict || conflict, duplicate: assessment.duplicate, targetCheckpoint: clone(assessment.target), state: clone(states[index]) })) };
         }
+        return this.#withDurableUndo(requests, states, assessments.map((entry) => entry.operations), async () => {
         const applied = [];
         try {
           for (let index = 0; index < assessments.length; index += 1) {
@@ -981,6 +989,7 @@ export class VersioningService {
           results.push({ applied: true, conflict: null, duplicate: assessment.duplicate, targetCheckpoint: clone(assessment.target), state: clone(state) });
         }
         return { applied: true, conflict: null, results };
+        });
       });
     });
   }
@@ -1066,6 +1075,7 @@ export class VersioningService {
             })),
           };
         }
+        return this.#withDurableUndo(requests, states, assessments.map((entry) => entry.plan.operations), async () => {
         const applied = [];
         try {
           for (let index = 0; index < assessments.length; index += 1) {
@@ -1109,6 +1119,7 @@ export class VersioningService {
           results.push({ applied: true, conflict: null, duplicate: false, plan: assessment.plan, rewind: clone(rewind), state: clone(state) });
         }
         return { applied: true, conflict: null, results };
+        });
       });
     });
   }
@@ -1420,6 +1431,84 @@ export class VersioningService {
   }
 
   async #withLock(key, operation) {
+    const scope = /^(?:ledger|materialization|registry|path):(.+):(ssh_[A-Za-z0-9_-]{43})(?::.*)?$/.exec(key);
+    return scope ? this.#withScope({ actorId: scope[1], serverIdentity: scope[2] }, () => this.#withLocalLock(key, operation)) : this.#withLocalLock(key, operation);
+  }
+
+  async #withScope(scope, operation, mutating = true) {
+    if (inVersionScope(scope)) return operation();
+    return withVersionScope(scope, async () => {
+      const key = versionScopeKey(scope);
+      if (this.#scopeEpochs.get(key) !== versionScopeEpoch(scope) || this.#pendingRecovery.has(key)) {
+        this.invalidateRemoteState();
+        await this.#recoverUndo(scope);
+      }
+      try { return await operation(); }
+      finally { this.#scopeEpochs.set(key, mutating ? bumpVersionScopeEpoch(scope) : versionScopeEpoch(scope)); }
+    });
+  }
+
+  #undoPath(scope) { return `${this.baseRoot}/${scope.actorId}/${scope.serverIdentity}/mutation-undo.json`; }
+
+  async #withDurableUndo(requests, states, operations, operation) {
+    const scope = requests[0].locator;
+    invariant(requests.every((request) => request.locator.actorId === scope.actorId && request.locator.serverIdentity === scope.serverIdentity), "VERSION_BATCH_SCOPE_MISMATCH", "原子版本操作必须属于同一用户和服务器", { status: 400 });
+    if (!operations.some((items) => items?.length)) return operation();
+    for (let index = 0; index < operations.length; index += 1) {
+      const captured = await this.remoteFs.capturePaths({ paths: operations[index].map((item) => item.path), objectsRoot: states[index].storage.objectsRoot });
+      for (let offset = 0; offset < captured.length; offset += 1) invariant(captured[offset].path === operations[index][offset].path && snapshotsEqual(captured[offset].snapshot, operations[index][offset].actual), "VERSION_PATH_CHANGED_DURING_ADMISSION", "版本切换准备期间文件发生变化", { status: 409 });
+    }
+    const file = this.#undoPath(scope);
+    const previous = await this.remoteFs.readJson(file);
+    invariant(!previous?.pending, "VERSION_RECOVERY_REQUIRED", "上次版本操作尚未恢复", { status: 409 });
+    const layout = storageLayout({ baseRoot: this.baseRoot, ...scope });
+    const materializations = await this.remoteFs.readJson(layout.materializationsFile);
+    const journal = { schemaVersion: 1, revision: (previous?.revision ?? -1) + 1, pending: { requests: clone(requests), states: clone(states), operations: clone(operations), materializations } };
+    await this.remoteFs.writeJsonAtomic(file, journal, { expectedRevision: previous?.revision ?? null });
+    try {
+      const result = await operation();
+      await this.remoteFs.writeJsonAtomic(file, { ...journal, revision: journal.revision + 1, pending: null }, { expectedRevision: journal.revision });
+      return result;
+    } catch (error) {
+      // Recovery includes every domain in the batch, including domains whose
+      // receipt was already durable when a later index write failed.
+      this.#scopeEpochs.delete(versionScopeKey(scope));
+      try { await this.#recoverUndo(scope); }
+      catch (recoveryError) { this.#pendingRecovery.add(versionScopeKey(scope)); error.recoveryError = recoveryError; }
+      throw error;
+    }
+  }
+
+  async #recoverUndo(scope) {
+    const file = this.#undoPath(scope);
+    const journal = await this.remoteFs.readJson(file);
+    if (!journal?.pending) return;
+    invariant(journal.schemaVersion === 1 && Number.isSafeInteger(journal.revision), "VERSION_RECOVERY_INVALID", "版本恢复日志无效", { status: 500 });
+    const pending = journal.pending;
+    for (let index = pending.states.length - 1; index >= 0; index -= 1) {
+      const locator = normalizeLocator(pending.requests[index].locator);
+      invariant(locator.actorId === scope.actorId && locator.serverIdentity === scope.serverIdentity, "VERSION_RECOVERY_SCOPE_INVALID", "版本恢复日志越界", { status: 500 });
+      const state = validateDomainState(pending.states[index], locator);
+      for (const operation of [...pending.operations[index]].reverse()) {
+        const actual = await this.remoteFs.fingerprintPath({ path: assertVersionedAbsolutePath(operation.path) });
+        invariant(snapshotsEqual(actual, operation.actual) || snapshotsEqual(actual, operation.desired), "VERSION_RECOVERY_PATH_CONFLICT", "恢复期间发现额外文件修改，已保留恢复日志", { status: 409 });
+        if (!snapshotsEqual(actual, operation.actual)) await this.remoteFs.restoreSnapshot({ path: operation.path, snapshot: operation.actual, objectsRoot: state.storage.objectsRoot });
+      }
+      const layout = storageLayout({ baseRoot: this.baseRoot, ...locator });
+      const current = await this.remoteFs.readJson(layout.stateFile);
+      await this.remoteFs.writeJsonAtomic(layout.stateFile, { ...state, revision: (current?.revision ?? state.revision) + 1, updatedAt: isoTime(this.clock) }, { expectedRevision: current?.revision ?? null });
+    }
+    const locator = pending.requests[0].locator;
+    const layout = storageLayout({ baseRoot: this.baseRoot, ...locator });
+    const current = await this.remoteFs.readJson(layout.materializationsFile);
+    const before = validateMaterializations(pending.materializations, locator);
+    if (current || pending.materializations) await this.remoteFs.writeJsonAtomic(layout.materializationsFile, { ...before, revision: (current?.revision ?? 0) + 1, updatedAt: isoTime(this.clock) }, { expectedRevision: current?.revision ?? null });
+    await this.remoteFs.writeJsonAtomic(file, { ...journal, revision: journal.revision + 1, pending: null }, { expectedRevision: journal.revision });
+    this.invalidateRemoteState();
+    this.#pendingRecovery.delete(versionScopeKey(scope));
+  }
+
+  async #withLocalLock(key, operation) {
     const previous = this.#locks.get(key) || Promise.resolve();
     let release;
     const current = new Promise((resolve) => { release = resolve; });

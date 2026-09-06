@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { timelineReplayView } from "../../../shared/timeline-projection.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +29,7 @@ import { FileTaskStore } from "../orchestrator/persistence.mjs";
 import { RealtimeSocketServer } from "../realtime-socket.mjs";
 import { SshCredentialVault, SshServerRegistry, Ssh2TransportFactory, SshWorkerPool } from "../ssh/index.mjs";
 import { SkillMarketplaceService } from "../skills/index.mjs";
+import { SkillDistributionService } from "../skills/distribution.mjs";
 import { OpenAIChatModel } from "../web-agent/openai-model.mjs";
 import { DynamicSshPolicy } from "./adapters.mjs";
 import { loadOrCreateRuntimeSecrets } from "./secrets.mjs";
@@ -192,8 +194,11 @@ export class EasyWorkRuntime {
   async #initialize() {
     this.auth = new AuthDeviceService({ ...this.authOptions, dataRoot: this.dataRoot, sessionSecret: this.secrets.sessionSecret, clock: this.clock });
     this.prompts = new PromptRepository({ promptRoot: this.promptRoot });
-    this.skillMarketplace = new SkillMarketplaceService({ dataRoot: this.dataRoot, clock: this.clock, queue: this.queue, prompts: this.prompts });
+    this.skillMarketplace = new SkillMarketplaceService({ dataRoot: this.dataRoot, clock: this.clock, queue: this.queue, prompts: this.prompts, onDeployment: (id) => this.skillDistribution.reconcile(id) });
+    this.skillDistribution = new SkillDistributionService({ dataRoot: this.dataRoot, clock: this.clock, marketplace: this.skillMarketplace, auth: this.auth });
     await this.skillMarketplace.ensureBuiltins();
+    await this.skillMarketplace.cleanupStorage({ dryRun: false });
+    await this.skillDistribution.reconcile();
     this.platform = new PlatformConfigurationService({ dataRoot: this.dataRoot, masterSecret: this.secrets.masterSecret, clock: this.clock, queue: this.queue });
     this.providers = new ProviderService({
       dataRoot: this.dataRoot,
@@ -471,9 +476,10 @@ export class EasyWorkRuntime {
       auth: this.auth,
       servicesForActor: (actor) => this.servicesForActor(actor),
       allowedOrigins: this.allowedOrigins,
-      bootstrap: (request) => request.services.bootstrap(request.session),
+      bootstrap: (request) => request.services.bootstrap(request.session, { conversationId: request.query.conversationId }),
       logout: (request) => this.logoutSession(request),
       auditSession: async ({ action, result, request }) => {
+        if (action === "auth.registered") await this.skillDistribution.installForActor(result.actor);
         // Authentication must never wait for the Actor service container. That
         // Actor service initialization may reconcile persisted SSH state and
         // detached tasks, and a slow remote server must not block login.
@@ -593,6 +599,7 @@ export class EasyWorkRuntime {
       brokerForActor: async (actor) => (await this.servicesForActor(actor)).broker,
       authorizeTopic: async ({ actor, topic }) => {
         const services = await this.servicesForActor(actor);
+        if (topic === `conversations:${actor.actorId}`) return topic;
         if (topic.startsWith("conversation:")) {
           await services.baseConversations.getConversation(topic.slice("conversation:".length));
           return topic;
@@ -607,6 +614,10 @@ export class EasyWorkRuntime {
         if (topic.startsWith("terminal:")) {
           const visible = [...services.remoteBundles.values()].some((entry) => entry.backend?.terminal?.ownsTopic?.(topic));
           invariant(visible, "REALTIME_TOPIC_FORBIDDEN", "无权订阅该终端会话", { status: 403 });
+          return topic;
+        }
+        if (topic.startsWith("scheduler:")) {
+          await services.servers.get(topic.slice("scheduler:".length));
           return topic;
         }
         invariant(false, "REALTIME_TOPIC_FORBIDDEN", "无权订阅该 topic", { status: 403 });
@@ -633,6 +644,15 @@ export class EasyWorkRuntime {
       conversationId: request.params.id,
       commandId: commandId(request),
     }));
+    router.route("POST", "/api/conversations/:id/startup-failure", (request) => {
+      const body = strictBody(request.body, ["messageId", "failure"], "记录工作启动失败");
+      return request.services.interactions.recordStartupFailure({
+        conversationId: request.params.id,
+        messageId: body.messageId,
+        failure: body.failure,
+        commandId: commandId(request),
+      });
+    });
     router.route("POST", "/api/conversations/:id/interrupt", (request) => request.services.interactions.interruptConversation(request.params.id, { commandId: commandId(request) }));
     router.route("GET", "/api/conversations/:id/runs/:runId", async (request) => {
       await request.services.conversations.getConversation(request.params.id);
@@ -640,10 +660,19 @@ export class EasyWorkRuntime {
     });
     router.route("GET", "/api/conversations/:id/events", async (request) => {
       await request.services.conversations.getConversation(request.params.id);
-      return request.services.interactions.events(request.params.id, {
+      return timelineReplayView(await request.services.interactions.events(request.params.id, {
         afterSequence: request.query.after ? Number(request.query.after) : 0,
         limit: request.query.limit ? Number(request.query.limit) : 2_000,
-      });
+      }), request.query.view);
+    });
+    router.route("POST", "/api/conversations/:id/events/details", async (request) => {
+      await request.services.conversations.getConversation(request.params.id);
+      return request.services.broker.details(`conversation:${request.params.id}`, strictBody(request.body, ["eventIds"], "读取事件详情").eventIds);
+    });
+    router.route("GET", "/api/conversations/:id/events/details", async (request) => {
+      await request.services.conversations.getConversation(request.params.id);
+      strictQuery(request.query, ["ids"], "读取事件详情");
+      return request.services.broker.details(`conversation:${request.params.id}`, String(request.query.ids || "").split(","));
     });
     router.route("GET", "/api/conversations/:id/context", (request) => request.services.conversationContext.get(request.params.id));
     router.route("PATCH", "/api/conversations/:id/context", (request) => request.services.conversationContext.update(request.params.id, {
@@ -721,7 +750,7 @@ export class EasyWorkRuntime {
       expectedRevision: expectedRevision(request),
     }));
 
-    router.route("GET", "/api/help", () => this.helpDocument());
+    router.route("GET", "/api/help", () => this.helpDocument(), { auth: false });
 
     router.route("GET", "/api/servers/:id/capabilities", async (request) => ({ data: await request.services.serverCapabilities.get(request.params.id) }));
     router.route("POST", "/api/servers/:id/capabilities/refresh", async (request) => ({ data: await request.services.serverCapabilities.get(request.params.id, { refresh: true }) }));
@@ -835,6 +864,41 @@ export class EasyWorkRuntime {
       const body = requiredObject(request.body, "手动添加 Agent");
       return (await request.services.agentDeploymentFor(request.params.id)).registerUserDeployment(request.params.agentId, { root: body.root });
     });
+    router.route("POST", "/api/servers/:id/agents/:agentId/readiness", async (request) => {
+      const body = strictBody(request.body || {}, ["configScope", "source"], "检查 Agent");
+      invariant(body.source == null || ["managed", "user"].includes(body.source), "AGENT_CONFIG_SOURCE_INVALID", "Agent 配置来源无效", { status: 400 });
+      const deployment = await request.services.agentDeploymentFor(request.params.id);
+      const runtimeStatus = await deployment.resolveRuntime(request.params.agentId, { source: body.source || null });
+      const backend = await request.services.remoteBackend(request.params.id);
+      invariant(typeof backend.agentConfiguration?.inspect === "function", "AGENT_CONFIG_READ_UNAVAILABLE", "远端 backend 未提供 Agent 配置读取能力", { status: 503 });
+      const configuration = await backend.agentConfiguration.inspect(request.params.agentId, {
+        source: runtimeStatus.source,
+        configScope: body.configScope || "default",
+      });
+      const model = String(configuration?.values?.model || "").trim();
+      invariant(!runtimeStatus.managed || model, "AGENT_MODEL_NOT_CONFIGURED", `${runtimeStatus.displayName} 尚未选择模型`, {
+        status: 409,
+        details: { agentId: request.params.agentId },
+      });
+      const protocolReadiness = typeof backend.agentTransport?.checkReadiness === "function"
+        ? await backend.agentTransport.checkReadiness(request.params.agentId, {
+            source: runtimeStatus.source,
+            configScope: body.configScope || "default",
+          })
+        : null;
+      return {
+        ready: true,
+        agentId: request.params.agentId,
+        displayName: runtimeStatus.displayName,
+        source: runtimeStatus.source,
+        managed: runtimeStatus.managed,
+        model: model || null,
+        configScope: configuration.configScope,
+        inherited: configuration.inherited === true,
+        configurationRevision: configuration.revision,
+        protocol: protocolReadiness?.protocol || null,
+      };
+    });
     router.route("GET", "/api/servers/:id/agents/:agentId/update", async (request) => (await request.services.agentDeploymentFor(request.params.id)).checkUpdate(request.params.agentId));
     for (const [route, method] of [["install", "install"], ["update", "install"], ["uninstall", "uninstall"]]) {
       router.route("POST", `/api/servers/:id/agents/:agentId/${route}`, async (request) => (await request.services.agentDeploymentFor(request.params.id))[method](request.params.agentId, requiredObject(request.body || {}, `Agent ${route}`)));
@@ -877,10 +941,20 @@ export class EasyWorkRuntime {
 
     router.route("GET", "/api/tasks/:id/events", async (request) => {
       await request.services.orchestrator.getTask(request.params.id);
-      return request.services.broker.replay(taskTopic(request.params.id), {
+      return timelineReplayView(await request.services.broker.replay(taskTopic(request.params.id), {
         afterSequence: request.query.after ? Number(request.query.after) : 0,
         limit: request.query.limit ? Number(request.query.limit) : 2_000,
-      });
+      }), request.query.view);
+    });
+
+    router.route("POST", "/api/tasks/:id/events/details", async (request) => {
+      await request.services.orchestrator.getTask(request.params.id);
+      return request.services.broker.details(taskTopic(request.params.id), strictBody(request.body, ["eventIds"], "读取事件详情").eventIds);
+    });
+    router.route("GET", "/api/tasks/:id/events/details", async (request) => {
+      await request.services.orchestrator.getTask(request.params.id);
+      strictQuery(request.query, ["ids"], "读取事件详情");
+      return request.services.broker.details(taskTopic(request.params.id), String(request.query.ids || "").split(","));
     });
 
     router.route("GET", "/api/servers/:id/workspaces/:workspaceId/files", async (request) => {
@@ -1004,7 +1078,10 @@ export class EasyWorkRuntime {
       const output = await (await request.services.schedulerFor(request.params.id)).jobOutput({ jobId: request.params.jobId, stream: request.query.stream, offset: request.query.offset && Number(request.query.offset), maxBytes: request.query.maxBytes && Number(request.query.maxBytes) });
       return { ...output, bytesBase64: output.bytes.toString("base64"), bytes: undefined };
     });
-    router.route("POST", "/api/servers/:id/scheduler/jobs", async (request) => (await request.services.schedulerFor(request.params.id)).submit({ ...requiredObject(request.body, "提交作业"), commandId: commandId(request) }));
+    router.route("POST", "/api/servers/:id/scheduler/jobs", (request) => {
+      const body = strictBody(request.body, ["workspaceId", "conversationId", "branchId", "partition", "scriptPath", "args"], "提交作业");
+      return request.services.submitSchedulerJob(request.params.id, { ...body, commandId: commandId(request) });
+    });
     router.route("POST", "/api/servers/:id/scheduler/jobs/:jobId/cancel", async (request) => (await request.services.schedulerFor(request.params.id)).cancelJob({ jobId: request.params.jobId, commandId: commandId(request) }));
   }
 

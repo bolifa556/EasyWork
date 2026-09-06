@@ -9,18 +9,33 @@ import {
 import { renderSemanticContext } from "./tools.mjs";
 
 const DEFAULT_LIMITS = Object.freeze({
-  maxIterations: 96,
-  maxToolCalls: 128,
-  maxWallTimeMs: 30 * 60_000,
+  maxIterations: Infinity,
+  maxToolCalls: Infinity,
+  maxWallTimeMs: null,
+  workModelTimeoutMs: 60_000,
+  chatModelTimeoutMs: 5 * 60_000,
   toolTimeoutMs: 35_000,
   maxInputTokens: 160_000,
-  maxOutputTokens: 32_000,
+  maxOutputTokens: null,
 });
 
 function combineSignals(...signals) {
   const active = signals.filter(Boolean);
   if (active.length === 1) return active[0];
   return AbortSignal.any(active);
+}
+
+function idleTimeout(milliseconds) {
+  const controller = new AbortController();
+  let timer;
+  const refresh = () => {
+    clearTimeout(timer);
+    if (controller.signal.aborted) return;
+    timer = setTimeout(() => controller.abort(new DOMException("Model response stalled", "TimeoutError")), milliseconds);
+    timer.unref?.();
+  };
+  refresh();
+  return { signal: controller.signal, refresh, dispose: () => clearTimeout(timer) };
 }
 
 function normalizedModelResult(value = {}) {
@@ -183,13 +198,29 @@ function addCandidate(pool, value, { required = false } = {}) {
   return pool.get(candidateId);
 }
 
-async function workToolResult(fragments, rendered, prompts, presentation) {
-  if (!fragments.length) return rendered || await prompts.webToolResult("emptyResult");
+async function workToolResult(fragments, rendered, prompts, presentation, suffix = "") {
+  if (!fragments.length) return [rendered || await prompts.webToolResult("emptyResult"), suffix].filter(Boolean).join(presentation.sectionSeparator);
   const blocks = await Promise.all(fragments.map((fragment) => prompts.webToolResult("candidateItem", {
     CANDIDATE_ID: fragment.candidateId,
     CONTENT: fragment.rendered || fragment.knowledge?.content || "",
   })));
-  return blocks.filter(Boolean).join(presentation.sectionSeparator);
+  return [...blocks.filter(Boolean), String(suffix || "").trim()].filter(Boolean).join(presentation.sectionSeparator);
+}
+
+async function rewrittenHandoffCandidate(fragment, revisedContent, prompts, presentation) {
+  const content = String(revisedContent || "").replace(/\r\n/g, "\n").trim();
+  const title = String(fragment?.reference?.name || "").trim();
+  const memory = String(fragment?.knowledge?.key || "").startsWith("memory:");
+  const presented = memory
+    ? { memory: [{ ...(title ? { title } : {}), content }] }
+    : { conversation: [{ role: "message", content }] };
+  return {
+    ...structuredClone(fragment),
+    rendered: normalizedHandoff(await renderSemanticContext(presented, prompts), presentation.truncationSuffix),
+    presented,
+    knowledge: { ...structuredClone(fragment.knowledge), content },
+    rewritten: true,
+  };
 }
 
 const MAX_HANDOFF_CHARACTERS = 48_000;
@@ -283,6 +314,7 @@ async function handoffPresentation(fragments, prompts, presentation) {
       : String(fragment?.knowledge?.content || "").trim();
     const knownIndex = referenceIndexes.get(key);
     if (knownIndex !== undefined) {
+      if (fragment?.rewritten) references[knownIndex].edited = true;
       if (detail) {
         const current = String(references[knownIndex].detail || "").trim();
         if (!current) references[knownIndex].detail = detail;
@@ -291,7 +323,7 @@ async function handoffPresentation(fragments, prompts, presentation) {
       continue;
     }
     referenceIndexes.set(key, references.length);
-    references.push({ kind, name, ...(detail ? { detail } : {}) });
+    references.push({ kind, name, ...(detail ? { detail } : {}), ...(fragment?.rewritten ? { edited: true } : {}) });
   }
   const skills = [];
   const seenSkills = new Set();
@@ -344,7 +376,9 @@ export class WebAgentRuntime {
     skipModel = false,
   }) {
     if (!['chat', 'work'].includes(mode)) throw new TypeError("Unknown Web Agent mode");
-    const runTimeout = AbortSignal.timeout(this.limits.maxWallTimeMs);
+    const runTimeout = Number.isFinite(this.limits.maxWallTimeMs) && this.limits.maxWallTimeMs > 0
+      ? AbortSignal.timeout(this.limits.maxWallTimeMs)
+      : null;
     const runSignal = combineSignals(signal, runTimeout);
     const emit = async (kind, payload = {}) => {
       await this.eventSink({
@@ -363,6 +397,7 @@ export class WebAgentRuntime {
     let usage = null;
     const discardedReasoningIterations = new Set();
     const candidatePool = new Map();
+    const candidateOverrides = new Map();
     const requiredHandoffPool = new Map();
     const toolCache = new Map();
     const filterObservations = async (fragments) => {
@@ -390,7 +425,7 @@ export class WebAgentRuntime {
         for (const entry of candidatePool.values()) {
           if (entry.required || requested.has(entry.candidateId)) addCandidate(selectedPool, entry, { required: entry.required });
         }
-        const selected = [...selectedPool.values()];
+        const selected = [...selectedPool.values()].map((entry) => candidateOverrides.get(entry.candidateId) || entry);
         const collected = await handoffPresentation(selected, this.prompts, presentation);
         const acceptedFragments = typeof handoffFilter === "function"
           ? await handoffFilter(collected.fragments.map((entry) => structuredClone(entry)))
@@ -425,8 +460,17 @@ export class WebAgentRuntime {
       if (mode === "work" && skipModel) {
         return completeWork(0);
       }
-      const availableTools = this.tools.definitions(mode);
-      const availableToolNames = new Set(availableTools.map((tool) => String(tool.name || "")).filter(Boolean));
+      let availableTools = this.tools.definitions(mode);
+      if (mode === "work") {
+        const canDiscoverRewritableCandidate = availableTools.some((tool) => ["memory_search", "conversation_reference_read"].includes(tool.name));
+        const hasRewritableCandidate = [...candidatePool.values()].some((candidate) => (
+          String(candidate?.knowledge?.key || "").startsWith("memory:")
+          || String(candidate?.toolName || "") === "conversation_reference_read"
+        ));
+        if (!canDiscoverRewritableCandidate && !hasRewritableCandidate) {
+          availableTools = availableTools.filter((tool) => tool.name !== "handoff_rewrite_candidate");
+        }
+      }
       const onlySubmitAvailable = mode === "work"
         && availableTools.length === 1
         && availableTools[0].name === "handoff_submit";
@@ -448,25 +492,34 @@ export class WebAgentRuntime {
         ...(observedContext ? [{ role: "system", content: observedContext }] : []),
         { role: "user", content: currentRequest },
       ];
-      let forceSubmit = false;
+      let continuationGuidanceAdded = false;
       for (let iteration = 0; iteration < this.limits.maxIterations; iteration += 1) {
         runSignal.throwIfAborted();
-        const forcedSubmitAttempt = mode === "work" && forceSubmit;
+        const iterationTools = availableTools;
+        const availableToolNames = new Set(iterationTools.map((tool) => String(tool.name || "")).filter(Boolean));
         let streamedContent = "";
         let streamedReasoning = "";
         let streamedOutput = false;
         const segmentId = `${runId}:output:${iteration}`;
-        const rawResult = await this.model.complete({
+        const modelTimeout = idleTimeout(mode === "work"
+          ? this.limits.workModelTimeoutMs
+          : this.limits.chatModelTimeoutMs);
+        const modelSignal = combineSignals(runSignal, modelTimeout.signal);
+        let rawResult;
+        try {
+          rawResult = await this.model.complete({
               mode,
               messages,
-              tools: availableTools,
-              ...(mode === "work" ? { toolChoice: forceSubmit || onlySubmitAvailable ? "handoff_submit" : "required" } : {}),
+              tools: iterationTools,
+              ...(mode === "work" ? { toolChoice: onlySubmitAvailable ? "handoff_submit" : "required" } : {}),
               limits: {
                 maxInputTokens: this.limits.maxInputTokens,
                 maxOutputTokens: this.limits.maxOutputTokens,
               },
-              signal: runSignal,
+              signal: modelSignal,
+              onActivity: modelTimeout.refresh,
               onDelta: async (delta) => {
+                if (delta.content) modelTimeout.refresh();
                 if (delta.kind === "reasoning" && delta.content) {
                   streamedReasoning += delta.content;
                   await emit("run.reasoning.delta", { content: delta.content, iteration });
@@ -486,6 +539,19 @@ export class WebAgentRuntime {
                 }
               },
             });
+        } catch (error) {
+          if (modelTimeout.signal.aborted && !runSignal.aborted) {
+            const timeout = new Error(mode === "work"
+              ? "网页 Agent 模型响应超时，请重试"
+              : "模型响应超时，请重试");
+            timeout.code = "MODEL_RESPONSE_TIMEOUT";
+            timeout.retryable = true;
+            throw timeout;
+          }
+          throw error;
+        } finally {
+          modelTimeout.dispose();
+        }
         const result = normalizedModelResult(rawResult);
         usage = result.usage || usage;
         const nextReasoning = streamedReasoning || result.reasoning;
@@ -518,14 +584,16 @@ export class WebAgentRuntime {
         }
         if (!result.toolCalls.length) {
           if (mode === "work") {
-            if (forceSubmit) {
-              // A provider can ignore even a named tool choice. Selection is
-              // advisory: required fragments still travel, while unselected
-              // observations stay local and the original user request can
-              // continue to the remote Agent without a fabricated answer.
-              return completeWork(iteration + 1, []);
+            // Keep the current investigation and its tools. A prose response
+            // does not prove that retrieval is complete, so it must not force
+            // an empty handoff or replay the request with only submit enabled.
+            if (nextContent || nextReasoning) {
+              messages.push({ role: "assistant", content: nextContent || nextReasoning });
             }
-            forceSubmit = true;
+            if (!continuationGuidanceAdded) {
+              messages.push({ role: "system", content: await this.prompts.webToolResult("workContinue") });
+              continuationGuidanceAdded = true;
+            }
             continue;
           } else {
             if (nextContent) finalContent += nextContent;
@@ -550,35 +618,13 @@ export class WebAgentRuntime {
           toolCalls: result.toolCalls,
         });
         const supplementalModelMessages = [];
-        const hasTerminalCalls = result.toolCalls.some((call) => this.tools.resolve(call.name, mode)?.terminal === true);
         const hasNonTerminalCalls = result.toolCalls.some((call) => this.tools.resolve(call.name, mode)?.terminal !== true);
-        if (mode === "work" && hasTerminalCalls && hasNonTerminalCalls) {
-          // Work selection is an atomic state transition: a model must either
-          // inspect more material or submit the candidates it already has. A
-          // provider that serializes both choices into one batch must not make
-          // the speculative reads observable before its submit decision wins.
-          // Answer every tool call to keep the provider protocol balanced,
-          // then narrow the retry to the terminal operation.
-          for (const call of result.toolCalls) {
-            toolCallCount += 1;
-            if (toolCallCount > this.limits.maxToolCalls) throw new Error("Web Agent exceeded tool-call budget");
-            messages.push({
-              role: "tool",
-              toolCallId: call.id,
-              name: call.name,
-              content: await this.prompts.webToolResult("candidateMixed"),
-            });
-          }
-          forceSubmit = true;
-          continue;
-        }
-        let terminalArgumentsFailed = false;
         let submittedCandidateIds = null;
         for (const call of result.toolCalls) {
           runSignal.throwIfAborted();
           toolCallCount += 1;
           if (toolCallCount > this.limits.maxToolCalls) throw new Error("Web Agent exceeded tool-call budget");
-          const tool = this.tools.resolve(call.name, mode);
+          const tool = availableToolNames.has(call.name) ? this.tools.resolve(call.name, mode) : null;
           if (!tool) {
             // A model can occasionally hallucinate an unavailable tool name.
             // Treat that as a recoverable tool result so it can correct itself
@@ -605,10 +651,6 @@ export class WebAgentRuntime {
               name: call.name,
               content: await this.prompts.webToolResult("failedResult", { ERROR_MESSAGE: message }),
             });
-            if (mode === "work" && tool.terminal) {
-              terminalArgumentsFailed = true;
-              forceSubmit = true;
-            }
             continue;
           }
           let input;
@@ -631,13 +673,14 @@ export class WebAgentRuntime {
           }
           if (tool.terminal) {
             if (hasNonTerminalCalls) {
+              // Execute the reads/rewrites in this batch, then let the model
+              // select from their results in a later, separate submit call.
               messages.push({
                 role: "tool",
                 toolCallId: call.id,
                 name: call.name,
                 content: await this.prompts.webToolResult("candidateMixed"),
               });
-              forceSubmit = true;
               continue;
             }
             const unknown = input.candidateIds.filter((candidateId) => !candidatePool.has(candidateId));
@@ -648,11 +691,34 @@ export class WebAgentRuntime {
                 name: call.name,
                 content: await this.prompts.webToolResult("candidateUnknown", { CANDIDATE_IDS: unknown.join("、") }),
               });
-              forceSubmit = true;
               continue;
             }
             submittedCandidateIds = input.candidateIds;
             messages.push({ role: "tool", toolCallId: call.id, name: call.name, content: "" });
+            continue;
+          }
+          if (call.name === "handoff_rewrite_candidate") {
+            const candidate = candidatePool.get(input.candidateId);
+            const rewritable = candidate && (
+              String(candidate?.knowledge?.key || "").startsWith("memory:")
+              || String(candidate?.toolName || "") === "conversation_reference_read"
+            );
+            if (!rewritable) {
+              messages.push({
+                role: "tool",
+                toolCallId: call.id,
+                name: call.name,
+                content: await this.prompts.webToolResult("candidateRewriteUnknown", { CANDIDATE_ID: input.candidateId }),
+              });
+              continue;
+            }
+            candidateOverrides.set(input.candidateId, await rewrittenHandoffCandidate(candidate, input.revisedContent, this.prompts, presentation));
+            messages.push({
+              role: "tool",
+              toolCallId: call.id,
+              name: call.name,
+              content: await this.prompts.webToolResult("candidateRewritten", { CANDIDATE_ID: input.candidateId }),
+            });
             continue;
           }
           const idempotencyKey = `${runId}:${call.id}`;
@@ -661,7 +727,7 @@ export class WebAgentRuntime {
             const cacheKey = `${call.name}\0${stableJson(input)}`;
             const cached = toolCache.get(cacheKey);
             if (cached) {
-              messages.push({ role: "tool", toolCallId: call.id, name: call.name, content: cached.content });
+              messages.push({ role: "tool", toolCallId: call.id, name: call.name, content: await this.prompts.webToolResult("alreadyQueried") });
               continue;
             }
             const rawOutput = await tool.execute({ actor, scope, input, idempotencyKey, signal: toolSignal });
@@ -673,7 +739,10 @@ export class WebAgentRuntime {
             const output = pruned?.output ?? rawOutput;
             let allObserved = Boolean(pruned?.allObserved);
             const presented = tool.present({ input, output });
-            const rendered = normalizedHandoff(await tool.render(presented), presentation.truncationSuffix);
+            const renderedSource = await tool.render(presented);
+            const rendered = tool.handoff
+              ? normalizedHandoff(renderedSource, presentation.truncationSuffix)
+              : String(renderedSource || "").trim();
             const observed = [];
             const resultCandidates = [];
             let observationsFiltered = false;
@@ -716,10 +785,16 @@ export class WebAgentRuntime {
             if (observed.length && typeof observationSink === "function") {
               await observationSink(observed.map((entry) => structuredClone(entry)));
             }
+            // Deduplicating source text must not discard its continuation
+            // cursor. A search hit can equal the first page of a longer read;
+            // the raw response still tells the model how to reach later pages.
+            const modelSuffix = mode === "work" || allObserved
+              ? await tool.modelSuffix({ input, output: rawOutput, presented })
+              : "";
             const content = allObserved
-              ? await this.prompts.webToolResult("alreadyObserved")
+              ? [await this.prompts.webToolResult("alreadyObserved"), modelSuffix].filter(Boolean).join(presentation.sectionSeparator)
               : mode === "work"
-                ? await workToolResult(resultCandidates, rendered, this.prompts, presentation)
+                ? await workToolResult(resultCandidates, rendered, this.prompts, presentation, modelSuffix)
                 : rendered || await this.prompts.webToolResult("emptyResult");
             messages.push({ role: "tool", toolCallId: call.id, name: call.name, content });
             const modelMessages = allObserved ? [] : await tool.modelMessages({ input, output, presented });
@@ -748,15 +823,8 @@ export class WebAgentRuntime {
         }
         messages.push(...supplementalModelMessages);
         if (mode === "work" && submittedCandidateIds !== null) return completeWork(iteration + 1, submittedCandidateIds);
-        if (mode === "work" && terminalArgumentsFailed && forcedSubmitAttempt && !hasNonTerminalCalls) {
-          // The provider failed both the ordinary required-tool request and a
-          // named handoff_submit retry. Keep only required fragments and let
-          // the original user request proceed instead of failing the turn.
-          return completeWork(iteration + 1, []);
-        }
-        if (mode === "work" && !hasNonTerminalCalls) forceSubmit = true;
       }
-      if (mode === "work") return completeWork(this.limits.maxIterations, []);
+      if (mode === "work") throw Object.assign(new Error("网页 Agent 未在规定轮次内完成资料选择，请重试"), { code: "WEB_HANDOFF_PROTOCOL_FAILED", retryable: true });
       throw new Error("Web Agent exceeded iteration budget");
     } catch (error) {
       if (runSignal.aborted) {

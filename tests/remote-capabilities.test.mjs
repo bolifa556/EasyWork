@@ -77,6 +77,13 @@ function memoryRemote() {
     async upload(localPath, remotePath) { uploads.push({ localPath, remotePath }); ensureParents(remotePath); files.set(remotePath, await fs.readFile(localPath)); },
     async exec(command) {
       commands.push(command);
+      const publication = /mv -T -- '([^']+)' '([^']+)'/.exec(command);
+      if (publication) {
+        for (const [candidate, bytes] of [...files]) if (candidate.startsWith(`${publication[1]}/`)) {
+          files.set(`${publication[2]}${candidate.slice(publication[1].length)}`, bytes);
+          files.delete(candidate);
+        }
+      }
       if (command.includes("printf '%s' \"$HOME\"")) return { code: 0, stdout: "/home/alice", stderr: "" };
       if (command.startsWith("readlink -f --")) {
         const candidate = command.slice("readlink -f --".length).trim().replace(/^'|'$/g, "");
@@ -508,14 +515,19 @@ test("skill deployment uploads immutable actor files only to ~/.easywork/skills 
     agentSkillRefs: [],
   };
   const refs = await deployment.ensure(plan);
-  assert.deepEqual(refs, [{ skillId: "check", version: "1.0", sha256: digest, remotePath: "/home/alice/.easywork/skills/check/1.0" }]);
+  const actorKey = cryptoHash(Buffer.from(`${currentActor.actorType}:${currentActor.actorId}`));
+  const remotePath = `/home/alice/.easywork/skills/packages/${actorKey}/${digest}`;
+  assert.deepEqual(refs, [{ skillId: "check", version: "1.0", sha256: digest, remotePath, entrypoint: `${remotePath}/SKILL.md` }]);
   assert.equal(remote.uploads.length, 1);
-  assert.equal(remote.files.get("/home/alice/.easywork/skills/check/1.0/SKILL.md").toString(), content.toString());
+  assert.equal(remote.files.get(`${remotePath}/SKILL.md`).toString(), content.toString());
   await deployment.ensure(plan);
   assert.equal(remote.uploads.length, 1, "verified remote hash makes deployment idempotent");
   const inspected = await deployment.inspect();
   assert.equal(inspected.items[0].actorId, "alice");
   assert.equal(inspected.items[0].status, "up-to-date");
+  remote.files.set(`${remotePath}/SKILL.md`, Buffer.from("changed"));
+  await assert.rejects(() => deployment.ensure(plan), { code: "REMOTE_SKILL_CACHE_CORRUPT" });
+  assert.equal(remote.files.get(`${remotePath}/SKILL.md`).toString(), "changed", "corrupt immutable packages are rejected rather than overwritten");
   await assert.rejects(() => deployment.ensure({ ...plan, actorId: "mallory" }), (error) => error?.code === "REMOTE_SKILL_PLAN_SCOPE_MISMATCH");
 });
 

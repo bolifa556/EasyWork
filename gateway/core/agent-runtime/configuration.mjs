@@ -120,6 +120,7 @@ export class ManagedAgentConfiguration {
     this.materializations = new Map();
     this.snapshots = new Map();
     this.runtimeValuesCache = new Map();
+    this.inheritedScopes = new Set();
   }
 
   #mutate(key, worker) {
@@ -142,6 +143,7 @@ export class ManagedAgentConfiguration {
   }
 
   #rememberConfiguration(agentId, scope, installation, document, path, inherited = false) {
+    const key = snapshotKey(agentId, scope);
     const configuration = Object.freeze({
       agentId,
       configScope: scope,
@@ -155,8 +157,10 @@ export class ManagedAgentConfiguration {
       fields: structuredClone(schemaFor(agentId)),
       values: structuredClone(document.values),
     });
-    this.snapshots.set(snapshotKey(agentId, scope), structuredClone(configuration));
-    this.runtimeValuesCache.set(snapshotKey(agentId, scope), structuredClone(document.values));
+    this.snapshots.set(key, structuredClone(configuration));
+    this.runtimeValuesCache.set(key, structuredClone(document.values));
+    if (inherited) this.inheritedScopes.add(key);
+    else this.inheritedScopes.delete(key);
     return configuration;
   }
 
@@ -187,7 +191,7 @@ export class ManagedAgentConfiguration {
 
     const installation = await this.deploymentService.status(agentId, { source: input.source || null });
     invariant(installation.installed, "AGENT_NOT_INSTALLED", `${installation.displayName} 未安装`, { status: 409 });
-    const { document, path, paths } = await this.#read(agentId, configScope);
+    const { document, path, paths, inherited } = await this.#read(agentId, configScope);
     const currentValue = String(document.values[field] || "");
     if (currentValue === appliedEffort || currentValue !== configuredValue) {
       return Object.freeze({
@@ -196,7 +200,7 @@ export class ManagedAgentConfiguration {
         requestedEffort,
         appliedEffort,
         currentValue,
-        configuration: this.#rememberConfiguration(agentId, configScope, installation, document, path, false),
+        configuration: this.#rememberConfiguration(agentId, configScope, installation, document, path, inherited),
       });
     }
 
@@ -209,7 +213,16 @@ export class ManagedAgentConfiguration {
     };
     await this.#prepare(paths);
     await this.executor.writeAtomic(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    this.runtimeValuesCache.set(snapshotKey(agentId, configScope), structuredClone(next.values));
+    const writtenKey = snapshotKey(agentId, configScope);
+    this.runtimeValuesCache.set(writtenKey, structuredClone(next.values));
+    this.inheritedScopes.delete(writtenKey);
+    if (configScope === "default") {
+      for (const inheritedKey of [...this.inheritedScopes]) {
+        if (!inheritedKey.endsWith(`\0${agentId}`)) continue;
+        this.runtimeValuesCache.delete(inheritedKey);
+        this.snapshots.delete(inheritedKey);
+      }
+    }
     return Object.freeze({
       changed: true,
       field,
@@ -234,7 +247,16 @@ export class ManagedAgentConfiguration {
     const next = { schemaVersion: CONFIG_SCHEMA_VERSION, agentId, revision: document.revision + 1, values: { ...document.values, ...patch }, updatedAt: new Date(this.clock()).toISOString() };
     await this.#prepare(paths);
     await this.executor.writeAtomic(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    this.runtimeValuesCache.set(snapshotKey(agentId, configScope), structuredClone(next.values));
+    const writtenKey = snapshotKey(agentId, configScope);
+    this.runtimeValuesCache.set(writtenKey, structuredClone(next.values));
+    this.inheritedScopes.delete(writtenKey);
+    if (configScope === "default") {
+      for (const inheritedKey of [...this.inheritedScopes]) {
+        if (!inheritedKey.endsWith(`\0${agentId}`)) continue;
+        this.runtimeValuesCache.delete(inheritedKey);
+        this.snapshots.delete(inheritedKey);
+      }
+    }
     return this.inspect(agentId, { source: installation.source, configScope });
   }
 
@@ -245,8 +267,10 @@ export class ManagedAgentConfiguration {
     const key = snapshotKey(agentId, scope);
     const cached = this.runtimeValuesCache.get(key);
     if (cached) return structuredClone(cached);
-    const { document } = await this.#read(agentId, scope);
+    const { document, inherited } = await this.#read(agentId, scope);
     this.runtimeValuesCache.set(key, structuredClone(document.values));
+    if (inherited) this.inheritedScopes.add(key);
+    else this.inheritedScopes.delete(key);
     return structuredClone(document.values);
   }
 
@@ -320,9 +344,15 @@ export class ManagedAgentConfiguration {
 
   async #read(agentId, configScope = "default") {
     const home = await this.executor.home();
-    const paths = remoteAgentConfigurationPaths(home, agentId, this.actorId, scopeOf(configScope));
+    const scope = scopeOf(configScope);
+    const paths = remoteAgentConfigurationPaths(home, agentId, this.actorId, scope);
     const scoped = await this.#readDocument(paths.configurationFile, agentId);
     if (scoped) return { document: scoped, path: paths.configurationFile, paths, inherited: false };
+    if (scope !== "default") {
+      const defaults = remoteAgentConfigurationPaths(home, agentId, this.actorId, "default");
+      const inherited = await this.#readDocument(defaults.configurationFile, agentId);
+      if (inherited) return { document: inherited, path: paths.configurationFile, paths, inherited: true };
+    }
     return {
       document: normalizeDocument(agentId, null),
       path: paths.configurationFile,

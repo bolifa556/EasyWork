@@ -102,7 +102,7 @@ export class OpenAIChatModel {
     this.systemMessageSeparator = systemMessageSeparator;
   }
 
-  async complete({ messages, tools = [], toolChoice, limits, signal, onDelta }) {
+  async complete({ messages, tools = [], toolChoice, limits = {}, signal, onDelta, onActivity }) {
     const response = await this.fetchImpl(this.url, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.apiKey}` },
@@ -113,7 +113,9 @@ export class OpenAIChatModel {
         tool_choice: openAiToolChoice(toolChoice, tools),
         stream: true,
         stream_options: { include_usage: true },
-        max_tokens: limits.maxOutputTokens,
+        ...(Number.isFinite(limits.maxOutputTokens) && limits.maxOutputTokens > 0
+          ? { max_tokens: limits.maxOutputTokens }
+          : {}),
         ...(this.temperature === null ? {} : { temperature: this.temperature }),
       }),
       signal,
@@ -132,6 +134,7 @@ export class OpenAIChatModel {
       const delta = payload.choices?.[0]?.delta || {};
       const contentDelta = delta.content || "";
       const reasoningDelta = delta.reasoning_content || delta.reasoning || "";
+      if (contentDelta || reasoningDelta || delta.tool_calls?.length) await onActivity?.();
       if (contentDelta) { content += contentDelta; await onDelta?.({ kind: "content", content: contentDelta }); }
       if (reasoningDelta) { reasoning += reasoningDelta; await onDelta?.({ kind: "reasoning", content: reasoningDelta }); }
       for (const [index, tool] of (delta.tool_calls || []).entries()) mergeToolDelta(toolDeltas, tool, tool.index ?? index);

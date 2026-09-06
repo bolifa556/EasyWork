@@ -1,13 +1,15 @@
 "use client";
 
-import { Suspense, lazy, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { Suspense, lazy, useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import {
   ArrowLeft,
   ChevronRight,
   CircleUserRound,
+  Copy,
   FileStack,
   Folder,
+  FolderX,
   FolderOpen,
   HelpCircle,
   Home,
@@ -30,23 +32,24 @@ import {
 import type { ConversationSummary, Page, ProjectSummary } from "@/app/core/contracts";
 import { commandId } from "@/app/core/gateway/client";
 import { useAppRuntime } from "../runtime/AppRuntime";
-import { announceConversationsChanged } from "../runtime/cacheEvents";
+import { announceConversationsChanged, subscribeConversationsChanged } from "../runtime/cacheEvents";
 import { LoadingState } from "../ui/LoadingState";
 import { FeatureErrorBoundary } from "../ui/FeatureErrorBoundary";
 import { AccountDialog } from "./AccountDialog";
+import { ConversationCopyMenu, type ConversationCopyMode } from "./ConversationCopyMenu";
+import { SlidingMenuPages, type ConversationMenuPage } from "./SlidingMenuPages";
+import { conversationReferenceClipboard } from "../features/conversation/conversation-reference";
+import { copyLink, copyTextWhenReady } from "../ui/clipboard";
 import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
-import { WorkspaceSidebar } from "../features/workspace/WorkspaceSidebar";
+import { useMobileMenuAnchor } from "../ui/useMobileMenuAnchor";
+import { bindMobileDrawers, type DrawerSide } from "./mobile-drawers";
+import { bindMobileViewport } from "./mobile-viewport";
+import { loadConversationView, loadLibraryView, loadSkillsView, loadHelpView, loadAdminView, loadServerManager, loadProjectView } from "../runtime/feature-loaders";
 import styles from "./AppShell.module.css";
 
-const loadConversationView = () => import("../features/conversation/ConversationView");
-const loadLibraryView = () => import("../features/library/LibraryView");
-const loadSkillsView = () => import("../features/skills/SkillsView");
-const loadHelpView = () => import("../features/help/HelpView");
-const loadAdminView = () => import("../features/admin/AdminView");
-const loadServerManager = () => import("../features/servers/ServerManager");
-const loadProjectView = () => import("../features/projects/ProjectView");
-
+const WorkspaceSidebar = lazy(() => import("../features/workspace/WorkspaceSidebar").then((module) => ({ default: module.WorkspaceSidebar })));
+const FilePreviewPanel = lazy(() => import("../features/viewers/FilePreviewPanel"));
 const ConversationView = lazy(loadConversationView);
 const LibraryView = lazy(loadLibraryView);
 const SkillsView = lazy(loadSkillsView);
@@ -60,18 +63,50 @@ function warmFeature(loader: () => Promise<unknown>) {
 }
 
 type ShellMenu =
-  | { kind: "conversation"; item: ConversationSummary; left: number; top: number; page: "main" | "projects"; trigger: HTMLButtonElement }
+  | { kind: "conversation"; item: ConversationSummary; left: number; top: number; page: ConversationMenuPage; trigger: HTMLButtonElement }
   | { kind: "project"; item: ProjectSummary; left: number; top: number; trigger: HTMLButtonElement };
+type ShellMenuInput =
+  | Omit<Extract<ShellMenu, { kind: "conversation" }>, "left" | "top" | "trigger">
+  | Omit<Extract<ShellMenu, { kind: "project" }>, "left" | "top" | "trigger">;
 
 type ConversationRename = { item: ConversationSummary; value: string; saving: boolean };
 type ProjectRename = { item: ProjectSummary; value: string; saving: boolean };
-type PendingProjectDelete = { item: ProjectSummary; idempotencyKey: string };
+type ProjectDeleteChoice = "project-only" | "project-and-conversations";
+type PendingProjectDelete = {
+  item: ProjectSummary;
+  projectOnlyCommandId: string;
+  withConversationsCommandId: string;
+};
+type ProjectDeleteResult = {
+  movedConversationIds?: string[];
+  deletedConversationIds?: string[];
+};
 type ProjectConversationPage = {
   items: ConversationSummary[];
   nextCursor: string | null;
   loaded: boolean;
   loading: boolean;
   error: string | null;
+};
+
+type ConversationSearchHit = {
+  conversationId: string;
+  title: string;
+  projectId: string | null;
+  mode: "chat" | "work";
+  updatedAt: string;
+  titleMatched: boolean;
+  matches: Array<{
+    messageId: string;
+    role: "user" | "assistant";
+    createdAt: string;
+    excerpt: { before: string; match: string; after: string };
+  }>;
+};
+
+type ConversationSearchPage = {
+  items: ConversationSearchHit[];
+  nextCursor: string | null;
 };
 
 const SIDEBAR_DEFAULT_WIDTH = 252;
@@ -116,6 +151,8 @@ function ScrollingTitle({ title }: { title: string }) {
 
 export function AppShell() {
   const runtime = useAppRuntime();
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => setHydrated(true), []);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [resizingSidebar, setResizingSidebar] = useState(false);
@@ -129,16 +166,21 @@ export function AppShell() {
   const [standaloneChatsCache, setStandaloneChatsCache] = useState<{ key: string; items: ConversationSummary[] } | null>(null);
   const [loadingAllChatsKey, setLoadingAllChatsKey] = useState<string | null>(null);
   const [projectConversationCache, setProjectConversationCache] = useState<{ key: string; pages: Record<string, ProjectConversationPage> }>({ key: "", pages: {} });
-  const [searchConversationCache, setSearchConversationCache] = useState<{ key: string; items: ConversationSummary[]; loading: boolean; error: string | null }>({ key: "", items: [], loading: false, error: null });
+  const [conversationCacheGeneration, setConversationCacheGeneration] = useState(0);
+  const [searchConversationCache, setSearchConversationCache] = useState<{ key: string; items: ConversationSearchHit[]; nextCursor: string | null; loading: boolean; error: string | null }>({ key: "", items: [], nextCursor: null, loading: false, error: null });
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [menu, setMenu] = useState<ShellMenu | null>(null);
+  const [copyingConversation, setCopyingConversation] = useState<ConversationCopyMode | null>(null);
+  const copyInFlight = useRef(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  useMobileMenuAnchor(menu?.trigger, menuRef);
   const [conversationRename, setConversationRename] = useState<ConversationRename | null>(null);
   const [conversationPendingDelete, setConversationPendingDelete] = useState<ConversationSummary | null>(null);
   const [deletingConversation, setDeletingConversation] = useState(false);
   const [projectRename, setProjectRename] = useState<ProjectRename | null>(null);
   const [projectPendingDelete, setProjectPendingDelete] = useState<PendingProjectDelete | null>(null);
-  const [deletingProject, setDeletingProject] = useState(false);
+  const [deletingProject, setDeletingProject] = useState<ProjectDeleteChoice | null>(null);
   const [projectDialog, setProjectDialog] = useState<{ conversationId?: string } | null>(null);
   const [projectName, setProjectName] = useState("");
   const [projectMemoryMode, setProjectMemoryMode] = useState<"project-only" | "global">("project-only");
@@ -147,6 +189,21 @@ export function AppShell() {
   const renameInFlight = useRef(false);
   const renameCancelled = useRef(false);
   const shellRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => bindMobileViewport(window), []);
+  const mobileDrawers = useRef<ReturnType<typeof bindMobileDrawers> | null>(null);
+  const mobileDrawerReady = !runtime.loading && Boolean(runtime.bootstrap) && !runtime.error;
+  const getDrawerState = useEffectEvent(() => ({ left: runtime.sidebarOpen, right: runtime.rightRailOpen && runtime.view.kind === "conversation" && !runtime.filePreviewVisible, allowRight: runtime.view.kind === "conversation" && !runtime.filePreviewVisible, disabled: runtime.filePreviewVisible }));
+  const setDrawerOpen = useEffectEvent((side: DrawerSide, open: boolean) => {
+    if (side === "left") runtime.setSidebarOpen(open);
+    else runtime.setRightRailOpen(open);
+  });
+  useEffect(() => {
+    if (!shellRef.current || !mobileDrawerReady) return;
+    const controller = bindMobileDrawers(shellRef.current, { getState: () => getDrawerState(), setOpen: (side, open) => setDrawerOpen(side, open) });
+    mobileDrawers.current = controller;
+    return () => { controller.dispose(); mobileDrawers.current = null; };
+  }, [mobileDrawerReady]);
+  useLayoutEffect(() => { mobileDrawers.current?.sync(); }, [runtime.sidebarOpen, runtime.rightRailOpen, runtime.view, runtime.filePreviewVisible]);
   const sidebarResizeCleanup = useRef<(() => void) | null>(null);
   const renamingConversationId = conversationRename?.item.id ?? null;
   const renameSaving = conversationRename?.saving ?? false;
@@ -157,17 +214,29 @@ export function AppShell() {
   const bootstrapReady = Boolean(runtime.bootstrap);
   const actorId = runtime.bootstrap?.actor.id;
   const actorIsAdmin = Boolean(runtime.bootstrap?.actor.roles.includes("admin"));
-  const bootstrapConversationKey = `${actorId || "guest"}:${runtime.bootstrap?.conversationCursor || "end"}:${conversations.map((item) => `${item.id}:${item.revision}`).join(",")}:${projects.map((project) => `${project.id}:${project.revision}:${project.conversationCount}`).join(",")}`;
+  const activeConversationId = runtime.view.kind === "conversation" ? runtime.view.conversationId : null;
+  const navigation = runtime.bootstrap?.conversationNavigation?.conversationId === activeConversationId ? runtime.bootstrap.conversationNavigation : null;
+  const activeConversation = navigation?.conversation ?? null;
+  const activeProjectId = activeConversation?.projectId ?? (runtime.view.kind === "project" ? runtime.view.projectId : null);
+  const expansionKey = actorId || "guest";
+  const bootstrapConversationKey = `${actorId || "guest"}:${conversationCacheGeneration}:${runtime.bootstrap?.conversationCursor || "end"}:${conversations.map((item) => `${item.id}:${item.revision}`).join(",")}:${projects.map((project) => `${project.id}:${project.revision}:${project.conversationCount}`).join(",")}:${navigation?.projectConversations?.items.map((item) => `${item.id}:${item.revision}`).join(",") || ""}`;
   const searchConversationKey = `${bootstrapConversationKey}\n${normalizedQuery}`;
-  const expandedProjects = expandedProjectsCache.key === bootstrapConversationKey ? expandedProjectsCache.items : EMPTY_PROJECT_IDS;
-  const expandedProjectLists = expandedProjectListsCache.key === bootstrapConversationKey ? expandedProjectListsCache.items : EMPTY_PROJECT_IDS;
+  const expandedProjects = expandedProjectsCache.key === expansionKey ? expandedProjectsCache.items : new Set(activeProjectId ? [activeProjectId] : []);
+  const expandedProjectLists = expandedProjectListsCache.key === expansionKey ? expandedProjectListsCache.items : EMPTY_PROJECT_IDS;
   const showAllChats = showAllChatsCache.key === bootstrapConversationKey && showAllChatsCache.value;
   const allStandaloneChats = standaloneChatsCache?.key === bootstrapConversationKey ? standaloneChatsCache.items : null;
   const loadingAllChats = loadingAllChatsKey === bootstrapConversationKey;
-  const projectConversationPages = projectConversationCache.key === bootstrapConversationKey ? projectConversationCache.pages : EMPTY_PROJECT_PAGES;
-  const searchConversations = searchConversationCache.key === searchConversationKey ? searchConversationCache.items : [];
+  const projectConversationPages = useMemo(() => {
+    const page = navigation?.projectConversations;
+    const seed: Record<string, ProjectConversationPage> = page ? {
+      [page.projectId]: { items: page.items, nextCursor: page.nextCursor, loaded: true, loading: false, error: null },
+    } : {};
+    return { ...seed, ...(projectConversationCache.key === bootstrapConversationKey ? projectConversationCache.pages : EMPTY_PROJECT_PAGES) };
+  }, [navigation, projectConversationCache, bootstrapConversationKey]);
+  const searchResults = searchConversationCache.key === searchConversationKey ? searchConversationCache.items : [];
   const searchLoading = Boolean(normalizedQuery) && (searchConversationCache.key !== searchConversationKey || searchConversationCache.loading);
   const searchError = searchConversationCache.key === searchConversationKey ? searchConversationCache.error : null;
+  const searchConversations: ConversationSummary[] = [];
   const standaloneSource = normalizedQuery
     ? searchConversations.filter((item) => !item.projectId)
     : showAllChats && allStandaloneChats ? allStandaloneChats : conversations.slice(0, INITIAL_CHAT_LIMIT);
@@ -176,42 +245,44 @@ export function AppShell() {
     project.id,
     normalizedQuery
       ? searchConversations.filter((item) => item.projectId === project.id)
-      : projectConversationPages[project.id]?.items ?? [],
+      : mergeConversationPages(projectConversationPages[project.id]?.items, activeConversation?.projectId === project.id ? [activeConversation] : []),
   ]));
   const knownConversations = mergeConversationPages(
     conversations,
     allStandaloneChats,
     searchConversations,
     ...Object.values(projectConversationPages).map((page) => page.items),
+    activeConversation ? [activeConversation] : [],
   );
   const visibleProjects = projects.filter((project) => !normalizedQuery
     || project.name.toLocaleLowerCase("zh-CN").includes(normalizedQuery)
     || (grouped.get(project.id) ?? []).some((item) => item.title.toLocaleLowerCase("zh-CN").includes(normalizedQuery)));
-  const displayedProjects = showAllProjects || normalizedQuery ? visibleProjects : visibleProjects.slice(0, 4);
+  const displayedProjects = showAllProjects || normalizedQuery ? visibleProjects : visibleProjects.filter((project, index) => index < 4 || project.id === activeProjectId);
+
+  useEffect(() => {
+    if (!activeProjectId) return;
+    setProjectsOpen(true);
+    setExpandedProjectsCache((cache) => ({ key: expansionKey, items: new Set([...(cache.key === expansionKey ? cache.items : []), activeProjectId]) }));
+  }, [expansionKey, activeConversationId, activeProjectId]);
 
   useEffect(() => () => sidebarResizeCleanup.current?.(), []);
+
+  useEffect(() => subscribeConversationsChanged((detail) => {
+    if (detail.kind === "renamed") setConversationCacheGeneration((current) => current + 1);
+    setSearchConversationCache((current) => ({ ...current, key: "" }));
+    void runtime.refreshBootstrap().catch(() => undefined);
+  }), [runtime]);
 
   useEffect(() => {
     if (!normalizedQuery) return undefined;
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      setSearchConversationCache({ key: searchConversationKey, items: [], loading: true, error: null });
+      setSearchConversationCache({ key: searchConversationKey, items: [], nextCursor: null, loading: true, error: null });
       void (async () => {
-        const items: ConversationSummary[] = [];
-        const visitedCursors = new Set<string>();
-        let cursor: string | null = null;
-        do {
-          const params = new URLSearchParams({ limit: "100" });
-          if (cursor) params.set("cursor", cursor);
-          const result = await runtime.api.get<Page<ConversationSummary>>(`/api/conversations?${params}`, controller.signal);
-          items.push(...result.data.items);
-          const nextCursor = result.data.nextCursor ?? null;
-          if (nextCursor && visitedCursors.has(nextCursor)) break;
-          if (nextCursor) visitedCursors.add(nextCursor);
-          cursor = nextCursor;
-        } while (cursor && !controller.signal.aborted);
+        const params = new URLSearchParams({ query: normalizedQuery, limit: "20", messageLimit: "12" });
+        const result = await runtime.api.get<ConversationSearchPage>(`/api/conversation-search?${params}`, controller.signal);
         if (!controller.signal.aborted) setSearchConversationCache((current) => current.key === searchConversationKey
-          ? { ...current, items: mergeConversationPages(items) }
+          ? { ...current, items: result.data.items, nextCursor: result.data.nextCursor }
           : current);
       })().catch((reason) => {
         if (!controller.signal.aborted) setSearchConversationCache((current) => current.key === searchConversationKey
@@ -226,9 +297,31 @@ export function AppShell() {
     return () => { controller.abort(); window.clearTimeout(timer); };
   }, [normalizedQuery, runtime.api, searchConversationKey]);
 
+  const loadMoreSearchResults = async () => {
+    if (!normalizedQuery || searchConversationCache.key !== searchConversationKey || !searchConversationCache.nextCursor || searchConversationCache.loading) return;
+    setSearchConversationCache((current) => ({ ...current, loading: true, error: null }));
+    try {
+      const params = new URLSearchParams({ query: normalizedQuery, limit: "20", messageLimit: "12", cursor: searchConversationCache.nextCursor });
+      const result = await runtime.api.get<ConversationSearchPage>(`/api/conversation-search?${params}`);
+      setSearchConversationCache((current) => current.key === searchConversationKey ? {
+        ...current,
+        items: [...current.items, ...result.data.items.filter((item) => !current.items.some((known) => known.conversationId === item.conversationId))],
+        nextCursor: result.data.nextCursor,
+        loading: false,
+      } : current);
+    } catch (reason) {
+      setSearchConversationCache((current) => current.key === searchConversationKey ? { ...current, loading: false, error: reason instanceof Error ? reason.message : "无法搜索对话" } : current);
+    }
+  };
+
+  const openSearchResult = (conversationId: string, messageId?: string) => {
+    runtime.navigate({ kind: "conversation", conversationId, ...(messageId ? { messageId } : {}) });
+    runtime.setSidebarOpen(false);
+  };
+
   useEffect(() => {
     if (runtime.loading || !bootstrapReady) return undefined;
-    const queue: Array<() => Promise<unknown>> = [loadLibraryView, loadSkillsView, loadServerManager, loadHelpView, loadProjectView];
+    const queue: Array<() => Promise<unknown>> = [loadConversationView, loadLibraryView, loadSkillsView, loadServerManager, loadHelpView, loadProjectView];
     if (actorIsAdmin) queue.push(loadAdminView);
     let cancelled = false;
     let timer: number | null = null;
@@ -291,12 +384,12 @@ export function AppShell() {
     }
   };
 
-  const loadProjectConversations = async (projectId: string, loadAll = false) => {
+  const loadProjectConversations = useCallback(async (projectId: string, loadAll = false) => {
     const current = projectConversationPages[projectId];
     if (current?.loading) return false;
     if (current?.loaded && (!loadAll || !current.nextCursor)) return true;
     setProjectConversationCache((cache) => {
-      const pages = cache.key === bootstrapConversationKey ? cache.pages : EMPTY_PROJECT_PAGES;
+      const pages = cache.key === bootstrapConversationKey ? cache.pages : projectConversationPages;
       return {
         key: bootstrapConversationKey,
         pages: {
@@ -356,22 +449,31 @@ export function AppShell() {
       }));
       return false;
     }
-  };
+  }, [projectConversationPages, bootstrapConversationKey, runtime.api]);
+
+  useEffect(() => {
+    if (!runtime.bootstrap) return;
+    for (const projectId of expandedProjects) {
+      const page = projectConversationPages[projectId];
+      const loadAll = expandedProjectLists.has(projectId);
+      if (!page?.loading && !page?.error && (!page?.loaded || loadAll && page.nextCursor)) void loadProjectConversations(projectId, loadAll);
+    }
+  }, [expandedProjects, expandedProjectLists, projectConversationPages, loadProjectConversations, runtime.bootstrap]);
 
   const toggleProjectConversationList = async (projectId: string, showAll: boolean) => {
     if (showAll) {
       setExpandedProjectListsCache((cache) => {
-        const next = new Set(cache.key === bootstrapConversationKey ? cache.items : EMPTY_PROJECT_IDS);
+        const next = new Set(cache.key === expansionKey ? cache.items : EMPTY_PROJECT_IDS);
         next.delete(projectId);
-        return { key: bootstrapConversationKey, items: next };
+        return { key: expansionKey, items: next };
       });
       return;
     }
     if (await loadProjectConversations(projectId, true)) {
       setExpandedProjectListsCache((cache) => {
-        const next = new Set(cache.key === bootstrapConversationKey ? cache.items : EMPTY_PROJECT_IDS);
+        const next = new Set(cache.key === expansionKey ? cache.items : EMPTY_PROJECT_IDS);
         next.add(projectId);
-        return { key: bootstrapConversationKey, items: next };
+        return { key: expansionKey, items: next };
       });
     }
   };
@@ -431,7 +533,8 @@ export function AppShell() {
     const focusFirst = window.requestAnimationFrame(() => {
       const root = document.querySelector<HTMLElement>(`[data-shell-menu="${menu.kind}"]`);
       root?.querySelectorAll("button").forEach((button) => button.setAttribute("role", "menuitem"));
-      root?.querySelector<HTMLButtonElement>("button:not([disabled])")?.focus();
+      const active = root?.querySelector<HTMLElement>('[data-menu-page][aria-hidden="false"]') ?? root;
+      active?.querySelector<HTMLButtonElement>("button:not([disabled])")?.focus({ preventScroll: true });
     });
     const close = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
@@ -488,15 +591,24 @@ export function AppShell() {
     setProjectDialog({ conversationId });
   };
 
-  const openMenu = (event: ReactMouseEvent<HTMLButtonElement>, next: Omit<ShellMenu, "left" | "top">) => {
+  const openMenu = (event: ReactMouseEvent<HTMLButtonElement>, next: ShellMenuInput) => {
     event.stopPropagation();
     const rect = event.currentTarget.getBoundingClientRect();
-    setMenu({ ...next, trigger: event.currentTarget, left: Math.max(10, Math.min(window.innerWidth - 210, rect.right + 5)), top: Math.max(10, Math.min(window.innerHeight - 290, rect.top)) } as ShellMenu);
+    setMenu({ ...next, trigger: event.currentTarget, left: Math.max(10, Math.min(window.innerWidth - (next.kind === "conversation" ? 266 : 210), rect.right + 5)), top: Math.max(10, Math.min(window.innerHeight - 320, rect.top)) } as ShellMenu);
   };
 
   const moveMenuFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (menu?.kind === "conversation" && menu.page !== "main" && ["ArrowLeft", "Escape"].includes(event.key)) {
+      event.preventDefault(); event.stopPropagation(); setMenu({ ...menu, page: "main" }); return;
+    }
+    if (event.key === "ArrowRight") {
+      const button = document.activeElement as HTMLButtonElement | null;
+      if (button?.dataset.submenu) { event.preventDefault(); button.click(); }
+      return;
+    }
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
-    const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not([disabled])')];
+    const active = event.currentTarget.querySelector<HTMLElement>('[data-menu-page][aria-hidden="false"]') ?? event.currentTarget;
+    const items = [...active.querySelectorAll<HTMLButtonElement>('button:not([disabled])')];
     if (!items.length) return;
     event.preventDefault();
     const current = Math.max(0, items.indexOf(document.activeElement as HTMLButtonElement));
@@ -520,6 +632,38 @@ export function AppShell() {
     setMenu(null);
     renameCancelled.current = false;
     setConversationRename({ item, value: item.title, saving: false });
+  };
+
+  const copyConversation = async (item: ConversationSummary, mode: ConversationCopyMode) => {
+    if (copyInFlight.current) return;
+    copyInFlight.current = true;
+    setCopyingConversation(mode);
+    const trigger = menu?.trigger;
+    const content = mode === "reference" ? null : (async () => {
+      const copy = await import("../features/conversation/conversation-copy.mjs");
+      const [snapshot, timeline] = await Promise.all([
+        copy.loadConversationCopy(runtime.api, item.id, mode === "all"),
+        mode === "all" ? import("../features/conversation/ConversationTimeline") : Promise.resolve(null),
+      ]);
+      return copy.conversationCopyMarkdown(snapshot, {
+        includeActivity: mode === "all",
+        activityMarkdown: timeline?.conversationTimelineMarkdown,
+        answerBody: (value: string) => copy.splitRemoteFinalPresentation(value).body,
+        origin: window.location.origin,
+      });
+    })();
+    try {
+      if (mode === "reference") await copyLink(conversationReferenceClipboard(item, window.location.origin));
+      else await copyTextWhenReady(content!);
+      setMenu((current) => current?.kind === "conversation" && current.item.id === item.id ? null : current);
+      if (trigger?.isConnected) trigger.focus();
+      runtime.notify("已复制", "success");
+    } catch (reason) {
+      runtime.notify(reason instanceof Error ? reason.message : "复制失败，请重试", "error");
+    } finally {
+      copyInFlight.current = false;
+      setCopyingConversation(null);
+    }
   };
 
   const saveConversationRename = async () => {
@@ -592,21 +736,24 @@ export function AppShell() {
     }
   };
 
-  const deleteProject = async () => {
+  const deleteProject = async (choice: ProjectDeleteChoice) => {
     const pending = projectPendingDelete;
     if (!pending || deletingProject) return;
-    setDeletingProject(true);
+    const deleteConversations = choice === "project-and-conversations";
+    setDeletingProject(choice);
     try {
-      await runtime.api.delete(`/api/projects/${encodeURIComponent(pending.item.id)}`, {
+      const result = await runtime.api.delete<ProjectDeleteResult>(`/api/projects/${encodeURIComponent(pending.item.id)}${deleteConversations ? "?conversationPolicy=delete" : ""}`, {
         expectedRevision: pending.item.revision,
-        idempotencyKey: pending.idempotencyKey,
+        idempotencyKey: deleteConversations ? pending.withConversationsCommandId : pending.projectOnlyCommandId,
       });
       setProjectPendingDelete(null);
       await runtime.refreshBootstrap();
-      if (runtime.view.kind === "project" && runtime.view.projectId === pending.item.id) runtime.navigate({ kind: "home" }, { replace: true });
-      runtime.notify("项目已删除", "success");
+      for (const conversationId of result.data.deletedConversationIds ?? []) announceConversationsChanged({ conversationId, kind: "deleted" });
+      const currentConversationDeleted = runtime.view.kind === "conversation" && (result.data.deletedConversationIds ?? []).includes(runtime.view.conversationId);
+      if ((runtime.view.kind === "project" && runtime.view.projectId === pending.item.id) || currentConversationDeleted) runtime.navigate({ kind: "home" }, { replace: true });
+      runtime.notify(deleteConversations ? "项目及其所有对话已删除" : "项目已删除，对话已保留", "success");
     } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "项目删除失败", "error"); }
-    finally { setDeletingProject(false); }
+    finally { setDeletingProject(null); }
   };
 
   const renderConversation = (conversation: ConversationSummary, nested = false) => {
@@ -637,7 +784,17 @@ export function AppShell() {
     </div>;
   };
 
-  if (runtime.loading) return <div className={styles.app}><aside className={styles.sidebar} /><main className={`${styles.main} ${styles.loading}`}><LoadingState /></main></div>;
+  if (runtime.loading) return <div className={styles.app}>
+    <aside className={styles.sidebar}><div className={styles.brand}><span data-ui-icon="" className={styles.mark}>E</span><span>EasyWork</span></div>
+      <nav className={styles.primaryNav} aria-label="功能导航">
+        <button className={styles.navItem} onClick={() => runtime.navigate({ kind: "home" })}><span data-ui-icon="" className={styles.navIcon}><Plus size={18} /></span>新对话</button>
+        <button className={styles.navItem} onClick={() => runtime.navigate({ kind: "library" })}><span data-ui-icon="" className={styles.navIcon}><FileStack size={17} /></span>文件库</button>
+        <button className={styles.navItem} onClick={() => runtime.navigate({ kind: "skills" })}><span data-ui-icon="" className={styles.navIcon}><Sparkles size={17} /></span>技能</button>
+        <button className={styles.navItem} onClick={() => runtime.navigate({ kind: "servers" })}><span data-ui-icon="" className={styles.navIcon}><Server size={17} /></span>远程服务器</button>
+        <button className={styles.navItem} onClick={() => runtime.navigate({ kind: "help" })}><span data-ui-icon="" className={styles.navIcon}><HelpCircle size={17} /></span>帮助</button>
+      </nav></aside>
+    <main className={styles.main}><Suspense fallback={<LoadingState />}>{hydrated && runtime.view.kind === "help" ? <HelpView /> : <LoadingState />}</Suspense></main>
+  </div>;
   if (runtime.error || !runtime.bootstrap) return <div className={styles.app}><main className={`${styles.main} ${styles.fatal}`}><h1>EasyWork 服务暂时不可用</h1><p>{runtime.error}</p><button onClick={() => window.location.reload()}>重新连接</button></main></div>;
   const actor = runtime.bootstrap.actor;
   const workspaceSidebarActive = runtime.view.kind === "conversation"
@@ -664,42 +821,58 @@ export function AppShell() {
       style={{ "--sidebar-current-width": `${sidebarCollapsed ? SIDEBAR_COLLAPSED_WIDTH : sidebarWidth}px` } as CSSProperties}
     >
       <button className={`${styles.scrim} ${runtime.sidebarOpen ? styles.open : ""}`} aria-label="关闭菜单" onClick={() => runtime.setSidebarOpen(false)} />
-      <aside className={`${styles.sidebar} ${runtime.sidebarOpen ? styles.open : ""}`}>
+      <aside data-mobile-drawer-panel="left" className={`${styles.sidebar} ${runtime.sidebarOpen ? styles.open : ""}`}>
         <div className={styles.collapsedRail}>
           <div className={styles.collapsedTop}>
             <button className={styles.openSidebarButton} aria-label="打开侧边栏" title="打开侧边栏" onClick={() => setDesktopSidebarCollapsed(false)}>
-              <span className={styles.collapsedMark}>E</span>
+              <span data-ui-icon="" className={styles.collapsedMark}>E</span>
               <PanelLeftOpen className={styles.openSidebarIcon} size={19} />
             </button>
             <button className={styles.collapsedAction} aria-label="新对话" title="新对话" onClick={() => runtime.navigate({ kind: "home" })}><SquarePen size={19} /></button>
           </div>
           <button className={styles.collapsedAccount} aria-label={actor.type === "user" ? actor.username : "登录或注册"} title={actor.type === "user" ? actor.username : "登录或注册"} onClick={() => setAccountOpen(true)}>
-            <span className={styles.avatar}>{actor.type === "user" ? actor.username.slice(0, 1).toUpperCase() : <CircleUserRound size={16} />}</span>
+            <span data-ui-icon="" className={styles.avatar}>{actor.type === "user" ? actor.username.slice(0, 1).toUpperCase() : <CircleUserRound size={16} />}</span>
           </button>
         </div>
         <div className={styles.expandedSidebar}>
-          <div className={styles.brand}>
-            <button className={styles.brandButton} onClick={() => runtime.navigate({ kind: "home" })}><span className={styles.mark}>E</span><span>EasyWork</span></button>
-            {workspaceSidebarActive ? <button className={styles.sidebarReturn} aria-label="返回对话界面" title="返回" onClick={() => { setDesktopSidebarCollapsed(false); runtime.setWorkspaceSidebar(null); runtime.closeWorkspacePreviews(workspaceSidebarActive.conversationId); }}><ArrowLeft size={18} /></button> : <button className={`${styles.search} ${searchOpen ? styles.searchActive : ""}`} aria-label="搜索" onClick={() => { setSearchOpen((value) => !value); if (searchOpen) setQuery(""); }}><Search size={18} /></button>}
+          <div className={styles.brand} data-mobile-fixed-gesture="">
+            <button className={styles.brandButton} onClick={() => runtime.navigate({ kind: "home" })}><span data-ui-icon="" className={styles.mark}>E</span><span>EasyWork</span></button>
+            {workspaceSidebarActive ? <button className={styles.sidebarReturn} aria-label="返回对话界面" title="返回" onClick={() => runtime.requestCloseFilePreviews(workspaceSidebarActive.conversationId, () => { setDesktopSidebarCollapsed(false); runtime.setWorkspaceSidebar(null); })}><ArrowLeft size={18} /></button> : <button className={`${styles.search} ${searchOpen ? styles.searchActive : ""}`} aria-label="搜索" onClick={() => { setSearchOpen((value) => !value); if (searchOpen) setQuery(""); }}><Search size={18} /></button>}
             <button className={styles.sidebarToggle} aria-label="关闭侧边栏" title="关闭侧边栏" onClick={() => setDesktopSidebarCollapsed(true)}><PanelLeftClose size={18} /></button>
           </div>
         {workspaceSidebarActive ? <>
-          <WorkspaceSidebar key={`${workspaceSidebarActive.serverId}:${workspaceSidebarActive.workspaceId}`} session={workspaceSidebarActive} />
+          <Suspense fallback={<LoadingState />}><WorkspaceSidebar key={`${workspaceSidebarActive.serverId}:${workspaceSidebarActive.workspaceId}`} session={workspaceSidebarActive} /></Suspense>
           <footer className={styles.footer}>
-            {actor.roles.includes("admin") ? <button className={`${styles.footerItem} ${runtime.view.kind === "admin" ? styles.active : ""}`} onClick={() => runtime.navigate({ kind: "admin" })}><span className={styles.navIcon}><Settings2 size={17} /></span>管理员面板</button> : null}
-            <button className={styles.footerItem} onClick={() => setAccountOpen(true)}><span className={styles.avatar}>{actor.type === "user" ? actor.username.slice(0, 1).toUpperCase() : <CircleUserRound size={16} />}</span><span className={styles.treeLabel}>{actor.type === "user" ? actor.username : "登录或注册"}</span></button>
+            {actor.roles.includes("admin") ? <button className={`${styles.footerItem} ${runtime.view.kind === "admin" ? styles.active : ""}`} onClick={() => runtime.navigate({ kind: "admin" })}><span data-ui-icon="" className={styles.navIcon}><Settings2 size={17} /></span>管理员面板</button> : null}
+            <button className={styles.footerItem} onClick={() => setAccountOpen(true)}><span data-ui-icon="" className={styles.avatar}>{actor.type === "user" ? actor.username.slice(0, 1).toUpperCase() : <CircleUserRound size={16} />}</span><span className={styles.treeLabel}>{actor.type === "user" ? actor.username : "登录或注册"}</span></button>
           </footer>
         </> : <>
-        <nav className={styles.fixedNav} aria-label="快捷操作">
-          <button className={`${styles.navItem} ${runtime.view.kind === "home" ? styles.active : ""}`} onClick={() => runtime.navigate({ kind: "home" })}><span className={styles.navIcon}><Plus size={18} /></span>新对话</button>
-          {searchOpen ? <div className={styles.searchBox}><span className={styles.navIcon}><Search size={17} /></span><input autoFocus aria-label="搜索项目和对话" placeholder="搜索项目和对话" value={query} onChange={(event) => setQuery(event.target.value)} /></div> : null}
+        <nav className={styles.fixedNav} data-mobile-fixed-gesture="" aria-label="快捷操作">
+          <button className={`${styles.navItem} ${runtime.view.kind === "home" ? styles.active : ""}`} onClick={() => runtime.navigate({ kind: "home" })}><span data-ui-icon="" className={styles.navIcon}><Plus size={18} /></span>新对话</button>
+          {searchOpen ? <div className={styles.searchBox}><span data-ui-icon="" className={styles.navIcon}><Search size={17} /></span><input autoFocus aria-label="搜索对话标题和消息" placeholder="搜索对话标题和消息" value={query} onChange={(event) => setQuery(event.target.value)} /></div> : null}
         </nav>
-        <div className={styles.navScroll}>
+        {normalizedQuery ? <div className={styles.searchResults} aria-live="polite">
+          {searchLoading && !searchResults.length ? <span className={styles.searchState}><LoaderCircle className={styles.spin} size={14} />搜索中</span> : null}
+          {searchError ? <span className={styles.searchState}>{searchError}</span> : null}
+          {!searchLoading && !searchError && !searchResults.length ? <span className={styles.searchState}>没有找到结果</span> : null}
+          {searchResults.map((result) => <article className={styles.searchResult} key={result.conversationId}>
+            <button className={styles.searchResultTitle} type="button" title={result.title} onClick={() => openSearchResult(result.conversationId)}>
+              <span>{result.title}</span><small>{result.projectId ? projects.find((project) => project.id === result.projectId)?.name || "项目对话" : "聊天"}</small>
+            </button>
+            {result.matches.map((match) => <button className={styles.searchMatch} type="button" key={match.messageId} onClick={() => openSearchResult(result.conversationId, match.messageId)}>
+              <span>{match.role === "user" ? "你" : "EasyWork"}</span>
+              <p>{match.excerpt.before}<mark>{match.excerpt.match}</mark>{match.excerpt.after}</p>
+            </button>)}
+            {result.titleMatched && !result.matches.length ? <button className={styles.searchTitleOnly} type="button" onClick={() => openSearchResult(result.conversationId)}>标题匹配</button> : null}
+          </article>)}
+          {searchConversationCache.key === searchConversationKey && searchConversationCache.nextCursor ? <button className={styles.searchMore} type="button" disabled={searchConversationCache.loading} onClick={() => void loadMoreSearchResults()}>{searchConversationCache.loading ? "正在加载" : "显示更多"}</button> : null}
+        </div> : null}
+        <div className={`${styles.navScroll} ${normalizedQuery ? styles.navScrollHidden : ""}`}>
           <nav className={styles.primaryNav} aria-label="功能导航">
-            <button className={`${styles.navItem} ${runtime.view.kind === "library" ? styles.active : ""}`} onPointerEnter={() => warmFeature(loadLibraryView)} onFocus={() => warmFeature(loadLibraryView)} onClick={() => runtime.navigate({ kind: "library" })}><span className={styles.navIcon}><FileStack size={17} /></span>文件库</button>
-            <button className={`${styles.navItem} ${runtime.view.kind === "skills" ? styles.active : ""}`} onPointerEnter={() => warmFeature(loadSkillsView)} onFocus={() => warmFeature(loadSkillsView)} onClick={() => runtime.navigate({ kind: "skills" })}><span className={styles.navIcon}><Sparkles size={17} /></span>技能</button>
-            <button className={`${styles.navItem} ${runtime.view.kind === "servers" ? styles.active : ""}`} onPointerEnter={() => warmFeature(loadServerManager)} onFocus={() => warmFeature(loadServerManager)} onClick={() => runtime.navigate({ kind: "servers" })}><span className={styles.navIcon}><Server size={17} /></span>远程服务器</button>
-            <button className={`${styles.navItem} ${runtime.view.kind === "help" ? styles.active : ""}`} onPointerEnter={() => warmFeature(loadHelpView)} onFocus={() => warmFeature(loadHelpView)} onClick={() => runtime.navigate({ kind: "help" })}><span className={styles.navIcon}><HelpCircle size={17} /></span>帮助</button>
+            <button className={`${styles.navItem} ${runtime.view.kind === "library" ? styles.active : ""}`} onPointerEnter={() => warmFeature(loadLibraryView)} onFocus={() => warmFeature(loadLibraryView)} onClick={() => runtime.navigate({ kind: "library" })}><span data-ui-icon="" className={styles.navIcon}><FileStack size={17} /></span>文件库</button>
+            <button className={`${styles.navItem} ${runtime.view.kind === "skills" ? styles.active : ""}`} onPointerEnter={() => warmFeature(loadSkillsView)} onFocus={() => warmFeature(loadSkillsView)} onClick={() => runtime.navigate({ kind: "skills" })}><span data-ui-icon="" className={styles.navIcon}><Sparkles size={17} /></span>技能</button>
+            <button className={`${styles.navItem} ${runtime.view.kind === "servers" ? styles.active : ""}`} onPointerEnter={() => warmFeature(loadServerManager)} onFocus={() => warmFeature(loadServerManager)} onClick={() => runtime.navigate({ kind: "servers" })}><span data-ui-icon="" className={styles.navIcon}><Server size={17} /></span>远程服务器</button>
+            <button className={`${styles.navItem} ${runtime.view.kind === "help" ? styles.active : ""}`} onPointerEnter={() => warmFeature(loadHelpView)} onFocus={() => warmFeature(loadHelpView)} onClick={() => runtime.navigate({ kind: "help" })}><span data-ui-icon="" className={styles.navIcon}><HelpCircle size={17} /></span>帮助</button>
           </nav>
           <section className={styles.section}>
             <div className={styles.sectionHeading}>
@@ -712,20 +885,20 @@ export function AppShell() {
                 const expanded = Boolean(normalizedQuery) || expandedProjects.has(project.id);
                 const projectConversations = (grouped.get(project.id) ?? []).filter((item) => !normalizedQuery || item.title.toLocaleLowerCase("zh-CN").includes(normalizedQuery));
                 const showAll = expandedProjectLists.has(project.id) || Boolean(normalizedQuery);
-                const displayed = showAll ? projectConversations : projectConversations.slice(0, INITIAL_PROJECT_CHAT_LIMIT);
+                const displayed = showAll ? projectConversations : projectConversations.filter((item, index) => index < INITIAL_PROJECT_CHAT_LIMIT || item.id === activeConversationId);
                 const projectPage = projectConversationPages[project.id];
                 const canToggleProjectList = showAll ? projectConversations.length > INITIAL_PROJECT_CHAT_LIMIT : Boolean(projectPage?.nextCursor);
                 return <div key={project.id}>
-                  <div className={styles.treeProject}><button className={`${styles.treeItem} ${runtime.view.kind === "project" && runtime.view.projectId === project.id ? styles.active : ""}`} onClick={() => {
+                  <div className={styles.treeProject}><button aria-expanded={expanded} className={`${styles.treeItem} ${runtime.view.kind === "project" && runtime.view.projectId === project.id ? styles.active : ""}`} onClick={() => {
                     if (normalizedQuery) return;
                     setExpandedProjectsCache((cache) => {
-                      const next = new Set(cache.key === bootstrapConversationKey ? cache.items : EMPTY_PROJECT_IDS);
+                      const next = new Set(expandedProjects);
                       if (expanded) next.delete(project.id); else next.add(project.id);
-                      return { key: bootstrapConversationKey, items: next };
+                      return { key: expansionKey, items: next };
                     });
                     if (!expanded && !projectPage?.loaded) void loadProjectConversations(project.id);
                   }}>
-                    <span className={styles.navIcon}>{expanded ? <FolderOpen size={17} /> : <Folder size={17} />}</span><span className={styles.treeLabel}>{project.name}</span>
+                    <span data-ui-icon="" className={styles.navIcon}>{expanded ? <FolderOpen size={17} /> : <Folder size={17} />}</span><span className={styles.treeLabel}>{project.name}</span>
                   </button><button className={styles.projectHome} aria-label={`${project.name} 项目主页`} onClick={() => runtime.navigate({ kind: "project", projectId: project.id })}><Home size={15} /></button><button className={styles.projectMenuButton} aria-label={`${project.name} 更多操作`} aria-haspopup="menu" aria-expanded={menu?.kind === "project" && menu.item.id === project.id} onClick={(event) => openMenu(event, { kind: "project", item: project })}><MoreHorizontal size={15} /></button></div>
                   {project.conversationCount > 0 || projectPage ? <div className={`${styles.projectChatsMotion} ${expanded ? styles.projectChatsExpanded : ""}`} aria-hidden={!expanded}><div><div>
                     {projectPage?.loading && !displayed.length ? <span className={`${styles.treeNotice} ${styles.nested}`}><LoaderCircle className={styles.spin} size={13} />正在读取对话</span> : null}
@@ -746,16 +919,14 @@ export function AppShell() {
               <button className={styles.sectionAction} aria-label="新对话" onClick={() => runtime.navigate({ kind: "home" })}><Plus size={16} /></button>
             </div>
             <div className={`${styles.sectionMotion} ${chatsOpen ? styles.expanded : ""}`} aria-hidden={!chatsOpen}><div><div className={styles.tree}>
-              {searchLoading ? <span className={styles.treeNotice}><LoaderCircle className={styles.spin} size={13} />正在搜索</span> : null}
-              {searchError ? <span className={styles.treeNotice}>{searchError}</span> : null}
               {standalone.map((conversation) => renderConversation(conversation))}
               {!normalizedQuery && (Boolean(runtime.bootstrap?.conversationCursor) || Boolean(allStandaloneChats && allStandaloneChats.length > INITIAL_CHAT_LIMIT)) ? <button className={styles.more} disabled={loadingAllChats} onClick={() => void toggleAllChats()}>{loadingAllChats ? "正在加载" : showAllChats ? "收起" : "更多"}</button> : null}
             </div></div></div>
           </section>
         </div>
         <footer className={styles.footer}>
-          {actor.roles.includes("admin") ? <button className={`${styles.footerItem} ${runtime.view.kind === "admin" ? styles.active : ""}`} onClick={() => runtime.navigate({ kind: "admin" })}><span className={styles.navIcon}><Settings2 size={17} /></span>管理员面板</button> : null}
-          <button className={styles.footerItem} onClick={() => setAccountOpen(true)}><span className={styles.avatar}>{actor.type === "user" ? actor.username.slice(0, 1).toUpperCase() : <CircleUserRound size={16} />}</span><span className={styles.treeLabel}>{actor.type === "user" ? actor.username : "登录或注册"}</span></button>
+          {actor.roles.includes("admin") ? <button className={`${styles.footerItem} ${runtime.view.kind === "admin" ? styles.active : ""}`} onClick={() => runtime.navigate({ kind: "admin" })}><span data-ui-icon="" className={styles.navIcon}><Settings2 size={17} /></span>管理员面板</button> : null}
+          <button className={styles.footerItem} onClick={() => setAccountOpen(true)}><span data-ui-icon="" className={styles.avatar}>{actor.type === "user" ? actor.username.slice(0, 1).toUpperCase() : <CircleUserRound size={16} />}</span><span className={styles.treeLabel}>{actor.type === "user" ? actor.username : "登录或注册"}</span></button>
         </footer>
         </>}
         </div>
@@ -770,16 +941,68 @@ export function AppShell() {
         />
       </aside>
       <main className={styles.main}>
-        <button className={styles.mobileTop} aria-label="打开菜单" onClick={() => runtime.setSidebarOpen(true)}><Menu size={19} /></button>
-        <FeatureErrorBoundary resetKey={JSON.stringify(runtime.view)}><Suspense fallback={<LoadingState />}>{main}</Suspense></FeatureErrorBoundary>
+        <button className={`${styles.mobileTop} ${runtime.view.kind === "conversation" && runtime.rightRailOpen && !runtime.filePreviewVisible ? styles.mobileTopHidden : ""}`} aria-label="打开菜单" onClick={() => runtime.setSidebarOpen(true)}><Menu size={19} /></button>
+        <div className={styles.mainContent} inert={runtime.filePreviewVisible} style={runtime.filePreviewVisible ? { visibility: "hidden" } : undefined}><FeatureErrorBoundary resetKey={JSON.stringify(runtime.view)}><Suspense fallback={<LoadingState />}>{main}</Suspense></FeatureErrorBoundary></div>
+        {runtime.filePreviewTabs.length ? <Suspense fallback={null}><FilePreviewPanel key={actor.id} /></Suspense> : null}
       </main>
       <div className={styles.toastStack} aria-live="polite" aria-atomic="false">{runtime.toasts.map((toast) => <div key={toast.id} role={toast.tone === "error" ? "alert" : "status"} className={`${styles.toast} ${styles[toast.tone]}`}>{toast.message}</div>)}</div>
       {accountOpen ? <AccountDialog onClose={() => setAccountOpen(false)} /> : null}
       {projectDialog ? <Modal title="新建项目" size="compact" onClose={() => setProjectDialog(null)}><form className={styles.projectDialog} autoComplete="off" onSubmit={(event) => { event.preventDefault(); void createProject(); }}><label><span>项目名称</span><input autoFocus name="easywork-project-name" autoComplete="off" value={projectName} placeholder="输入项目名称" onChange={(event) => setProjectName(event.target.value)} /></label><fieldset><legend>记忆范围</legend><button type="button" className={projectMemoryMode === "project-only" ? styles.selectedMemory : ""} onClick={() => setProjectMemoryMode("project-only")}><strong>仅项目内</strong><span>只使用该项目中的对话和文件</span></button><button type="button" className={projectMemoryMode === "global" ? styles.selectedMemory : ""} onClick={() => setProjectMemoryMode("global")}><strong>全局记忆</strong><span>也可以使用账号的全局记忆</span></button></fieldset><footer><Button type="button" onClick={() => setProjectDialog(null)}>取消</Button><Button type="submit" variant="primary" disabled={!projectName.trim() || creatingProject}>{creatingProject ? "创建中" : "创建"}</Button></footer></form></Modal> : null}
       {projectRename ? <Modal title="重命名项目" size="compact" onClose={() => { if (!projectRename.saving) setProjectRename(null); }}><form className={styles.renameDialog} onSubmit={(event) => { event.preventDefault(); void renameProject(); }}><label><span>项目名称</span><input autoFocus value={projectRename.value} onChange={(event) => setProjectRename((current) => current ? { ...current, value: event.target.value } : current)} /></label><footer><Button type="button" disabled={projectRename.saving} onClick={() => setProjectRename(null)}>取消</Button><Button type="submit" variant="primary" disabled={projectRename.saving || !projectRename.value.trim() || projectRename.value.trim() === projectRename.item.name}>{projectRename.saving ? "保存中" : "保存"}</Button></footer></form></Modal> : null}
       {conversationPendingDelete ? <Modal title="删除对话？" size="compact" onClose={() => { if (!deletingConversation) setConversationPendingDelete(null); }}><div className={styles.deleteDialog}><p>“{conversationPendingDelete.title}”将从聊天记录中删除，此操作无法撤销。</p><footer><Button disabled={deletingConversation} onClick={() => setConversationPendingDelete(null)}>取消</Button><Button variant="danger" disabled={deletingConversation} icon={deletingConversation ? <LoaderCircle className={styles.spin} size={15} /> : <Trash2 size={15} />} onClick={() => void deleteConversation()}>{deletingConversation ? "正在删除" : "删除"}</Button></footer></div></Modal> : null}
-      {projectPendingDelete ? <Modal title="删除项目？" size="compact" onClose={() => { if (!deletingProject) setProjectPendingDelete(null); }}><div className={styles.deleteDialog}><p>“{projectPendingDelete.item.name}”将被删除，项目中的对话会移出项目并继续保留。此操作无法撤销。</p><footer><Button disabled={deletingProject} onClick={() => setProjectPendingDelete(null)}>取消</Button><Button variant="danger" disabled={deletingProject} icon={deletingProject ? <LoaderCircle className={styles.spin} size={15} /> : <Trash2 size={15} />} onClick={() => void deleteProject()}>{deletingProject ? "正在删除" : "删除"}</Button></footer></div></Modal> : null}
-      {menu && typeof document !== "undefined" ? createPortal(<><button className={styles.menuScrim} aria-label="关闭菜单" onClick={() => { const trigger = menu.trigger; setMenu(null); window.requestAnimationFrame(() => trigger.focus()); }} /><div className={`${styles.itemMenu} ${menu.kind === "conversation" && menu.page === "projects" ? styles.projectMoveMenu : ""}`} role="menu" aria-label={menu.kind === "conversation" ? `${menu.item.title} 操作` : `${menu.item.name} 操作`} data-shell-menu={menu.kind} onKeyDown={moveMenuFocus} style={{ left: menu.left, top: menu.top }}>{menu.kind === "conversation" ? menu.page === "projects" ? <><div className={styles.menuFixedActions}><button onClick={() => setMenu({ ...menu, page: "main" })}><ChevronRight className={styles.backChevron} size={16} />返回</button><button onClick={() => openProjectDialog(menu.item.id)}><Plus size={16} />新建项目</button>{menu.item.projectId ? <button onClick={() => void conversationAction(menu.item, "move", null)}><Folder size={16} />移出项目</button> : null}</div><span className={styles.menuSeparator} aria-hidden="true" /><div className={`${styles.projectDestinationList} ${projects.filter((project) => project.id !== menu.item.projectId).length > 4 ? styles.projectDestinationScrollable : ""}`}>{projects.filter((project) => project.id !== menu.item.projectId).map((project) => <button key={project.id} onClick={() => void conversationAction(menu.item, "move", project.id)}><Folder size={16} /><span>{project.name}</span></button>)}</div></> : <><button onClick={() => beginConversationRename(menu.item)}><Pencil size={16} />重命名</button><button onClick={() => setMenu({ ...menu, page: "projects" })}><FolderOpen size={16} />移至项目<ChevronRight className={styles.menuTail} size={16} /></button><button onClick={() => void conversationAction(menu.item, "pin")}><Pin size={16} />{menu.item.pinned ? "取消置顶" : "置顶聊天"}</button><button className={styles.dangerMenuItem} onClick={() => { setConversationPendingDelete(menu.item); setMenu(null); }}><Trash2 size={16} />删除</button></> : <><button onClick={() => { runtime.navigate({ kind: "home", projectId: menu.item.id, mode: "chat" }); setMenu(null); }}><Plus size={16} />新对话</button><button onClick={() => { setProjectRename({ item: menu.item, value: menu.item.name, saving: false }); setMenu(null); }}><Pencil size={16} />重命名项目</button><button onClick={() => { runtime.navigate({ kind: "project", projectId: menu.item.id }); setMenu(null); }}><LayoutDashboard size={16} />项目主页</button><button className={styles.dangerMenuItem} onClick={() => { setProjectPendingDelete({ item: menu.item, idempotencyKey: commandId("project-delete") }); setMenu(null); }}><Trash2 size={16} />删除项目</button></>}</div></>, document.body) : null}
+      {projectPendingDelete ? <Modal title="删除项目？" size="compact" onClose={() => { if (!deletingProject) setProjectPendingDelete(null); }}>
+        <div className={`${styles.deleteDialog} ${styles.projectDeleteDialog}`}>
+          <p className={styles.projectDeleteLead}><strong>“{projectPendingDelete.item.name}”</strong>{projectPendingDelete.item.conversationCount > 0 ? `中有 ${projectPendingDelete.item.conversationCount} 个对话，请选择如何处理。` : "中还没有对话。"} 删除项目后无法恢复。</p>
+          <div className={styles.projectDeleteOptions} aria-label="删除范围说明">
+            <div className={styles.projectDeleteOption}><span data-ui-icon="" className={styles.projectDeleteOptionIcon}><FolderX size={17} /></span><span><strong>仅删除项目</strong><small>对话将移至聊天列表，并继续保留。</small></span></div>
+            <div className={`${styles.projectDeleteOption} ${styles.projectDeleteOptionDanger}`}><span data-ui-icon="" className={styles.projectDeleteOptionIcon}><Trash2 size={17} /></span><span><strong>删除项目及所有对话</strong><small>项目内的聊天、工作对话及其记录将永久删除。</small></span></div>
+          </div>
+          <footer className={styles.projectDeleteActions}>
+            <Button disabled={Boolean(deletingProject)} onClick={() => setProjectPendingDelete(null)}>取消</Button>
+            <Button className={styles.projectOnlyDelete} disabled={Boolean(deletingProject)} icon={deletingProject === "project-only" ? <LoaderCircle className={styles.spin} size={15} /> : <FolderX size={15} />} onClick={() => void deleteProject("project-only")}>{deletingProject === "project-only" ? "正在删除" : "仅删除项目"}</Button>
+            <Button variant="danger" disabled={Boolean(deletingProject)} icon={deletingProject === "project-and-conversations" ? <LoaderCircle className={styles.spin} size={15} /> : <Trash2 size={15} />} onClick={() => void deleteProject("project-and-conversations")}>{deletingProject === "project-and-conversations" ? "正在删除" : "删除项目及所有对话"}</Button>
+          </footer>
+        </div>
+      </Modal> : null}
+      {menu && typeof document !== "undefined" ? createPortal(<>
+        <button className={styles.menuScrim} aria-label="关闭菜单" onClick={() => { const trigger = menu.trigger; setMenu(null); window.requestAnimationFrame(() => trigger.focus()); }} />
+        <div ref={menuRef} className={`${styles.itemMenu} ${menu.kind === "conversation" ? styles.conversationMenu : ""} ${menu.kind === "conversation" && menu.page === "projects" ? styles.projectMoveMenu : ""}`}
+          role="menu" aria-label={menu.kind === "conversation" ? `${menu.item.title} 操作` : `${menu.item.name} 操作`}
+          data-shell-menu={menu.kind} data-shell-page={menu.kind === "conversation" ? menu.page : undefined}
+          onKeyDown={moveMenuFocus} style={{ left: menu.left, top: menu.top }}>
+          {menu.kind === "conversation" ? <SlidingMenuPages key={menu.item.id} page={menu.page} pages={{
+            main: <>
+              <button onClick={() => beginConversationRename(menu.item)}><Pencil size={16} />重命名</button>
+              <button onClick={() => void conversationAction(menu.item, "pin")}><Pin size={16} />{menu.item.pinned ? "取消置顶" : "置顶聊天"}</button>
+              <button data-submenu="projects" aria-haspopup="menu" onClick={() => setMenu({ ...menu, page: "projects" })}><FolderOpen size={16} />移至项目<ChevronRight className={styles.menuTail} size={16} /></button>
+              <button data-submenu="copy" aria-haspopup="menu" onClick={() => setMenu({ ...menu, page: "copy" })}><Copy size={16} />复制<ChevronRight className={styles.menuTail} size={16} /></button>
+              <span data-ui-icon="" className={styles.menuSeparator} aria-hidden="true" />
+              <button className={styles.dangerMenuItem} onClick={() => { setConversationPendingDelete(menu.item); setMenu(null); }}><Trash2 size={16} />删除</button>
+            </>,
+            projects: <>
+              <div className={styles.menuFixedActions}>
+                <button onClick={() => setMenu({ ...menu, page: "main" })}><ChevronRight className={styles.backChevron} size={16} />返回</button>
+                <button onClick={() => openProjectDialog(menu.item.id)}><Plus size={16} />新建项目</button>
+                {menu.item.projectId ? <button onClick={() => void conversationAction(menu.item, "move", null)}><Folder size={16} />移出项目</button> : null}
+              </div>
+              <span data-ui-icon="" className={styles.menuSeparator} aria-hidden="true" />
+              <div className={`${styles.projectDestinationList} ${projects.filter((project) => project.id !== menu.item.projectId).length > 4 ? styles.projectDestinationScrollable : ""}`}>
+                {projects.filter((project) => project.id !== menu.item.projectId).map((project) => <button key={project.id} onClick={() => void conversationAction(menu.item, "move", project.id)}><Folder size={16} /><span>{project.name}</span></button>)}
+              </div>
+            </>,
+            copy: <>
+              <button onClick={() => setMenu({ ...menu, page: "main" })}><ChevronRight className={styles.backChevron} size={16} />返回</button>
+              <span data-ui-icon="" className={styles.menuSeparator} aria-hidden="true" />
+              <ConversationCopyMenu copying={copyingConversation} onCopy={(mode) => void copyConversation(menu.item, mode)} />
+            </>,
+          }} /> : <>
+            <button onClick={() => { runtime.navigate({ kind: "home", projectId: menu.item.id, mode: "chat" }); setMenu(null); }}><Plus size={16} />新对话</button>
+            <button onClick={() => { setProjectRename({ item: menu.item, value: menu.item.name, saving: false }); setMenu(null); }}><Pencil size={16} />重命名项目</button>
+            <button onClick={() => { runtime.navigate({ kind: "project", projectId: menu.item.id }); setMenu(null); }}><LayoutDashboard size={16} />项目主页</button>
+            <button className={styles.dangerMenuItem} onClick={() => { setProjectPendingDelete({ item: menu.item, projectOnlyCommandId: commandId("project-delete"), withConversationsCommandId: commandId("project-delete-with-conversations") }); setMenu(null); }}><Trash2 size={16} />删除项目</button>
+          </>}
+        </div>
+      </>, document.body) : null}
     </div>
   );
 }

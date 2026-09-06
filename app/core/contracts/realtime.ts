@@ -49,6 +49,7 @@ export type RealtimeSubscribe = {
   requestId: string;
   topics: string[];
   resume: Record<string, number>;
+  replayView?: "summary";
 };
 
 export type RealtimeUnsubscribe = {

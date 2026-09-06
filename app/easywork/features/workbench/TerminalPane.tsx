@@ -478,12 +478,12 @@ export default function TerminalPane({ serverId, cacheScope, workspacePath }: Pr
 
   return <div className={`${styles.pane} ${styles.terminalPane}`}>
     <div className={styles.terminalToolbar}>
-      <span className={`${styles.sessionStatus} ${styles[`session_${status}`] || ""}`}><i />{statusText[status] || status}</span>
+      <span className={`${styles.sessionStatus} ${styles[`session_${status}`] || ""}`}><i data-ui-icon="" />{statusText[status] || status}</span>
       <div className={styles.terminalSwitcher} ref={switcherRoot}>
         <button type="button" className={styles.terminalSwitcherButton} aria-haspopup="menu" aria-expanded={switcherOpen} onClick={() => setSwitcherOpen((open) => !open)}><SquareTerminal size={14} /><span>{activeView?.label || "终端"}</span><ChevronDown size={13} /></button>
         {switcherOpen ? <div className={styles.terminalSwitcherMenu} role="menu" aria-label="终端会话">
-          {sessionList.map(({ session, label }) => <button type="button" role="menuitemradio" aria-checked={session.sessionId === activeSessionId} key={session.sessionId} onClick={() => selectSession(session.sessionId)}><span className={`${styles.terminalSessionDot} ${styles[`session_${session.status === "open" ? session.attached ? "open" : "detached" : session.status}`] || ""}`}><i /></span><span>{label}</span><small>{statusText[session.status === "open" && !session.attached ? "detached" : session.status] || session.status}</small>{session.sessionId === activeSessionId ? <Check size={14} /> : null}</button>)}
-          <span className={styles.terminalSwitcherSeparator} />
+          {sessionList.map(({ session, label }) => <button type="button" role="menuitemradio" aria-checked={session.sessionId === activeSessionId} key={session.sessionId} onClick={() => selectSession(session.sessionId)}><span data-ui-icon="" className={`${styles.terminalSessionDot} ${styles[`session_${session.status === "open" ? session.attached ? "open" : "detached" : session.status}`] || ""}`}><i data-ui-icon="" /></span><span>{label}</span><small>{statusText[session.status === "open" && !session.attached ? "detached" : session.status] || session.status}</small>{session.sessionId === activeSessionId ? <Check size={14} /> : null}</button>)}
+          <span data-ui-icon="" className={styles.terminalSwitcherSeparator} />
           <button type="button" className={styles.newTerminalButton} disabled={creating} onClick={() => void createSession().catch((reason) => setError(reason instanceof Error ? reason.message : "终端创建失败"))}>{creating ? <LoaderCircle className={styles.spin} size={14} /> : <Plus size={14} />}新增终端</button>
         </div> : null}
       </div>

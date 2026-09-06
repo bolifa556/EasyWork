@@ -71,9 +71,10 @@
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 720px) {
-  .page { padding: max(70px, calc(env(safe-area-inset-top) + 62px)) 16px max(40px, env(safe-area-inset-bottom)); }
+  .page { padding: max(8px, env(safe-area-inset-top)) 16px max(40px, env(safe-area-inset-bottom)); }
   .document { font-size: 15.5px; line-height: 1.78; }
-  .document h1 { padding-bottom: 12px; font-size: 22px; line-height: 1.3; }
+  .document h1 { display:flex; min-height:44px; align-items:center; padding:0 0 12px 52px; font-size:22px; line-height:1.3; }
+  .document h1::after { left:52px; }
   .document h1 + p { padding-left: 12px; font-size: 15px; line-height: 1.7; }
   .document h2 { margin-top: 1.45rem; padding-left: 12px; font-size: 18px; }
   .document h3 { font-size: 16.5px; }

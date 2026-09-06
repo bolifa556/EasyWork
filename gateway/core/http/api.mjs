@@ -87,6 +87,22 @@ export function createApi(options) {
     limit: request.query.limit ? Number(request.query.limit) : undefined,
     projectId: request.query.unassigned === "true" ? null : request.query.projectId,
   }));
+  router.route("GET", "/api/conversation-search", (request) => request.services.conversations.searchConversations({
+    query: request.query.query,
+    cursor: request.query.cursor,
+    limit: request.query.limit ? Number(request.query.limit) : undefined,
+    messageLimit: request.query.messageLimit ? Number(request.query.messageLimit) : undefined,
+    projectId: request.query.projectId,
+    unassigned: request.query.unassigned === "true",
+  }));
+  router.route("GET", "/api/conversation-references/candidates", (request) => request.services.conversations.searchReferenceCandidates({
+    conversationId: request.query.conversationId,
+    projectId: request.query.unassigned === "true" ? null : request.query.projectId,
+    mode: request.query.mode,
+    query: request.query.query,
+    cursor: request.query.cursor,
+    limit: request.query.limit ? Number(request.query.limit) : undefined,
+  }));
   router.route("POST", "/api/conversations", (request) => {
     const body = requiredBody(request);
     return request.services.conversations.sendMessage({ ...body, expectedRevision: expectedRevision(request), commandId: commandId(request), role: "user" });
@@ -148,7 +164,12 @@ export function createApi(options) {
   router.route("POST", "/api/projects", (request) => request.services.projects.create(requiredBody(request)));
   router.route("GET", "/api/projects/:id", (request) => request.services.projects.get(request.params.id));
   router.route("PATCH", "/api/projects/:id", (request) => request.services.projects.update({ ...withRevision(request), projectId: request.params.id }));
-  router.route("DELETE", "/api/projects/:id", (request) => request.services.projects.delete({ projectId: request.params.id, expectedRevision: expectedRevision(request), commandId: commandId(request) }));
+  router.route("DELETE", "/api/projects/:id", (request) => request.services.projects.delete({
+    projectId: request.params.id,
+    expectedRevision: expectedRevision(request),
+    commandId: commandId(request),
+    ...(request.query.conversationPolicy ? { conversationPolicy: request.query.conversationPolicy } : {}),
+  }));
 
   router.route("GET", "/api/collections", (request) => request.services.collections.list());
   router.route("POST", "/api/collections", (request) => request.services.collections.create(requiredBody(request)));
@@ -216,7 +237,15 @@ export function createApi(options) {
   router.route("GET", "/api/skills", (request) => request.services.skills.inspect());
   router.route("POST", "/api/skills", (request) => request.services.skills.uploadVersion({ ...requiredBody(request), commandId: commandId(request) }));
   router.route("GET", "/api/skill-center/installed", (request) => request.services.skills.listInstalled());
+  router.route("POST", "/api/skill-center/installed", (request) => request.services.skills.createInstalled({
+    ...exactBody(request, ["name", "description", "files"], ["name", "files"], "上传个人技能"),
+    commandId: commandId(request),
+  }));
   router.route("GET", "/api/skill-center/installed/:skillId", (request) => request.services.skills.getInstalledDetail(request.params.skillId));
+  router.route("PATCH", "/api/skill-center/installed/:skillId", (request) => request.services.skills.updateInstalled(request.params.skillId, {
+    ...exactBody(request, ["name", "description", "fileUpdates"], [], "编辑个人技能"),
+    expectedRevision: expectedRevision(request),
+  }));
   router.route("PATCH", "/api/skill-center/installed/:skillId/applicability", (request) => request.services.skills.updateApplicability(request.params.skillId, requiredBody(request)));
   router.route("DELETE", "/api/skill-center/installed/:skillId", (request) => request.services.skills.uninstall({
     skillId: request.params.skillId,
@@ -259,6 +288,7 @@ export function createApi(options) {
   router.route("POST", "/api/providers", (request) => request.services.providers.createUserProvider(request.session.actor, { ...requiredBody(request), commandId: commandId(request) }));
   router.route("PATCH", "/api/providers/:id", (request) => request.services.providers.updateUserProvider(request.session.actor, { ...requiredBody(request), providerId: request.params.id, expectedRevision: expectedRevision(request), commandId: commandId(request) }));
   router.route("DELETE", "/api/providers/:id", (request) => request.services.providers.deleteUserProvider(request.session.actor, { providerId: request.params.id, expectedRevision: expectedRevision(request), commandId: commandId(request) }));
+  router.route("POST", "/api/providers/models", (request) => request.services.providers.detectUserModelsFromDraft(request.session.actor, requiredBody(request)));
   router.route("POST", "/api/providers/:id/models", (request) => request.services.providers.detectModels(request.session.actor, { providerId: request.params.id, purpose: requiredBody(request).purpose || "web" }));
   router.route("POST", "/api/providers/:id/reveal", (request) => (
     request.services.providers.revealUserProvider(request.session.actor, request.params.id)

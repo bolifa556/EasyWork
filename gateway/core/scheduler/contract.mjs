@@ -66,6 +66,12 @@ export function canonicalSchedulerFilePath(value, field = "outputPath") {
   return normalized;
 }
 
+export function schedulerSubmitScriptPath(value) {
+  const scriptPath = String(value || "");
+  invariant(scriptPath.length > 0 && scriptPath.length <= 4096 && !/[\0\r\n]/.test(scriptPath), "SCHEDULER_SUBMIT_PATH_INVALID", "scriptPath 无效", { status: 400 });
+  return scriptPath;
+}
+
 export function createExecDescriptor(input) {
   const executable = String(input?.executable || "");
   invariant(EXECUTABLES.has(executable), "SCHEDULER_EXECUTABLE_FORBIDDEN", "Scheduler 命令不在允许列表中", { status: 500, expose: false });
@@ -86,6 +92,7 @@ export function createExecDescriptor(input) {
     parser: assertId(input?.parser, "parser"),
     timeoutMs: Number(input?.timeoutMs ?? 15_000),
     maxOutputBytes: Number(input?.maxOutputBytes ?? 2 * 1024 * 1024),
+    ...(input?.cwd ? { cwd: canonicalSchedulerFilePath(input.cwd, "cwd") } : {}),
   };
   invariant(Number.isSafeInteger(descriptor.timeoutMs) && descriptor.timeoutMs > 0 && descriptor.timeoutMs <= 120_000, "SCHEDULER_TIMEOUT_INVALID", "Scheduler timeout 无效", { status: 500, expose: false });
   invariant(Number.isSafeInteger(descriptor.maxOutputBytes) && descriptor.maxOutputBytes > 0 && descriptor.maxOutputBytes <= 32 * 1024 * 1024, "SCHEDULER_OUTPUT_LIMIT_INVALID", "Scheduler 输出上限无效", { status: 500, expose: false });

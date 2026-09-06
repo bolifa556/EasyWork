@@ -4,10 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FileStack } from "lucide-react";
 import { commandId } from "@/app/core/gateway/client";
 import { uploadResource } from "@/app/core/gateway/resource-upload";
+import { deleteResourceBindings } from "@/app/core/gateway/resource-delete";
 import { useAppRuntime } from "@/app/easywork/runtime/AppRuntime";
-import LibraryFilePreview from "./LibraryFilePreview";
 import LibraryPage from "./LibraryPage";
-import type { LibraryCollection, LibraryFile } from "./types";
+import type { LibraryCollection, LibraryFile, LibraryUploadFile } from "./types";
 import styles from "./LibraryView.module.css";
 
 type CollectionRecord = {
@@ -31,7 +31,7 @@ type ResourceWriteResult = {
   revision: number;
   blob: { size: number };
   version: ResourceVersionRecord;
-  binding: { path: string | null };
+  binding: { id: string; path: string | null };
 };
 
 type ResourceListItem = {
@@ -66,6 +66,7 @@ function resourceStatus(version: ResourceVersionRecord): LibraryFile["status"] {
 function resourceFile(result: ResourceWriteResult): LibraryFile {
   return {
     id: result.version.id,
+    bindingId: result.binding.id,
     name: result.version.filename,
     relativePath: result.binding.path || result.version.filename,
     size: result.blob.size,
@@ -78,6 +79,7 @@ function resourceFile(result: ResourceWriteResult): LibraryFile {
 function listedResourceFile(item: ResourceListItem): LibraryFile {
   return {
     id: item.version.id,
+    bindingId: item.binding.id,
     name: item.version.filename,
     relativePath: item.binding.path || item.version.filename,
     size: item.size,
@@ -102,7 +104,7 @@ export type LibraryViewProps = { collectionId?: string };
 
 export default function LibraryView({ collectionId }: LibraryViewProps) {
   const runtime = useAppRuntime();
-  const { api, navigate, notify } = runtime;
+  const { api, navigate, notify, openFilePreview, closeFilePreview, filePreviewTabs } = runtime;
   const enabled = runtime.bootstrap?.featureFlags.resources === true;
   const cacheKey = runtime.bootstrap?.actor.id || "unresolved";
   const initialCache = libraryPageCache.get(cacheKey);
@@ -110,7 +112,6 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
   const [filesByCollection, setFilesByCollection] = useState<Record<string, LibraryFile[]>>(() => initialCache?.filesByCollection || {});
   const [loading, setLoading] = useState(() => !initialCache);
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [previewFile, setPreviewFile] = useState<LibraryFile | null>(null);
   const resourceRevision = useRef(initialCache?.resourceRevision || 0);
 
   const loadCollections = useCallback(async (signal?: AbortSignal) => {
@@ -202,12 +203,12 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
     }
   };
 
-  const uploadFiles = async (id: string, directory: string, selected: File[]) => {
+  const uploadFiles = async (id: string, directory: string, selected: LibraryUploadFile[]) => {
     setBusyAction("upload");
     try {
-      for (const file of selected) {
-        const folderPath = file.webkitRelativePath || file.name;
-        const relativePath = [directory, folderPath].filter(Boolean).join("/");
+      for (const item of selected) {
+        const relativePath = [directory, item.relativePath].filter(Boolean).join("/");
+        const file = item.file;
         const result = await uploadResource<ResourceWriteResult>(api, file, {
           ownerType: "collection",
           ownerId: id,
@@ -222,6 +223,25 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
     } catch (reason) {
       notify(errorMessage(reason), "error");
       await loadCollections();
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const deleteFiles = async (id: string, selected: LibraryFile[]) => {
+    if (busyAction || !selected.length) return;
+    setBusyAction("delete");
+    try {
+      await deleteResourceBindings(api, { type: "collection", id }, selected.map((file) => file.bindingId), (bindingId, revision) => {
+        resourceRevision.current = revision;
+        setFilesByCollection((current) => ({ ...current, [id]: (current[id] ?? []).filter((file) => file.bindingId !== bindingId) }));
+        const deletedId = selected.find((file) => file.bindingId === bindingId)?.id;
+        filePreviewTabs.filter((tab) => tab.source.kind === "resource" && tab.source.resourceVersionId === deletedId).forEach((tab) => closeFilePreview(tab.id));
+      });
+      notify(selected.length === 1 ? "文件已删除" : `${selected.length} 个文件已删除`, "success");
+    } catch (reason) {
+      notify(errorMessage(reason), "error");
+      throw reason;
     } finally {
       setBusyAction(null);
     }
@@ -261,10 +281,11 @@ export default function LibraryView({ collectionId }: LibraryViewProps) {
       onCreateCollection={createCollection}
       onRenameCollection={renameCollection}
       onDeleteCollection={deleteCollection}
+      onDeleteFiles={deleteFiles}
       onUploadFiles={uploadFiles}
+      onUploadError={(message) => notify(message, "error")}
       onRetryIndex={retryIndex}
-      onPreviewFile={setPreviewFile}
+      onPreviewFile={(file) => openFilePreview({ name: file.name, size: file.size, source: { kind: "resource", resourceVersionId: file.id } })}
     />
-    {previewFile ? <LibraryFilePreview key={previewFile.id} file={previewFile} onClose={() => setPreviewFile(null)} /> : null}
   </>;
 }

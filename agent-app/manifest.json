@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-08-25T18:08:54.7836353Z",
+  "agents": {
+    "opencode": {
+      "version": "1.18.23",
+      "source": "https://github.com/anomalyco/opencode/releases/tag/v1.18.23",
+      "artifacts": {
+        "linux-x64": {
+          "archive": "tar.gz",
+          "binary": "opencode",
+          "sha256": "ab7015cd8113e011a461f30a0c2b77d8299a144ff688cb62e93e8802835d7288",
+          "file": "opencode/opencode-linux-x64.tar.gz",
+          "source": "https://github.com/anomalyco/opencode/releases/download/v1.18.23/opencode-linux-x64.tar.gz",
+          "size": 60522055
+        },
+        "linux-arm64": {
+          "archive": "tar.gz",
+          "binary": "opencode",
+          "sha256": "86d3afaf4e8784f9adab189be2a315c12b27ec40a04b70defbe70595c3cc7c65",
+          "file": "opencode/opencode-linux-arm64.tar.gz",
+          "source": "https://github.com/anomalyco/opencode/releases/download/v1.18.23/opencode-linux-arm64.tar.gz",
+          "size": 60331289
+        },
+        "linux-x64-musl": {
+          "archive": "tar.gz",
+          "binary": "opencode",
+          "sha256": "18e3e5064ecddde181886256c9e57774207d3dd0460b615ba8e47a1690ff3526",
+          "file": "opencode/opencode-linux-x64-musl.tar.gz",
+          "source": "https://github.com/anomalyco/opencode/releases/download/v1.18.23/opencode-linux-x64-musl.tar.gz",
+          "size": 62888499
+        },
+        "linux-arm64-musl": {
+          "archive": "tar.gz",
+          "binary": "opencode",
+          "sha256": "f7488a9d10f4406aa582deca4b54716d0e2f610668524ce5c3697e5e4d61ff51",
+          "file": "opencode/opencode-linux-arm64-musl.tar.gz",
+          "source": "https://github.com/anomalyco/opencode/releases/download/v1.18.23/opencode-linux-arm64-musl.tar.gz",
+          "size": 62461037
+        }
+      }
+    },
+    "codex": {
+      "version": "0.149.1",
+      "source": "https://github.com/openai/codex/releases/tag/rust-v0.149.1",
+      "artifacts": {
+        "linux-x64": {
+          "size": 99479490,
+          "binary": "codex-x86_64-unknown-linux-musl",
+          "source": "https://github.com/openai/codex/releases/download/rust-v0.149.1/codex-x86_64-unknown-linux-musl.tar.gz",
+          "archive": "tar.gz",
+          "sha256": "e24fb784c7d71140d67afb620f56e9137496cf7f6c9e19217fa3666dcf306278",
+          "file": "codex/codex-x86_64-unknown-linux-musl.tar.gz"
+        },
+        "linux-arm64": {
+          "size": 91899352,
+          "binary": "codex-aarch64-unknown-linux-musl",
+          "source": "https://github.com/openai/codex/releases/download/rust-v0.149.1/codex-aarch64-unknown-linux-musl.tar.gz",
+          "archive": "tar.gz",
+          "sha256": "14df6802e39a956de994e844b90d51d8254bcc8057b6e66f0f3e3b8f7e2da5b0",
+          "file": "codex/codex-aarch64-unknown-linux-musl.tar.gz"
+        },
+        "linux-x64-musl": {
+          "size": 99479490,
+          "binary": "codex-x86_64-unknown-linux-musl",
+          "source": "https://github.com/openai/codex/releases/download/rust-v0.149.1/codex-x86_64-unknown-linux-musl.tar.gz",
+          "archive": "tar.gz",
+          "sha256": "e24fb784c7d71140d67afb620f56e9137496cf7f6c9e19217fa3666dcf306278",
+          "file": "codex/codex-x86_64-unknown-linux-musl.tar.gz"
+        },
+        "linux-arm64-musl": {
+          "size": 91899352,
+          "binary": "codex-aarch64-unknown-linux-musl",
+          "source": "https://github.com/openai/codex/releases/download/rust-v0.149.1/codex-aarch64-unknown-linux-musl.tar.gz",
+          "archive": "tar.gz",
+          "sha256": "14df6802e39a956de994e844b90d51d8254bcc8057b6e66f0f3e3b8f7e2da5b0",
+          "file": "codex/codex-aarch64-unknown-linux-musl.tar.gz"
+        }
+      }
+    },
+    "claudecode": {
+      "version": "2.1.245",
+      "source": "https://claude.ai/install.sh",
+      "artifacts": {
+        "linux-x64": {
+          "archive": "raw",
+          "size": 391948592,
+          "source": "https://downloads.claude.ai/claude-code-releases/2.1.245/linux-x64/claude",
+          "sha256": "16ad2b94deaf7b29abed966d981c9991a47af0420f5be8ed4a3f83bea9f678bc",
+          "file": "claudecode/claude-2.1.245-linux-x64"
+        },
+        "linux-arm64": {
+          "archive": "raw",
+          "size": 389077224,
+          "source": "https://downloads.claude.ai/claude-code-releases/2.1.245/linux-arm64/claude",
+          "sha256": "d0da299303d710a7cc5cdece9629958f5128ce1a727e15463c651ed5cf385c7f",
+          "file": "claudecode/claude-2.1.245-linux-arm64"
+        },
+        "linux-x64-musl": {
+          "archive": "raw",
+          "size": 386060256,
+          "source": "https://downloads.claude.ai/claude-code-releases/2.1.245/linux-x64-musl/claude",
+          "sha256": "d25564bc5d84ec988a762cfe25fe51cb706b96eaec614f704ddbf653ab08ba00",
+          "file": "claudecode/claude-2.1.245-linux-x64-musl"
+        },
+        "linux-arm64-musl": {
+          "archive": "raw",
+          "size": 382222104,
+          "source": "https://downloads.claude.ai/claude-code-releases/2.1.245/linux-arm64-musl/claude",
+          "sha256": "8707fbe629fdd9876d9c356baa833a697dac76cd9a7157088f667199b8492851",
+          "file": "claudecode/claude-2.1.245-linux-arm64-musl"
+        }
+      }
+    }
+  }
+}

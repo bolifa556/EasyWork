@@ -11,6 +11,7 @@ const modelLayout = Object.freeze({ systemMessageSeparator: "\n\n" });
 
 test("OpenAI chat model streams reasoning and final text while assembling tool arguments", async () => {
   const deltas = [];
+  let activities = 0;
   const model = new OpenAIChatModel({
     ...modelLayout,
     baseUrl: "https://models.example.test",
@@ -20,6 +21,7 @@ test("OpenAI chat model streams reasoning and final text while assembling tool a
       const body = JSON.parse(request.body);
       assert.equal(JSON.stringify(body).includes("test-secret"), false);
       assert.equal(body.tool_choice, "auto");
+      assert.equal(body.max_tokens, 100);
       return {
         ok: true,
         body: stream([
@@ -38,11 +40,13 @@ test("OpenAI chat model streams reasoning and final text while assembling tool a
     tools: [{ name: "context_get_state", description: "state", inputSchema: { type: "object" } }],
     limits: { maxOutputTokens: 100 },
     onDelta: async (delta) => deltas.push(delta),
+    onActivity: async () => { activities += 1; },
   });
   assert.equal(result.reasoning, "检查");
   assert.equal(result.content, "完成");
   assert.deepEqual(result.toolCalls, [{ id: "call_1", name: "context_get_state", input: {} }]);
   assert.deepEqual(deltas.map((entry) => entry.kind), ["reasoning", "content"]);
+  assert.equal(activities, 3, "tool-argument deltas also keep a progressing model request alive");
 });
 
 test("OpenAI chat model treats DONE as the terminal boundary even when the provider keeps HTTP open", async () => {

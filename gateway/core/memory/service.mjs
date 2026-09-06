@@ -19,6 +19,21 @@ const AUTHORITY_WEIGHT = Object.freeze({
   "model-inferred": 1,
 });
 const LEVEL_WEIGHT = Object.freeze({ task: 5, conversation: 4, workspace: 3, project: 2, user: 1 });
+const DEFAULT_RETRIEVAL = Object.freeze({
+  configured: false,
+  embeddingProfileId: null,
+  retrievalProfileId: null,
+  enabled: true,
+  vectorWeight: 0.55,
+  lexicalWeight: 0.15,
+  titleWeight: 0.3,
+  minimumScore: 0.12,
+  diversityLambda: 0.72,
+  recallLimit: 48,
+  resultLimit: 8,
+  tokenBudget: 3200,
+  pageSize: 20,
+});
 
 const createId = (prefix) => `${prefix}_${crypto.randomUUID()}`;
 const sha256 = (value) => crypto.createHash("sha256").update(value).digest("hex");
@@ -63,6 +78,10 @@ function validateDocument(data) {
     for (const version of record.versions) {
       if (!version?.id || !Number.isSafeInteger(version.sequence) || version.sequence < 1 || typeof version.content !== "string") return false;
       if (!SENSITIVITIES.has(version.sensitivity) || !PORTABILITIES.has(version.portability)) return false;
+      if (version.embedding !== undefined && version.embedding !== null) {
+        if (typeof version.embedding.profileId !== "string" || !version.embedding.profileId || !Array.isArray(version.embedding.vector) || !version.embedding.vector.length) return false;
+        if (!version.embedding.vector.every((item) => Number.isFinite(Number(item)))) return false;
+      }
     }
   }
   for (const entry of data.invalidations) {
@@ -95,6 +114,89 @@ function relevance(content, query) {
   let score = 0;
   for (const token of query) if (haystack.has(token)) score += token.length > 1 ? 2 : 1;
   return score;
+}
+
+function normalizedRelevance(content, query) {
+  if (!query.size) return 0;
+  const haystack = queryTokens(content);
+  let matched = 0;
+  let possible = 0;
+  for (const token of query) {
+    const weight = token.length > 1 ? 2 : 1;
+    possible += weight;
+    if (haystack.has(token)) matched += weight;
+  }
+  return possible ? matched / possible : 0;
+}
+
+function cosineSimilarity(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length || !left.length) return 0;
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = Number(left[index]);
+    const b = Number(right[index]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+    dot += a * b;
+    leftNorm += a * a;
+    rightNorm += b * b;
+  }
+  return leftNorm && rightNorm ? Math.max(0, dot / Math.sqrt(leftNorm * rightNorm)) : 0;
+}
+
+function memoryEmbeddingText(semanticKey, content) {
+  return `${String(semanticKey || "").trim()}\n${String(content || "").trim()}`;
+}
+
+function lexicalSimilarity(left, right) {
+  const leftTokens = queryTokens(left);
+  const rightTokens = queryTokens(right);
+  if (!leftTokens.size || !rightTokens.size) return 0;
+  let intersection = 0;
+  for (const token of leftTokens) if (rightTokens.has(token)) intersection += 1;
+  return intersection / (leftTokens.size + rightTokens.size - intersection);
+}
+
+function memoryEntrySimilarity(left, right) {
+  const leftEmbedding = left.version.embedding;
+  const rightEmbedding = right.version.embedding;
+  if (leftEmbedding?.profileId && leftEmbedding.profileId === rightEmbedding?.profileId) {
+    const similarity = cosineSimilarity(leftEmbedding.vector, rightEmbedding.vector);
+    if (similarity > 0) return similarity;
+  }
+  return lexicalSimilarity(
+    memoryEmbeddingText(left.semanticKey, left.version.content),
+    memoryEmbeddingText(right.semanticKey, right.version.content),
+  );
+}
+
+function diversifyMemoryEntries(entries, lambda) {
+  if (entries.length < 2 || lambda >= 1) return entries;
+  const remaining = [...entries];
+  const selected = [];
+  while (remaining.length) {
+    let bestIndex = 0;
+    let bestMmr = Number.NEGATIVE_INFINITY;
+    for (let index = 0; index < remaining.length; index += 1) {
+      const candidate = remaining[index];
+      let redundancy = 0;
+      for (const prior of selected) redundancy = Math.max(redundancy, memoryEntrySimilarity(candidate, prior));
+      const mmr = lambda * candidate.score - (1 - lambda) * redundancy;
+      const current = remaining[bestIndex];
+      if (
+        mmr > bestMmr
+        || (mmr === bestMmr && candidate.score > current.score)
+        || (mmr === bestMmr && candidate.score === current.score && candidate.version.sequence > current.version.sequence)
+        || (mmr === bestMmr && candidate.score === current.score && candidate.version.sequence === current.version.sequence && candidate.recordId.localeCompare(current.recordId) < 0)
+      ) {
+        bestMmr = mmr;
+        bestIndex = index;
+      }
+    }
+    selected.push(remaining.splice(bestIndex, 1)[0]);
+  }
+  return selected;
 }
 
 function scopeMatches(memoryScope, scope) {
@@ -130,11 +232,12 @@ function selectedVersion(record, { asOfSequence, snapshotVersionIds, invalidated
 }
 
 export class PersistentMemoryService {
-  constructor({ dataRoot, actor, queue, clock }) {
+  constructor({ dataRoot, actor, queue, clock, embedder = null }) {
     this.dataRoot = dataRoot;
     this.actor = actor;
     this.queue = queue;
     this.clock = clock;
+    this.embedder = embedder;
   }
 
   #repository() {
@@ -161,6 +264,43 @@ export class PersistentMemoryService {
     }
   }
 
+  async retrievalConfiguration() {
+    if (!this.embedder?.memoryConfiguration) return DEFAULT_RETRIEVAL;
+    try {
+      return Object.freeze({ ...DEFAULT_RETRIEVAL, ...(await this.embedder.memoryConfiguration()) });
+    } catch {
+      return DEFAULT_RETRIEVAL;
+    }
+  }
+
+  async #embeddingFor(semanticKey, content) {
+    if (!this.embedder?.embedTexts) return null;
+    const configuration = await this.retrievalConfiguration();
+    if (!configuration.configured || !configuration.enabled || !configuration.embeddingProfileId) return null;
+    try {
+      const embedded = await this.embedder.embedTexts([memoryEmbeddingText(semanticKey, content)]);
+      const vector = embedded?.vectors?.[0];
+      if (!Array.isArray(vector) || !vector.length) return null;
+      return { profileId: configuration.embeddingProfileId, vector: vector.map(Number) };
+    } catch {
+      // Memory writes and lexical retrieval must remain available while the
+      // shared Embedding provider is unavailable. Missing vectors are
+      // backfilled on a later search.
+      return null;
+    }
+  }
+
+  async #persistEmbeddings(updates) {
+    if (!updates.length) return;
+    await this.#update((data) => {
+      for (const update of updates) {
+        const record = data.records[update.recordId];
+        const version = record?.versions?.find((candidate) => candidate.id === update.versionId);
+        if (version) version.embedding = structuredClone(update.embedding);
+      }
+    });
+  }
+
   async append(input) {
     const scope = normalizeScope(input.scope, this.actor);
     const semanticKey = normalizeText(input.semanticKey, "Memory semanticKey", 512);
@@ -173,6 +313,7 @@ export class PersistentMemoryService {
     const portability = String(input.portability || (scope.level === "workspace" ? "workspace-bound" : scope.level === "project" ? "project-bound" : scope.level === "task" ? "task-bound" : "universal"));
     invariant(PORTABILITIES.has(portability), "MEMORY_PORTABILITY_INVALID", "Memory portability 无效", { status: 400 });
     const source = normalizeSource(input.source);
+    const embedding = await this.#embeddingFor(semanticKey, content);
     const recordId = `memory_${scopeIdentity(scope, semanticKey).slice(0, 32)}`;
     let output;
     await this.#update((data) => {
@@ -200,6 +341,7 @@ export class PersistentMemoryService {
         source,
         supersedes: versions.at(-1)?.id || null,
         createdAt,
+        ...(embedding ? { embedding } : {}),
       };
       const record = {
         id: recordId,
@@ -262,6 +404,7 @@ export class PersistentMemoryService {
           source: provenance,
           supersedes: null,
           createdAt,
+          ...(original.embedding ? { embedding: structuredClone(original.embedding) } : {}),
         };
         data.records[recordId] = {
           id: recordId,
@@ -294,6 +437,20 @@ export class PersistentMemoryService {
       output = structuredClone(entry);
     });
     return output;
+  }
+
+  async filterObservations(fragments) {
+    if (!fragments.some((fragment) => String(fragment?.knowledge?.key || "").startsWith("memory:"))) return fragments;
+    const state = (await this.#repository().read()).data;
+    const invalidated = invalidatedVersionIds(state, state.sequence);
+    return fragments.filter((fragment) => {
+      const key = String(fragment?.knowledge?.key || "");
+      if (!key.startsWith("memory:")) return true;
+      const record = state.records[key.slice("memory:".length)];
+      if (!record) return false;
+      const latest = [...record.versions].reverse().find((version) => !invalidated.has(version.id));
+      return Boolean(latest && String(latest.content).trim() === String(fragment.knowledge.content || "").trim());
+    });
   }
 
   async invalidateSources({ sourceIds, reason, source }) {
@@ -368,27 +525,110 @@ export class PersistentMemoryService {
       // Concrete filenames, job ids and similar identifiers constrain the
       // requested subject. Generic prose such as “静态检查” must not surface a
       // different fact merely because it shares one broad phrase.
-      if (requiredAnchors.length && !containsExplicitQueryAnchor(version.content, requiredAnchors)) continue;
-      const relevanceScore = relevance(version.content, query);
-      if (query.size && relevanceScore === 0) continue;
+      const searchable = memoryEmbeddingText(record.semanticKey, version.content);
+      if (requiredAnchors.length && !containsExplicitQueryAnchor(searchable, requiredAnchors)) continue;
+      const relevanceScore = relevance(searchable, query);
       entries.push({
         recordId: record.id,
         semanticKey: record.semanticKey,
         scope: structuredClone(record.scope),
         version: structuredClone(version),
         score: LEVEL_WEIGHT[record.scope.level] * 10 + (AUTHORITY_WEIGHT[version.authority] || 0) + version.confidence + relevanceScore,
+        lexicalScore: normalizedRelevance(version.content, query),
+        titleScore: normalizedRelevance(record.semanticKey, query),
+        vectorScore: 0,
       });
     }
+    if (query.size && entries.length) {
+      const configuration = await this.retrievalConfiguration();
+      let queryVector = null;
+      const missing = configuration.configured && configuration.enabled && configuration.embeddingProfileId && this.embedder?.embedTexts
+        ? entries.filter((entry) => entry.version.embedding?.profileId !== configuration.embeddingProfileId)
+        : [];
+      if (configuration.configured && configuration.enabled && configuration.embeddingProfileId && this.embedder?.embedTexts) {
+        try {
+          const queryEmbedding = await this.embedder.embedTexts([String(options.query || "")]);
+          queryVector = queryEmbedding?.vectors?.[0] || null;
+          const updates = [];
+          const pageSize = Math.min(100, Math.max(5, Number(configuration.pageSize) || DEFAULT_RETRIEVAL.pageSize));
+          for (let offset = 0; offset < missing.length; offset += pageSize) {
+            const page = missing.slice(offset, offset + pageSize);
+            try {
+              const embedded = await this.embedder.embedTexts(page.map((entry) => memoryEmbeddingText(entry.semanticKey, entry.version.content)));
+              for (let index = 0; index < page.length; index += 1) {
+                const vector = embedded?.vectors?.[index];
+                if (!Array.isArray(vector) || !vector.length) continue;
+                const embedding = { profileId: configuration.embeddingProfileId, vector: vector.map(Number) };
+                page[index].version.embedding = embedding;
+                updates.push({ recordId: page[index].recordId, versionId: page[index].version.id, embedding });
+              }
+            } catch {
+              // A failed backfill page must not discard vectors from other
+              // pages or disable lexical/title retrieval for this query.
+            }
+          }
+          await this.#persistEmbeddings(updates);
+        } catch {
+          queryVector = null;
+        }
+      }
+      const vectorWeight = queryVector ? configuration.vectorWeight : 0;
+      const totalWeight = vectorWeight + configuration.lexicalWeight + configuration.titleWeight;
+      for (const entry of entries) {
+        entry.vectorScore = queryVector ? cosineSimilarity(queryVector, entry.version.embedding?.vector) : 0;
+        const semanticScore = totalWeight
+          ? (entry.vectorScore * vectorWeight + entry.lexicalScore * configuration.lexicalWeight + entry.titleScore * configuration.titleWeight) / totalWeight
+          : 0;
+        const scopeBonus = entry.scope.level === "conversation" ? 0.03 : entry.scope.level === "project" ? 0.02 : 0.01;
+        const authorityBonus = ((AUTHORITY_WEIGHT[entry.version.authority] || 0) / 6) * 0.02;
+        const confidenceBonus = Number(entry.version.confidence || 0) * 0.01;
+        entry.semanticScore = semanticScore;
+        entry.score = semanticScore + scopeBonus + authorityBonus + confidenceBonus;
+      }
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        if (
+          (entry.vectorScore <= 0 && entry.lexicalScore <= 0 && entry.titleScore <= 0)
+          || entry.semanticScore < configuration.minimumScore
+        ) entries.splice(index, 1);
+      }
+    }
     entries.sort((left, right) => right.score - left.score || right.version.sequence - left.version.sequence || left.recordId.localeCompare(right.recordId));
-    return { sequence: state.data.sequence, asOfSequence, entries: entries.slice(0, limit) };
+    const configuration = query.size ? await this.retrievalConfiguration() : DEFAULT_RETRIEVAL;
+    const diversified = query.size ? diversifyMemoryEntries(entries, configuration.diversityLambda) : entries;
+    return { sequence: state.data.sequence, asOfSequence, entries: diversified.slice(0, limit) };
   }
 
   async snapshot(scope, options = {}) {
+    validateEffectiveContextScope(scope);
+    invariant(scope.actorType === this.actor.actorType && scope.actorId === this.actor.actorId, "MEMORY_SCOPE_ACTOR_MISMATCH", "Memory scope 不属于当前 Actor", { status: 403 });
     const state = await this.#repository().read();
-    const selected = await this.select(scope, { ...options, asOfSequence: state.data.sequence, versionIds: [] });
+    const asOfSequence = options.asOfSequence ?? state.data.sequence;
+    invariant(Number.isSafeInteger(asOfSequence) && asOfSequence >= 0 && asOfSequence <= state.data.sequence, "MEMORY_SEQUENCE_INVALID", "Memory snapshot sequence 无效", { status: 400 });
+    const explicitVersions = options.versionIds ?? [];
+    const snapshotVersionIds = new Set(explicitVersions || []);
+    const invalidated = invalidatedVersionIds(state.data, asOfSequence);
+    const baselineSequence = scope.memoryBaselineSequence ?? options.baselineSequence ?? null;
+    invariant(baselineSequence === null || (Number.isSafeInteger(baselineSequence) && baselineSequence >= 0 && baselineSequence <= asOfSequence), "MEMORY_BASELINE_INVALID", "Memory baseline 无效", { status: 400 });
+    const invalidatedAtBaseline = baselineSequence === null ? invalidated : invalidatedVersionIds(state.data, baselineSequence);
+    const versionIds = [];
+    for (const record of Object.values(state.data.records)) {
+      if (!scopeMatches(record.scope, scope)) continue;
+      const version = selectedVersion(record, {
+        asOfSequence,
+        snapshotVersionIds,
+        invalidated,
+        baselineSequence,
+        invalidatedAtBaseline,
+      });
+      if (!version || (version.sensitivity === "restricted" && !options.includeRestricted)) continue;
+      if (!durableStoredMemory(record.semanticKey, version.content)) continue;
+      versionIds.push(version.id);
+    }
     return {
       sequence: state.data.sequence,
-      versionIds: selected.entries.map((entry) => entry.version.id),
+      asOfSequence,
+      versionIds,
     };
   }
 
@@ -398,6 +638,7 @@ export class PersistentMemoryService {
       id: entry.version.id,
       kind: "memory",
       semanticKey: entry.semanticKey,
+      title: entry.semanticKey,
       content: entry.version.content,
       tokenEstimate: options.tokenEstimator?.(entry.version.content),
       sensitivity: entry.version.sensitivity,

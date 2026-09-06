@@ -1,3 +1,6 @@
+import { parseRemoteArtifactLinks } from "../../../shared/remote-artifact-links.mjs";
+export { remoteArtifactPath } from "../../../shared/remote-artifact-links.mjs";
+
 export function text(value) {
   return typeof value === "string" ? value : "";
 }
@@ -195,49 +198,6 @@ export function safeResultText(value) {
   return text(source.output || source.content || source.text || source.message);
 }
 
-export function remoteArtifactPath(value) {
-  if (typeof value !== "string") return "";
-  const candidate = value.trim();
-  if (!candidate || candidate.includes("\0")) return "";
-  if (!candidate.startsWith("file://")) return candidate.startsWith("/") ? candidate : "";
-  try {
-    const url = new URL(candidate);
-    if (url.protocol !== "file:" || (url.hostname && url.hostname !== "localhost")) return "";
-    const path = decodeURIComponent(url.pathname);
-    return path.startsWith("/") && !path.includes("\0") ? path : "";
-  } catch {
-    return "";
-  }
-}
-
-function artifactNameFromLink(label, artifactPath) {
-  const fallback = artifactPath.split("/").filter(Boolean).at(-1);
-  if (fallback) return fallback;
-  const cleaned = text(label).replace(/[*_`]/g, "").trim();
-  return cleaned && cleaned.length <= 255 ? cleaned : "download";
-}
-
-function cleanLinkedArtifactLine(line, artifacts) {
-  let linked = false;
-  const cleaned = line.replace(/\[([^\]\r\n]{1,255})\]\((file:\/\/\/[^)\r\n]+)\)/g, (match, label, target) => {
-    const artifactPath = remoteArtifactPath(target);
-    if (!artifactPath) return match;
-    linked = true;
-    artifacts.push({ source: "remote", path: artifactPath, name: artifactNameFromLink(label, artifactPath), kind: "file" });
-    return "";
-  });
-  if (!linked) return line;
-  const normalized = cleaned
-    // A model may emphasize the Markdown link itself. Once the link becomes
-    // an Artifact card those now-empty emphasis markers must disappear too.
-    .replace(/(?:\*{2,}|_{2,}|~~)/g, "")
-    .replace(/[ \t]+([，。；：,.!?])/g, "$1")
-    .trimEnd();
-  if (/^\s*(?:[-*+]\s*|\d+[.)]\s*)?$/.test(normalized)) return "";
-  if (/^\s*(?:[-*+]\s*|\d+[.)]\s*)?(?:下载|download)\s*[:：]?\s*$/i.test(normalized)) return "";
-  return /[:：]\s*$/.test(normalized) ? normalized.replace(/[:：]\s*$/, "。") : normalized;
-}
-
 /**
  * A remote Agent can expose an existing workspace file without copying its
  * bytes through the model protocol by returning a standard Markdown file URL.
@@ -246,19 +206,17 @@ function cleanLinkedArtifactLine(line, artifacts) {
  * verifies scope/hash and streams the file only when the user downloads it.
  */
 export function emitLinkedRemoteArtifacts(context, value, source = {}) {
-  const original = text(value);
-  const artifacts = [];
-  const cleaned = original.split(/\r?\n/)
-    .map((line) => cleanLinkedArtifactLine(line, artifacts))
-    .filter((line) => line !== "")
-    .join("\n")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  const { original, cleaned, artifacts } = parseRemoteArtifactLinks(value);
 
+  recordItem(context.state, "easywork:linked-final", { original, cleaned, paths: artifacts.map((artifact) => artifact.path) });
+
+  const emittedPaths = new Set();
   for (const artifact of artifacts) {
     const itemId = `download:${artifact.path}`;
-    if (object(context.state.items[itemId]).artifactEmitted === true) continue;
+    // Deduplicate repeated links within this answer, not across the binding's
+    // later tasks: each delivery must verify and register its own Artifact.
+    if (emittedPaths.has(artifact.path)) continue;
+    emittedPaths.add(artifact.path);
     recordItem(context.state, itemId, { artifactEmitted: true, path: artifact.path, name: artifact.name });
     context.emit("artifact", "completed", artifact, { ...source, itemId });
   }

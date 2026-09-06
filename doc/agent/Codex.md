@@ -68,7 +68,7 @@ Codex 会把上一个 model 和 reasoning effort 持久到 native thread。因�
 | 运行中追加 | `turn/steer {threadId, expectedTurnId, input}` |
 | 终止 | `turn/interrupt {threadId, turnId}` |
 | 压缩 | `thread/compact/start {threadId}` |
-| 分支 | `thread/fork {threadId, path?, lastTurnId?|beforeTurnId?, cwd?, excludeTurns:true}` |
+| 分支 | `thread/fork {threadId, path?, lastTurnId?\|beforeTurnId?, cwd?, excludeTurns:true}` |
 | 回退 | `thread/revert {threadId, beforeTurnId}` |
 | 上下文用量 | 原生 token usage 事件缓存 |
 | 审批 | 对原生 server request 发送 JSON-RPC response |
@@ -94,15 +94,17 @@ Codex 会把上一个 model 和 reasoning effort 持久到 native thread。因�
 
 Codex 不通过共享 `CODEX_HOME` 自动发现 EasyWork Skill。原因是网页父子分支可能共享原生 store，如果把 Skill 放入全局发现目录，会把一个 binding 的 Skill 泄漏给另一个 binding。
 
-每次 `turn/start` 时，当前 binding 新选中的 Skill 作为原生 input item 加入：
+个人包固定、SSH 上传校验、远端缓存与对话自有副本的完整目录关系，见[远端文件版本与 Agent 机制](../远端文件版本与Agent机制.md)第 7.1 节。Codex 不生成 `easywork-selected` 组合命令，直接使用各技能的原生入口。
+
+app-server 初始化后调用 `skills/extraRoots/set`，以 `extraRoots: [<binding-skills-root>]` 注册当前 binding 的 Skill 根。每次选用技能的 `turn/start` 前，调用 `skills/list`，传入 `cwds: [<当前工作区>]` 和 `forceReload: true`，确认入口已经被原生发现且解析路径仍位于当前 binding 内；没有发现时明确失败，不把“目录已部署”当成“技能已加载”。本轮选中的 Skill 使用发现结果返回的名称与路径作为原生 input item 加入；路径可以是当前视图入口，也可以是其解析后的自有文件代次：
 
 ```json
-{"type":"skill","name":"<skill-id>","path":"<binding-skill-view>/<skill-id>/SKILL.md"}
+{"type":"skill","name":"<discovered-native-skill-name>","path":"<discovered-binding-skill-path>/SKILL.md"}
 ```
 
-同一 input 中按 path 去重。服务器级不可变包缓存仍可共享，但传给 Codex 的 path 总是 binding-local 视图。Context receipt 确保同一 native thread 已确认的 Skill 版本不被普通上下文重复发送；换绑 thread 时重新评估。
+同一 input 中按 path 去重。包缓存按用户和内容摘要隔离，binding 拥有自己的文件副本；目录指针不指向共享缓存。同版 pin 只免除重复复制，不免除本轮显式 Skill input：用户再次需要同一技能时仍调用该技能，保留当前 binding 副本中的内容。分支从所选 Task 的实际技能快照建立独立副本。
 
-上游选择有三种来源：网页 Agent 选择、用户显式附加、Work 设置中的强制启用。模式和服务器范围先由 EasyWork 过滤；强制项不交给网页模型读取或批准，最终与其他来源共用上述原生 input item 和版本收据。
+上游选择有三种来源：网页 Agent 选择、用户显式附加、Work 设置中的强制启用。模式和服务器范围先由 EasyWork 过滤；强制项在切换远端绑定后的首次提问由后端检查安装记录，只补齐缺少的版本，后续连续提问复用检查结果；不交给网页模型读取或批准。实际补发项与其他本轮选中项共用上述原生 input item 和版本收据。
 
 ## 7. 文件写前 Hook
 

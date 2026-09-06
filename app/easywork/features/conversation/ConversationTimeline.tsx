@@ -1,22 +1,28 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { BookOpen, Bot, Box, Brain, Check, ChevronRight, CircleStop, Code2, Copy, Database, Download, File, FileArchive, FileAudio, FileCode2, FileImage, FileSpreadsheet, FileText, FileType2, FileVideo, Gauge, GitBranch, HardDriveDownload, LoaderCircle, MessageCircle, Network, Package, Presentation, Send, ShieldCheck, Square, Terminal, Wrench, X } from "lucide-react";
 import type { ArtifactSummary, RealtimeEnvelope, TaskSummary } from "@/app/core/contracts";
 import { useAppRuntime } from "../../runtime/AppRuntime";
 import { MarkdownContent } from "./MarkdownContent";
-import { artifactDisplayName } from "./artifact-presentation.mjs";
+import { parseRemoteArtifactLinks } from "@/shared/remote-artifact-links.mjs";
+import { artifactAnswerMarkdown, artifactDisplayName, conversationArtifactCards, referencedArtifactCards } from "./artifact-presentation.mjs";
+import { canPreviewFile, fileTypeLabel } from "@/shared/file-preview.mjs";
+import { groupAgentActivity, timelineDetailIds } from "@/shared/timeline-projection.mjs";
+import { TimelineDetails, TimelineDetailStatus, useTimelineDetails } from "./TimelineDetails";
+import { markdownFence, markdownLabel, splitRemoteFinalPresentation } from "./conversation-copy.mjs";
 import styles from "./ConversationTimeline.module.css";
 
 type OutputSegment = { id: string; runId: string | null; content: string; target: "final" | "activity" | "handoff" | null; committed: boolean; first: RealtimeEnvelope };
-type BackgroundRead = { id: string; name: string; input: Record<string, unknown>; output: unknown };
-type ReasoningEntry = { type: "reasoning"; id: string; iteration: number; text: string };
+type BackgroundRead = { detailIds: string[]; id: string; name: string; input: Record<string, unknown>; output: unknown };
+type ReasoningEntry = { detailIds: string[]; type: "reasoning"; id: string; iteration: number; text: string };
 type ThoughtEntry =
   | ReasoningEntry
   | { type: "activity"; id: string; text: string }
-  | { type: "background"; id: string; reads: BackgroundRead[] };
-type HandoffReference = { kind: string; name: string; detail?: string };
-type Handoff = { userMessage: string; contextBrief: string; references: HandoffReference[] };
+  | { type: "background"; id: string; reads: BackgroundRead[] }
+  | { type: "state"; detailIds: string[]; id: string; state: Record<string, unknown> };
+type HandoffReference = { kind: string; name: string; detail?: string; edited?: boolean };
+type Handoff = { detailIds: string[]; userMessage: string; contextBrief: string; references: HandoffReference[] };
 type ApprovalDecision = "approve" | "approve_session" | "reject";
 type ApprovalResponder = (taskId: string, requestId: string, decision: ApprovalDecision) => Promise<void>;
 type InputResponder = (taskId: string, requestId: string, answers: Record<string, string | string[]>) => Promise<void>;
@@ -34,7 +40,7 @@ type AgentQuestion = {
 const AGENT_PLAN_TOOLS = new Set(["TodoWrite", "todowrite", "TaskCreate", "TaskUpdate", "update_plan"]);
 const WEB_AGENT_PROTOCOL_TOOLS = new Set([
   "memory_search", "resource_search", "resource_read", "conversation_search",
-  "skill_search", "skill_list", "context_get_state", "handoff_submit",
+  "skill_search", "skill_list", "handoff_rewrite_candidate", "handoff_submit",
 ]);
 const TOOL_CALL_ENVELOPE_KEYS = new Set([
   "id", "type", "name", "parameters", "arguments", "input", "function", "tool_call_id",
@@ -141,19 +147,7 @@ function safeJson(value: unknown, limit = 12_000) {
   } catch { return String(value ?? ""); }
 }
 
-export function splitRemoteFinalPresentation(value: string) {
-  const content = String(value || "").replace(/\r\n/g, "\n").trim();
-  const match = content.match(/^([\s\S]*?\S)\n{2,}(#{1,6}[ \t]+\S[\s\S]*)$/);
-  if (!match) return { activity: "", body: content };
-  const activity = match[1].trim();
-  const body = match[2].trim();
-  const activityLines = activity.split("\n").filter((line) => line.trim());
-  const alreadyStructured = /^(?:#{1,6}[ \t]|[-*+][ \t]|\d+\.[ \t]|```|>)/m.test(activity);
-  if (!activity || !body || alreadyStructured || activity.length > 500 || activityLines.length > 3) {
-    return { activity: "", body: content };
-  }
-  return { activity, body };
-}
+export { splitRemoteFinalPresentation } from "./conversation-copy.mjs";
 
 export function classifyConversationOutput(events: RealtimeEnvelope[]) {
   const runEvents = latestRunEvents(events);
@@ -227,16 +221,16 @@ function backgroundItems(output: unknown) {
   return values;
 }
 
-function resultTitle(source: string, value: unknown, index: number, query = "") {
+function resultTitle(source: string, value: unknown, index: number) {
   const record = payloadRecord(value);
+  if (record.timelineTitle) return String(record.timelineTitle);
   const directText = compactText(value, 84);
   if (source === "conversation") {
     const role = record.role === "user" ? "用户" : record.role === "assistant" ? "回复" : "消息";
     return compactText(record.content || record.text || record.title, 84) || directText || `${role} ${index + 1}`;
   }
   if (source === "memory") {
-    const matchedQuery = compactText(query, 84);
-    return matchedQuery ? `${matchedQuery}${index > 0 ? ` · ${index + 1}` : ""}` : `记忆 ${index + 1}`;
+    return compactText(record.title || record.semanticKey, 84) || `记忆 ${index + 1}`;
   }
   if (source === "skills") {
     const name = String(record.name || record.skillId || "").trim();
@@ -300,44 +294,69 @@ function handoffReferences(output: unknown, skillDetails: ReadonlyMap<string, st
     const eventDetail = String(record.detail || "").trim();
     const skillDetail = kind.toLocaleLowerCase() === "skill" ? skillDetails.get(handoffSkillKey(name)) || "" : "";
     const detail = skillDetail.length > eventDetail.length ? skillDetail : eventDetail;
-    return [{ kind, name, ...(detail ? { detail } : {}) }];
+    return [{ kind, name, ...(detail ? { detail } : {}), ...(record.edited === true ? { edited: true } : {}) }];
   });
+}
+
+function BackgroundResult({ result, index }: { result: { id: string; source: string; value: unknown; detailIds: string[] }; index: number }) {
+  const [open, setOpen] = useState(false);
+  const state = useTimelineDetails(result.detailIds, open);
+  const semanticText = semanticResultText(result.source, result.value);
+  const expandable = Boolean(semanticText || payloadRecord(result.value).timelineHasDetail);
+  const title = resultTitle(result.source, result.value, index);
+  return <div className={`${styles.backgroundResult} ${open ? styles.backgroundResultOpen : ""}`}>
+    {expandable ? <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+      <small>{sourceLabel(result.source)}</small><span>{title}</span><ChevronRight size={12} />
+    </button> : <div className={styles.backgroundResultStatic}><small>{sourceLabel(result.source)}</small><span>{title}</span></div>}
+    {open ? <div className={styles.backgroundResultMotion}><div><div className={styles.backgroundResultDetail}>
+      <TimelineDetailStatus state={state} />{!state.loading ? <MarkdownContent content={semanticText} compact activity /> : null}
+    </div></div></div> : null}
+  </div>;
 }
 
 function BackgroundTrace({ reads }: { reads: BackgroundRead[] }) {
   const [open, setOpen] = useState(false);
-  const [openedResult, setOpenedResult] = useState<string | null>(null);
-  const seenResults = new Set<string>();
   const results = reads.flatMap((item) => backgroundItems(item.output).map((result) => ({
-    ...result,
-    id: `${item.id}:${result.id}`,
-    query: String(item.input.query || item.input.filename || "").trim(),
-  }))).filter((result) => {
-    const key = `${result.source}:${safeJson(result.value, 4_000)}`;
-    if (seenResults.has(key)) return false;
-    seenResults.add(key);
-    return true;
-  });
+    ...result, id: `${item.id}:${result.id}`, detailIds: item.detailIds,
+  })));
   if (!results.length) return null;
   return <div className={`${styles.backgroundTrace} ${open ? styles.backgroundTraceOpen : ""}`}>
     <button className={styles.backgroundHeading} type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span className={styles.backgroundGlyph}><BookOpen size={15} /></span>
-      <span className={styles.backgroundLabel}>已查阅背景</span>
+      <span data-ui-icon="" className={styles.backgroundGlyph}><BookOpen size={15} /></span>
+      <span className={styles.backgroundLabel}>已查阅背景</span><ChevronRight className={styles.backgroundChevron} size={13} />
+    </button>
+    {open ? <div className={styles.backgroundMotion}><div>{results.map((result, index) => <BackgroundResult key={result.id} result={result} index={index} />)}</div></div> : null}
+  </div>;
+}
+
+function CurrentStateTrace({ state, detailIds }: { state: Record<string, unknown>; detailIds: string[] }) {
+  const [open, setOpen] = useState(false);
+  const detailState = useTimelineDetails(detailIds, open);
+  const server = payloadRecord(state.server);
+  const workspace = payloadRecord(state.workspace);
+  const agent = payloadRecord(state.agent);
+  const schedulerLabels: Record<string, string> = { slurm: "Slurm", pbs: "PBS", generic: "通用调度器" };
+  const serverName = String(server.name || "").trim();
+  const schedulerType = String(server.scheduler || "").trim().toLowerCase();
+  const scheduler = ["none", "unknown"].includes(schedulerType)
+    ? ""
+    : schedulerLabels[schedulerType] || String(server.scheduler || "").trim();
+  const values = [
+    { key: "server", label: "服务器", value: [serverName, scheduler].filter(Boolean).join(" · ") },
+    { key: "workspace", label: "工作区", value: String(workspace.name || workspace.path || "").trim() },
+    { key: "agent", label: "Agent", value: String(agent.name || "").trim() },
+  ].filter((entry) => entry.value);
+  if (!values.length && !detailIds.length) return null;
+  return <div className={`${styles.backgroundTrace} ${open ? styles.backgroundTraceOpen : ""}`}>
+    <button className={styles.backgroundHeading} type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+      <span data-ui-icon="" className={styles.backgroundGlyph}><Network size={15} /></span>
+      <span className={styles.backgroundLabel}>已查阅当前状态</span>
       <ChevronRight className={styles.backgroundChevron} size={13} />
     </button>
-    <div className={styles.backgroundMotion}><div>
-      {results.map((result, index) => {
-        const expanded = openedResult === result.id;
-        const semanticText = semanticResultText(result.source, result.value);
-        const title = resultTitle(result.source, result.value, index, result.query);
-        return <div className={`${styles.backgroundResult} ${expanded ? styles.backgroundResultOpen : ""}`} key={result.id}>
-          {semanticText ? <button type="button" onClick={() => setOpenedResult(expanded ? null : result.id)} aria-expanded={expanded}>
-            <small>{sourceLabel(result.source)}</small><span>{title}</span><ChevronRight size={12} />
-          </button> : <div className={styles.backgroundResultStatic}><small>{sourceLabel(result.source)}</small><span>{title}</span></div>}
-          {semanticText ? <div className={styles.backgroundResultMotion}><div><div className={styles.backgroundResultDetail}><MarkdownContent content={semanticText} compact activity /></div></div></div> : null}
-        </div>;
-      })}
-    </div></div>
+    {open ? <div className={styles.backgroundMotion}><div>
+      <TimelineDetailStatus state={detailState} />
+      {values.map((entry) => <div className={styles.backgroundResult} key={entry.key}><div className={styles.backgroundResultStatic}><small>{entry.label}</small><span>{entry.value}</span></div></div>)}
+    </div></div> : null}
   </div>;
 }
 
@@ -378,6 +397,11 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
   let handoff: Handoff | null = null;
   for (const event of webEvents) {
     const payload = payloadRecord(event.payload);
+    if (event.kind === "run.context.state") {
+      const state = payloadRecord(payload.state);
+      if (Object.keys(state).length) entries.push({ type: "state", detailIds: timelineDetailIds(event), id: `state:${event.eventId}`, state });
+      continue;
+    }
     if (event.kind === "run.reasoning.delta") {
       // Compatibility for runs persisted before Work terminal content stopped
       // being exposed: the unused model answer immediately before handoff is
@@ -394,12 +418,13 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
       const previousVisibleStream = visibleReasoningStreams.get(streamKey) || "";
       const addition = nextStream.startsWith(previousVisibleStream) ? nextStream.slice(previousVisibleStream.length) : nextStream;
       visibleReasoningStreams.set(streamKey, nextStream);
-      if (!addition) continue;
+      if (payload.timelineProtocol === true || (!addition && !payload.timelineHasText)) continue;
       const previous = entries.at(-1);
       if (previous?.type !== "reasoning") {
         const reasoning: ReasoningEntry = {
           type: "reasoning",
-          id: `reasoning:${latestStarted?.ids.runId || "web"}:${iteration}:${event.eventId}`,
+          detailIds: timelineDetailIds(event),
+          id: `reasoning:${latestStarted?.ids.runId || "web"}:${iteration}:${streamKey}`,
           iteration,
           text: addition,
         };
@@ -408,6 +433,7 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
       else {
         const separator = previous.text && !previous.text.endsWith("\n") && !addition.startsWith("\n") ? "\n\n" : "";
         previous.text += `${separator}${addition}`;
+        previous.detailIds.push(...timelineDetailIds(event));
       }
       continue;
     }
@@ -431,6 +457,7 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
         nonSkillReferences[0].detail = rawContextBrief;
       }
       handoff = {
+        detailIds: timelineDetailIds(event),
         userMessage: String(payload.userMessage || "").trim(),
         contextBrief: String(payload.displayBrief || "").trim(),
         references,
@@ -438,8 +465,17 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
       continue;
     }
     if (event.kind === "run.handoff.dispatched") {
+      if (handoff) handoff.detailIds.push(...timelineDetailIds(event));
       if (handoff && ["append", "resume"].includes(String(payload.operation || ""))) {
         handoff = { ...handoff, contextBrief: "", references: [] };
+      }
+      else if (handoff && Array.isArray(payload.references)) {
+        const deliveredReferences = handoffReferences(payload.references, selectedSkillDetails);
+        handoff = {
+          ...handoff,
+          contextBrief: payload.contextIncluded === false ? "" : handoff.contextBrief,
+          references: deliveredReferences,
+        };
       }
       else if (handoff && payload.contextIncluded === false) {
         // `contextIncluded` describes ordinary prompt context only. Skills are
@@ -457,6 +493,7 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
     if (event.kind !== "run.context.read") continue;
     if (payload.name === "context_get_state") continue;
     const read: BackgroundRead = {
+      detailIds: timelineDetailIds(event),
       id: String(payload.callId || event.eventId),
       name: String(payload.name || ""),
       input: payloadRecord(payload.input),
@@ -479,7 +516,12 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
   const terminal = handoffTerminal ?? persisted ?? formalTerminal;
   const running = Boolean(started && !terminal);
   const elapsedMs = started && terminal ? Math.max(0, Date.parse(terminal.occurredAt) - Date.parse(started.occurredAt)) : 0;
-  const visibleEntries = entries.filter((entry) => entry.type === "background" || entry.text.trim().length > 0);
+  const visibleEntries = entries.filter((entry) => (
+    entry.type === "background"
+    || entry.type === "state"
+    || (entry.type === "reasoning" && entry.detailIds.length > 0)
+    || entry.text.trim().length > 0
+  ));
   const rawAbortReason = formalTerminal?.kind === "run.aborted"
     ? String(payloadRecord(formalTerminal.payload).reason || "请求已停止")
     : "";
@@ -499,14 +541,15 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
 
 function ReasoningTrace({ entry, running, disclosureId }: { entry: ReasoningEntry; running: boolean; disclosureId: string }) {
   const [open, toggleOpen] = useTimelineDisclosure(disclosureId, running, true);
+  const detailState = useTimelineDetails(entry.detailIds, open);
   const content = entry.text.replace(/\n(?:[ \t]*\n){2,}/g, "\n\n").trim();
   return <section className={`${styles.reasoningTrace} ${open ? styles.reasoningTraceOpen : ""}`}>
     <button type="button" className={styles.reasoningHeading} aria-expanded={open} onClick={toggleOpen}>
-      <span className={styles.reasoningGlyph}><MessageCircle size={15} /></span>
+      <span data-ui-icon="" className={styles.reasoningGlyph}><MessageCircle size={15} /></span>
       <span className={styles.reasoningLabel}>思考内容</span>
       <ChevronRight className={styles.reasoningChevron} size={13} />
     </button>
-    <div className={styles.reasoningMotion}><div><div className={styles.reasoningText}><MarkdownContent content={content} compact activity /></div></div></div>
+    {open ? <div className={styles.reasoningMotion}><div><div className={styles.reasoningText}><TimelineDetailStatus state={detailState} />{!detailState.loading ? <MarkdownContent content={content} compact activity /> : null}</div></div></div> : null}
   </section>;
 }
 
@@ -520,16 +563,18 @@ function WebThought({ events, handoff = null }: { events: RealtimeEnvelope[]; ha
   const label = trace.running ? "正在思考" : trace.failure ? "处理失败" : trace.aborted ? "思考已停止" : "思考完成";
   return <section className={`${styles.webThought} ${open ? styles.webThoughtOpen : ""} ${trace.running ? styles.webThoughtRunning : ""}`}>
     <button type="button" className={styles.webThoughtHeading} disabled={!hasBody} aria-expanded={hasBody ? open : undefined} onClick={() => hasBody && toggleOpen()}>
-      <span className={styles.webThoughtGlyph}>{trace.running ? <LoaderCircle size={17} /> : trace.failure ? <X size={17} /> : trace.aborted ? <Square size={17} /> : <Brain size={17} />}</span>
+      <span data-ui-icon="" className={styles.webThoughtGlyph}>{trace.running ? <LoaderCircle size={17} /> : trace.failure ? <X size={17} /> : trace.aborted ? <Square size={17} /> : <Brain size={17} />}</span>
       <span className={styles.activityHeadingLabel}>{label}</span>
       {hasBody ? <ChevronRight className={styles.webThoughtChevron} size={13} /> : null}
     </button>
-    {hasBody ? <div className={styles.webThoughtMotion}><div><div className={styles.webThoughtBody}>
+    {hasBody && open ? <div className={styles.webThoughtMotion}><div><div className={styles.webThoughtBody}>
       {trace.entries.map((entry) => entry.type === "reasoning"
         ? <ReasoningTrace key={entry.id} entry={entry} running={trace.running} disclosureId={`${disclosureId}:reasoning:${entry.id}`} />
         : entry.type === "background"
           ? <BackgroundTrace key={entry.id} reads={entry.reads} />
-          : <p key={entry.id} className={styles.activityText}>{entry.text.trim()}</p>)}
+          : entry.type === "state"
+            ? <CurrentStateTrace key={entry.id} state={entry.state} detailIds={entry.detailIds} />
+            : <p key={entry.id} className={styles.activityText}>{entry.text.trim()}</p>)}
       {handoff ? <WorkHandoff handoff={handoff} /> : null}
     </div></div></div> : null}
     {terminalReason ? <div className={styles.runFailure} role="alert">{terminalReason}</div> : null}
@@ -537,22 +582,24 @@ function WebThought({ events, handoff = null }: { events: RealtimeEnvelope[]; ha
 }
 
 function WorkHandoff({ handoff }: { handoff: Handoff }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
+  const detailState = useTimelineDetails(handoff.detailIds, open);
   const referenceGroups = useMemo(() => {
     const groups = new Map<string, HandoffReference[]>();
     for (const reference of handoff.references) groups.set(reference.kind, [...(groups.get(reference.kind) || []), reference]);
     return [...groups.entries()].map(([kind, references]) => ({ kind, references }));
   }, [handoff.references]);
-  if (!handoff.userMessage && !handoff.contextBrief && !handoff.references.length) return null;
+  if (!handoff.detailIds.length && !handoff.userMessage && !handoff.contextBrief && !handoff.references.length) return null;
   return <section className={`${styles.handoff} ${open ? styles.handoffOpen : ""}`}>
     <button type="button" className={styles.handoffHeading} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span className={styles.handoffGlyph}><Send size={15} /></span><span className={styles.handoffLabel}>发给远端 Agent</span><ChevronRight className={styles.handoffChevron} size={13} />
+      <span data-ui-icon="" className={styles.handoffGlyph}><Send size={15} /></span><span className={styles.handoffLabel}>发给远端 Agent</span><ChevronRight className={styles.handoffChevron} size={13} />
     </button>
-    <div className={styles.handoffMotion}><div><div className={styles.handoffRail}><div className={styles.handoffBody}>
+    {open ? <div className={styles.handoffMotion}><div><div className={styles.handoffRail}><div className={styles.handoffBody}>
+      <TimelineDetailStatus state={detailState} />
       {handoff.userMessage ? <p>{handoff.userMessage}</p> : null}
       {handoff.contextBrief ? <p>{handoff.contextBrief}</p> : null}
       {referenceGroups.map((group) => <HandoffReferenceGroup key={group.kind} kind={group.kind} references={group.references} />)}
-    </div></div></div></div>
+    </div></div></div></div> : null}
   </section>;
 }
 
@@ -564,7 +611,7 @@ function HandoffReferenceGroup({ kind, references }: { kind: string; references:
     <button type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
       <span>{kind}</span><strong>{references.length} 项</strong><ChevronRight size={13} />
     </button>
-    <div className={styles.handoffReferenceMotion}><div>{references.map((reference) => <HandoffDetailReference key={`${reference.kind}:${reference.name}`} reference={{ ...reference, kind: "" }} />)}</div></div>
+    {open ? <div className={styles.handoffReferenceMotion}><div>{references.map((reference) => <HandoffDetailReference key={`${reference.kind}:${reference.name}`} reference={{ ...reference, kind: "" }} />)}</div></div> : null}
   </section>;
 }
 
@@ -573,11 +620,11 @@ function HandoffDetailReference({ reference }: { reference: HandoffReference }) 
   const expandable = Boolean(reference.detail?.trim());
   return <section className={`${styles.handoffSkillReference} ${open ? styles.handoffSkillReferenceOpen : ""}`}>
     {expandable ? <button type="button" className={styles.handoffSkillHeading} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span className={styles.handoffReferenceKind}>{reference.kind}</span><strong>{reference.name}</strong><ChevronRight size={13} />
+      <span className={styles.handoffReferenceKind}>{reference.kind}</span><strong>{reference.name}</strong>{reference.edited ? <em className={styles.handoffEdited}>本轮整理</em> : null}<ChevronRight size={13} />
     </button> : <div className={styles.handoffReference}>
-      <span className={styles.handoffReferenceKind}>{reference.kind}</span><strong>{reference.name}</strong>
+      <span className={styles.handoffReferenceKind}>{reference.kind}</span><strong>{reference.name}</strong>{reference.edited ? <em className={styles.handoffEdited}>本轮整理</em> : null}
     </div>}
-    {expandable ? <div className={styles.handoffSkillMotion}><div><div className={styles.handoffSkillDetail}><MarkdownContent content={reference.detail!} compact activity /></div></div></div> : null}
+    {expandable && open ? <div className={styles.handoffSkillMotion}><div><div className={styles.handoffSkillDetail}><MarkdownContent content={reference.detail!} compact activity /></div></div></div> : null}
   </section>;
 }
 
@@ -679,6 +726,7 @@ function mergedNestedPayload(previous: RealtimeEnvelope, current: RealtimeEnvelo
   return {
     ...previousOuter,
     ...currentOuter,
+    timelineDetailIds: [...new Set([...timelineDetailIds(previous), ...timelineDetailIds(current)])],
     event: {
       ...payloadRecord(nestedPayload(previous)),
       ...payloadRecord(nestedPayload(current)),
@@ -946,14 +994,14 @@ function CopyButton({ content, label }: { content: string; label: string }) {
   }}>{copied ? <Check size={13} /> : <Copy size={13} />}</button>;
 }
 
-function conciseToolValue(value: unknown) {
+function conciseToolValue(value: unknown): string {
   if (typeof value === "string") return value.trim();
   if (Array.isArray(value)) return value.map(conciseToolValue).filter(Boolean).join(", ");
   if (value && typeof value === "object") return safeJson(value, 320).replace(/\s+/g, " ");
   return value == null ? "" : String(value);
 }
 
-function toolParts(event: RealtimeEnvelope) {
+function toolParts(event: RealtimeEnvelope, includeDetails = true) {
   const record = payloadRecord(nestedPayload(event));
   const input = payloadRecord(record.input);
   const name = String(record.name || "tool");
@@ -963,13 +1011,14 @@ function toolParts(event: RealtimeEnvelope) {
   const search = /(?:^|_)(?:grep|search|search_text|ripgrep)(?:_|$)/.test(normalizedName);
   const discover = /(?:^|_)(?:glob|find|find_files|list|list_files)(?:_|$)/.test(normalizedName);
   const command = String(input.command || record.command || "");
-  const output = typeof record.result === "string" ? record.result : textFrom(record.result) || String(record.text || record.output || "");
   const primary = conciseToolValue(input.pattern || input.query || input.search || input.glob || input.path || input.directory);
   const location = conciseToolValue(input.path || input.directory || input.cwd);
   const summary = shell
     ? command || name
     : [name, primary, location && location !== primary ? location : ""].filter(Boolean).join(" · ");
   const label = shell ? "运行命令" : search ? "搜索内容" : discover ? "查找文件" : "调用工具";
+  if (!includeDetails) return { label, summary, output: "", detail: "", shell };
+  const output = typeof record.result === "string" ? record.result : textFrom(record.result) || String(record.text || record.output || "");
   const inputText = Object.keys(input).length ? safeJson(input) : "";
   const detail = shell
     ? `$ ${command || name}${output ? `\n${output}` : ""}`
@@ -1033,19 +1082,20 @@ function EmbeddedApproval({ event, taskId, taskStatus, onApproval }: { event: Re
 }
 
 function CommandItem({ event, taskId, taskStatus, onApproval }: { event: RealtimeEnvelope; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
-  const [open, setOpen] = useState(false);
-  const tool = toolParts(event);
+  const [open, setOpen] = useState(event.status === "waiting");
+  const detailState = useTimelineDetails(timelineDetailIds(event), open);
+  const tool = useMemo(() => toolParts(event, open), [event, open]);
   const cancelled = ["cancelled", "interrupted"].includes(String(event.status));
   return <article className={`${styles.commandItem} ${open ? styles.itemOpen : ""} ${isRunningEvent(event) ? styles.running : ""} ${event.status === "failed" ? styles.error : ""} ${cancelled ? styles.cancelled : ""}`}>
     <button type="button" className={styles.commandSummary} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
       <span className={styles.commandStatus}>{event.status === "failed" ? <X size={12} /> : ["cancelled", "interrupted"].includes(String(event.status)) ? <Square size={8} /> : tool.shell ? <Terminal size={12} /> : <Wrench size={12} />}</span>
       <span className={styles.operationKind}>{tool.label}</span><code>{tool.summary}</code><small>{eventStatusLabel(event.status)}</small><ChevronRight className={styles.itemChevron} size={13} />
     </button>
-    <div className={styles.itemMotion}><div><div className={styles.terminalWrap}>
-      <CopyButton content={tool.detail} label={tool.shell ? "复制命令和输出" : "复制工具输入和结果"} />
-      <pre className={styles.remoteTerminal}><code>{tool.detail || (isRunningEvent(event) ? "等待远端结果…" : "Agent 未返回可显示的工具结果。")}</code></pre>
+    {open ? <div className={styles.itemMotion}><div><div className={styles.terminalWrap}>
+      <TimelineDetailStatus state={detailState} /><CopyButton content={tool.detail} label={tool.shell ? "复制命令和输出" : "复制工具输入和结果"} />
+      {!detailState.loading ? <pre className={styles.remoteTerminal}><code>{tool.detail || (isRunningEvent(event) ? "等待远端结果…" : "Agent 未返回可显示的工具结果。")}</code></pre> : null}
       <EmbeddedApproval event={event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />
-    </div></div></div>
+    </div></div></div> : null}
   </article>;
 }
 
@@ -1093,21 +1143,21 @@ function operationEntries(events: RealtimeEnvelope[]) {
 }
 
 function OperationGroup({ events, taskId, taskStatus, onApproval }: { events: RealtimeEnvelope[]; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
-  const entries = operationEntries(events);
+  const entries = useMemo(() => operationEntries(events), [events]);
   const waiting = events.some((event) => event.status === "waiting");
   const running = events.some(isRunningEvent);
   const failed = events.some((event) => event.status === "failed");
   const cancelled = events.every((event) => ["cancelled", "interrupted"].includes(String(event.status)));
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(waiting);
   return <section className={`${styles.activityGroup} ${open ? styles.groupOpen : ""} ${running ? styles.running : ""} ${failed ? styles.error : ""}`}>
     <button type="button" className={`${styles.groupHeading} ${styles.commandGroupHeading}`} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span className={styles.groupGlyph}>{failed ? <X size={13} /> : <Wrench size={14} />}</span>
+      <span data-ui-icon="" className={styles.groupGlyph}>{failed ? <X size={13} /> : <Wrench size={14} />}</span>
       <strong>{waiting ? `等待执行 ${entries.length} 个操作` : running ? `正在执行 ${entries.length} 个操作` : cancelled ? `已取消 ${entries.length} 个操作` : `执行了 ${entries.length} 个操作`}</strong>
       <ChevronRight className={styles.groupChevron} size={13} />
     </button>
-    <div className={styles.groupMotion}><div className={styles.commandList}>{entries.map((entry) => entry.type === "tool"
+    {open ? <div className={styles.groupMotion}><div className={styles.commandList}>{entries.map((entry) => entry.type === "tool"
       ? <CommandItem key={entry.id} event={entry.event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />
-      : <FileItem key={entry.id} file={entry.file} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />)}</div></div>
+      : <FileItem key={entry.id} file={entry.file} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />)}</div></div> : null}
   </section>;
 }
 
@@ -1121,7 +1171,7 @@ function diffTone(line: string) {
 
 function DiffView({ content }: { content: string }) {
   const lines = content.replace(/\r\n/g, "\n").split("\n");
-  return <div className={styles.fileDiff} aria-label="文件修改差异"><CopyButton content={content} label="复制 Diff" /><span className={styles.diffCaption}><Code2 size={13} />Diff</span><div className={styles.diffLines}>{lines.map((line, index) => <div className={`${styles.diffLine} ${diffTone(line)}`} key={`${index}:${line}`}><span>{index + 1}</span><code>{line || " "}</code></div>)}</div></div>;
+  return <div className={styles.fileDiff} aria-label="文件修改差异"><CopyButton content={content} label="复制 Diff" /><span className={styles.diffCaption}><Code2 size={13} />Diff</span><div className={styles.diffLines} data-mobile-swipe-ignore>{lines.map((line, index) => <div className={`${styles.diffLine} ${diffTone(line)}`} key={`${index}:${line}`}><span>{index + 1}</span><code>{line || " "}</code></div>)}</div></div>;
 }
 
 type FileEntry = { path?: string; diff?: string; output?: string; operation?: "read" | "edit"; status?: string | null; id: string; event: RealtimeEnvelope };
@@ -1144,7 +1194,7 @@ function mergedFileEntries(events: RealtimeEnvelope[]) {
         output: file.output || previous?.output,
         operation: "edit",
         status: previous?.status === "failed" || event.status === "failed" ? "failed" : previous?.status === "updated" || isRunningEvent(event) ? "updated" : event.status,
-        event,
+        event: previous ? { ...event, payload: { ...payloadRecord(event.payload), timelineDetailIds: [...new Set([...timelineDetailIds(previous.event), ...timelineDetailIds(event)])] } } : event,
       });
     }
   }
@@ -1153,17 +1203,18 @@ function mergedFileEntries(events: RealtimeEnvelope[]) {
 
 function FileItem({ file, taskId, taskStatus, onApproval }: { file: FileEntry; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
   const [open, setOpen] = useState(false);
+  const detailState = useTimelineDetails(timelineDetailIds(file.event), open);
   const name = file.path?.split(/[\\/]/).filter(Boolean).at(-1) || "未命名文件";
   const running = ["started", "updated", "running"].includes(String(file.status));
   const cancelled = ["cancelled", "interrupted"].includes(String(file.status));
   const reading = file.operation === "read";
   return <article className={`${styles.fileItem} ${open ? styles.itemOpen : ""} ${running ? styles.running : ""} ${file.status === "failed" ? styles.error : ""} ${cancelled ? styles.cancelled : ""}`}>
     <button type="button" className={styles.fileSummary} aria-expanded={open} onClick={() => setOpen((value) => !value)}><span className={styles.fileStatus}>{file.status === "failed" ? <X size={12} /> : cancelled ? <Square size={8} /> : <FileText size={13} />}</span><span className={styles.operationKind}>{reading ? "读取文件" : "编辑文件"}</span><span className={styles.fileCopy}><strong>{name}</strong>{file.path ? <small>{file.path}</small> : null}</span><ChevronRight className={styles.itemChevron} size={13} /></button>
-    <div className={styles.itemMotion}><div><div className={styles.fileDetail}>{file.diff ? <DiffView content={file.diff} /> : file.output ? <><CopyButton content={file.output} label={reading ? "复制文件内容" : "复制文件修改内容"} /><pre className={styles.fileRaw}>{file.output}</pre></> : <p className={styles.fileEmpty}>{reading ? "Agent 未返回可显示的文件内容。" : "Agent 未返回可显示的差异内容。"}</p>}<EmbeddedApproval event={file.event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} /></div></div></div>
+    {open ? <div className={styles.itemMotion}><div><div className={styles.fileDetail}><TimelineDetailStatus state={detailState} />{detailState.loading ? null : file.diff ? <DiffView content={file.diff} /> : file.output ? <><CopyButton content={file.output} label={reading ? "复制文件内容" : "复制文件修改内容"} /><pre className={styles.fileRaw}>{file.output}</pre></> : <p className={styles.fileEmpty}>{reading ? "Agent 未返回可显示的文件内容。" : "Agent 未返回可显示的差异内容。"}</p>}<EmbeddedApproval event={file.event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} /></div></div></div> : null}
   </article>;
 }
 
-function approvalValue(value: unknown) {
+function approvalValue(value: unknown): string {
   if (typeof value === "string") return value.trim();
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (Array.isArray(value)) return value.map(approvalValue).filter(Boolean).join(" ");
@@ -1328,7 +1379,7 @@ function displayFileSize(value: unknown) {
   return `${Math.max(0.1, size / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
-type ArtifactCardData = Pick<ArtifactSummary, "id" | "name" | "mime" | "size" | "createdAt">;
+export type ArtifactCardData = Pick<ArtifactSummary, "id" | "name" | "mime" | "size" | "createdAt"> & { workspaceId?: string; path?: string; failure?: string };
 
 function ArtifactCardRow({ artifact }: { artifact: ArtifactCardData }) {
   const runtime = useAppRuntime();
@@ -1337,6 +1388,10 @@ function ArtifactCardRow({ artifact }: { artifact: ArtifactCardData }) {
   const mime = String(artifact.mime || "application/octet-stream");
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
+  const previewable = !artifact.failure && canPreviewFile({ name, mime }) && runtime.view.kind === "conversation";
+  const openPreview = () => {
+    if (previewable && runtime.view.kind === "conversation") runtime.openFilePreview({ conversationId: runtime.view.conversationId, name, size: Number(artifact.size) || 0, source: { kind: "artifact", artifactId } });
+  };
   const download = async () => {
     if (!artifactId || downloading) return;
     setDownloading(true); setError("");
@@ -1347,50 +1402,40 @@ function ArtifactCardRow({ artifact }: { artifact: ArtifactCardData }) {
       setError(reason instanceof Error ? reason.message : "下载链接生成失败");
     } finally { setDownloading(false); }
   };
-  return <article className={styles.artifactCard}>
-    <span className={styles.artifactGlyph}>{artifactFileIcon(name, mime)}</span>
-    <span className={styles.artifactCopy}><strong>{name}</strong><small>{displayFileSize(artifact.size)}</small>{error ? <em>{error}</em> : null}</span>
-    <button type="button" disabled={!artifactId || downloading} onClick={() => void download()}>{downloading ? <LoaderCircle className={styles.spin} size={15} /> : <Download size={15} />}<span>下载</span></button>
+  const contents = <><span data-ui-icon="" className={styles.artifactGlyph}>{artifactFileIcon(name, mime)}</span><span className={styles.artifactCopy}><strong>{name}</strong><small className={styles.artifactMeta}><span className={styles.artifactFileMeta}>{fileTypeLabel({ name, mime })} · {displayFileSize(artifact.size)}</span>{previewable ? <span className={styles.artifactOpenHint} aria-hidden="true">打开文件</span> : null}</small>{error || artifact.failure ? <em>{error || artifact.failure}</em> : null}</span></>;
+  return <article className={styles.artifactCard} data-artifact-id={artifactId} data-previewable={previewable}>
+    {previewable ? <button type="button" className={styles.artifactPreview} aria-label={`预览 ${name}`} onClick={openPreview}>{contents}</button> : <div className={styles.artifactPreview}>{contents}</div>}
+    <button className={styles.artifactDownload} data-ui-icon="" type="button" aria-label={`下载 ${name}`} aria-busy={downloading} disabled={!artifactId || downloading || Boolean(artifact.failure)} onClick={() => void download()}>{downloading ? <LoaderCircle className={styles.spin} size={17} /> : <Download size={17} />}</button>
   </article>;
 }
 
 export function ConversationArtifactCards({ events = [], artifacts = [] }: { events?: RealtimeEnvelope[]; artifacts?: ArtifactSummary[] }) {
-  const cards = useMemo(() => {
-    const byId = new Map<string, ArtifactCardData>();
-    for (const artifact of [...artifacts]
-      .filter((entry) => ["active", "pinned"].includes(entry.lifecycle))
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))) {
-      byId.set(artifact.id, artifact);
-    }
-    for (const event of orderedEvents(events)) {
-      if (event.kind !== "artifact") continue;
-      const record = payloadRecord(nestedPayload(event));
-      const artifact = payloadRecord(record.artifact);
-      const id = String(record.artifactId || artifact.id || "");
-      if (!id) continue;
-      byId.set(id, {
-        id,
-        name: String(artifact.name || record.name || "结果文件"),
-        mime: String(artifact.mime || "application/octet-stream"),
-        size: Number(artifact.size),
-        createdAt: String(artifact.createdAt || event.occurredAt),
-      });
-    }
-    return [...byId.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
-  }, [artifacts, events]);
+  const cards: ArtifactCardData[] = useMemo(() => conversationArtifactCards(orderedEvents(events), artifacts), [artifacts, events]);
   if (!cards.length) return null;
   return <div className={styles.artifactCards} aria-label="下载文件">{cards.map((artifact) => <ArtifactCardRow key={artifact.id} artifact={artifact} />)}</div>;
 }
 
+export function ConversationAnswer({ content, events = [], artifacts = [], artifactHistory = [], workspaceId }: { content: string; events?: RealtimeEnvelope[]; artifacts?: ArtifactSummary[]; artifactHistory?: ArtifactCardData[]; workspaceId?: string }) {
+  const markdown = useMemo(() => artifactAnswerMarkdown(content, orderedEvents(events)), [content, events]);
+  const cards: ArtifactCardData[] = useMemo(() => referencedArtifactCards(markdown, conversationArtifactCards(orderedEvents(events), artifacts), artifactHistory, {
+    workspaceId, before: orderedEvents(events).at(-1)?.occurredAt,
+  }), [markdown, events, artifacts, artifactHistory, workspaceId]);
+  return <MarkdownContent content={markdown} artifactCards={cards} renderArtifact={(id) => {
+    const card = cards.find((entry) => entry.id === id);
+    return card ? <div className={styles.artifactCards} aria-label="下载文件"><ArtifactCardRow artifact={card} /></div> : null;
+  }} />;
+}
+
 function EventRow({ event, taskId, taskStatus, onApproval }: { event: RealtimeEnvelope; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
   const record = payloadRecord(nestedPayload(event));
-  const text = event.kind === "approval_request"
+  const [open, setOpen] = useState(event.kind === "approval_request" && event.status === "waiting");
+  const text = !open ? "" : event.kind === "approval_request"
     ? approvalRequestText(record)
     : textFrom(record) || (event.kind !== "command" && Object.keys(record).length ? safeJson(record) : "");
   const detail = event.kind === "approval_request" ? "" : eventDetailLabel(event, record);
   const secondary = detail || (event.kind !== "approval_request" && event.producer.startsWith("agent:") ? event.producer.slice(6) : "");
-  const expandable = Boolean(text);
-  const [open, setOpen] = useState(event.kind === "approval_request" && event.status === "waiting");
+  const expandable = Boolean(timelineDetailIds(event).length || textFrom(record) || Object.keys(record).length);
+  const detailState = useTimelineDetails(timelineDetailIds(event), open);
   const [responding, setResponding] = useState<ApprovalDecision | null>(null);
   const [submitted, setSubmitted] = useState<{ requestId: string; decision: ApprovalDecision } | null>(null);
   const [approvalError, setApprovalError] = useState("");
@@ -1405,8 +1450,8 @@ function EventRow({ event, taskId, taskStatus, onApproval }: { event: RealtimeEn
     finally { setResponding(null); }
   };
   return <article className={`${styles.agentEvent} ${styles[`kind_${event.kind}`] || ""} ${open ? styles.itemOpen : ""} ${isRunningEvent(event) ? styles.running : ""} ${event.status === "failed" || event.kind === "error" ? styles.error : ""}`}>
-    <button type="button" className={styles.eventSummary} aria-expanded={expandable ? open : undefined} onClick={() => expandable && setOpen((value) => !value)}><span className={styles.eventGlyph}>{eventIcon(event)}</span><span className={styles.eventCopy}><strong>{eventLabel(event)}</strong>{secondary ? <small>{secondary}</small> : null}</span><span className={styles.eventStatus}>{event.kind === "approval_request" && event.status === "waiting" ? "等待操作" : eventStatusLabel(event.status)}</span>{expandable ? <ChevronRight className={styles.itemChevron} size={13} /> : <span />}</button>
-    {expandable ? <div className={styles.itemMotion}><div><div className={styles.eventDetail}>{text ? <div className={styles.eventOutput}><MarkdownContent content={text} compact activity /></div> : null}{approvalPending ? <div className={styles.approvalActions}><button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve")}>{responding === "approve" ? <LoaderCircle className={styles.spin} size={13} /> : null}允许一次</button>{record.allowSession !== false ? <button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve_session")}>{responding === "approve_session" ? <LoaderCircle className={styles.spin} size={13} /> : null}本会话允许</button> : null}<button type="button" className={styles.rejectApproval} disabled={Boolean(responding)} onClick={() => void respond("reject")}>{responding === "reject" ? <LoaderCircle className={styles.spin} size={13} /> : null}拒绝</button></div> : null}{approvalError ? <small className={styles.approvalError}>{approvalError}</small> : null}</div></div></div> : null}
+    <button type="button" className={styles.eventSummary} aria-expanded={expandable ? open : undefined} onClick={() => expandable && setOpen((value) => !value)}><span data-ui-icon="" className={styles.eventGlyph}>{eventIcon(event)}</span><span className={styles.eventCopy}><strong>{eventLabel(event)}</strong>{secondary ? <small>{secondary}</small> : null}</span><span className={styles.eventStatus}>{event.kind === "approval_request" && event.status === "waiting" ? "等待操作" : eventStatusLabel(event.status)}</span>{expandable ? <ChevronRight className={styles.itemChevron} size={13} /> : <span />}</button>
+    {expandable && open ? <div className={styles.itemMotion}><div><div className={styles.eventDetail}><TimelineDetailStatus state={detailState} />{text && !detailState.loading ? <div className={styles.eventOutput}><MarkdownContent content={text} compact activity /></div> : null}{approvalPending ? <div className={styles.approvalActions}><button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve")}>{responding === "approve" ? <LoaderCircle className={styles.spin} size={13} /> : null}允许一次</button>{record.allowSession !== false ? <button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve_session")}>{responding === "approve_session" ? <LoaderCircle className={styles.spin} size={13} /> : null}本会话允许</button> : null}<button type="button" className={styles.rejectApproval} disabled={Boolean(responding)} onClick={() => void respond("reject")}>{responding === "reject" ? <LoaderCircle className={styles.spin} size={13} /> : null}拒绝</button></div> : null}{approvalError ? <small className={styles.approvalError}>{approvalError}</small> : null}</div></div></div> : null}
   </article>;
 }
 
@@ -1429,7 +1474,7 @@ type ActivitySegment =
   | { type: "event"; id: string; event: RealtimeEnvelope };
 
 export function normalizeRemoteArtifactLinkText(value: string) {
-  return value.replace(/\[([^\]\r\n]{1,255})\]\(file:\/\/\/[^)\r\n]+\)/g, "$1").replace(/\s+/g, " ").trim();
+  return parseRemoteArtifactLinks(value).cleaned.replace(/\s+/g, " ").trim();
 }
 
 function normalizedActivityText(event: RealtimeEnvelope) {
@@ -1490,6 +1535,14 @@ function finalSummaryMessageIds(events: RealtimeEnvelope[], finalTexts: string[]
   return hidden;
 }
 
+function activityIdentity(event: RealtimeEnvelope) {
+  // Journal IDs identify deliveries. A cumulative stream replaces its previous
+  // delivery, but must keep the same mounted disclosure and its reader state.
+  const itemId = sourceItemId(event);
+  return itemId ? `${event.producer}:${event.kind}:${itemId}`
+    : String(payloadRecord(event.payload).realtimeStreamKey || event.eventId);
+}
+
 function activitySegments(events: RealtimeEnvelope[], finalTextHints: string[] = []) {
   const segments: ActivitySegment[] = [];
   const finalTexts = [...new Set([
@@ -1503,7 +1556,7 @@ function activitySegments(events: RealtimeEnvelope[], finalTextHints: string[] =
     if (finalMessageIds.has(event.eventId)) continue;
     const type = ["tool_call", "file_change"].includes(event.kind) ? "operations" : null;
     const previous = segments.at(-1);
-    if (!type && previous?.type === "event" && normalizedActivityText(previous.event) === normalizedActivityText(event)) {
+    if (!type && previous?.type === "event" && !timelineDetailIds(event).length && !timelineDetailIds(previous.event).length && normalizedActivityText(previous.event) === normalizedActivityText(event)) {
       const sameNarrativeKind = ["message", "reasoning", "error"].includes(event.kind) && previous.event.kind === event.kind;
       const repeatedCommandFailure = event.producer === "task-orchestrator"
         && event.kind === "command"
@@ -1512,8 +1565,8 @@ function activitySegments(events: RealtimeEnvelope[], finalTextHints: string[] =
       if (sameNarrativeKind || repeatedCommandFailure) continue;
     }
     if (type && previous?.type === type) previous.events.push(event);
-    else if (type === "operations") segments.push({ type, id: event.eventId, events: [event] });
-    else segments.push({ type: "event", id: event.eventId, event });
+    else if (type === "operations") segments.push({ type, id: activityIdentity(event), events: [event] });
+    else segments.push({ type: "event", id: activityIdentity(event), event });
   }
   return segments;
 }
@@ -1573,6 +1626,11 @@ function useTimelineDisclosure(identity: string, running: boolean, expandable: b
     : justFinished
       ? false
       : running || storedTimelineDisclosure(identity));
+  useEffect(() => {
+    if (samePhase) return;
+    if (justFinished) writeTimelineDisclosure(identity, false);
+    setChoice({ identity, running, expandable, open });
+  }, [identity, running, expandable, open, samePhase, justFinished]);
   const toggleOpen = () => {
     const next = expandable ? !open : false;
     if (!running) writeTimelineDisclosure(identity, next);
@@ -1604,16 +1662,57 @@ function AgentFailureNotice({ message }: { message: string }) {
   </section>;
 }
 
-function AgentCall({ events, status, task, taskId, finalTextHint = "", failure = null, detailsLoading = false, onApproval, onInput }: { events: RealtimeEnvelope[]; status: string; task?: TaskSummary; taskId?: string; finalTextHint?: string; failure?: { code: string; message: string } | null; detailsLoading?: boolean; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+function AgentReasoning({ event }: { event: RealtimeEnvelope }) {
+  const detailState = useTimelineDetails(timelineDetailIds(event), true);
+  const content = textFrom(nestedPayload(event)).replace(/\n(?:[ \t]*\n){2,}/g, "\n\n").trim();
+  return <section className={`${styles.reasoningText} ${styles.agentReasoningText}`} aria-label="Agent 思考文本">
+    <TimelineDetailStatus state={detailState} />
+    {!detailState.loading ? <MarkdownContent content={content} compact activity /> : null}
+  </section>;
+}
+
+function AgentActivityItem({ segment, taskId, status, onApproval, onInput }: { segment: ActivitySegment; taskId?: string; status: string; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+  if (segment.type === "operations") return <OperationGroup events={segment.events} taskId={taskId} taskStatus={status} onApproval={onApproval} />;
+  const event = segment.event;
+  if (event.kind === "input_request") return <AgentInputRequest event={event} taskId={taskId} taskStatus={status} onInput={onInput} />;
+  if (event.kind === "reasoning") return <AgentReasoning event={event} />;
+  if (event.kind === "message") return <AgentThought event={event} />;
+  return <EventRow event={event} taskId={taskId} taskStatus={status} onApproval={onApproval} />;
+}
+
+function AgentThinking({ segments, id, running, taskId, status, onApproval, onInput }: { segments: ActivitySegment[]; id: string; running: boolean; taskId?: string; status: string; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+  const [open, toggleOpen] = useTimelineDisclosure(`remote-thinking:${taskId}:${id}`, running, true);
+  return <section className={styles.agentThinking}>
+    <button className={styles.reasoningHeading} type="button" aria-expanded={open} onClick={toggleOpen}>
+      <span data-ui-icon="" className={styles.reasoningGlyph}><Brain size={15} /></span>
+      <span className={styles.reasoningLabel}>{running ? "Agent思考中" : "Agent已思考"}</span><ChevronRight className={styles.reasoningChevron} size={13} />
+    </button>
+    {open ? <div className={styles.agentThinkingMotion}><div className={styles.agentThinkingBody}>{segments.map((segment) => <AgentActivityItem key={segment.id} segment={segment} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</div></div> : null}
+  </section>;
+}
+
+function AgentCallContents({ events, status, taskId, finalTextHint, running, onApproval, onInput }: { events: RealtimeEnvelope[]; status: string; taskId?: string; finalTextHint: string; running: boolean; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
   const segments = useMemo(() => activitySegments(
     settledEvents(events, status),
     TERMINAL_TASK_STATUSES.has(status) && finalTextHint ? [finalTextHint] : [],
   ), [events, finalTextHint, status]);
+  const groups = useMemo(() => groupAgentActivity(segments) as Array<ActivitySegment | { type: "thinking"; id: string; segments: ActivitySegment[] }>, [segments]);
+  return <>{groups.map((group, index) => group.type === "thinking"
+    ? <AgentThinking key={group.id} segments={group.segments} id={group.id} running={running && index === groups.length - 1} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />
+    : <AgentActivityItem key={group.id} segment={group} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</>;
+}
+
+function AgentCall({ events, status, task, taskId, finalTextHint = "", failure = null, detailsLoading = false, onApproval, onInput }: { events: RealtimeEnvelope[]; status: string; task?: TaskSummary; taskId?: string; finalTextHint?: string; failure?: { code: string; message: string } | null; detailsLoading?: boolean; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
   const finalActivities = useMemo(() => [...new Set(events
     .filter((event) => event.kind === "final")
     .map((event) => splitRemoteFinalPresentation(textFrom(nestedPayload(event))).activity)
     .filter(Boolean))], [events]);
-  const hasActivity = segments.length > 0 || finalActivities.length > 0;
+  // Do not coalesce commands or construct detail rows while the call is closed.
+  // A message-only turn still needs the normal final-answer deduplication.
+  const hasActivity = useMemo(() => finalActivities.length > 0
+    || events.some((event) => event.kind !== "message" && visibleRemoteEvent(event))
+    || activitySegments(events, TERMINAL_TASK_STATUSES.has(status) && finalTextHint ? [finalTextHint] : []).length > 0,
+  [events, finalActivities, finalTextHint, status]);
   const stageDetail = taskPreparationDetail(status);
   const hasDetails = detailsLoading || hasActivity || Boolean(stageDetail);
   const running = !TERMINAL_TASK_STATUSES.has(status);
@@ -1625,33 +1724,26 @@ function AgentCall({ events, status, task, taskId, finalTextHint = "", failure =
   const interrupted = ["interrupted", "cancelled"].includes(status);
   const conversationId = String(events[0]?.ids.conversationId || task?.conversationId || "unknown");
   const disclosureId = `agent:${conversationId}:${taskId || "unknown"}`;
-  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, disclosureRunning, hasDetails && !detailsLoading);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, disclosureRunning, hasDetails);
   if (failed) return <AgentFailureNotice message={agentFailureMessage(events, task, failure)} />;
   return <section className={`${styles.agentCall} ${open ? styles.agentCallOpen : ""} ${running ? styles.agentCallRunning : ""} ${interrupted ? styles.agentCallInterrupted : ""} ${hasDetails ? "" : styles.agentCallNoDetails}`}>
-    <button type="button" className={styles.agentCallHeading} aria-expanded={hasDetails && !detailsLoading ? open : undefined} onClick={() => hasDetails && !detailsLoading && toggleOpen()}>
-      <span className={styles.agentCallGlyph}>{interrupted ? <CircleStop size={17} strokeWidth={1.8} /> : <Bot size={17} />}</span>
+    <button type="button" className={styles.agentCallHeading} aria-expanded={hasDetails ? open : undefined} onClick={() => hasDetails && toggleOpen()}>
+      <span data-ui-icon="" className={styles.agentCallGlyph}>{interrupted ? <CircleStop size={17} strokeWidth={1.8} /> : <Bot size={17} />}</span>
       <span className={styles.activityHeadingLabel}>{running ? "Agent调用中" : interrupted ? "Agent调用已停止" : "Agent调用完成"}</span>
-      {detailsLoading ? <LoaderCircle className={`${styles.agentCallChevron} ${styles.spin}`} size={13} aria-label="正在载入 Agent 调用" /> : hasDetails ? <ChevronRight className={styles.agentCallChevron} size={13} /> : null}
+      {hasDetails ? <ChevronRight className={styles.agentCallChevron} size={13} /> : null}
     </button>
-    {hasDetails && !detailsLoading ? <div className={styles.agentCallMotion}><div><div className={styles.agentActivity}>
+    {hasDetails && open ? <div className={styles.agentCallMotion}><div><div className={styles.agentActivity}>
       {stageDetail ? <div className={styles.agentCallStage}><LoaderCircle className={styles.spin} size={15} /><span>{stageDetail}</span></div> : null}
-      {segments.map((segment) => segment.type === "operations"
-        ? <OperationGroup key={segment.id} events={segment.events} taskId={taskId} taskStatus={status} onApproval={onApproval} />
-        : segment.event.kind === "input_request"
-            ? <AgentInputRequest key={segment.id} event={segment.event} taskId={taskId} taskStatus={status} onInput={onInput} />
-          : ["message", "reasoning"].includes(segment.event.kind)
-            ? <AgentThought key={segment.id} event={segment.event} />
-            : <EventRow key={segment.id} event={segment.event} taskId={taskId} taskStatus={status} onApproval={onApproval} />)}
+      <AgentCallContents events={events} status={status} taskId={taskId} finalTextHint={finalTextHint} running={disclosureRunning} onApproval={onApproval} onInput={onInput} />
       {finalActivities.map((content, index) => <AgentFinalActivity key={`final-activity:${index}:${content}`} content={content} />)}
+      {detailsLoading ? <p role="status">正在载入活动记录…</p> : null}
     </div></div></div> : null}
   </section>;
 }
 
 function visibleRemoteEvent(event: RealtimeEnvelope) {
   if (event.kind === "plan" || event.kind === "plan_state") return false;
-  // Artifacts are rendered as persistent download cards immediately below
-  // the assistant body. Keeping them inside the collapsible Agent call made a
-  // successful download look missing whenever that call was closed.
+  // Artifacts appear at their file-link positions in the assistant body.
   if (event.kind === "artifact") return false;
   if (event.producer === "task-orchestrator") {
     if (event.kind === "status") return false;
@@ -1672,7 +1764,7 @@ function visibleRemoteEvent(event: RealtimeEnvelope) {
     const operation = String(payloadRecord(nestedPayload(event)).operation || "");
     return ["unmapped_agent_event", "agent_compatibility_issue", "agent_effort_adjusted"].includes(operation);
   }
-  if (["message", "reasoning"].includes(event.kind) && !textFrom(nestedPayload(event)).trim()) return false;
+  if (["message", "reasoning"].includes(event.kind) && !textFrom(nestedPayload(event)).trim() && !payloadRecord(nestedPayload(event)).timelineHasText) return false;
   return true;
 }
 
@@ -1729,7 +1821,7 @@ function remoteTaskStatus(events: RealtimeEnvelope[], taskById: Readonly<Record<
   return status;
 }
 
-export function ConversationTimeline({ events, mode = "chat", taskIdHint = "", finalTextHint = "", loading = false, taskById = {}, settledTaskIds = new Set(), onApproval, onInput }: { events: RealtimeEnvelope[]; mode?: "chat" | "work"; taskIdHint?: string; finalTextHint?: string; loading?: boolean; taskById?: Readonly<Record<string, TaskSummary>>; settledTaskIds?: ReadonlySet<string>; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+function HydratedConversationTimeline({ events, mode = "chat", taskIdHint = "", finalTextHint = "", loading = false, taskById = {}, settledTaskIds = new Set(), onApproval, onInput }: { events: RealtimeEnvelope[]; mode?: "chat" | "work"; taskIdHint?: string; finalTextHint?: string; loading?: boolean; taskById?: Readonly<Record<string, TaskSummary>>; settledTaskIds?: ReadonlySet<string>; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
   const webTrace = useMemo(() => buildWebTrace(events), [events]);
   const directRemoteAppend = useMemo(() => isDirectRemoteAppendTimeline(events), [events]);
   const remoteAll = useMemo(() => orderedEvents(events.filter((event) => event.producer === "task-orchestrator" || event.producer.startsWith("agent:"))), [events]);
@@ -1770,4 +1862,133 @@ export function ConversationTimeline({ events, mode = "chat", taskIdHint = "", f
     {mode === "work" && remoteTaskId ? <AgentCall key={remoteTaskId} events={remoteAll} status={status} task={taskById[remoteTaskId]} taskId={remoteTaskId} finalTextHint={finalTextHint} detailsLoading={loading} onApproval={onApproval} onInput={onInput} /> : null}
     {mode === "work" && launchFailure ? <AgentCall key={launchFailureEvent!.eventId} events={[]} status="failed" taskId={`launch:${String(launchFailureEvent!.ids.runId || launchFailureEvent!.eventId)}`} failure={launchFailure} /> : null}
   </section>;
+}
+
+export function ConversationTimeline(props: Parameters<typeof HydratedConversationTimeline>[0]) {
+  return <TimelineDetails events={props.events}>{(events) => <HydratedConversationTimeline {...props} events={events} />}</TimelineDetails>;
+}
+
+/** Markdown projection of the same semantic rows used by the disclosures. */
+export function conversationTimelineMarkdown({ events, mode = "chat", taskIdHint = "", finalTextHint = "", taskById = {} }: Parameters<typeof HydratedConversationTimeline>[0]) {
+  const output: string[] = [];
+  const heading = (label: string, level = 4) => output.push(`${"#".repeat(level)} ${markdownLabel(label)}`);
+  const trace = buildWebTrace(events);
+  const directAppend = isDirectRemoteAppendTimeline(events);
+  if (!directAppend && (trace.started || trace.entries.length || trace.handoff || trace.failure || trace.abortReason)) {
+    heading(trace.running ? "正在思考" : trace.failure ? "处理失败" : trace.aborted ? "思考已停止" : "思考完成", 3);
+    for (const entry of trace.entries) {
+      if (entry.type === "reasoning") {
+        heading("思考内容");
+        output.push(entry.text.trim());
+      } else if (entry.type === "state") {
+        const server = payloadRecord(entry.state.server);
+        const workspace = payloadRecord(entry.state.workspace);
+        const agent = payloadRecord(entry.state.agent);
+        const schedulerType = String(server.scheduler || "");
+        const scheduler = ["none", "unknown"].includes(schedulerType) ? "" : ({ slurm: "Slurm", pbs: "PBS", generic: "通用调度器" } as Record<string, string>)[schedulerType] || schedulerType;
+        const values = [
+          ["服务器", [server.name, scheduler].filter(Boolean).join(" · ")],
+          ["工作区", workspace.name || workspace.path],
+          ["Agent", agent.name],
+        ].filter(([, value]) => value);
+        if (values.length) {
+          heading("已查阅当前状态");
+          output.push(values.map(([label, value]) => `- ${label}：${markdownLabel(value)}`).join("\n"));
+        }
+      } else if (entry.type === "background") {
+        heading("已查阅背景");
+        const results = entry.reads.flatMap((read) => backgroundItems(read.output));
+        results.forEach((result, index) => {
+          heading(`${sourceLabel(result.source)} ${resultTitle(result.source, result.value, index)}`, 5);
+          const content = semanticResultText(result.source, result.value);
+          if (content) output.push(content);
+        });
+      } else if (entry.text.trim()) output.push(entry.text.trim());
+    }
+    if (mode === "work" && trace.handoff) {
+      heading("发给远端 Agent");
+      if (trace.handoff.userMessage) output.push(trace.handoff.userMessage);
+      if (trace.handoff.contextBrief) output.push(trace.handoff.contextBrief);
+      for (const reference of trace.handoff.references) {
+        heading(`${reference.kind} ${reference.name}${reference.edited ? "（本轮整理）" : ""}`, 5);
+        if (reference.detail) output.push(reference.detail);
+      }
+    }
+    if (trace.failure || trace.abortReason) output.push(trace.failure || trace.abortReason);
+  }
+  if (mode !== "work") return output.filter(Boolean).join("\n\n");
+
+  const remote = orderedEvents(events.filter((event) => event.producer === "task-orchestrator" || event.producer.startsWith("agent:")));
+  const handedOffTask = orderedEvents(events).filter((event) => event.kind === "run.handoff.dispatched").map(eventTaskId).filter(Boolean).at(-1);
+  const taskId = remote.map(eventTaskId).filter(Boolean).at(-1) || handedOffTask || taskIdHint;
+  if (!taskId) {
+    const failure = [...orderedEvents(events)].reverse().find((event) => event.kind === "run.failed");
+    if (failure && (trace.handoff || directAppend)) output.push(String(payloadRecord(failure.payload).message || "远端 Agent 启动失败"));
+    return output.filter(Boolean).join("\n\n");
+  }
+  const status = remoteTaskStatus(remote, taskById, taskId, new Set(), terminalWebTaskStatus(events, taskId));
+  if (status === "failed") {
+    output.push(agentFailureMessage(remote, taskById[taskId]));
+    return output.filter(Boolean).join("\n\n");
+  }
+  const running = !TERMINAL_TASK_STATUSES.has(status);
+  heading(running ? "Agent调用中" : ["cancelled", "interrupted"].includes(status) ? "Agent调用已停止" : "Agent调用完成", 3);
+  const stage = taskPreparationDetail(status);
+  if (stage) output.push(stage);
+  const segments = activitySegments(settledEvents(remote, status), !running && finalTextHint ? [finalTextHint] : []);
+  const groups = groupAgentActivity(segments) as Array<ActivitySegment | { type: "thinking"; id: string; segments: ActivitySegment[] }>;
+  const appendEmbeddedApproval = (event: RealtimeEnvelope) => {
+    const approval = payloadRecord(payloadRecord(event.payload).embeddedApproval);
+    if (!Object.keys(approval).length) return;
+    const text = approvalRequestText(payloadRecord(nestedPayload(approval as RealtimeEnvelope)));
+    if (text) { heading("请求审批", 5); output.push(text); }
+  };
+  const appendSegment = (segment: ActivitySegment) => {
+    if (segment.type === "operations") {
+      const entries = operationEntries(segment.events);
+      const label = segment.events.some((event) => event.status === "waiting") ? "等待执行"
+        : segment.events.some(isRunningEvent) ? "正在执行"
+          : segment.events.every((event) => ["cancelled", "interrupted"].includes(String(event.status))) ? "已取消" : "执行了";
+      heading(`${label} ${entries.length} 个操作`, 5);
+      for (const entry of entries) {
+        if (entry.type === "tool") {
+          const parts = toolParts(entry.event);
+          heading(`${parts.label} ${parts.summary} ${eventStatusLabel(entry.event.status)}`, 6);
+          if (parts.detail) output.push(markdownFence(parts.detail, parts.shell ? "shell" : ""));
+          appendEmbeddedApproval(entry.event);
+        } else {
+          const { file } = entry;
+          heading(`${file.operation === "read" ? "读取文件" : "编辑文件"} ${file.path || "未命名文件"}`, 6);
+          if (file.diff || file.output) output.push(markdownFence(file.diff || file.output, file.diff ? "diff" : ""));
+          else output.push(file.operation === "read" ? "Agent 未返回可显示的文件内容。" : "Agent 未返回可显示的差异内容。");
+          appendEmbeddedApproval(file.event);
+        }
+      }
+      return;
+    }
+    const event = segment.event;
+    const record = payloadRecord(nestedPayload(event));
+    if (event.kind === "message" || event.kind === "reasoning") {
+      output.push(normalizedActivityText(event));
+    } else if (event.kind === "input_request") {
+      heading("Agent 需要补充信息", 5);
+      for (const question of agentQuestions(record)) {
+        output.push(question.question);
+        if (question.options.length) output.push(question.options.map((option) => `- ${markdownLabel(option.label)}${option.description ? `：${option.description}` : ""}`).join("\n"));
+      }
+    } else {
+      heading(`${eventLabel(event)} ${eventStatusLabel(event.status)}`, 5);
+      const text = event.kind === "approval_request" ? approvalRequestText(record)
+        : textFrom(record) || (event.kind !== "command" && Object.keys(record).length ? safeJson(record) : "");
+      if (text) output.push(text);
+    }
+  };
+  groups.forEach((group, index) => {
+    if (group.type === "thinking") {
+      heading(running && index === groups.length - 1 ? "Agent思考中" : "Agent已思考");
+      group.segments.forEach(appendSegment);
+    } else appendSegment(group);
+  });
+  output.push(...new Set(remote.filter((event) => event.kind === "final").map((event) => splitRemoteFinalPresentation(textFrom(nestedPayload(event))).activity).filter(Boolean)));
+  return output.filter(Boolean).join("\n\n");
 }

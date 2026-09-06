@@ -51,6 +51,12 @@ export type ConversationSummary = EntityRevision & {
   pinned: boolean;
   lastMessageAt: string;
   runningTaskId: string | null;
+  origin?: {
+    conversationId: string;
+    title: string;
+    messageId: string;
+    questionPreview: string;
+  };
 };
 
 export type MessageAttachment = {
@@ -62,6 +68,7 @@ export type MessageAttachment = {
 
 export type ConversationMessage = {
   id: string;
+  originMessageId?: string;
   conversationId: string;
   branchId: string;
   role: "user" | "assistant" | "system";
@@ -70,6 +77,14 @@ export type ConversationMessage = {
   taskId: string | null;
   replyToMessageId?: string | null;
   attachments?: MessageAttachment[];
+  references?: Array<{
+    type: "conversation";
+    referenceId: string;
+    conversationId: string;
+    snapshotId: string;
+    branchId: string;
+    title: string;
+  }>;
 };
 
 export type ArtifactSummary = EntityRevision & {
@@ -261,6 +276,11 @@ export type BootstrapResponse = {
   providers: ModelProviderSummary[];
   projects: ProjectSummary[];
   recentConversations: ConversationSummary[];
+  conversationNavigation?: {
+    conversationId: string;
+    conversation: ConversationSummary | null;
+    projectConversations: { projectId: string; items: ConversationSummary[]; nextCursor: string | null } | null;
+  };
   conversationCursor?: string;
   servers: ServerSummary[];
   runningTasks: TaskSummary[];

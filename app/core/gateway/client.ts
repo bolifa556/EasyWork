@@ -1,5 +1,6 @@
 import { GatewayError, type ApiFailureBody, type ApiSuccess } from "../contracts";
 import { prefixedIdentifier } from "../identifiers";
+import { StartupPrefetch } from "./startup-prefetch";
 
 type RequestOptions = Omit<RequestInit, "body"> & {
   body?: unknown;
@@ -9,12 +10,41 @@ type RequestOptions = Omit<RequestInit, "body"> & {
 };
 
 export class GatewayClient {
+  private readonly startupPrefetch = new StartupPrefetch();
+  private readonly authenticatedRequests = new Set<AbortController>();
+  private readonly authenticatedUploads = new Set<XMLHttpRequest>();
+
   constructor(
     private readonly baseUrl = "",
     private readonly deviceToken: () => string | null = () => null,
   ) {}
 
+  beginSessionTransition() {
+    this.startupPrefetch.clear();
+    for (const controller of this.authenticatedRequests) controller.abort("session-transition");
+    this.authenticatedRequests.clear();
+    for (const request of this.authenticatedUploads) request.abort();
+    this.authenticatedUploads.clear();
+  }
+
+  private trackedSignal(options: RequestOptions) {
+    if (options.authenticated === false) return { signal: options.signal, release: () => undefined };
+    const controller = new AbortController();
+    const abort = () => controller.abort(options.signal?.reason);
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener("abort", abort, { once: true });
+    this.authenticatedRequests.add(controller);
+    return {
+      signal: controller.signal,
+      release: () => {
+        this.authenticatedRequests.delete(controller);
+        options.signal?.removeEventListener("abort", abort);
+      },
+    };
+  }
+
   async request<T>(path: string, options: RequestOptions = {}): Promise<ApiSuccess<T>> {
+    if (!["GET", "HEAD"].includes(options.method || "GET")) this.startupPrefetch.clear();
     const headers = new Headers(options.headers);
     headers.set("accept", "application/json");
     const token = this.deviceToken();
@@ -28,12 +58,17 @@ export class GatewayClient {
       headers.set("content-type", "application/json");
       body = JSON.stringify(options.body);
     }
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      ...options,
-      headers,
-      body,
-      credentials: "include",
-    });
+    const tracked = this.trackedSignal(options);
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        ...options,
+        signal: tracked.signal,
+        headers,
+        body,
+        credentials: "include",
+      });
+    } finally { tracked.release(); }
     const payload = (await response.json().catch(() => null)) as
       | ApiSuccess<T>
       | ApiFailureBody
@@ -64,11 +99,16 @@ export class GatewayClient {
     const headers = new Headers(options.headers);
     const token = this.deviceToken();
     if (options.authenticated !== false && token) headers.set("authorization", `Bearer ${token}`);
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      ...options,
-      headers,
-      credentials: "include",
-    });
+    const tracked = this.trackedSignal(options);
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        ...options,
+        signal: tracked.signal,
+        headers,
+        credentials: "include",
+      });
+    } finally { tracked.release(); }
     if (!response.ok) {
       const payload = await response.clone().json().catch(() => null) as ApiFailureBody | null;
       const fallback: ApiFailureBody = payload && "error" in payload
@@ -93,13 +133,18 @@ export class GatewayClient {
     if (options.authenticated !== false && token) headers.set("authorization", `Bearer ${token}`);
     if (options.expectedRevision !== undefined) headers.set("if-match", `\"${options.expectedRevision}\"`);
     if (options.idempotencyKey) headers.set("idempotency-key", options.idempotencyKey);
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      ...options,
-      method: options.method || "POST",
-      headers,
-      body,
-      credentials: "include",
-    });
+    const tracked = this.trackedSignal(options);
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        ...options,
+        signal: tracked.signal,
+        method: options.method || "POST",
+        headers,
+        body,
+        credentials: "include",
+      });
+    } finally { tracked.release(); }
     const payload = (await response.json().catch(() => null)) as ApiSuccess<T> | ApiFailureBody | null;
     if (!response.ok) {
       const fallback: ApiFailureBody = payload && "error" in payload
@@ -127,6 +172,7 @@ export class GatewayClient {
   ): Promise<ApiSuccess<T>> {
     return new Promise((resolve, reject) => {
       const request = new XMLHttpRequest();
+      if (options.authenticated !== false) this.authenticatedUploads.add(request);
       request.open(options.method || "PUT", `${this.baseUrl}${path}`, true);
       request.withCredentials = true;
       request.setRequestHeader("accept", "application/json");
@@ -136,15 +182,17 @@ export class GatewayClient {
       if (options.idempotencyKey) request.setRequestHeader("idempotency-key", options.idempotencyKey);
       new Headers(options.headers).forEach((value, key) => request.setRequestHeader(key, value));
       request.upload.onprogress = (event) => onProgress(event.loaded, event.lengthComputable ? event.total : body.size);
-      request.onerror = () => reject(new GatewayError(0, {
+      const release = () => this.authenticatedUploads.delete(request);
+      request.onerror = () => { release(); reject(new GatewayError(0, {
         error: { code: "NETWORK_ERROR", message: "上传连接中断", retryable: true },
         meta: { requestId: "" },
-      }));
-      request.onabort = () => reject(new GatewayError(499, {
+      })); };
+      request.onabort = () => { release(); reject(new GatewayError(499, {
         error: { code: "UPLOAD_ABORTED", message: "上传已取消", retryable: true },
         meta: { requestId: request.getResponseHeader("x-request-id") ?? "" },
-      }));
+      })); };
       request.onload = () => {
+        release();
         const payload = (() => {
           try { return JSON.parse(request.responseText) as ApiSuccess<T> | ApiFailureBody; } catch { return null; }
         })();
@@ -171,7 +219,12 @@ export class GatewayClient {
   }
 
   get<T>(path: string, signal?: AbortSignal) {
-    return this.request<T>(path, { method: "GET", signal });
+    return this.startupPrefetch.take<ApiSuccess<T>>(path, this.deviceToken(), signal)
+      ?? this.request<T>(path, { method: "GET", signal });
+  }
+
+  prefetch(path: string) {
+    this.startupPrefetch.start(path, this.deviceToken(), () => this.request(path, { method: "GET" }));
   }
 
   post<T>(path: string, body?: unknown, options: Omit<RequestOptions, "body" | "method"> = {}) {

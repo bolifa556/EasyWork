@@ -10,6 +10,7 @@ import {
   createExecDescriptor,
   createFileRangeDescriptor,
   createUnavailableFeature,
+  schedulerSubmitScriptPath,
 } from "./contract.mjs";
 
 const PIPE = "|";
@@ -388,7 +389,7 @@ export class SlurmSchedulerAdapter {
 
   submit(input) {
     const partition = assertPartitionName(input?.partition);
-    const scriptPath = canonicalSchedulerFilePath(input?.scriptPath, "scriptPath");
+    const scriptPath = schedulerSubmitScriptPath(input?.scriptPath);
     const args = (input?.args || []).map((value, index) => {
       const result = String(value);
       invariant(result.length <= 4096 && !/[\0\r\n]/.test(result), "SCHEDULER_SUBMIT_ARG_INVALID", `args[${index}] 无效`, { status: 400 });
@@ -400,6 +401,7 @@ export class SlurmSchedulerAdapter {
       parser: "slurm.submit.v1",
       readOnly: false,
       timeoutMs: 30_000,
+      cwd: input?.cwd,
     });
     return {
       descriptor,

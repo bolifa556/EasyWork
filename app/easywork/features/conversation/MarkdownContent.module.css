@@ -52,10 +52,20 @@
 .skillSummaryRow > p > strong:first-child { margin-right: .62em; color: #343a32; font-weight: 650; white-space: nowrap; }
 .markdown hr { width: 100%; border: 0; border-top: 1px solid #e5e5e5; }
 .markdown > hr:last-child { display:none; }
-.tableWrap { position: relative; max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; overscroll-behavior-y: auto; border: 1px solid #e4e4e4; border-radius: 10px; }
-.markdown table { width: 100%; min-width: 360px; border-collapse: collapse; font-size: 16px; line-height: 1.55; }
+.tableWrap { position:relative; width:100%; min-width:0; max-width:100%; overflow:hidden; border:1px solid #e4e4e4; border-radius:10px; }
+.markdown table { width:100%; min-width:0; table-layout:fixed; border-collapse:collapse; font-size:16px; line-height:1.55; }
 .markdown th,.markdown td { border-bottom: 1px solid #e8e8e8; padding: 8px 10px; font-size: inherit; line-height: inherit; text-align: left; vertical-align: top; }
-.markdown th { background: #f6f6f6; color: #555; font-weight: 600; }
+.markdown th { background:#f6f6f6; color:#555; font-weight:600; overflow-wrap:normal; word-break:normal; }
+.markdown th:last-child { padding-right:34px; }
+.tableCellValue { min-width:0; overflow-wrap:anywhere; word-break:normal; }
+.tableStacked table,.tableStacked tbody,.tableStacked tr { display:block; width:100%; }
+.tableStacked colgroup { display:none; }
+.tableStacked thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+.markdown .tableStacked tr { border-bottom:1px solid #e4e4e4; padding:8px 0; }
+.markdown .tableStacked tr:last-child { border-bottom:0; }
+.markdown .tableStacked td { display:grid; grid-template-columns:minmax(5em,27%) minmax(0,1fr); gap:12px; border:0; padding:6px 10px; }
+.tableStacked td::before { content:attr(data-column-label); color:#66645c; font-weight:600; overflow-wrap:normal; }
+.tableStacked tbody tr:first-child td:first-child { padding-right:34px; }
 .markdown tr:last-child td { border-bottom: 0; }
 .copyableCodeBlock {
   --code-block-surface: #fbf7eb;
@@ -160,7 +170,11 @@
 .tableWrap > .blockCopyButton,.quoteBlock > .blockCopyButton { border-color: rgb(86 78 64 / 14%); background: rgb(251 248 239 / 72%); color: #756e61; box-shadow: 0 1px 4px rgb(46 39 28 / 5%); }
 .blockCopyButton:hover,.blockCopyButton:focus-visible { background: #e8e5de; color: #3f4935; opacity: 1; transform: translateY(-1px); }
 .tableWrap > .blockCopyButton:hover,.quoteBlock > .blockCopyButton:hover { background: rgb(249 245 235 / 94%); color: #3f4935; }
-.blockCopyButton.copied { border-color: rgb(83 119 70 / 23%); color: #527047; opacity: 1; }
+.blockCopyButton.copied { display:inline-flex; width:auto; gap:3px; padding:0 5px; border-color:rgb(83 119 70 / 23%); color:#527047; opacity:1; font-size:11px; white-space:nowrap; }
+.copyableCodeBlock:not(.copyableCodeBlockWithCopy) .remoteTerminal code { padding-right:8px; }
+@media (max-width:719px) {
+  .codeScrollbar { display:none; }
+}
 .compact { gap: .5em; font-size: 12px; line-height: 1.55; }
 .compact table { min-width: 0; font-size: 11px; }
 .compact th,.compact td { padding: 6px 7px; }
@@ -176,7 +190,7 @@
 .activity .blockCopyButton { border-color:rgb(86 78 64 / 13%); background:rgb(250 248 242 / 82%); color:#756e61; }
 .activity .quoteBlock { border-left-width:2px; padding:.05em 34px .05em 9px; color:#5f6762; white-space:normal; }
 .activity .quoteBlock p { margin:0; white-space:normal; }
-.activity .tableWrap { overflow-x:auto; overflow-y:visible; }
+.activity .tableWrap { overflow:hidden; }
 .activity table { font-size:inherit; }
 
 @media (max-width: 719px) {

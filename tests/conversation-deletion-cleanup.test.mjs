@@ -100,6 +100,7 @@ test("离线删除登记三种 Agent 会话，连接失败保留登记，成功�
     version: "7",
   });
   assert.equal(local.scheduled, true);
+  assert.equal(unbound, 1, "删除请求返回前应已同步解除服务器绑定");
   await container.taskRuntime.waitForIdle();
   assert.equal(unbound, 1);
   let queue = (await container.conversationDeletionCleanup.read()).data;

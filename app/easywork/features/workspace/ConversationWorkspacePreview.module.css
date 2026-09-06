@@ -1,6 +1,9 @@
-.previewPanel { position:absolute; z-index:24; inset:var(--conversation-header-height,0) 0 0; display:grid; min-width:0; min-height:0; grid-template-rows:auto minmax(0,1fr); overflow:hidden; background:var(--ew-surface-solid); animation:previewIn 170ms cubic-bezier(.2,.75,.25,1) both; }
+.previewPanel { position:absolute; z-index:20; inset:0; display:grid; width:100%; height:100%; min-width:0; min-height:0; grid-template-rows:auto minmax(0,1fr); overflow:hidden; background:var(--ew-surface-solid); animation:previewIn 170ms cubic-bezier(.2,.75,.25,1) both; }
+.previewPanel[hidden],.tabPane[hidden] { display:none; }
+.tabPane { height:100%; min-width:0; min-height:0; }
+.pendingViewer { display:grid; height:100%; min-height:0; grid-template-rows:auto minmax(0,1fr); }
 .tabBar { display:flex; min-width:0; min-height:42px; align-items:center; gap:5px; padding:4px 7px 4px 8px; border-bottom:1px solid var(--ew-line); background:rgb(248 245 237 / 88%); backdrop-filter:blur(12px); }
-.tabScroll { display:flex; min-width:0; max-width:min(70%,900px); align-self:stretch; overflow-x:auto; scrollbar-width:none; }
+.tabScroll { display:flex; min-width:0; max-width:100%; flex:1; align-self:stretch; overflow-x:auto; scrollbar-width:none; }
 .tabScroll::-webkit-scrollbar { display:none; }
 .fileTab { position:relative; display:flex; min-width:118px; max-width:210px; min-height:34px; align-items:center; border-right:1px solid rgb(79 73 59 / 8%); background:transparent; color:var(--ew-ink-muted); }
 .fileTab:first-child { border-radius:8px 0 0 8px; }
@@ -26,7 +29,7 @@
 @keyframes previewIn { from { opacity:0; transform:translateY(5px); } }
 @keyframes spin { to { transform:rotate(360deg); } }
 @media (max-width:719px) {
-  .tabBar { min-height:50px; padding-top:max(4px,env(safe-area-inset-top)); }
+  .tabBar { min-height:60px; padding-top:max(8px,env(safe-area-inset-top)); padding-left:56px; }
   .tabScroll { max-width:none; flex:1; }
   .fileTab { min-width:112px; min-height:var(--ew-mobile-touch); }
   .tabSelect { min-height:var(--ew-mobile-touch); font-size:12.5px; }

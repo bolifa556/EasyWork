@@ -79,6 +79,14 @@ function validateSnapshotMeta(meta, conversationId) {
   invariant(CONVERSATION_MODES.includes(meta.mode) && !Object.hasOwn(meta, "type"), "CONVERSATION_SNAPSHOT_CORRUPT", "对话快照 mode 无效", { status: 500, expose: false });
   invariant(typeof meta.title === "string" && typeof meta.pinned === "boolean", "CONVERSATION_SNAPSHOT_CORRUPT", "对话快照元数据无效", { status: 500, expose: false });
   invariant(typeof meta.createdAt === "string" && typeof meta.updatedAt === "string" && typeof meta.lastMessageAt === "string", "CONVERSATION_SNAPSHOT_CORRUPT", "对话快照时间无效", { status: 500, expose: false });
+  invariant(meta.origin === undefined || (
+    meta.origin
+    && typeof meta.origin === "object"
+    && typeof meta.origin.conversationId === "string"
+    && typeof meta.origin.title === "string"
+    && typeof meta.origin.messageId === "string"
+    && typeof meta.origin.questionPreview === "string"
+  ), "CONVERSATION_SNAPSHOT_CORRUPT", "对话来源元数据无效", { status: 500, expose: false });
   invariant(Array.isArray(meta.branches), "CONVERSATION_SNAPSHOT_CORRUPT", "对话分支索引无效", { status: 500, expose: false });
   invariant(meta.branches.every((branch) => branch && typeof branch === "object" && Number.isSafeInteger(branch.messageCount) && branch.messageCount >= 0), "CONVERSATION_SNAPSHOT_CORRUPT", "对话分支元数据无效", { status: 500, expose: false });
   return meta;
@@ -87,7 +95,16 @@ function validateSnapshotMeta(meta, conversationId) {
 function validateMessage(message, conversationId, messageId) {
   invariant(message?.schemaVersion === CONVERSATION_SCHEMA_VERSION && message.entityType === "ConversationMessage", "CONVERSATION_MESSAGE_CORRUPT", "消息 schema 无效", { status: 500, expose: false });
   invariant(message.id === messageId && message.conversationId === conversationId, "CONVERSATION_MESSAGE_CORRUPT", "消息归属无效", { status: 500, expose: false });
+  invariant(message.originMessageId === undefined || /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(message.originMessageId), "CONVERSATION_MESSAGE_CORRUPT", "继承消息来源无效", { status: 500, expose: false });
   invariant(["user", "assistant", "system", "tool"].includes(message.role) && typeof message.content === "string", "CONVERSATION_MESSAGE_CORRUPT", "消息内容无效", { status: 500, expose: false });
+  invariant(message.references === undefined || (Array.isArray(message.references) && message.references.every((reference) => (
+    reference?.type === "conversation"
+    && /^cref_[a-f0-9]{32}$/.test(String(reference.referenceId || ""))
+    && typeof reference.conversationId === "string"
+    && typeof reference.snapshotId === "string"
+    && typeof reference.branchId === "string"
+    && typeof reference.title === "string"
+  ))), "CONVERSATION_MESSAGE_CORRUPT", "消息引用无效", { status: 500, expose: false });
   return message;
 }
 

@@ -1,7 +1,7 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # dependencies
-/node_modules
+node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -53,4 +53,46 @@ next-env.d.ts
 # Local device-specific notes and FRP runtime
 /requirments.md
 /frp/
-/agent-app/
+/agent-app/*
+!/agent-app/manifest.json
+
+# Device synchronization settings
+/sync/
+.stfolder/
+.stversions/
+.stignore
+
+# Release archives and staging output
+/releases/
+*.zip
+*.tar.gz
+*.tar.xz
+*.7z
+*.exe
+*.msi
+
+# Local environments, caches and credentials
+.venv/
+venv/
+env/
+.conda/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.npm/
+.pnpm-store/
+.turbo/
+.vscode/
+.idea/
+*.log
+*.pid
+*.key
+*.pfx
+*.p12
+id_rsa
+id_ed25519
+Thumbs.db
+Desktop.ini
+!.env.example

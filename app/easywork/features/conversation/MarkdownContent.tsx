@@ -1,13 +1,17 @@
 "use client";
 
-import { Children, isValidElement, useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
+import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import { Check, Copy } from "lucide-react";
+import { Copy } from "lucide-react";
+import { copyText } from "../../ui/clipboard";
+import { codeWheelPosition } from "./code-scroll";
 import styles from "./MarkdownContent.module.css";
-import { ensureBlankLineBeforeTables, protectShellVariablesFromInlineMath } from "./markdown-normalization.mjs";
+import { ensureBlankLineBeforeTables, ensureSectionBlockBoundaries, protectShellVariablesFromInlineMath } from "./markdown-normalization.mjs";
+import { remarkArtifactCards } from "./artifact-markdown.mjs";
+import { markdownTableLayout } from "./markdown-table-layout.mjs";
 
 type MarkdownAstNode = {
   type: string;
@@ -173,50 +177,38 @@ function remarkInstalledSkillRows() {
   };
 }
 
-function nodeText(node: ReactNode): string {
+export function nodeText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(nodeText).join("");
   if (isValidElement<{ children?: ReactNode }>(node)) return nodeText(node.props.children);
   return "";
 }
 
-async function copyPlainText(content: string) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(content);
-    return;
-  }
-  const textarea = document.createElement("textarea");
-  textarea.value = content;
-  textarea.style.position = "fixed";
-  textarea.style.opacity = "0";
-  document.body.appendChild(textarea);
-  textarea.select();
-  document.execCommand("copy");
-  textarea.remove();
-}
-
 function BlockCopyButton({ content, label = "复制内容" }: { content: string; label?: string }) {
   const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (!copied && !failed) return;
+    const timer = window.setTimeout(() => { setCopied(false); setFailed(false); }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [copied, failed]);
   if (!content.trim()) return null;
   return <button
     className={`${styles.blockCopyButton} ${copied ? styles.copied : ""}`}
     type="button"
-    aria-label={copied ? "已复制" : label}
-    title={copied ? "已复制" : label}
+    aria-label={copied ? "已复制" : failed ? "复制失败，请长按文字复制" : label}
+    title={copied ? "已复制" : failed ? "复制失败，请长按文字复制" : label}
     onClick={(event) => {
       event.preventDefault();
       event.stopPropagation();
-      void copyPlainText(content).then(() => {
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1_400);
-      });
+      void copyText(content).then(() => setCopied(true)).catch(() => setFailed(true));
     }}
-  >{copied ? <Check size={13} /> : <Copy size={13} />}</button>;
+  >{copied ? <span>已复制</span> : <Copy size={13} />}</button>;
 }
 
 type CodeScrollState = { max: number; value: number; thumbWidth: number; visible: boolean };
 
-function MarkdownCodeBlock({ children, source, terminal, activity }: { children: ReactNode; source: string; terminal: boolean; activity: boolean }) {
+export function MarkdownCodeBlock({ children, source, terminal = false, activity = false, copy = true, viewportClassName = "" }: { children: ReactNode; source: string; terminal?: boolean; activity?: boolean; copy?: boolean; viewportClassName?: string }) {
   const blockRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLPreElement>(null);
   const scrollbarRef = useRef<HTMLInputElement>(null);
@@ -245,19 +237,10 @@ function MarkdownCodeBlock({ children, source, terminal, activity }: { children:
     if (!block || !viewport) return;
     syncScroll();
     const handleWheel = (event: WheelEvent) => {
-      const max = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
-      if (max <= 1) return;
-      const rawDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-      if (!rawDelta) return;
-      const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE
-        ? 16
-        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-          ? viewport.clientWidth
-          : 1;
-      const next = Math.min(max, Math.max(0, viewport.scrollLeft + rawDelta * unit));
+      const next = codeWheelPosition(viewport, event);
+      if (next === null) return;
       event.preventDefault();
       event.stopPropagation();
-      if (next === viewport.scrollLeft) return;
       viewport.scrollLeft = next;
       syncScroll();
     };
@@ -273,12 +256,13 @@ function MarkdownCodeBlock({ children, source, terminal, activity }: { children:
       observer?.disconnect();
     };
   }, [source, syncScroll]);
-  const withCopy = !activity && Boolean(source.trim());
+  const withCopy = copy && !activity && Boolean(source.trim());
   return <div ref={blockRef} className={`${styles.copyableCodeBlock} ${withCopy ? styles.copyableCodeBlockWithCopy : ""}`}>
     {withCopy ? <BlockCopyButton content={source} label="复制代码" /> : null}
     <pre
       ref={viewportRef}
-      className={`${styles.remoteTerminal} ${styles.markdownTerminal} ${terminal ? styles.terminalFence : styles.codeFence}`}
+      data-code-viewport=""
+      className={`${styles.remoteTerminal} ${styles.markdownTerminal} ${terminal ? styles.terminalFence : styles.codeFence} ${viewportClassName}`}
       onScroll={syncScroll}
     >{children}</pre>
     <input
@@ -314,37 +298,98 @@ function fencedCodeLanguage(children: ReactNode) {
   return String(child.props.className || "").match(/(?:^|\s)language-([^\s]+)/i)?.[1]?.toLowerCase() || "";
 }
 
-export function MarkdownContent({ content, compact = false, activity = false }: { content: string; compact?: boolean; activity?: boolean }) {
-  const normalizedContent = ensureBlankLineBeforeTables(protectShellVariablesFromInlineMath(String(content || "").replace(/<\/?think>/gi, "").replace(
-    /^(\s*(?:#{1,6}\s+.+|\*\*[^*\n]+\*\*|__[^_\n]+__))\r?\n(?=\s*\d+[.)]\s+)/gm,
-    "$1\n\n",
-  )));
-  return <div className={`${styles.markdown} ${compact ? styles.compact : ""} ${activity ? styles.activity : ""}`}>
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath, remarkPlainUrlBoundaries, remarkLooseStrongMarkers, remarkInstalledSkillRows]}
-      rehypePlugins={[rehypeKatex]}
-      components={{
-        a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
-        pre: ({ children }) => {
-          const language = fencedCodeLanguage(children);
-          const terminal = /^(?:bash|sh|shell|console|terminal|zsh|fish|powershell|pwsh|cmd)$/.test(language);
-          const source = nodeText(children).replace(/\n$/, "");
-          return <MarkdownCodeBlock source={source} terminal={terminal} activity={activity}>{children}</MarkdownCodeBlock>;
-        },
-        code: ({ children, className }) => {
-          const value = String(children).replace(/\n$/, "");
-          const block = Boolean(className) || value.includes("\n");
-          return <code className={block ? className : activity ? styles.activityInline : compact ? className : `${styles.inlineField} ${styles[`tone${inlineTone(value)}`]}`}>{children}</code>;
-        },
-        table: ({ children }) => <div className={styles.tableWrap}>
-          {!activity ? <BlockCopyButton content={nodeText(children)} label="复制表格内容" /> : null}
-          <table>{children}</table>
-        </div>,
-        blockquote: ({ children, className }) => <blockquote className={`${styles.quoteBlock} ${String(className || "").includes("skill-summary-row") ? styles.skillSummaryRow : ""}`}>
-          {!activity ? <BlockCopyButton content={nodeText(children)} label="复制引用内容" /> : null}
-          {children}
-        </blockquote>,
-      }}
-    >{normalizedContent}</ReactMarkdown>
+function MarkdownTable({ children, activity }: { children: ReactNode; activity: boolean }) {
+  const wrapper = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  const { rows, labels } = useMemo(() => {
+    const rows: string[][] = [];
+    for (const section of Children.toArray(children)) {
+      if (!isValidElement<{ children?: ReactNode }>(section)) continue;
+      for (const row of Children.toArray(section.props.children)) {
+        if (!isValidElement<{ children?: ReactNode }>(row)) continue;
+        rows.push(Children.toArray(row.props.children).filter(isValidElement).map(nodeText));
+      }
+    }
+    return { rows, labels: rows[0] || [] };
+  }, [children]);
+  const layout = useMemo(() => markdownTableLayout(rows), [rows]);
+  useLayoutEffect(() => {
+    const node = wrapper.current;
+    if (!node) return;
+    const measure = () => setWidth(node.clientWidth);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+  const stacked = width > 0 && width < layout.stackBelow;
+  const labelled = Children.map(children, (section) => {
+    if (!isValidElement<{ children?: ReactNode }>(section) || section.type !== "tbody") return section;
+    return cloneElement(section, {}, Children.map(section.props.children, (row) => {
+      if (!isValidElement<{ children?: ReactNode }>(row)) return row;
+      return cloneElement(row, {}, Children.toArray(row.props.children).filter(isValidElement).map((cell, index) => {
+        if (!isValidElement<{ children?: ReactNode; "data-column-label"?: string }>(cell)) return cell;
+        return cloneElement(cell, { "data-column-label": labels[index] || "" }, <div className={styles.tableCellValue}>{cell.props.children}</div>);
+      }));
+    }));
+  });
+  return <div ref={wrapper} className={`${styles.tableWrap} ${stacked ? styles.tableStacked : ""}`}>
+    {!activity ? <BlockCopyButton content={nodeText(children)} label="复制表格内容" /> : null}
+    <table><colgroup>{layout.widths.map((value: number, index: number) => <col key={index} style={{ width: `${value}%` }} />)}</colgroup>{labelled}</table>
   </div>;
+}
+
+type MarkdownRenderOptions = { compact: boolean; activity: boolean; renderArtifact?: (id: string) => ReactNode };
+const MarkdownRenderContext = createContext<MarkdownRenderOptions>({ compact: false, activity: false });
+
+// Stable component types preserve DOM, measurements and scroll state while
+// streamed Markdown changes. Render options travel through context instead of
+// recreating a new component function for every token or artifact update.
+const markdownComponents: Components = {
+  div: function MarkdownDiv({ node, children, ...props }) {
+    const { renderArtifact } = useContext(MarkdownRenderContext);
+    const artifactId = node?.properties?.["data-artifact-id"] ?? node?.properties?.dataArtifactId;
+    return artifactId && renderArtifact ? renderArtifact(String(artifactId)) : <div {...props}>{children}</div>;
+  },
+  a: function MarkdownLink({ node: _node, children, ...props }) {
+    return <a {...props} target="_blank" rel="noreferrer">{children}</a>;
+  },
+  pre: function MarkdownPre({ children }) {
+    const { activity } = useContext(MarkdownRenderContext);
+    const language = fencedCodeLanguage(children);
+    const terminal = /^(?:bash|sh|shell|console|terminal|zsh|fish|powershell|pwsh|cmd)$/.test(language);
+    const source = nodeText(children).replace(/\n$/, "");
+    return <MarkdownCodeBlock source={source} terminal={terminal} activity={activity}>{children}</MarkdownCodeBlock>;
+  },
+  code: function MarkdownCode({ children, className }) {
+    const { activity, compact } = useContext(MarkdownRenderContext);
+    const value = String(children).replace(/\n$/, "");
+    const block = Boolean(className) || value.includes("\n");
+    return <code className={block ? className : activity ? styles.activityInline : compact ? className : `${styles.inlineField} ${styles[`tone${inlineTone(value)}`]}`}>{children}</code>;
+  },
+  table: function MarkdownTableElement({ children }) {
+    const { activity } = useContext(MarkdownRenderContext);
+    return <MarkdownTable activity={activity}>{children}</MarkdownTable>;
+  },
+  blockquote: function MarkdownQuote({ children, className }) {
+    const { activity } = useContext(MarkdownRenderContext);
+    return <blockquote className={`${styles.quoteBlock} ${String(className || "").includes("skill-summary-row") ? styles.skillSummaryRow : ""}`}>
+      {!activity ? <BlockCopyButton content={nodeText(children)} label="复制引用内容" /> : null}
+      {children}
+    </blockquote>;
+  },
+};
+
+export function MarkdownContent({ content, compact = false, activity = false, artifactCards = [], renderArtifact }: { content: string; compact?: boolean; activity?: boolean; artifactCards?: Array<{ id: string; name: string; path?: string }>; renderArtifact?: (id: string) => ReactNode }) {
+  const normalizedContent = ensureBlankLineBeforeTables(ensureSectionBlockBoundaries(protectShellVariablesFromInlineMath(
+    String(content || "").replace(/<\/?think>/gi, ""),
+  )));
+  const options = useMemo(() => ({ compact, activity, renderArtifact }), [compact, activity, renderArtifact]);
+  return <MarkdownRenderContext.Provider value={options}><div className={`${styles.markdown} ${compact ? styles.compact : ""} ${activity ? styles.activity : ""}`}>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath, remarkPlainUrlBoundaries, remarkLooseStrongMarkers, remarkInstalledSkillRows, [remarkArtifactCards, { cards: artifactCards }]]}
+      rehypePlugins={[rehypeKatex]}
+      components={markdownComponents}
+    >{normalizedContent}</ReactMarkdown>
+  </div></MarkdownRenderContext.Provider>;
 }

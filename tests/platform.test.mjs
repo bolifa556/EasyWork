@@ -166,7 +166,21 @@ test("Embedding 只有平台配置，保留模型和分块 profile；用户 Prov
     const result = await configurePlatformProvider(platform, admin, "embedding", 0, "command-embedding-0001");
     assert.equal(result.provider.embedding.model, "qwen3-embedding");
     assert.equal(result.provider.embedding.chunkSize, 2400);
+    assert.deepEqual(result.provider.embedding.memory, {
+      enabled: true,
+      vectorWeight: 0.55,
+      lexicalWeight: 0.15,
+      titleWeight: 0.3,
+      minimumScore: 0.12,
+      diversityLambda: 0.72,
+      recallLimit: 48,
+      resultLimit: 8,
+      tokenBudget: 3200,
+      pageSize: 20,
+    });
     assert.match(result.provider.embeddingProfileId, /^emb_[a-f0-9]{24}$/);
+    assert.match(result.provider.memoryEmbeddingProfileId, /^mem_emb_[a-f0-9]{24}$/);
+    assert.match(result.provider.memoryRetrievalProfileId, /^mem_ret_[a-f0-9]{24}$/);
     assert.deepEqual((await providers.listAvailableProviders(user, "embedding")).map((entry) => entry.id), [PLATFORM_PROVIDER_IDS.embedding]);
     await assert.rejects(() => providers.createUserProvider(user, {
       provider: { name: "私有 Embedding", baseUrl: "https://private.example/v1", protocol: "openai-embeddings" },
@@ -180,6 +194,43 @@ test("Embedding 只有平台配置，保留模型和分块 profile；用户 Prov
       modelId: "qwen3-embedding",
       requireModel: true,
     }), (error) => error?.code === "EMBEDDING_PLATFORM_ONLY");
+  });
+});
+
+test("文件分块和记忆检索配置独立保存，排序参数不会使文件向量 profile 失效", async () => {
+  await fixture(async (dataRoot) => {
+    const { platform } = services(dataRoot);
+    const admin = actor("admin_memory_retrieval", ["admin"]);
+    const configured = await configurePlatformProvider(platform, admin, "embedding", 0, "command-embedding-memory-0001");
+    const fileProfileId = configured.provider.embeddingProfileId;
+    const memoryEmbeddingProfileId = configured.provider.memoryEmbeddingProfileId;
+    const retrievalProfileId = configured.provider.memoryRetrievalProfileId;
+    const updated = await platform.updateProvider(admin, {
+      purpose: "embedding",
+      patch: {
+        memory: {
+          enabled: true,
+          vectorWeight: 0.6,
+          lexicalWeight: 0.25,
+          titleWeight: 0.15,
+          minimumScore: 0.16,
+          diversityLambda: 0.68,
+          recallLimit: 64,
+          resultLimit: 8,
+          tokenBudget: 3600,
+          pageSize: 24,
+        },
+      },
+      expectedRevision: configured.revision,
+      commandId: "command-embedding-memory-0002",
+    });
+    assert.equal(updated.provider.embedding.chunkSize, 2400);
+    assert.equal(updated.provider.embedding.memory.recallLimit, 64);
+    assert.equal(updated.provider.embedding.memory.minimumScore, 0.16);
+    assert.equal(updated.provider.embedding.memory.diversityLambda, 0.68);
+    assert.equal(updated.provider.embeddingProfileId, fileProfileId);
+    assert.equal(updated.provider.memoryEmbeddingProfileId, memoryEmbeddingProfileId);
+    assert.notEqual(updated.provider.memoryRetrievalProfileId, retrievalProfileId);
   });
 });
 
@@ -350,6 +401,8 @@ test("OpenAI-compatible 模型检测生成能力 descriptor，不在响应中泄
             { id: "qwen3-embedding", owned_by: "lab", capabilities: { embeddings: true } },
             { id: "glm-5.2-107", context_window: 200000, supports_tools: true, supports_streaming: true },
             { id: "image-model" },
+            { id: "mineru" },
+            { id: "unlimited-ocr" },
           ],
         }),
       };
@@ -361,6 +414,8 @@ test("OpenAI-compatible 模型检测生成能力 descriptor，不在响应中泄
   assert.deepEqual(descriptors.find((entry) => entry.id === "qwen3-embedding").purposes, ["embedding"]);
   assert.equal(descriptors.find((entry) => entry.id === "glm-5.2-107").capabilities.toolCalling, true);
   assert.deepEqual(descriptors.find((entry) => entry.id === "image-model").purposes, []);
+  assert.deepEqual(descriptors.find((entry) => entry.id === "mineru").purposes, []);
+  assert.deepEqual(descriptors.find((entry) => entry.id === "unlimited-ocr").purposes, []);
   assert.equal(JSON.stringify(descriptors).includes("sk-detector-secret"), false);
 });
 

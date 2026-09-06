@@ -1,3 +1,5 @@
+import { parseRemoteArtifactLinks, stripFileLinkDecoration } from "../../../../shared/remote-artifact-links.mjs";
+
 const DOWNLOAD_INTENT_PATTERN = /(?:下载|download|文件(?:已|仍)?(?:确认)?存在|链接如下)/i;
 const LIST_MARKER_PATTERN = /^(?:[-*+\u2022]\s+|\d+[.)]\s+)/;
 const FILE_TOKEN_PATTERN = /[^\s/\\()[\]{}<>，。,:：;；"'`]+(?:\.tar\.(?:gz|bz2|xz|zst)|\.(?:txt|md|pdf|docx?|xlsx?|xlsm|ods|csv|tsv|pptx?|ppsx?|odp|png|jpe?g|gif|webp|svg|bmp|ico|tiff?|heic|wav|mp3|flac|aac|ogg|m4a|wma|aiff|mp4|mov|mkv|avi|webm|wmv|m4v|mpeg|zip|7z|rar|tar|gz|bz2|xz|tgz|zst|cab|sqlite|sqlite3|db|sql|json|ya?ml|toml|xml|html?|css|jsx?|tsx?|mjs|cjs|py|java|c|cc|cpp|h|hpp|rs|go|rb|php|swift|kt|sh|ps1|log|rtf|odt|pages|numbers|key|woff2?|ttf|otf|eot|exe|msi|dmg|pkg|deb|rpm|apk|appimage|iso|dwg|dxf|step|stp|iges|igs|stl|obj|3mf|blend|bin))(?![\p{L}\p{N}_.-])/giu;
@@ -18,6 +20,9 @@ function lineCandidate(value) {
 export function artifactDisplayName(value) {
   const original = text(value) || "结果文件";
   const matches = [...original.matchAll(FILE_TOKEN_PATTERN)].map((match) => text(match[0]));
+  // A real basename may contain spaces. Only shorten a legacy label when it
+  // contains a description after the filename, not part of the filename itself.
+  if (matches.length && original.endsWith(matches.at(-1))) return original;
   return matches[0] || original;
 }
 
@@ -94,4 +99,63 @@ export function referencedArtifactsForDownloadReply(content, artifacts) {
     latestByName.set(display || raw, artifact);
   }
   return [...latestByName.values()];
+}
+
+const eventPayload = (event) => event.payload?.event || event.payload || {};
+
+export function conversationArtifactCards(events = [], artifacts = []) {
+  const byId = new Map();
+  const unavailable = new Set();
+  for (const artifact of artifacts) {
+    if (["active", "pinned"].includes(artifact.lifecycle)) byId.set(artifact.id, { ...artifact, name: artifactDisplayName(artifact.name) });
+    else unavailable.add(artifact.id);
+  }
+  for (const event of events) {
+    if (event.kind !== "artifact") continue;
+    const record = eventPayload(event), artifact = record.artifact || {};
+    const id = String(record.artifactId || artifact.id || (record.failure?.message ? `failed:${event.eventId}` : ""));
+    if (!id || unavailable.has(id)) continue;
+    byId.set(id, {
+      ...artifact, ...byId.get(id), id, path: record.path,
+      name: artifactDisplayName(artifact.name || record.name),
+      mime: artifact.mime || "application/octet-stream", size: Number(artifact.size),
+      createdAt: artifact.createdAt || event.occurredAt,
+      ...(record.failure?.message ? { failure: record.failure.message } : {}),
+    });
+  }
+  return [...byId.values()].sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id));
+}
+
+function answerIdentity(value) {
+  const identity = parseRemoteArtifactLinks(value).cleaned.split(/\r?\n/)
+    .filter((line) => stripFileLinkDecoration(line).trim())
+    .join("\n").replace(/\s+/g, " ").trim();
+  return identity || (String(value || "").trim() ? "文件已准备好下载。" : "");
+}
+
+/** Replay the matching final's original Markdown, including historical runs. */
+export function artifactAnswerMarkdown(content, events = []) {
+  const identity = answerIdentity(content);
+  if (!identity) return String(content || "");
+  const candidates = [...events].reverse().filter((event) => ["final", "message"].includes(event.kind));
+  for (const event of candidates) {
+    const record = eventPayload(event);
+    if (event.kind === "message" && (record.delta === true || record.role && record.role !== "assistant")) continue;
+    const original = record.artifactMarkdown || record.text;
+    if (typeof original !== "string" || !parseRemoteArtifactLinks(original).artifacts.length) continue;
+    if (answerIdentity(original) === identity) return original;
+  }
+  return String(content || "");
+}
+
+export function referencedArtifactCards(markdown, ownCards, history, { workspaceId, before } = {}) {
+  const needed = new Set(parseRemoteArtifactLinks(markdown).artifacts.map((artifact) => artifact.path));
+  for (const card of ownCards) needed.delete(card.path);
+  const byPath = new Map();
+  if (workspaceId) for (const card of history) {
+    if (card.failure || card.workspaceId !== workspaceId || !needed.has(card.path) || !before || card.createdAt > before) continue;
+    const previous = byPath.get(card.path);
+    if (!previous || previous.createdAt < card.createdAt) byPath.set(card.path, card);
+  }
+  return [...ownCards, ...byPath.values()];
 }

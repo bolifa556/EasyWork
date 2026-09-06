@@ -8,6 +8,13 @@ const stylePath = new URL("../app/easywork/features/skills/SkillsView.module.css
 const runtimePath = new URL("../app/easywork/runtime/AppRuntime.tsx", import.meta.url);
 const apiPath = new URL("../gateway/core/http/api.mjs", import.meta.url);
 
+test("技能页标题不重复展示列表数量", async () => {
+  const view = await readFile(viewPath, "utf8");
+  assert.match(view, /function SkillsHeader\(\)[\s\S]+?<h1>技能<\/h1>/);
+  assert.match(view, /<SkillsHeader \/>/);
+  assert.doesNotMatch(view, /<SkillsHeader count=|<span>\{count\}<\/span>/);
+});
+
 test("技能范围由标题下标签打开，模式先于服务器，管理员编辑复用同一弹窗", async () => {
   const [view, styles] = await Promise.all([readFile(viewPath, "utf8"), readFile(stylePath, "utf8")]);
   const fields = view.slice(view.indexOf("function ApplicabilityFields"), view.indexOf("function ApplicabilityDialog"));
@@ -23,7 +30,7 @@ test("技能范围由标题下标签打开，模式先于服务器，管理员�
   assert.match(dialog, /<Modal title="技能适用范围" size="compact"/);
   assert.doesNotMatch(dialog, /subtitle=|不符合条件的技能/);
   assert.match(view, /<DetailPage key=\{`\$\{view\.detailSource\}:\$\{view\.detailId\}`\}/);
-  const editor = view.slice(view.indexOf("function EditMarketForm"), view.indexOf("function DetailPage"));
+  const editor = view.slice(view.indexOf("function EditSkillForm"), view.indexOf("function DetailPage"));
   assert.doesNotMatch(editor, /ApplicabilityFields|适用服务器/);
   assert.doesNotMatch(view, /scopeDraft|setScopeDraft/);
   assert.match(styles, /\.serverScopeFields:disabled\s*\{\s*opacity:/);
@@ -36,9 +43,9 @@ test("市场范围弹窗立即独立保存，更新版本但不重建内容编�
   assert.match(scopeSave, /applicability: saved\.applicability, revision: saved\.revision/);
   assert.doesNotMatch(scopeSave, /editing|load\(/);
   assert.ok(scopeSave.indexOf("api.patch") < scopeSave.indexOf("setScopeOpen(false)"));
-  assert.match(view, /<EditMarketForm key=\{detail\.id\}/);
-  const editor = view.slice(view.indexOf("function EditMarketForm"), view.indexOf("function DetailPage"));
-  const contentSave = view.slice(view.indexOf("const saveMarketSkill ="), view.indexOf("const saveApplicability ="));
+  assert.match(view, /<EditSkillForm key=\{detail\.id\}/);
+  const editor = view.slice(view.indexOf("function EditSkillForm"), view.indexOf("function DetailPage"));
+  const contentSave = view.slice(view.indexOf("const saveSkill ="), view.indexOf("const saveApplicability ="));
   assert.doesNotMatch(editor, /applicability/);
   assert.doesNotMatch(contentSave, /applicability/);
   assert.match(contentSave, /expectedRevision: detail\.revision/);
@@ -75,7 +82,7 @@ test("技能页使用三标签、独立路由详情和文件列表，并提供�
   assert.doesNotMatch(view, /window\.confirm|ChevronDown|ChevronRight|activeVersion|版本切换|版本号/);
   assert.match(view, /<Modal/);
   assert.match(view, /onUninstall/);
-  assert.match(view, /editMarketSkill/);
+  assert.match(view, /editSkill/);
   assert.match(view, /startEditing/);
   assert.match(view, /fileUpdates/);
   assert.match(view, /技能内容/);
@@ -86,6 +93,7 @@ test("技能页使用三标签、独立路由详情和文件列表，并提供�
   assert.match(view, /className=\{styles\.skillActions\}/);
   assert.match(view, /onInstall=\{\(item\)/);
   assert.match(view, /const installing = source === "market" && busy === item\.id && !item\.installed/);
+  assert.doesNotMatch(view, /updateAvailable/);
   assert.match(view, /aria-busy=\{installing\}/);
   assert.match(view, /installing \? <LoaderCircle className=\{styles\.spin\}/);
   assert.match(view, /installing \? "安装中"/);
@@ -108,7 +116,7 @@ test("技能页使用三标签、独立路由详情和文件列表，并提供�
 
 test("技能编辑去除冗余标题，名称简介输入框对齐并使用技能内容标签", async () => {
   const [view, styles] = await Promise.all([readFile(viewPath, "utf8"), readFile(stylePath, "utf8")]);
-  const editor = view.slice(view.indexOf("function EditMarketForm"), view.indexOf("function DetailPage"));
+  const editor = view.slice(view.indexOf("function EditSkillForm"), view.indexOf("function DetailPage"));
   assert.doesNotMatch(editor, /编辑技能|修改名称、简介|Markdown 内容|editHeading/);
   assert.match(editor, /<span>技能名称<\/span><input/);
   assert.match(editor, /<span>简介<\/span><textarea/);

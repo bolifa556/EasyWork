@@ -172,32 +172,42 @@ export class ServerCapabilityService {
     invariant(Number.isSafeInteger(this.ttlMs) && this.ttlMs >= 1_000 && this.ttlMs <= 60 * 60_000, "SERVER_CAPABILITY_TTL_INVALID", "服务器能力 TTL 无效", { status: 500, expose: false });
     this.cache = new Map();
     this.pending = new Map();
+    this.epochs = new Map();
   }
 
   async get(serverId, { refresh = false } = {}) {
     const server = await this.servers.get(serverId);
-    const key = `${server.connection.status}:${server.connection.generation}:${server.profile.serverIdentity || "unidentified"}`;
+    const key = this.#key(server);
+    const pendingKey = `${serverId}:${key}`;
     const current = this.cache.get(serverId);
     const now = dateFrom(this.clock);
     if (!refresh && current?.key === key && Date.parse(current.profile.expiresAt) > now.valueOf()) return clone(current.profile);
-    if (!refresh && this.pending.has(serverId)) return clone(await this.pending.get(serverId));
-    const detection = this.#detect(server, now, { refreshScheduler: refresh }).then((profile) => {
-      this.cache.set(serverId, { key, profile });
+    if (!refresh && this.pending.has(pendingKey)) return clone(await this.pending.get(pendingKey));
+    const detection = this.#detect(server, now, { refreshScheduler: refresh }).then(async (profile) => {
+      if (this.#key(await this.servers.get(serverId)) !== key) return this.get(serverId);
+      if (this.pending.get(pendingKey) === detection) this.cache.set(serverId, { key, profile });
       return profile;
-    }).finally(() => this.pending.delete(serverId));
-    this.pending.set(serverId, detection);
+    }).finally(() => {
+      if (this.pending.get(pendingKey) === detection) this.pending.delete(pendingKey);
+    });
+    this.pending.set(pendingKey, detection);
     return clone(await detection);
   }
 
   async peek(serverId) {
     const server = await this.servers.get(serverId);
-    const key = `${server.connection.status}:${server.connection.generation}:${server.profile.serverIdentity || "unidentified"}`;
+    const key = this.#key(server);
     const current = this.cache.get(serverId);
     return current?.key === key ? clone(current.profile) : null;
   }
 
   invalidate(serverId) {
     this.cache.delete(String(serverId));
+    this.epochs.set(String(serverId), (this.epochs.get(String(serverId)) || 0) + 1);
+  }
+
+  #key(server) {
+    return `${server.connection.status}:${server.connection.generation}:${server.profile.serverIdentity || "unidentified"}:${this.epochs.get(String(server.profile.id)) || 0}`;
   }
 
   async #detect(server, detectedAt, { refreshScheduler = false } = {}) {

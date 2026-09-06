@@ -114,11 +114,11 @@ export function WebContextDialog({ conversationId, onClose }: { conversationId?:
     {loading ? <LoadingState label="正在读取上下文" /> : unavailable ? <div className={styles.unavailable}><Brain size={23} /><strong>暂时无法读取</strong><span>{unavailable}</span></div> : !conversationId ? <div className={styles.unavailable}><MessagesSquare size={23} /><strong>尚未开始对话</strong><span>发送首条消息后即可查看和配置上下文。</span></div> : snapshot ? <div className={styles.layout}>
       <section className={styles.overview}>
         <div className={styles.usageHeading}>
-          <span className={styles.usageIcon}><MessageCircle size={19} /></span>
+          <span data-ui-icon="" className={styles.usageIcon}><MessageCircle size={19} /></span>
           <div><small>{usageTitle}</small><strong>{estimated ? "约 " : ""}{tokens(used)} / {tokens(limit)}</strong></div>
           <em>{Math.round(ratio * 100)}%</em>
         </div>
-        <div className={styles.progress} aria-hidden="true"><i style={{ width: `${Math.max(0, Math.min(100, ratio * 100))}%` }} /></div>
+        <div data-ui-icon="" className={styles.progress} aria-hidden="true"><i data-ui-icon="" style={{ width: `${Math.max(0, Math.min(100, ratio * 100))}%` }} /></div>
         <p className={styles.usageSource}>{usageNote}</p>
       </section>
 

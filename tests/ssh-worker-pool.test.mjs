@@ -57,6 +57,28 @@ test("SSH credentials are encrypted inside the Actor directory", async () => {
   }
 });
 
+test("Server registry prunes bindings that no longer belong to live conversations", async () => {
+  const ctx = await fixture();
+  try {
+    const registry = ctx.registryFactory(ctx.actor);
+    await registry.create({ id: "server_a", host: "example.internal", port: 22, username: "alice", authMethod: "password", credential: { password: "value" } });
+    await registry.create({ id: "server_b", host: "example-b.internal", port: 22, username: "alice", authMethod: "password", credential: { password: "value" } });
+    await registry.bindConversation("server_a", "conversation_live");
+    await registry.bindConversation("server_b", "conversation_deleted");
+    await registry.disableConversation("conversation_deleted");
+
+    const pruned = await registry.removeConversationBindings(["conversation_deleted"]);
+    assert.deepEqual(pruned, { removedConversationIds: ["conversation_deleted"], removedCount: 1 });
+    assert.deepEqual((await registry.get("server_a")).conversationIds, ["conversation_live"]);
+    assert.deepEqual((await registry.get("server_b")).conversationIds, []);
+    assert.deepEqual((await registry.get("server_b")).activeConversationIds, []);
+    assert.deepEqual(await registry.removeConversationBindings(["conversation_deleted"]), { removedConversationIds: [], removedCount: 0 });
+  } finally {
+    await ctx.pool.stop();
+    await rm(ctx.dataRoot, { recursive: true, force: true });
+  }
+});
+
 test("Different devices share one per-user worker and reuse each server connection", async () => {
   const ctx = await fixture();
   try {

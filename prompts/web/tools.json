@@ -49,6 +49,23 @@
         "additionalProperties": false
       }
     },
+    "conversation_reference_read": {
+      "description": "读取用户在当前消息中通过 @ 明确引用的 EasyWork 对话冻结原文；只能使用本轮目录给出的 reference_id，可按查询和角色筛选，并用返回游标继续读取",
+      "inputSchema": {
+        "type": "object",
+        "required": ["referenceId"],
+        "properties": {
+          "referenceId": { "type": "string" },
+          "query": { "type": "string" },
+          "roles": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["system", "user", "assistant", "tool"] }
+          },
+          "cursor": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
     "skill_search": {
       "description": "读取 skill_list 中一个名称完全一致的 Skill 正文；每次调用读取一个候选，存在多个相关候选时分别调用且同名不重复",
       "inputSchema": {
@@ -65,22 +82,20 @@
       "description": "查看已安装 Skill 的名称和简介；需要具体说明时再按一个完全一致的名称调用 skill_search",
       "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
     },
-    "context_get_state": {
-      "description": "读取当前任务可能需要的对话标题、项目名、服务器连接状态与调度器类型、工作区路径和 Agent 名称",
+    "handoff_rewrite_candidate": {
+      "description": "临时整理一条记忆或明确 @ 引用的对话候选，再由 handoff_submit 发送；candidate_id 与原标题保持不变，整理内容仅本轮有效且不会回写来源",
       "inputSchema": {
         "type": "object",
-        "required": ["fields"],
+        "required": ["candidateId", "revisedContent"],
         "properties": {
-          "fields": {
-            "type": "array",
-            "items": { "type": "string", "enum": ["conversation", "project", "server", "workspace", "agent"] }
-          }
+          "candidateId": { "type": "string" },
+          "revisedContent": { "type": "string" }
         },
         "additionalProperties": false
       }
     },
     "handoff_submit": {
-      "description": "结束 Work 网页上下文选择，并提交远端 Agent 确实缺少且会直接影响本轮执行的候选 ID；仅主题相近或远端可从当前工作区自行读取的不提交，无需补充时提交空数组",
+      "description": "提交本轮需要交给远端的候选资料。选择当前任务所需的事实或操作规范；工作区中的文件事实可留给远端自行读取，但这一规则不用于排除适用的 Skill。仅使用当前候选 ID；现有候选与必要查询均无相关内容，或无需补充时直接提交空数组。原始请求仍会交给远端，不推测或补写未取得的信息",
       "inputSchema": {
         "type": "object",
         "required": ["candidateIds"],

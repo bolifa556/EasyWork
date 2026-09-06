@@ -25,7 +25,7 @@ import { AtomicJsonRepository } from "../repository.mjs";
 import { ResourceService } from "../resources/service.mjs";
 import { SlurmSchedulerAdapter } from "../scheduler/slurm.mjs";
 import { SchedulerService } from "../scheduler/service.mjs";
-import { agentSubmissionReceipts, SchedulerSubmissionLedger, SchedulerSubmissionTracker } from "../scheduler/submissions.mjs";
+import { agentSchedulerActivity, agentSubmissionReceipts, SchedulerSubmissionLedger, SchedulerSubmissionTracker } from "../scheduler/submissions.mjs";
 import { createAgentBindingKey } from "../scope.mjs";
 import {
   filterEligibleSkillObservations,
@@ -63,11 +63,15 @@ import {
 
 const clone = (value) => value === undefined ? undefined : structuredClone(value);
 const nowIso = (clock) => clock().toISOString();
-const WORK_WEB_AGENT_LIMITS = Object.freeze({
-  maxIterations: 16,
-  maxToolCalls: 48,
-  maxWallTimeMs: 10 * 60_000,
-  maxOutputTokens: 384,
+export const WORK_WEB_AGENT_LIMITS = Object.freeze({
+  // Retrieval ends when the required context is ready, not at a fixed step
+  // count. Cancellation and stalled-request timeouts remain available.
+  maxIterations: Infinity,
+  maxToolCalls: Infinity,
+  maxWallTimeMs: null,
+  // Omit the provider's output-limit parameter. Reasoning and tool arguments
+  // share that budget; a small local cap can cut off an otherwise valid call.
+  maxOutputTokens: null,
 });
 const MIME_BY_EXTENSION = Object.freeze({
   ".txt": "text/plain", ".log": "text/plain", ".md": "text/markdown", ".markdown": "text/markdown",
@@ -82,6 +86,84 @@ const MIME_BY_EXTENSION = Object.freeze({
 function viewerMime(name, declared = "application/octet-stream") {
   const mime = String(declared || "application/octet-stream").toLowerCase();
   return mime === "application/octet-stream" ? MIME_BY_EXTENSION[path.posix.extname(String(name).toLowerCase())] || mime : mime;
+}
+
+function estimateMemoryTokens(value) {
+  const text = String(value || "");
+  let wide = 0;
+  let narrow = 0;
+  for (const character of text) {
+    if (/^[\x00-\x7F]$/.test(character)) narrow += 1;
+    else wide += 1;
+  }
+  return Math.max(1, Math.ceil(wide * 1.1 + narrow / 4));
+}
+
+function selectedWorkspaceName(routing = {}, workspace = null) {
+  const workspaceId = String(routing.workspaceId || "").normalize("NFKC").trim();
+  const explicit = String(routing.workspaceLabel || "").normalize("NFKC").trim();
+  const opaqueWorkspace = (value) => Boolean(value && (value === workspaceId || /^ws_[a-z0-9]+$/iu.test(value)));
+  if (explicit && explicit !== "已选工作区" && !opaqueWorkspace(explicit)) {
+    return Array.from(explicit).slice(0, 120).join("");
+  }
+  if (workspace?.kind === "virtual" || routing.workspacePreparation?.kind === "virtual" || routing.deferWorkspaceState) return "虚拟工作区";
+  const candidate = [routing.workspacePath, workspace?.canonicalPath]
+    .map((value) => String(value || "").replaceAll("\\", "/").replace(/\/+$/, ""))
+    .find((value) => value && !opaqueWorkspace(value)) || "";
+  if (/(?:^|\/)\.easywork\/workspaces(?:\/|$)/u.test(candidate)) return "虚拟工作区";
+  return candidate.split("/").filter(Boolean).at(-1) || "已选工作区";
+}
+
+export function workCurrentState(raw = {}, routing = {}) {
+  const projected = semanticState(raw, ["server", "workspace", "agent"]);
+  const selectedServerLabel = String(routing.serverLabel || "").normalize("NFKC").trim();
+  const configuredServerName = String(raw?.server?.profile?.name || "").normalize("NFKC").trim();
+  const serverName = selectedServerLabel && selectedServerLabel !== "已选服务器"
+    ? selectedServerLabel
+    : configuredServerName;
+  const detectedScheduler = String(projected.server?.scheduler || "").trim().toLowerCase();
+  const scheduler = ["slurm", "pbs", "generic"].includes(detectedScheduler) ? detectedScheduler : "";
+  if (serverName || scheduler) {
+    projected.server = {
+      ...(serverName ? { name: Array.from(serverName).slice(0, 120).join("") } : {}),
+      ...(scheduler ? { scheduler } : {}),
+    };
+  } else {
+    delete projected.server;
+  }
+  const workspaceName = selectedWorkspaceName(routing, raw.workspace);
+  projected.workspace = { name: workspaceName };
+  return projected;
+}
+
+// Explicit @ conversation references are frozen, turn-local source material.
+// They may be read, rewritten, and handed to the remote Agent, but must not be
+// promoted into EasyWork memory merely because the Web Agent inspected them.
+export function memoryExtractionObservations(fragments = []) {
+  return (Array.isArray(fragments) ? fragments : [])
+    .filter((fragment) => String(fragment?.toolName || "") !== "conversation_reference_read" && fragment?.rewritten !== true);
+}
+
+function handoffEventReferences(fragments = []) {
+  const references = [];
+  const indexes = new Map();
+  for (const fragment of Array.isArray(fragments) ? fragments : []) {
+    const kind = String(fragment?.reference?.kind || "").trim();
+    const name = String(fragment?.reference?.name || "").trim();
+    if (!kind || !name) continue;
+    const key = `${kind}\0${name}`;
+    const detail = kind.toLocaleLowerCase() === "skill" ? "" : String(fragment?.knowledge?.content || "").trim();
+    const currentIndex = indexes.get(key);
+    if (currentIndex !== undefined) {
+      const current = references[currentIndex];
+      if (fragment?.rewritten) current.edited = true;
+      if (detail && !String(current.detail || "").includes(detail)) current.detail = current.detail ? `${current.detail}\n\n${detail}` : detail;
+      continue;
+    }
+    indexes.set(key, references.length);
+    references.push({ kind, name, ...(detail ? { detail } : {}), ...(fragment?.rewritten ? { edited: true } : {}) });
+  }
+  return references;
 }
 
 function exactObject(input, allowed, operation) {
@@ -126,9 +208,8 @@ function normalizeGeneratedTitle(value) {
     .replace(/^(?:标题|对话标题)\s*[:：]\s*/, "")
     .replace(/^[\s"'“”‘’《》【】]+|[\s"'“”‘’《》【】。！？.!?]+$/g, "")
     .trim();
-  const title = Array.from(normalized).slice(0, 14).join("");
-  invariant(title.length > 0, "CONVERSATION_TITLE_GENERATION_EMPTY", "标题模型没有返回有效标题", { status: 502 });
-  return title;
+  invariant(normalized.length > 0, "CONVERSATION_TITLE_GENERATION_EMPTY", "标题模型没有返回有效标题", { status: 502 });
+  return normalized;
 }
 
 async function allConversations(service) {
@@ -191,20 +272,20 @@ export function settledConversationHistory(history, currentMessageId = null, { r
 }
 
 export function workConversationState(history, currentMessageId = null) {
-  // A Work Web Agent chooses supplemental knowledge; it does not continue the
-  // remote Agent's reasoning. The native remote conversation already owns its
-  // assistant replies, including their corrections and tool results. Feeding
-  // those replies back into the selector makes obsolete remote conclusions
-  // look like fresh facts and invites the webpage model to solve the task a
-  // second time. Keep the durable webpage checkpoint plus the user's effective
-  // instruction chain. The current request is supplied separately by run().
+  // The selector needs the visible conversation (including answers) to resolve
+  // follow-ups. Its own history is independent of native transcript delivery;
+  // receipt identities and delivery decisions never enter these messages.
   return settledConversationHistory(history, currentMessageId, { retainTrailingUsers: true })
-    .filter((entry) => entry?.role === "system" || entry?.role === "user");
+    .filter((entry) => ["system", "user", "assistant"].includes(entry?.role));
 }
 
-export async function workConversationTranscriptFragments(history, currentMessageId, prompts) {
+export async function workConversationTranscriptFragments(history, currentMessageId, prompts, { tasks = [] } = {}) {
+  // A replyTo edge is also used for ordinary consecutive user turns. It does
+  // not prove that an earlier cancelled preparation was delivered to native.
+  const undelivered = new Set(tasks.filter((task) => !task.startedAt && !task.remoteRunId
+    && ["failed", "interrupted", "cancelled"].includes(task.status)).map((task) => task.sourceMessageId));
   const messages = settledConversationHistory(history, currentMessageId)
-    .filter((entry) => entry?.role === "user" || entry?.role === "assistant");
+    .filter((entry) => (entry?.role === "user" || entry?.role === "assistant") && !undelivered.has(entry.id));
   return (await Promise.all(messages.map(async (message) => {
     const knowledge = await conversationKnowledgeUnit(message, prompts);
     if (!knowledge) return null;
@@ -699,6 +780,16 @@ class ConversationInteractionFacade {
     };
   }
 
+  async #legacySkillPinsAtTask(sourceTask) {
+    const summaries = await this.container.taskStore.listTasks({ conversationId: sourceTask.conversationId, limit: 1000 });
+    const tasks = await Promise.all(summaries.filter((task) => task.createdAt <= sourceTask.createdAt).map((task) => this.container.taskStore.getTask(task.id)));
+    const pins = new Map();
+    for (const task of tasks.filter((task) => task && task.agentBindingId === sourceTask.agentBindingId && task.status === "completed").sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+      for (const pin of task.skillPins || []) pins.set(pin.skillId, pin);
+    }
+    return [...pins.values()];
+  }
+
   async #tryNativeAgentFork({ sourceTask, targetConversationId, targetBranchId, inheritedConversationUnits = [] }) {
     if (!sourceTask || sourceTask.status !== "completed") return { applied: false, reason: "boundary_not_completed" };
     const sourceBinding = await this.container.taskRuntime.loadBinding(sourceTask.agentBindingId);
@@ -751,7 +842,8 @@ class ConversationInteractionFacade {
         // inherits the exact Skill capabilities that transcript could use.
         // Pins are copied as identities only; execute() materializes a fresh
         // branch-local discovery view from the immutable server cache.
-        skillPins: clone(Array.isArray(sourceBinding.native?.skillPins) ? sourceBinding.native.skillPins : []),
+        skillPins: clone(boundary?.skillSnapshot?.skillPins || sourceBinding.native?.skillCheckpoints?.[sourceTask.id]?.skillPins || await this.#legacySkillPinsAtTask(sourceTask)),
+        ...((boundary?.skillSnapshot || sourceBinding.native?.skillCheckpoints?.[sourceTask.id]) ? { skillSnapshot: clone(boundary?.skillSnapshot || sourceBinding.native.skillCheckpoints[sourceTask.id]) } : {}),
       },
       activeRunId: null,
       activeCommandId: null,
@@ -1206,6 +1298,9 @@ class ConversationInteractionFacade {
   }
 
   listConversations(input) { return this.base.listConversations(input); }
+  searchConversations(input) { return this.base.searchConversations(input); }
+  searchReferenceCandidates(input) { return this.base.searchReferenceCandidates(input); }
+  readConversationReference(input) { return this.base.readConversationReference(input); }
   getConversationSummaries(ids) { return this.base.getConversationSummaries(ids); }
   getConversation(id) { return this.base.getConversation(id); }
   listMessages(input) { return this.base.listMessages(input); }
@@ -1264,6 +1359,12 @@ class ConversationInteractionFacade {
       const followingTask = followingTaskId ? await this.container.taskStore.getTask(followingTaskId) : null;
       const task = followingTask || previousTask;
       if (boundary.role === "assistant" && boundary.taskId && previousTask?.id === boundary.taskId) boundaryNativeTask = previousTask;
+      if (boundaryNativeTask?.agentBindingId) {
+        const boundaryBinding = await this.container.taskRuntime.loadBinding(boundaryNativeTask.agentBindingId);
+        const requiredFrom = boundaryBinding?.native?.skillSnapshotRequiredFrom;
+        invariant(!requiredFrom || boundaryNativeTask.createdAt < requiredFrom || boundaryBinding.native?.skillCheckpoints?.[boundaryNativeTask.id],
+          "AGENT_SKILL_SNAPSHOT_UNAVAILABLE", "该回合的技能快照未成功保存，无法创建内容一致的分支；请从已保存快照的回合分支", { status: 409 });
+      }
       boundaryWorkspaceId = task?.route?.workspaceId || null;
       boundaryAgentId = task?.route?.agentId || boundaryAgentId;
       if (task?.route?.workspaceId && task.route.agentId) {
@@ -1564,6 +1665,31 @@ export class RemoteTaskLifecycle {
     this.extraction = extraction;
   }
 
+  async conversationHistoryForBinding(scope, currentTaskId = null) {
+    if (typeof this.container.baseConversations?.listMessages !== "function") return [];
+    const bindingKey = createAgentBindingKey(scope, scope.agentId);
+    const [binding, tasks] = await Promise.all([
+      this.container.taskRuntime.loadBinding(bindingKey),
+      this.container.taskStore.scanTasks
+        ? this.container.taskStore.scanTasks({ conversationId: scope.conversationId })
+        : this.container.taskStore.listTasks({ conversationId: scope.conversationId, limit: 1000 }),
+    ]);
+    const previous = tasks.filter((task) => task.id !== currentTaskId
+      && task.sourceMessageId !== this.extraction.messageId
+      // Failed preparation never changed the active native conversation.
+      // Keep the preceding delivered binding so retrying a switch still syncs.
+      && !(!task.startedAt && !task.remoteRunId && ["failed", "interrupted", "cancelled"].includes(task.status))
+      && (!task.branchId || !scope.branchId || task.branchId === scope.branchId))
+      .sort((left, right) => String(right.createdAt || right.updatedAt || "").localeCompare(String(left.createdAt || left.updatedAt || "")))[0];
+    const nativeSessionId = binding?.native?.sessionId || binding?.native?.threadId || binding?.state?.sessionId;
+    // An existing native conversation owns its history. Even a missing local
+    // receipt is not a reason to replay its transcript on an ordinary turn.
+    if (nativeSessionId && previous?.agentBindingId === bindingKey) return [];
+    const messages = await allMessages(this.container.baseConversations, scope.conversationId, scope.branchId);
+    const fragments = await workConversationTranscriptFragments(messages, this.extraction.messageId, this.container.runtime.prompts, { tasks });
+    return this.filterHandoff({ scope, fragments });
+  }
+
   async filterHandoff({ scope, fragments }) {
     if (!Array.isArray(fragments) || !fragments.length) return [];
     const selectedByIdentity = new Map();
@@ -1583,24 +1709,13 @@ export class RemoteTaskLifecycle {
     const binding = await this.container.taskRuntime.loadBinding(bindingKey);
     const nativeSessionId = binding?.native?.sessionId || binding?.native?.threadId || binding?.state?.sessionId || null;
     if (!nativeSessionId) return deduplicated;
-    // Skills use each Agent's native discovery path. The Web Agent reads the
-    // entrypoint only to decide applicability; the remote turn receives the
-    // immutable package through its isolated Skill view, never a second copy
-    // of SKILL.md in the ordinary prompt. native.skillPins is therefore the
-    // delivery receipt for this one context class, while ContextHub remains
-    // authoritative for memory and file/content fragments.
-    const installedSkillPins = new Map((Array.isArray(binding?.native?.skillPins) ? binding.native.skillPins : [])
-      .map((pin) => [String(pin?.skillId || ""), pin]));
+    // A package pin proves deployment, not invocation or model compliance.
+    // Keep applicable Skills available for selection in each new turn. Cached
+    // observations avoid rereading their source; deployment reuses the owned
+    // view, while the adapter invokes the selected native Skill explicitly.
     const skillFragments = deduplicated.filter((entry) => /^skill:(.+)$/.test(String(entry?.knowledge?.key || "")));
     const contextualFragments = deduplicated.filter((entry) => !skillFragments.includes(entry));
-    const pendingSkills = new Set(skillFragments.filter((entry) => {
-      const skillId = /^skill:(.+)$/.exec(String(entry.knowledge.key))?.[1] || "";
-      const pin = installedSkillPins.get(skillId);
-      if (!pin) return true;
-      const pinVersion = `${String(pin.version || "")}:${String(pin.sha256 || "")}`;
-      const observedVersion = String(entry.knowledge.version || "");
-      return observedVersion !== pinVersion && observedVersion !== `semantic-v1:${pinVersion}`;
-    }));
+    const pendingSkills = new Set(skillFragments);
     const knowledgeFragments = contextualFragments.filter((entry) => entry?.knowledge?.key && entry?.knowledge?.version);
     const semanticFragments = contextualFragments.filter((entry) => !entry?.knowledge?.key || !entry?.knowledge?.version);
     const acceptedKnowledge = await this.container.contextHub.unacknowledgedKnowledge({
@@ -1679,6 +1794,48 @@ export class RemoteTaskLifecycle {
         return !marker || pendingKeys.has(`${marker.key}\0${marker.version}`);
       }),
     };
+  }
+
+  async filterForcedSkillCatalog({ scope, skills }) {
+    const selectedIds = new Set((scope.selectedSkillVersions || []).map((pin) => String(pin.skillId)));
+    const bindingKey = createAgentBindingKey(scope, scope.agentId);
+    const checks = this.container.forcedSkillChecks ||= new Map();
+    let check = checks.get(scope.conversationId);
+    // Remember the active binding, not every binding ever seen: A -> B -> A
+    // must inspect A again on its next question, even if B had no forced Skills.
+    if (check?.bindingKey !== bindingKey) {
+      check = { bindingKey, checked: false, pending: new Set() };
+      checks.set(scope.conversationId, check);
+      if (checks.size > 256) checks.delete(checks.keys().next().value);
+    }
+    const identity = (skill) => {
+      const version = /^(?:semantic-v1:)?([^:]+):([a-f0-9]{64})$/.exec(String(skill.knowledge?.version || ""));
+      return version ? JSON.stringify([skill.skillId, version[1], version[2]]) : null;
+    };
+    if (!check.checked) {
+      const forced = skills.filter(isForcedWorkSkill);
+      const binding = forced.length ? await this.container.taskRuntime.loadBinding(bindingKey) : null;
+      const installed = new Set((binding?.native?.skillPins || []).map((pin) => JSON.stringify([pin.skillId, pin.version, pin.sha256])));
+      check.pending = new Set(forced.filter((skill) => !identity(skill) || !installed.has(identity(skill))).map(identity));
+      check.checked = true;
+    }
+    // Reuse this decision on consecutive questions. No remote/model check is
+    // needed until the webpage conversation switches its remote binding.
+    return skills.filter((skill) => {
+      if (!isForcedWorkSkill(skill) || selectedIds.has(String(skill.skillId))) return true;
+      return check.pending.has(identity(skill));
+    });
+  }
+
+  settleForcedSkillDelivery(scope, dispatch) {
+    const check = this.container.forcedSkillChecks?.get(scope.conversationId);
+    if (!check || check.bindingKey !== createAgentBindingKey(scope, scope.agentId) || !check.pending.size) return;
+    if (dispatch?.operation === "create" && ["running", "completed"].includes(dispatch.start?.status)) {
+      for (const pin of dispatch.task.skillPins || []) check.pending.delete(JSON.stringify([pin.skillId, pin.version, pin.sha256]));
+    } else {
+      // An interrupted/failed startup is not proof that installation finished.
+      check.checked = false;
+    }
   }
 
   async nativeTaskConversationKnowledge(task, conversationId, branchId, { includeAssistant = task?.status === "completed" } = {}) {
@@ -1764,6 +1921,7 @@ export class RemoteTaskLifecycle {
             sessionId: nativeSessionId,
             turnId: binding.native?.turnId || binding.state?.turnId || null,
             rolloutPath: binding.native?.rolloutPath || null,
+            skillSnapshot: binding.native?.skillCheckpoints?.[activeTask.id] || null,
           },
         });
       }
@@ -1778,7 +1936,10 @@ export class RemoteTaskLifecycle {
     if (existing) {
       if (this.extraction.runId) await this.container.webInteractionStore.addTask(this.extraction.runId, taskId);
       const handoffFragments = await this.filterHandoff({ scope, fragments: selectedHandoffFragments });
-      const handoffKnowledge = handoffFragments
+      const historyFragments = existing.status === "queued"
+        ? await this.conversationHistoryForBinding(scope, taskId)
+        : [];
+      const handoffKnowledge = [...handoffFragments, ...historyFragments]
         .filter((entry) => !String(entry?.knowledge?.key || "").startsWith("skill:"))
         .map((entry) => entry?.knowledge)
         .filter(Boolean);
@@ -1883,9 +2044,12 @@ export class RemoteTaskLifecycle {
       mode: "work",
       sourceMessageId: this.extraction.messageId,
       userMessage,
-      observedKnowledge: selectedHandoffFragments,
+      observedKnowledge: memoryExtractionObservations(selectedHandoffFragments),
     });
-    const handoffKnowledge = handoffFragments
+    // Transcript synchronization is backend-only. Do not return it as a Web
+    // Agent candidate, observation, visible handoff or memory-extraction input.
+    const historyFragments = await this.conversationHistoryForBinding({ ...taskScope, agentId: scope.agentId }, taskId);
+    const handoffKnowledge = [...handoffFragments, ...historyFragments]
       .filter((entry) => !String(entry?.knowledge?.key || "").startsWith("skill:"))
       .map((entry) => entry?.knowledge)
       .filter(Boolean);
@@ -2136,6 +2300,34 @@ class WebInteractionService {
     return { runId, status: "running", duplicate: !claimed.created };
   }
 
+  async recordStartupFailure(input) {
+    exactObject(input, ["conversationId", "messageId", "failure", "commandId"], "RecordWorkStartupFailure");
+    invariant(typeof input.commandId === "string" && input.commandId, "IDEMPOTENCY_KEY_REQUIRED", "启动失败记录必须提供 Idempotency-Key", { status: 428 });
+    const detail = await this.container.baseConversations.getConversation(String(input.conversationId || ""));
+    invariant(detail.summary.mode === "work", "WORK_STARTUP_FAILURE_MODE_INVALID", "只有工作对话可以记录启动失败", { status: 409 });
+    const messageId = String(input.messageId || "");
+    invariant(detail.messages.some((message) => message.id === messageId && message.role === "user"), "WORK_STARTUP_MESSAGE_NOT_FOUND", "启动失败没有对应的用户消息", { status: 404 });
+    const failure = {
+      code: String(input.failure?.code || "WORK_STARTUP_FAILED").replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 128),
+      message: String(redactSensitive(String(input.failure?.message || "工作任务启动失败"))).slice(0, 16_384),
+      retryable: input.failure?.retryable !== false,
+    };
+    const runId = `web_${crypto.createHash("sha256").update(`${this.container.actor.actorId}:startup:${input.commandId}`).digest("hex").slice(0, 32)}`;
+    const runInput = {
+      conversationId: detail.summary.id,
+      messageId,
+      providerId: "startup",
+      modelId: "startup",
+      scope: {},
+      commandId: input.commandId,
+    };
+    const claimed = await this.store.claim(runId, runInput);
+    if (claimed.record.status === "failed") return { runId, status: "failed", duplicate: true };
+    await this.store.fail(runId, failure);
+    await this.#publishFailure(runId, runInput, failure);
+    return { runId, status: "failed", duplicate: !claimed.created };
+  }
+
   async interruptConversation(conversationId, { commandId } = {}) {
     const id = String(conversationId || "");
     invariant(id && typeof commandId === "string" && commandId, "IDEMPOTENCY_KEY_REQUIRED", "停止对话必须提供 Idempotency-Key", { status: 428 });
@@ -2162,7 +2354,12 @@ class WebInteractionService {
     const webRun = (await this.store.listByConversation(id))
       .filter((record) => record.status === "running")
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.runId.localeCompare(left.runId))[0];
-    invariant(webRun, "CONVERSATION_TASK_NOT_RUNNING", "当前对话没有可停止的任务", { status: 409 });
+    if (!webRun) {
+      await this.container.baseConversations.getConversation(id);
+      const history = await this.container.taskStore.listTasks({ conversationId: id, limit: 1000 });
+      const latest = [...history].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+      return { ...(latest ? { taskId: latest.id } : {}), status: latest?.status || "completed", duplicate: true };
+    }
     const controller = this.runControllers.get(webRun.runId);
     invariant(controller, "WEB_RUN_INTERRUPT_UNAVAILABLE", "网页 Agent 当前无法停止，请稍后重试", { status: 409, retryable: true });
     if (controller.signal.aborted) return { runId: webRun.runId, status: "interrupting", duplicate: true };
@@ -2525,6 +2722,9 @@ class WebInteractionService {
           })().then((result) => ({ result }), (error) => ({ error }));
         remoteConfigurationOutcome = (async () => {
             if (!configurationSourceScope || !configurationAgentIds.length) return [];
+            // New conversations inherit the server-wide default dynamically.
+            // Only an explicit conversation/branch override is materialized.
+            if (configurationSourceScope === "default") return [];
             const backend = await this.container.remoteBackend(String(requestedScope.serverId));
             invariant(typeof backend.agentConfiguration?.materializeScopes === "function", "AGENT_CONFIG_SCOPES_MATERIALIZE_UNAVAILABLE", "远端 backend 未提供当前配置作用域物化能力", { status: 503 });
             return backend.agentConfiguration.materializeScopes(configurationAgentIds, {
@@ -2688,7 +2888,7 @@ class WebInteractionService {
             branchId,
             sourceMessageIds: messages.map((message) => message.id),
           })
-        ));
+        )).then((fragments) => this.container.memory.filterObservations?.(fragments) ?? fragments);
     // Filtering historical observations also migrates already-acknowledged
     // complete reads to file-version coverage receipts. Do this before exposing
     // the catalog, so a same-session Work turn does not even see files it has
@@ -2699,11 +2899,13 @@ class WebInteractionService {
           return true;
         })
       : Promise.resolve(true);
-    const selectedSkillPins = new Map();
     let applicableInstalledSkillCatalogPromise = null;
     const applicableInstalledSkillCatalog = () => {
       applicableInstalledSkillCatalogPromise ||= (async () => {
         let items = await requestRelevantInstalledSkills();
+        if (taskLifecycle) {
+          items = await taskLifecycle.filterForcedSkillCatalog({ scope: await resolvedAgentBindingScope(), skills: items });
+        }
         if (mode === "work" && items.length) {
           const probes = items.map((item) => ({
             toolName: "skill_list",
@@ -2744,11 +2946,6 @@ class WebInteractionService {
             ...(pins.has(String(entry.skillId)) ? { selectedSkillVersions: [pins.get(String(entry.skillId))] } : {}),
           })));
           const evidence = groups.flat();
-          for (const item of evidence) {
-            if (item?.skillId && item?.version && /^[a-f0-9]{64}$/.test(String(item.sha256 || ""))) {
-              selectedSkillPins.set(String(item.skillId), { skillId: String(item.skillId), version: String(item.version), sha256: String(item.sha256) });
-            }
-          }
           return evidence;
         })()
       : Promise.resolve([]);
@@ -2758,7 +2955,10 @@ class WebInteractionService {
     // project remain available on later turns after their chips are cleared.
     // Probe the authorized catalog before allowing the empty-handoff fast path.
     const allowWorkResources = mode !== "work" || requestedWorkSources.resources || hasSelectedResourceScope;
-    const scopedResourceCatalogPromise = mode === "work" && !skipWebAgentModel && allowWorkResources
+    // Chat and Work must discover files from the same authorized catalog.
+    // Work additionally filters entries already known by the target native
+    // session, while Chat consumes the catalog directly.
+    const scopedResourceCatalogPromise = !skipWebAgentModel && allowWorkResources
       ? Promise.all([
           historicalCoverageReadyPromise,
           this.container.resources.catalog({ scope, limit: 80 }),
@@ -2784,16 +2984,7 @@ class WebInteractionService {
     const workSkillToolsPromise = mode === "work" && !skipWebAgentModel
       ? installedSkillCatalog().then((catalog) => catalog.length > 0)
       : Promise.resolve(mode !== "work");
-    const requiredConversationHandoffPromise = mode === "work" && !taskId && !skipWebAgentModel && taskLifecycle
-      ? allMessages(this.container.baseConversations, input.conversationId, branchId).then(async (entries) => {
-          const fragments = await workConversationTranscriptFragments(entries, target.id, this.container.runtime.prompts);
-          if (!fragments.length) return [];
-          return taskLifecycle.filterHandoff({
-            scope: await resolvedAgentBindingScope(),
-            fragments,
-          });
-        })
-      : Promise.resolve([]);
+    const conversationReferences = Array.isArray(target.references) ? target.references : [];
     const toolsPromise = skipWebAgentModel ? Promise.resolve({
       resolve: () => null,
       definitions: () => [],
@@ -2843,24 +3034,33 @@ class WebInteractionService {
             selectedSkillIds: [skill.skillId],
             ...(pinnedVersion ? { selectedSkillVersions: [pinnedVersion] } : {}),
           });
-          if (mode === "work") {
-            for (const item of items) {
-              if (item?.skillId && item?.version && /^[a-f0-9]{64}$/.test(String(item.sha256 || ""))) {
-                selectedSkillPins.set(String(item.skillId), {
-                  skillId: String(item.skillId),
-                  version: String(item.version),
-                  sha256: String(item.sha256),
-                });
-              }
-            }
-          }
           return { skills: items };
+        },
+      },
+      conversationReferences: {
+        read: async ({ referenceId, query, roles, cursor }) => {
+          const configuration = await this.container.embedding.memoryConfiguration().catch(() => ({ pageSize: 20 }));
+          const result = await this.container.baseConversations.readConversationReference({
+            conversationId: input.conversationId,
+            messageId: target.id,
+            referenceId,
+            ...(query ? { query } : {}),
+            ...(roles?.length ? { roles } : {}),
+            ...(cursor ? { cursor } : {}),
+            limit: configuration.pageSize,
+          });
+          return {
+            conversation: result.items,
+            nextCursor: result.nextCursor,
+            reference: result.reference,
+          };
         },
       },
     }, this.container.runtime.prompts, {
       workMemoryTools,
       workResourceTools,
       workSkillTools,
+      conversationReferences,
     }));
     const historyPromise = skipWebAgentModel
       ? Promise.resolve([])
@@ -2869,20 +3069,21 @@ class WebInteractionService {
         : settledConversationHistory(entries, target.id))
         .map(({ role, content }) => ({ role, content })));
     const workEnvironmentPromise = mode === "work" && !taskId && !skipWebAgentModel
-      ? (async () => renderSemanticContext(
-          semanticState(
+      ? (async () => {
+          const state = workCurrentState(
             await this.container.contextState(scope, requestedScope, ["server", "workspace", "agent"], { includeCapabilities: true }),
-            ["server", "workspace", "agent"],
-          ),
-          this.container.runtime.prompts,
-        ))()
-      : Promise.resolve("");
-    const resourceCatalogPromise = mode === "work" && !skipWebAgentModel
-      ? Promise.all([workResourceToolsPromise, scopedResourceCatalogPromise]).then(async ([workResourceTools, catalog]) => {
-          if (!workResourceTools) return "";
+            requestedScope,
+          );
+          return { state, rendered: await renderSemanticContext(state, this.container.runtime.prompts) };
+        })()
+      : Promise.resolve({ state: null, rendered: "" });
+    const resourceCatalogPromise = !skipWebAgentModel
+      ? Promise.all([workResourceToolsPromise, scopedResourceCatalogPromise]).then(async ([resourceToolsAvailable, catalog]) => {
+          const catalogItems = Array.isArray(catalog?.items) ? catalog.items : [];
+          if (!resourceToolsAvailable || (!hasSelectedResourceScope && catalogItems.length === 0)) return "";
           const collections = await this.container.collections.list();
           const collectionNames = new Map(collections.map((entry) => [entry.id, entry.name]));
-          const entries = catalog.items.map((item) => {
+          const entries = catalogItems.map((item) => {
             const visibleItem = { ...item };
             delete visibleItem.resourceId;
             delete visibleItem.resourceVersionId;
@@ -2896,7 +3097,10 @@ class WebInteractionService {
           return this.container.runtime.prompts.resourceCatalog(entries);
         })
       : Promise.resolve("");
-    const [model, tools, , , history, priorObservations, workEnvironment, resourceCatalog, explicitlySelectedSkills, requestRelevantSkills, requiredConversationHandoff] = await Promise.all([
+    const conversationReferenceCatalogPromise = !skipWebAgentModel && conversationReferences.length
+      ? this.container.runtime.prompts.conversationReferenceCatalog(conversationReferences)
+      : Promise.resolve("");
+    const [model, tools, , , history, priorObservations, workEnvironment, resourceCatalog, conversationReferenceCatalog, explicitlySelectedSkills, requestRelevantSkills] = await Promise.all([
       modelPromise,
       toolsPromise,
       workResourceToolsPromise,
@@ -2905,19 +3109,23 @@ class WebInteractionService {
       priorObservationsPromise,
       workEnvironmentPromise,
       resourceCatalogPromise,
+      conversationReferenceCatalogPromise,
       explicitlySelectedSkillEvidencePromise,
       requestRelevantInstalledSkills(),
-      requiredConversationHandoffPromise,
     ]);
-    const sourceFilteredPriorObservations = mode === "work"
-      ? priorObservations.filter((fragment) => {
+    const sourceFilteredPriorObservations = priorObservations.filter((fragment) => {
           const toolName = String(fragment?.toolName || "");
+          if (toolName === "conversation_sync") return false;
+          // An explicit @ reference belongs to exactly one user message. It may
+          // be reread from that message's frozen snapshot, but its observation
+          // is never silently restored into a later turn.
+          if (toolName === "conversation_reference_read") return false;
+          if (mode !== "work") return true;
           if (toolName === "memory_search") return requestedWorkSources.memory;
           if (toolName === "resource_search" || toolName === "resource_read") return allowWorkResources;
           if (toolName === "skill_list" || toolName === "skill_search") return allowWorkSkills;
           return true;
-        })
-      : priorObservations;
+        });
     const relevantHistoricalObservations = mode === "work"
       ? filterRelevantHistoricalObservations(sourceFilteredPriorObservations, {
           request: target.content,
@@ -2957,7 +3165,16 @@ class WebInteractionService {
         payload: event.payload,
       }),
     });
-    const modelContext = [workEnvironment, resourceCatalog]
+    if (workEnvironment.state) {
+      await this.container.broker.append(`conversation:${detail.summary.id}`, {
+        producer: "web-agent",
+        kind: "run.context.state",
+        status: "completed",
+        ids: { conversationId: detail.summary.id, runId: input.runId, sourceMessageId: target.id },
+        payload: { state: workEnvironment.state },
+      });
+    }
+    const modelContext = [workEnvironment.rendered, conversationReferenceCatalog, resourceCatalog]
       .filter(Boolean)
       .map((content) => ({ role: "system", content }))
       .concat(history);
@@ -2978,7 +3195,7 @@ class WebInteractionService {
         // Deterministic selections belong to delivery, not the model's
         // candidate pool. In particular a forced Skill is never reread or
         // reconsidered by the Web Agent.
-        requiredHandoffFragments: [...requiredConversationHandoff, ...initialHandoffFragments],
+        requiredHandoffFragments: initialHandoffFragments,
         observationSink: (fragments) => this.container.webAgentObservations.record({
           conversationId: input.conversationId,
           branchId,
@@ -3010,32 +3227,46 @@ class WebInteractionService {
         // with this early warmup, so dispatch must not wait for it here.
         const mergedSkillPins = new Map((Array.isArray(agentScope.skillPins) ? agentScope.skillPins : [])
           .map((pin) => [String(pin.skillId), pin]));
-        const submittedSkillIds = new Set((result.selectedHandoffFragments || result.handoffFragments || [])
-          .map((fragment) => /^skill:(.+)$/.exec(String(fragment?.knowledge?.key || ""))?.[1])
-          .filter(Boolean));
-        for (const [skillId, pin] of selectedSkillPins) {
-          if (submittedSkillIds.has(skillId)) mergedSkillPins.set(skillId, pin);
-        }
+        const submittedSkills = (result.selectedHandoffFragments || result.handoffFragments || [])
+          .filter((fragment) => String(fragment?.knowledge?.key || "").startsWith("skill:"));
+        // Cached observations and newly read candidates use the same exact
+        // registry resolution. A tool read in this round is not a receipt.
+        const resolvedPins = submittedSkills.length ? await this.container.skills.resolveKnowledgePins(submittedSkills) : [];
+        for (const pin of resolvedPins) mergedSkillPins.set(pin.skillId, pin);
         agentScope.skillPins = [...mergedSkillPins.values()];
         const dispatch = await taskLifecycle.dispatch({
           scope: agentScope,
           userMessage: target.content,
-          // Keep every candidate explicitly submitted by the Web Agent until
-          // the orchestrator knows the actual native session. A stale binding
-          // may be replaced during start, but unsubmitted read results must
-          // never become remote context merely because the session changed.
-          handoffFragments: result.selectedHandoffFragments || result.handoffFragments || [],
+          // WebAgentRuntime already applies the binding receipt filter before
+          // showing “已发送” in the timeline. The lifecycle checks that exact
+          // set once more against the final native session only as a
+          // last-moment consistency guard.
+          handoffFragments: result.handoffFragments || [],
           idempotencyKey: `${input.runId}:handoff`,
           directRemoteTaskId: directRemoteTask?.id || null,
+        }).catch((error) => {
+          taskLifecycle.settleForcedSkillDelivery(agentScope, null);
+          throw error;
         });
+        taskLifecycle.settleForcedSkillDelivery(agentScope, dispatch);
         taskId = dispatch.taskId;
         if (dispatch.operation === "create") sentHandoffFragments = [...(dispatch.handoffFragments || [])];
+        const deliveredReferences = handoffEventReferences(dispatch.handoffFragments || []);
+        const deliveredContext = (dispatch.handoffFragments || []).some((fragment) => (
+          !String(fragment?.knowledge?.key || "").startsWith("skill:")
+          && Boolean(String(fragment?.rendered || fragment?.knowledge?.content || "").trim())
+        ));
         await this.container.broker.append(`conversation:${detail.summary.id}`, {
           producer: "web-agent",
           kind: "run.handoff.dispatched",
           status: "completed",
           ids: { conversationId: detail.summary.id, runId: input.runId, sourceMessageId: target.id, taskId },
-          payload: { operation: dispatch.operation, taskId, contextIncluded: dispatch.operation === "create" && Boolean(result.content) },
+          payload: {
+            operation: dispatch.operation,
+            taskId,
+            contextIncluded: dispatch.operation === "create" && deliveredContext,
+            references: dispatch.operation === "create" ? deliveredReferences : [],
+          },
         });
         // A Task journal is the immutable, self-contained history of one
         // webpage turn.  Mirror the preceding Web Agent events into it once a
@@ -3195,39 +3426,9 @@ class WebInteractionService {
       });
     }
     if (messages.length === 1 && detail.summary.title === defaultConversationTitle(target.content)) {
-      try {
-        const titlePrompt = await this.container.runtime.prompts.conversationTitle({
-          userPrompt: target.content,
-          assistantResponse: result.content,
-        });
-        const rawTitle = await this.container.runtime.completeAuxiliary({
-          actor: this.container.actor,
-          providerId: input.providerId,
-          modelId: input.modelId,
-          mode,
-          runId: `title_${crypto.createHash("sha256").update(`${input.conversationId}:${target.id}`).digest("hex").slice(0, 32)}`,
-          system: titlePrompt.system,
-          input: titlePrompt.input,
-          maxOutputTokens: 64,
-        });
-        const title = normalizeGeneratedTitle(rawTitle);
-        const latestConversation = await this.container.baseConversations.getConversation(input.conversationId);
-        if (latestConversation.summary.title === defaultConversationTitle(target.content)) {
-          const renamed = await this.container.baseConversations.rename({
-            conversationId: input.conversationId,
-            title,
-            expectedRevision: latestConversation.summary.revision,
-            commandId: derivedCommandId(`title:${input.conversationId}:${target.id}`, "rename"),
-          });
-          await this.container.broker.append(`conversation:${input.conversationId}`, {
-            producer: "web-agent",
-            kind: "conversation.title.updated",
-            status: "completed",
-            ids: { conversationId: input.conversationId, messageId: persisted.messageId, sourceMessageId: target.id, runId: input.runId },
-            payload: { title, conversationRevision: renamed.conversation.revision },
-          });
-        }
-      } catch { /* title generation is independent from the completed reply */ }
+      await this.container.taskRuntime.launch(`title:${input.conversationId}:${target.id}`, () => (
+        this.#generateConversationTitle({ input, mode, target, persisted, assistantResponse: result.content })
+      ));
     }
     if (mode === "chat") {
       await this.container.taskRuntime.launch(`memory:${persisted.messageId}`, async () => {
@@ -3241,13 +3442,69 @@ class WebInteractionService {
             providerId: input.providerId,
             modelId: input.modelId,
             mode,
-            observedKnowledge: result.observedFragments || [],
+            observedKnowledge: memoryExtractionObservations(result.observedFragments),
             dedupeKey: `message:${persisted.messageId}`,
           });
         } catch { /* the completed reply remains authoritative when extraction fails */ }
       });
     }
     return { ...result, messageId: persisted.messageId, conversation: persisted.conversation, taskId, taskStatus };
+  }
+
+  async #generateConversationTitle({ input, mode, target, persisted, assistantResponse }) {
+    const fallbackTitle = defaultConversationTitle(target.content);
+    try {
+      const current = await this.container.baseConversations.getConversation(input.conversationId);
+      if (current.summary.title !== fallbackTitle) return;
+      const titlePrompt = await this.container.runtime.prompts.conversationTitle({ userPrompt: target.content, assistantResponse });
+      const rawTitle = await this.container.runtime.completeAuxiliary({
+        actor: this.container.actor,
+        providerId: input.providerId,
+        modelId: input.modelId,
+        mode,
+        runId: `title_${crypto.createHash("sha256").update(`${input.conversationId}:${target.id}`).digest("hex").slice(0, 32)}`,
+        system: titlePrompt.system,
+        input: titlePrompt.input,
+        // Reasoning models share the output budget between reasoning and text.
+        // Keep the title concise through the prompt, without starving its answer.
+        maxOutputTokens: null,
+      });
+      const title = normalizeGeneratedTitle(rawTitle);
+      let renamed;
+      for (;;) {
+        const latest = await this.container.baseConversations.getConversation(input.conversationId);
+        if (latest.summary.title !== fallbackTitle || title === fallbackTitle) return;
+        try {
+          renamed = await this.container.baseConversations.rename({
+            conversationId: input.conversationId,
+            title,
+            expectedRevision: latest.summary.revision,
+            commandId: derivedCommandId(`title:${input.conversationId}:${target.id}:${latest.summary.revision}`, "rename"),
+          });
+          break;
+        } catch (error) {
+          // Reuse the generated text when a message or metadata write races us.
+          if (error?.code !== "REVISION_CONFLICT") throw error;
+        }
+      }
+      const event = {
+        producer: "web-agent",
+        kind: "conversation.title.updated",
+        status: "completed",
+        ids: { conversationId: input.conversationId, messageId: persisted.messageId, sourceMessageId: target.id, runId: input.runId },
+        payload: { title, conversationRevision: renamed.conversation.revision },
+      };
+      await this.container.broker.append(`conversation:${input.conversationId}`, event);
+      await this.container.broker.append(`conversations:${this.container.actor.actorId}`, event);
+    } catch (error) {
+      await this.container.audit.append({
+        action: "conversation.title.generate",
+        status: "failure",
+        target: { conversationId: input.conversationId },
+        requestId: input.runId,
+        metadata: { code: error?.code || "TITLE_GENERATION_FAILED", providerId: input.providerId, modelId: input.modelId },
+      });
+    }
   }
 
   async #acknowledgeNativeConversation(task, values, knowledge = [], report = null, { checkpoint = true } = {}) {
@@ -3284,6 +3541,7 @@ class WebInteractionService {
           sessionId: nativeSession,
           turnId: reportTurnId || binding.native?.turnId || binding.state?.turnId || null,
           rolloutPath: binding.native?.rolloutPath || null,
+          skillSnapshot: binding.native?.skillCheckpoints?.[task.id] || null,
         },
       });
     }
@@ -3431,6 +3689,15 @@ export class ActorServiceContainer {
     return { scheduled: launched.accepted, count: pending.length };
   }
 
+  async #pruneOrphanedServerConversationBindings() {
+    const servers = await this.servers.list();
+    const boundConversationIds = [...new Set(servers.flatMap((server) => server.conversationIds || []))];
+    if (!boundConversationIds.length) return { removedConversationIds: [], removedCount: 0 };
+    const liveConversations = await this.baseConversations.getConversationSummaries(boundConversationIds);
+    const liveConversationIds = new Set(liveConversations.map((conversation) => conversation.id));
+    return this.servers.removeConversationBindings(boundConversationIds.filter((conversationId) => !liveConversationIds.has(conversationId)));
+  }
+
   async #enqueueConversationDeletionCleanup(scope, serverIdentity, conversationId, revision) {
     for (;;) {
       const current = await this.conversationDeletionCleanup.read();
@@ -3525,14 +3792,15 @@ export class ActorServiceContainer {
       reason: "conversation deleted",
       source,
     });
-    await Promise.all([
+    const localCleanup = [
       this.conversationContext.forget(conversationId),
       this.webAgentObservations.forget(conversationId),
       this.webInteractionStore.forgetConversation(conversationId),
       this.contextHub.forgetConversation({ conversationId, bindingKeys, taskIds }),
       this.taskRuntime.clearBindings(bindingKeys),
-      this.servers.unbindConversationEverywhere(conversationId),
-    ]);
+    ];
+    if (!options.serverBindingCleared) localCleanup.push(this.servers.unbindConversationEverywhere(conversationId));
+    await Promise.all(localCleanup);
     if (options.scheduleRemote !== false) {
       await Promise.allSettled(remoteServerIds.map((serverId) => this.scheduleDeletedAgentConversationCleanup(serverId)));
     }
@@ -3544,8 +3812,12 @@ export class ActorServiceContainer {
     invariant(id, "CONVERSATION_ID_REQUIRED", "缺少对话 id", { status: 400 });
     const cleanupSource = source || { type: "conversation-delete-resume", id, version: "1" };
     await this.#enqueueConversationDeletionCleanup("local", null, id, String(cleanupSource.version || "1"));
+    // A deleted webpage conversation must disappear from the server registry
+    // before the delete request completes.  The heavier memory, task and
+    // remote-Agent cleanup remains resumable in the durable queue below.
+    await this.servers.unbindConversationEverywhere(id);
     const launched = await this.taskRuntime.launch(`conversation-delete:${id}`, async () => {
-      const result = await this.#cleanupDeletedConversation(id, cleanupSource);
+      const result = await this.#cleanupDeletedConversation(id, cleanupSource, { serverBindingCleared: true });
       await this.#consumeConversationDeletionCleanup("local", null, id, String(cleanupSource.version || "1"));
       return result;
     });
@@ -3571,6 +3843,7 @@ export class ActorServiceContainer {
       ...common,
       cursorSecret: this.runtime.secrets.cursorSecret,
       authorizeProject: async (projectId) => Boolean(await this.projects.get(projectId)),
+      projectMemoryMode: async (projectId) => (await this.projects.get(projectId))?.memoryMode || "global",
       // Prepare the local cleanup transaction before the tombstone becomes
       // visible.  The facade launches cleanup after commit; on a crash in that
       // narrow boundary startup can now recover from this durable entry.
@@ -3585,7 +3858,8 @@ export class ActorServiceContainer {
       },
     });
     this.workDrafts = new WorkDraftService(common);
-    this.memory = new PersistentMemoryService(common);
+    this.embedding = new DynamicEmbeddingAdapter({ platform: this.runtime.platform, fetchImpl: this.runtime.fetchImpl });
+    this.memory = new PersistentMemoryService({ ...common, embedder: this.embedding });
     this.memoryCoordinator = new MemoryCoordinator({
       ...common,
       memory: this.memory,
@@ -3655,13 +3929,23 @@ export class ActorServiceContainer {
         fetchImpl: this.runtime.fetchImpl,
         ocrExtractor: this.runtime.ocrExtractor || this.runtime.visionExtractor,
       }),
-      embedder: new DynamicEmbeddingAdapter({ platform: this.runtime.platform, fetchImpl: this.runtime.fetchImpl }),
+      embedder: this.embedding,
     });
     this.catalogConsistency = new CatalogConsistencyService({
       ...common,
       projects: this.projects,
       collections: this.collections,
       conversations: this.baseConversations,
+      deleteConversation: async (input) => {
+        if (this.conversations?.delete) return this.conversations.delete(input);
+        const result = await this.baseConversations.delete(input);
+        await this.scheduleConversationDeletionCleanup(input.conversationId, {
+          type: "conversation-delete",
+          id: String(input.commandId || input.conversationId),
+          version: String(result.conversation?.revision || 1),
+        });
+        return result;
+      },
       resources: this.resources,
       artifacts: { detachProject: (input) => this.artifacts.detachProject(input) },
       memories: {
@@ -3676,8 +3960,11 @@ export class ActorServiceContainer {
     this.skills = new SkillService({
       ...common,
       authorizeTask: async ({ taskId }) => Boolean(await this.taskStore.getTask(taskId)),
+      conversationTaskIds: async (conversationId) => (await allMessages(this.conversations, conversationId)).map((message) => message.taskId).filter(Boolean),
     });
     this.skillMarketplace = this.runtime.skillMarketplace;
+    await this.skills.cleanupStorage({ dryRun: false });
+    await this.runtime.skillDistribution.installForActor(this.actor, this.skills);
     const inspectSkills = this.skills.inspect.bind(this.skills);
     this.skills.inspect = async () => {
       const inspected = await inspectSkills();
@@ -3686,6 +3973,7 @@ export class ActorServiceContainer {
     this.servers = this.runtime.registryForActor(this.actor);
     this.sshWorker = this.runtime.sshPool.workerFor(this.actor);
     this.sshRestorePromise = this.sshWorker.restore().catch(() => []);
+    await this.#pruneOrphanedServerConversationBindings();
     await this.#migrateConversationDeletionCleanupState();
     await this.#resumeConversationDeletionTransactions();
     this.serverCapabilities = new ServerCapabilityService({
@@ -3775,12 +4063,21 @@ export class ActorServiceContainer {
       prompts: this.runtime.prompts,
       submissionRecorder: async ({ task, event, binding }) => {
         const receipts = agentSubmissionReceipts({ event, binding });
-        if (!receipts.length) return;
+        const schedulerActivity = agentSchedulerActivity({ event, binding });
+        if (!receipts.length && !schedulerActivity) return;
         const server = await this.servers.get(task.route.serverId);
         if (server.profile.serverIdentity !== task.route.serverIdentity) return;
+        if (!receipts.length) {
+          await this.notifySchedulerJobs(task.route.serverId, "agent_scheduler_activity", []);
+          void this.trackSchedulerSubmissions(task.route.serverId).catch(() => undefined);
+          return;
+        }
         const ledger = new SchedulerSubmissionLedger({ ...common, serverIdentity: task.route.serverIdentity, username: server.profile.username });
-        await ledger.record(receipts, { taskId: task.id, conversationId: task.conversationId, workspaceId: task.route.workspaceId, agentId: task.route.agentId });
-        void this.trackSchedulerSubmissions(task.route.serverId, receipts.map((receipt) => receipt.jobId)).catch(() => undefined);
+        const created = await ledger.record(receipts, { taskId: task.id, conversationId: task.conversationId, workspaceId: task.route.workspaceId, agentId: task.route.agentId });
+        if (created.length || schedulerActivity) {
+          await this.notifySchedulerJobs(task.route.serverId, created.length ? "submitted" : "agent_scheduler_activity", created);
+          void this.trackSchedulerSubmissions(task.route.serverId, receipts.map((receipt) => receipt.jobId)).catch(() => undefined);
+        }
       },
       taskFinalizer: async ({ task, event }) => {
         const finalText = String(event?.payload?.text || event?.payload?.content || "").trim();
@@ -3800,6 +4097,10 @@ export class ActorServiceContainer {
       .filter((entry) => entry.status === "connected")
       .map((entry) => this.scheduleDeletedAgentConversationCleanup(entry.serverId)))).catch(() => undefined);
     await this.orchestrator.recoverPending();
+    this.taskWatchdogTimer = setInterval(() => {
+      void this.orchestrator.monitorActiveRuns({ quietForMs: 120_000 }).catch(() => undefined);
+    }, 120_000);
+    this.taskWatchdogTimer.unref?.();
     this.interactions = new WebInteractionService(this, this.webInteractionStore);
     await this.interactions.initialize();
     this.conversations = new ConversationInteractionFacade(this.baseConversations, this.interactions, this.memoryCoordinator, this);
@@ -3862,13 +4163,15 @@ export class ActorServiceContainer {
           const artifact = await this.artifacts.get({ artifactId });
           const version = artifact.versions.at(-1);
           invariant(version, "PREVIEW_SOURCE_NOT_FOUND", "Artifact Preview 来源不存在", { status: 404 });
+          const serverIdentity = await this.artifacts.getSourceServerIdentity({ artifactId });
+          const server = serverIdentity ? (await this.servers.list()).find((entry) => entry.profile.serverIdentity === serverIdentity) : null;
           return {
             authorized: true,
             size: version.size,
             name: artifact.name,
             mime: viewerMime(artifact.name, version.mime),
             supportsRange: true,
-            metadata: { sourceType: "artifact", revision: artifact.revision },
+            metadata: { sourceType: "artifact", revision: artifact.revision, ...(server ? { serverId: server.profile.id, serverName: server.profile.name } : {}) },
             handle: { type: "artifact", artifactId, artifactRevision: artifact.revision, versionId: version.id },
           };
         }
@@ -3920,7 +4223,7 @@ export class ActorServiceContainer {
         const workspace = await workspaces.getWorkspace(input.workspaceId);
         const source = await this.remoteArtifactSource(server.profile.id);
         const inspected = await source.inspect({ workspaceId: input.workspaceId, candidatePath: path.posix.join(workspace.canonicalPath, input.relativePath) });
-        return { ...inspected, mime: viewerMime(inspected.name, inspected.mime), metadata: {} };
+        return { ...inspected, mime: viewerMime(inspected.name, inspected.mime), metadata: { serverId: server.profile.id, serverName: server.profile.name } };
       },
       openReadStream: async (input) => {
         const source = await this.remoteArtifactSourceByIdentity(input.serverIdentity);
@@ -3975,8 +4278,12 @@ export class ActorServiceContainer {
     const selected = new Set(sources || ["memory", "resources"]);
     const output = {};
     if (selected.has("memory")) {
-      const requestedLimit = Math.min(20, Math.max(1, Number(limit) || 8));
-      const candidates = await this.memory.contextEntries(scope, { query, limit: Math.min(64, requestedLimit * 4) });
+      const configuration = typeof this.memory.retrievalConfiguration === "function"
+        ? await this.memory.retrievalConfiguration()
+        : { resultLimit: 8, recallLimit: 48, tokenBudget: 3_200, pageSize: 20 };
+      const requestedLimit = Math.min(configuration.resultLimit, Math.min(20, Math.max(1, Number(limit) || configuration.resultLimit)));
+      const recallLimit = Math.min(256, Math.max(requestedLimit, configuration.recallLimit));
+      const candidates = await this.memory.contextEntries(scope, { query, limit: recallLimit, tokenEstimator: estimateMemoryTokens });
       // The Web Agent already receives the settled history of this webpage
       // conversation.  Re-querying a project/workspace memory extracted from
       // that same conversation only duplicates context and exposes an
@@ -3984,7 +4291,24 @@ export class ActorServiceContainer {
       // share project memory normally, while the native handoff path below can
       // independently deliver a fact to a genuinely new Agent session.
       const crossConversation = await this.memoryCoordinator.excludeConversationEntries(candidates, scope.conversationId, scope.branchId);
-      output.memory = (await this.#excludeMemoriesKnownByNativeSession(crossConversation, excludeAgentBindingId)).slice(0, requestedLimit);
+      const sessionEligible = await this.#excludeMemoriesKnownByNativeSession(crossConversation, excludeAgentBindingId);
+      const seenContent = new Set();
+      const diversified = sessionEligible.filter((entry) => {
+        const digest = crypto.createHash("sha256").update(String(entry.content || "").replace(/\r\n/g, "\n").trim()).digest("hex");
+        if (seenContent.has(digest)) return false;
+        seenContent.add(digest);
+        return true;
+      });
+      const memory = [];
+      let usedTokens = 0;
+      for (const entry of diversified) {
+        const tokens = Number(entry.tokenEstimate || estimateMemoryTokens(entry.content));
+        if (memory.length && usedTokens + tokens > configuration.tokenBudget) continue;
+        memory.push(entry);
+        usedTokens += tokens;
+        if (memory.length >= requestedLimit) break;
+      }
+      output.memory = memory;
     }
     if (selected.has("resources")) {
       try {
@@ -4019,6 +4343,12 @@ export class ActorServiceContainer {
   async contextState(scope, routing = {}, requestedFields = ["conversation", "project", "server", "workspace", "agent"], { includeCapabilities = false } = {}) {
     const fields = new Set((Array.isArray(requestedFields) ? requestedFields : []).map(String));
     const routedWorkspacePath = String(routing.workspacePath || "").trim();
+    const routedWorkspaceId = String(routing.workspaceId || scope.workspaceId || "").trim();
+    const usableRoutedWorkspacePath = routedWorkspacePath
+      && routedWorkspacePath !== routedWorkspaceId
+      && !/^ws_[a-z0-9]+$/iu.test(routedWorkspacePath)
+      ? routedWorkspacePath
+      : "";
     const routedScheduler = String(routing.scheduler || "").trim().toLowerCase();
     const cachedServerCapabilities = includeCapabilities && fields.has("server") && scope.serverId
       ? await this.serverCapabilities.peek(scope.serverId).catch(() => null)
@@ -4030,8 +4360,8 @@ export class ActorServiceContainer {
       fields.has("conversation") ? this.baseConversations.getConversation(scope.conversationId) : null,
       fields.has("project") && scope.projectId ? this.projects.get(scope.projectId) : null,
       fields.has("server") && scope.serverId ? this.servers.get(scope.serverId) : null,
-      fields.has("workspace") && routedWorkspacePath
-        ? Promise.resolve({ canonicalPath: routedWorkspacePath })
+      fields.has("workspace") && usableRoutedWorkspacePath
+        ? Promise.resolve({ canonicalPath: usableRoutedWorkspacePath })
         : fields.has("workspace") && !deferWorkspaceState && scope.serverId && scope.serverIdentity && scope.workspaceId
         ? this.workspaceFor(scope.serverId, scope.serverIdentity).then((service) => service.getWorkspace(scope.workspaceId)).catch(() => null)
         : null,
@@ -4042,7 +4372,10 @@ export class ActorServiceContainer {
         : null,
     ]);
     const agentId = String(routing.agentId || "");
-    const agent = fields.has("agent") && agentId ? { name: ({ opencode: "OpenCode", codex: "Codex", "claude-code": "Claude Code" })[agentId] || agentId } : null;
+    const agentLabel = String(routing.agentLabel || "").normalize("NFKC").trim();
+    const agent = fields.has("agent") && (agentId || agentLabel)
+      ? { name: Array.from(agentLabel || ({ opencode: "OpenCode", codex: "Codex", "claude-code": "Claude Code" })[agentId] || agentId).slice(0, 120).join("") }
+      : null;
     return { conversation, project, server, workspace, agent, serverCapabilities };
   }
 
@@ -4287,10 +4620,51 @@ export class ActorServiceContainer {
       authorizeServer: async () => true,
       queue: this.runtime.queue,
       clock: this.clock,
-      onSubmitted: (jobIds) => this.trackSchedulerSubmissions(serverId, jobIds),
+      onSubmitted: async (jobIds) => {
+        await this.notifySchedulerJobs(serverId, "submitted", jobIds);
+        await this.trackSchedulerSubmissions(serverId, jobIds);
+      },
+      onCancelled: async (jobIds) => {
+        await this.notifySchedulerJobs(serverId, "cancelled", jobIds);
+        await this.trackSchedulerSubmissions(serverId, jobIds);
+      },
     });
     this.schedulers.set(key, scheduler);
     return scheduler;
+  }
+
+  async submitSchedulerJob(serverId, input = {}) {
+    exactObject(input, ["workspaceId", "conversationId", "branchId", "partition", "scriptPath", "args", "commandId"], "提交作业");
+    const conversationId = String(input.conversationId || "");
+    const branchId = String(input.branchId || "");
+    const workspaceId = String(input.workspaceId || "");
+    invariant(conversationId && branchId && workspaceId, "SCHEDULER_WORKSPACE_REQUIRED", "提交作业需要当前对话工作区", { status: 400 });
+    const server = await this.servers.get(String(serverId || ""));
+    invariant(server.profile.serverIdentity, "SSH_SERVER_IDENTITY_REQUIRED", "请先确认主机指纹并连接服务器", { status: 409 });
+    const workspaces = await this.workspaceFor(server.profile.id, server.profile.serverIdentity);
+    const [workspace, bindings] = await Promise.all([
+      workspaces.getWorkspace(workspaceId),
+      workspaces.listBindings({ conversationId, branchId }),
+    ]);
+    invariant(workspace.actorId === this.actor.actorId && workspace.serverIdentity === server.profile.serverIdentity, "SCHEDULER_WORKSPACE_FORBIDDEN", "工作区不属于当前用户或服务器", { status: 403 });
+    invariant(bindings.some((binding) => binding.workspaceId === workspaceId), "SCHEDULER_WORKSPACE_NOT_BOUND", "当前对话没有绑定该工作区", { status: 403 });
+    return (await this.schedulerFor(server.profile.id)).submit({
+      commandId: input.commandId,
+      partition: input.partition,
+      scriptPath: input.scriptPath,
+      args: input.args,
+      cwd: workspace.canonicalPath,
+    });
+  }
+
+  async notifySchedulerJobs(serverId, reason, jobIds) {
+    for (const [key, scheduler] of this.schedulers) {
+      if (key.startsWith(`${serverId}:`)) scheduler.invalidateJobs(jobIds);
+    }
+    await this.broker.append(`scheduler:${serverId}`, {
+      producer: "scheduler", kind: "jobs.changed", status: "updated",
+      ids: { serverId }, payload: { reason, jobIds },
+    }).catch((error) => console.error(JSON.stringify({ scope: "scheduler-notify", code: error?.code || "SCHEDULER_NOTIFY_FAILED" })));
   }
 
   async trackSchedulerSubmissions(serverId, jobIds = null) {
@@ -4302,6 +4676,7 @@ export class ActorServiceContainer {
     if (!tracker) {
       tracker = new SchedulerSubmissionTracker({
         ledger: scheduler.submissions,
+        onChanged: (jobIds) => this.notifySchedulerJobs(serverId, "state_changed", jobIds),
         inspectJob: (jobId) => scheduler.inspectSubmittedJob(jobId),
         canPoll: async () => {
           const current = await this.servers.get(serverId);
@@ -4551,9 +4926,9 @@ export class ActorServiceContainer {
     return bundle.backend.remoteArtifactSource;
   }
 
-  async bootstrap(session) {
+  async bootstrap(session, { conversationId } = {}) {
     const conversationOverviewPromise = typeof this.baseConversations.bootstrapOverview === "function"
-      ? this.baseConversations.bootstrapOverview({ limit: 8, projectId: null })
+      ? this.baseConversations.bootstrapOverview({ limit: 8, projectId: null, ...(conversationId ? { activeConversationId: conversationId } : {}) })
       : Promise.all([
           this.baseConversations.listConversations({ limit: 8, projectId: null }),
           allConversations(this.baseConversations),
@@ -4579,7 +4954,22 @@ export class ActorServiceContainer {
       if (binding.ownerType === "project" && binding.invalidatedSequence === null) projectResourceCounts.set(binding.ownerId, (projectResourceCounts.get(binding.ownerId) || 0) + 1);
     }
     const username = session.profile?.username || "访客";
+    const summarizeConversation = (conversation) => ({
+      id: conversation.id, title: conversation.title, mode: conversation.mode,
+      projectId: conversation.projectId, pinned: conversation.pinned,
+      lastMessageAt: conversation.lastMessageAt, runningTaskId: taskByConversation.get(conversation.id) || null,
+      revision: conversation.revision, updatedAt: conversation.updatedAt,
+    });
+    const navigation = conversationPage.conversationNavigation;
     return {
+      ...(navigation ? { conversationNavigation: {
+        conversationId: navigation.conversationId,
+        conversation: navigation.conversation ? summarizeConversation(navigation.conversation) : null,
+        projectConversations: navigation.projectConversations ? {
+          ...navigation.projectConversations,
+          items: navigation.projectConversations.items.map(summarizeConversation),
+        } : null,
+      } } : {}),
       actor: {
         id: this.actor.actorId,
         type: this.actor.actorType,
@@ -4614,17 +5004,7 @@ export class ActorServiceContainer {
         revision: project.revision,
         updatedAt: project.updatedAt,
       })),
-      recentConversations: conversationPage.items.map((conversation) => ({
-        id: conversation.id,
-        title: conversation.title,
-        mode: conversation.mode,
-        projectId: conversation.projectId,
-        pinned: conversation.pinned,
-        lastMessageAt: conversation.lastMessageAt,
-        runningTaskId: taskByConversation.get(conversation.id) || null,
-        revision: conversation.revision,
-        updatedAt: conversation.updatedAt,
-      })),
+      recentConversations: conversationPage.items.map(summarizeConversation),
       conversationCursor: conversationPage.nextCursor || null,
       servers: serverItems.map(({ profile, connection, conversationIds, activeConversationIds = conversationIds }) => ({
         id: profile.id,
@@ -4676,6 +5056,8 @@ export class ActorServiceContainer {
   }
 
   async close() {
+    if (this.taskWatchdogTimer) clearInterval(this.taskWatchdogTimer);
+    this.taskWatchdogTimer = null;
     await Promise.all([...this.submissionTrackers.values()].map((tracker) => tracker.close()));
     this.submissionTrackers.clear();
     await this.waitForIdle();

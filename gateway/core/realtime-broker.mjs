@@ -20,6 +20,10 @@ export class RealtimeBroker {
     return this.journal.replay(topic, options);
   }
 
+  details(topic, eventIds) {
+    return this.journal.details(topic, eventIds);
+  }
+
   subscribe(topic, listener) {
     invariant(typeof listener === "function", "REALTIME_LISTENER_INVALID", "Realtime listener 无效", { status: 500, expose: false });
     this.emitter.on(topic, listener);

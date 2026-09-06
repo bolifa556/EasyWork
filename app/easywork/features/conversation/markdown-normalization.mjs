@@ -50,6 +50,86 @@ function tableHeaderLine(line) {
   return cells.length >= 2 && cells.some((cell) => cell.trim());
 }
 
+function markdownFenceMarker(line) {
+  return /^ {0,3}(`{3,}|~{3,})/.exec(String(line || ""))?.[1] || "";
+}
+
+function standaloneSectionLine(line) {
+  const value = String(line || "");
+  if (/^ {0,3}#{1,6}[ \t]+\S.*$/.test(value)) return true;
+  const match = /^ {0,3}(\*\*|__)(\S(?:.*\S)?)[ \t]*\1[ \t]*$/.exec(value);
+  return Boolean(match?.[2]?.trim());
+}
+
+function topLevelListLine(line) {
+  return /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+\S/.test(String(line || ""));
+}
+
+/**
+ * Restore block boundaries commonly lost while an Agent final response is
+ * assembled. A standalone emphasized label followed by a list is a section
+ * title, not a lazy continuation of the preceding list item. The first plain
+ * paragraph after that section list must likewise leave the final list item.
+ * Fenced examples and indented list content stay untouched.
+ */
+export function ensureSectionBlockBoundaries(input) {
+  const source = String(input || "");
+  const lines = source.replace(/\r\n/g, "\n").split("\n");
+  const output = [];
+  let fence = null;
+  let waitingForSectionList = false;
+  let insideSectionList = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const marker = markdownFenceMarker(line);
+    if (marker) {
+      if (!fence) fence = { character: marker[0], length: marker.length };
+      else if (marker[0] === fence.character && marker.length >= fence.length) fence = null;
+      output.push(line);
+      continue;
+    }
+    if (fence) {
+      output.push(line);
+      continue;
+    }
+
+    if (!line.trim()) {
+      output.push(line);
+      if (insideSectionList) insideSectionList = false;
+      continue;
+    }
+
+    if (standaloneSectionLine(line)) {
+      if (output.length && output.at(-1)?.trim()) output.push("");
+      output.push(line);
+      waitingForSectionList = true;
+      insideSectionList = false;
+      const next = lines[index + 1] || "";
+      if (next.trim() && topLevelListLine(next)) output.push("");
+      continue;
+    }
+
+    if (topLevelListLine(line)) {
+      if (waitingForSectionList) {
+        waitingForSectionList = false;
+        insideSectionList = true;
+      }
+      output.push(line);
+      continue;
+    }
+
+    if (waitingForSectionList) waitingForSectionList = false;
+    if (insideSectionList && /^\S/.test(line)) {
+      if (output.at(-1)?.trim()) output.push("");
+      insideSectionList = false;
+    }
+    output.push(line);
+  }
+
+  return output.join("\n");
+}
+
 /**
  * GFM tables need a block boundary before their header. Agent output often puts
  * the header directly after a short label, which otherwise leaves the pipes as
@@ -63,7 +143,7 @@ export function ensureBlankLineBeforeTables(input) {
   let fence = null;
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
-    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1] || "";
+    const marker = markdownFenceMarker(line);
     if (marker) {
       if (!fence) fence = { character: marker[0], length: marker.length };
       else if (marker[0] === fence.character && marker.length >= fence.length) fence = null;

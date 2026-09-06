@@ -35,6 +35,13 @@
 .fixedModel { display:inline-flex; min-height:32px; align-items:center; padding:4px 10px; border-radius:9px; background:rgba(72,74,66,.065); color:var(--ew-ink-muted); font-size:.76rem; font-weight:620; }
 .toggleLabel { display: flex!important; align-items: center; align-self: end; min-height: 42px; grid-template-columns: auto 1fr!important; }
 .toggleLabel input,.authOptions input { width: 17px; height: 17px; accent-color: var(--ew-green); }
+.embeddingSettings { display: grid; grid-column: 1/-1; gap: 13px; padding-top: 2px; }
+.embeddingTabs { display: inline-flex; width: fit-content; gap: 3px; padding: 3px; border-radius: 10px; background: rgba(78,78,67,.045); }
+.embeddingTabs button { min-width: 82px; min-height: 32px; padding: 5px 13px; border: 0; border-radius: 8px; background: transparent; color: var(--ew-ink-muted); font-size: .8rem; font-weight: 590; cursor: pointer; transition: color 140ms ease, background-color 140ms ease, box-shadow 140ms ease; }
+.embeddingTabs button:hover { color: var(--ew-ink); }
+.embeddingTabs button.active { background: rgba(255,255,255,.74); color: var(--ew-ink); box-shadow: 0 1px 5px rgba(50,46,36,.06); }
+.embeddingGrid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 13px; padding: 14px; border: 1px solid rgba(52,56,46,.08); border-radius: 13px; background: rgba(242,237,223,.18); animation: stageIn 150ms ease both; }
+.memoryHint { align-self: center; color: var(--ew-ink-muted); font-size: .75rem; line-height: 1.45; }
 .cardFooter { display: flex; min-height: 45px; align-items: end; justify-content: space-between; gap: 12px; margin-top: 14px; padding-top: 13px; border-top: 1px solid rgba(52,56,46,.09); }
 .cardFooter > span { color: var(--ew-ink-muted); font-size: .76rem; }
 .usagePanel { position: sticky; top: 0; padding: 18px; }
@@ -98,4 +105,11 @@
 @media (max-width: 1100px) { .apiPanel,.userPanel { grid-template-columns: 1fr; } .usagePanel { position: static; } .metrics { grid-template-columns: repeat(3,1fr); } .metric { grid-template-columns: 1fr; } .metric strong { grid-row: auto; } }
 @media (max-width: 760px) { .policyGrid { grid-template-columns: repeat(2,minmax(0,1fr)); } .connectionTable { overflow-x: auto; }.connectionHeader,.connectionRow { min-width: 720px; } }
 @media (max-width: 720px) { .tabs button { min-height:var(--ew-mobile-touch); }.formGrid input,.formGrid select,.policyGrid input,.networkGrid input,.networkGrid textarea { min-height:var(--ew-mobile-touch); }.usageTabs button { min-height:var(--ew-mobile-touch-compact); }.keyInput button { width:40px; height:40px; }.toggleLabel,.authOptions label { min-height:var(--ew-mobile-touch); }.toggleLabel input,.authOptions input { width:20px; height:20px; } }
-@media (max-width: 580px) { .tabs { display: flex; width: 100%; }.tabs button { flex: 1; justify-content: center; padding-inline: 8px; }.formGrid,.policyGrid,.networkGrid { grid-template-columns: 1fr; }.wideField,.keyField,.modelField { grid-column: auto; }.providerCard,.policyCard,.connectionCard,.usagePanel,.userListCard,.userDetailCard { padding: 15px; border-radius: 15px; }.metrics { grid-template-columns: 1fr; }.cardHeading { align-items: flex-start; }.cardHeading p { display: none; }.status { margin-left: auto; }.cardFooter { align-items: center; }.cardFooter > span { display: none; }.conversationRow { grid-template-columns: minmax(0,1fr) auto; }.conversationRow time { display: none; } }
+@media (max-width: 580px) { .tabs { display: flex; width: 100%; }.tabs button { flex: 1; justify-content: center; padding-inline: 8px; }.formGrid,.policyGrid,.networkGrid,.embeddingGrid { grid-template-columns: 1fr; }.wideField,.keyField,.modelField { grid-column: auto; }.providerCard,.policyCard,.connectionCard,.usagePanel,.userListCard,.userDetailCard { padding: 15px; border-radius: 15px; }.metrics { grid-template-columns: 1fr; }.cardHeading { align-items: flex-start; }.cardHeading p { display: none; }.status { margin-left: auto; }.cardFooter { align-items: center; }.cardFooter > span { display: none; }.conversationRow { grid-template-columns: minmax(0,1fr) auto; }.conversationRow time { display: none; } }
+@media (max-width: 580px) {
+  .userDetailHeader { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:5px 10px; }
+  .userDetailHeader > div { display:contents; }
+  .userDetailHeader > div > strong { grid-column:1; grid-row:1; }
+  .userDetailHeader > div > span { grid-column:1 / -1; grid-row:2; line-height:1.45; }
+  .userDetailHeader > button { grid-column:2; grid-row:1; min-height:40px; }
+}

@@ -8,8 +8,16 @@ function sourceMessageIdOf(event) {
 
 export function mergeConversationEvents(current, incoming) {
   const byId = new Map(current.map((event) => [event.eventId, event]));
-  for (const event of incoming) if (!byId.has(event.eventId)) byId.set(event.eventId, event);
-  if (byId.size === current.length) return current;
+  let upgraded = false;
+  for (const event of incoming) {
+    const previous = byId.get(event.eventId);
+    if (!previous) byId.set(event.eventId, event);
+    else if (previous.payload?.timelineDetailIds?.length && !event.payload?.timelineDetailIds?.length) {
+      byId.set(event.eventId, event);
+      upgraded = true;
+    }
+  }
+  if (!upgraded && byId.size === current.length) return current;
   const ordered = [...byId.values()].sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.sequence - right.sequence || left.eventId.localeCompare(right.eventId));
   const retained = new Map();
   const previousByTopic = new Map();

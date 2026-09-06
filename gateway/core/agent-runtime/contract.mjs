@@ -171,6 +171,9 @@ export function assertEasyWorkSkillPaths(skills, skillsRoot) {
       version: String(skill?.version || ""),
       remotePath,
       sha256: String(skill?.sha256 || "").toLowerCase(),
+      ...(skill?.entrypoint ? { entrypoint: String(skill.entrypoint) } : {}),
+      ...(skill?.nativeName ? { nativeName: String(skill.nativeName) } : {}),
+      ...(skill?.viewHash ? { viewHash: String(skill.viewHash) } : {}),
     });
   });
 }

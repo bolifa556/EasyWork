@@ -30,6 +30,15 @@ function boundedInteger(value, field, minimum, maximum) {
   return number;
 }
 
+function boundedNumber(value, field, minimum, maximum) {
+  const number = Number(value);
+  invariant(Number.isFinite(number) && number >= minimum && number <= maximum, "PLATFORM_SETTING_INVALID", `${field} 超出允许范围`, {
+    status: 400,
+    details: { field, minimum, maximum },
+  });
+  return number;
+}
+
 function unique(values) {
   return [...new Set((values || []).map((value) => String(value).trim()).filter(Boolean))];
 }
@@ -91,6 +100,23 @@ export function normalizeProtocol(value, purpose) {
   return requested;
 }
 
+export function normalizeMemoryRetrievalSettings(value = {}) {
+  const settings = {
+    enabled: value.enabled !== false,
+    vectorWeight: boundedNumber(value.vectorWeight ?? 0.55, "memory.vectorWeight", 0, 1),
+    lexicalWeight: boundedNumber(value.lexicalWeight ?? 0.15, "memory.lexicalWeight", 0, 1),
+    titleWeight: boundedNumber(value.titleWeight ?? 0.3, "memory.titleWeight", 0, 1),
+    minimumScore: boundedNumber(value.minimumScore ?? 0.12, "memory.minimumScore", 0, 1),
+    diversityLambda: boundedNumber(value.diversityLambda ?? 0.72, "memory.diversityLambda", 0, 1),
+    recallLimit: boundedInteger(value.recallLimit ?? 48, "memory.recallLimit", 8, 256),
+    resultLimit: boundedInteger(value.resultLimit ?? 8, "memory.resultLimit", 1, 20),
+    tokenBudget: boundedInteger(value.tokenBudget ?? 3200, "memory.tokenBudget", 256, 20000),
+    pageSize: boundedInteger(value.pageSize ?? 20, "memory.pageSize", 5, 100),
+  };
+  invariant(settings.vectorWeight + settings.lexicalWeight + settings.titleWeight > 0, "MEMORY_RETRIEVAL_WEIGHTS_EMPTY", "记忆检索权重不能全部为 0", { status: 400 });
+  return Object.freeze(settings);
+}
+
 export function normalizeEmbeddingSettings(value = {}) {
   const strategy = String(value.chunkStrategy || "semantic");
   invariant(["semantic", "fixed", "paragraph"].includes(strategy), "EMBEDDING_CHUNK_STRATEGY_INVALID", "Embedding 分块策略无效", { status: 400 });
@@ -107,6 +133,7 @@ export function normalizeEmbeddingSettings(value = {}) {
     chunkOverlap,
     batchSize: boundedInteger(value.batchSize ?? 32, "batchSize", 1, 256),
     hybridEnabled: value.hybridEnabled !== false,
+    memory: normalizeMemoryRetrievalSettings(value.memory),
   });
 }
 

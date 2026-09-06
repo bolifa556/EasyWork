@@ -1,6 +1,6 @@
 "use client";
 
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import {
   Brain,
   Check,
@@ -29,10 +29,15 @@ import {
 } from "lucide-react";
 import type { AgentSummary, ArtifactSummary, ConversationDetail, ConversationMessage, ConversationSummary, RealtimeEnvelope, ServerCapabilityProfile, TaskSummary, WorkDraftSelection, WorkDraftSnapshot, WorkspaceSummary } from "@/app/core/contracts";
 import { GatewayError } from "@/app/core/contracts";
+import { isActiveTask, mergeTaskSnapshots } from "@/app/core/task-snapshots";
 import { commandId } from "@/app/core/gateway/client";
 import { uploadResource } from "@/app/core/gateway/resource-upload";
 import { useAppRuntime, type ConversationPanel } from "../../runtime/AppRuntime";
+import { announceConversationsChanged } from "../../runtime/cacheEvents";
 import { Button } from "../../ui/Button";
+import { copyText } from "../../ui/clipboard";
+import { groupConversationTimeline } from "./conversation-copy.mjs";
+import { pastedConversationId, resolveConversationReference, type ConversationReferenceSelection } from "./conversation-reference";
 import { LoadingState } from "../../ui/LoadingState";
 import { Modal } from "../../ui/Modal";
 import { WebContextRing } from "../../ui/ProgressRing";
@@ -43,11 +48,10 @@ import { ConversationObjectPanel } from "./ConversationObjectPanel";
 import { AgentControl } from "./AgentControl";
 import { ConversationConnectionDialog } from "./ConversationConnectionDialog";
 import { ComposerResourceChips, ComposerResources, emptyComposerResources, type ComposerResourceSelection } from "./ComposerResources";
-import { classifyConversationOutput, ConversationArtifactCards, ConversationTimeline, isDirectRemoteAppendTimeline, splitRemoteFinalPresentation } from "./ConversationTimeline";
-import { referencedArtifactsForDownloadReply, stripArtifactPlaceholderLines } from "./artifact-presentation.mjs";
+import { classifyConversationOutput, ConversationAnswer, ConversationArtifactCards, type ArtifactCardData, ConversationTimeline, isDirectRemoteAppendTimeline, splitRemoteFinalPresentation } from "./ConversationTimeline";
+import { conversationArtifactCards, referencedArtifactsForDownloadReply, stripArtifactPlaceholderLines } from "./artifact-presentation.mjs";
 import { mergeConversationEvents, retainConversationEvents } from "./conversation-event-retention.mjs";
 import { followConversationScroll, type ConversationScrollPosition } from "./conversation-scroll";
-import { MarkdownContent } from "./MarkdownContent";
 import { PENDING_USER_WORKSPACE_SELECTION, WorkspaceDialog } from "./WorkspaceDialog";
 import { ConversationWorkspacePreview, type WorkspacePreviewHandle } from "../workspace/ConversationWorkspacePreview";
 import styles from "./ConversationView.module.css";
@@ -63,6 +67,7 @@ type BranchedConversationResult = {
   nativeConversation?: { applied: boolean; reason?: string; detail?: string; nativeSessionId?: string };
 };
 type WebModelSelection = { providerId: string; modelId: string };
+type ConversationReferenceRequest = { type: "conversation"; conversationId: string };
 type ConversationRoute = { serverId: string; agentId: string; workspaceId: string; workspacePath?: string };
 type ConversationServerBinding = { conversationId: string; serverId: string | null; connectionEnabled?: boolean };
 type WorkspaceRouteSnapshot = {
@@ -80,7 +85,6 @@ type RemoteDirectorySnapshot = { home: string; path: string; parent: string | nu
 type ApprovalDecision = "approve" | "approve_session" | "reject";
 type ApprovalResponder = (taskId: string, requestId: string, decision: ApprovalDecision) => Promise<void>;
 type InputResponder = (taskId: string, requestId: string, answers: Record<string, string | string[]>) => Promise<void>;
-
 function agentEventPayload(event: RealtimeEnvelope) {
   const payload = event.payload;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {} as Record<string, unknown>;
@@ -88,6 +92,33 @@ function agentEventPayload(event: RealtimeEnvelope) {
   return nested && typeof nested === "object" && !Array.isArray(nested)
     ? nested as Record<string, unknown>
     : payload as Record<string, unknown>;
+}
+
+function failureMessage(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const failure = value as Record<string, unknown>;
+  return typeof failure.message === "string" ? failure.message.trim() : "";
+}
+
+function latestInterruptFailure(events: RealtimeEnvelope[]) {
+  for (const event of [...events].reverse()) {
+    if (event.producer !== "task-orchestrator") continue;
+    const payload = agentEventPayload(event);
+    const operation = String(payload.operation || "");
+    if (operation !== "interrupt" && operation !== "startup-interrupt-cleanup") continue;
+    const message = failureMessage(payload.warning) || failureMessage(payload.failure);
+    if (message) return { eventId: event.eventId, occurredAt: event.occurredAt, message: `任务终止未完全成功：${message}` };
+  }
+  return null;
+}
+
+function isRecentEvent(occurredAt: string, lifetimeMs: number) {
+  const timestamp = Date.parse(occurredAt);
+  return Number.isFinite(timestamp) && Date.now() - timestamp <= lifetimeMs;
+}
+
+function orphanRecoveryDelay(createdAt: number) {
+  return Math.max(0, createdAt + 15_000 - Date.now());
 }
 
 function latestWebRunEvents(events: RealtimeEnvelope[]) {
@@ -118,21 +149,37 @@ function TaskPlanList({ task, className = "" }: { task: TaskSummary; className?:
   })}</div>;
 }
 
-function ComposerTaskPlan({ task }: { task?: TaskSummary }) {
+export function ComposerTaskPlan({ task }: { task?: TaskSummary }) {
   const [open, setOpen] = useState(false);
+  const planRef = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    if (!open) planRef.current?.querySelector("button")?.scrollTo({ top: 0 });
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: PointerEvent) => { if (!planRef.current?.contains(event.target as Node)) setOpen(false); };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [open]);
   if (!task?.plan?.length) return null;
   const current = task.plan.find((step) => step.status === "running")
     ?? task.plan.find((step) => step.status === "pending")
     ?? [...task.plan].reverse().find((step) => step.status === "completed")
     ?? task.plan[0];
   const currentIndex = Math.max(0, task.plan.findIndex((step) => step.id === current.id));
-  return <section className={`${styles.composerPlan} ${open ? styles.composerPlanOpen : ""}`} aria-label="当前执行计划">
-    <div className={styles.composerPlanExpanded}><TaskPlanList task={task} /></div>
-    <button type="button" className={styles.composerPlanCurrent} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span className={styles.taskPlanStatus}>{planStepIcon(current.status, 13)}</span>
-      <span className={styles.composerPlanText}>{current.text}</span>
-      <small>{currentIndex + 1}/{task.plan.length}</small>
-      <ChevronDown size={13} />
+  return <section ref={planRef} className={`${styles.composerPlan} ${open ? styles.composerPlanOpen : ""}`} aria-label="当前执行计划"
+    onPointerEnter={(event) => { if (event.pointerType === "mouse") setOpen(true); }}
+    onPointerLeave={(event) => { if (event.pointerType === "mouse") setOpen(false); }}
+    onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false); }}
+    onKeyDown={(event) => { if (event.key === "Escape") setOpen(false); }}>
+    <button type="button" className={styles.composerPlanCurrent} aria-label={open ? "收起执行计划" : "展开执行计划"} aria-expanded={open}
+      style={{ "--plan-count": task.plan.length, "--plan-current": currentIndex } as import("react").CSSProperties}
+      onClick={(event) => { if (event.detail === 0 || !window.matchMedia("(hover: hover) and (pointer: fine)").matches) setOpen((value) => !value); }}>
+      <span className={styles.composerPlanRows}>{task.plan.map((step, index) => <span className={styles.composerPlanRow} data-status={step.status} aria-hidden={!open && index !== currentIndex} key={index} title={step.text}>
+        <span className={styles.taskPlanStatus}>{planStepIcon(step.status, 13)}</span>
+        <span className={styles.composerPlanText}>{step.text}</span>
+        <small>{index + 1}/{task.plan.length}</small>
+      </span>)}</span>
     </button>
   </section>;
 }
@@ -154,6 +201,15 @@ type CachedServerSetup = {
 };
 const VIRTUAL_WORKSPACE = "__virtual__";
 const AUTOMATIC_WORKSPACE_LABEL = "由 EasyWork 自动分配";
+
+function selectedWorkspaceLabel(workspaceId: string | null, workspacePath: string | null, canonicalPath: string | null = null) {
+  if (workspaceId === VIRTUAL_WORKSPACE || workspacePath === AUTOMATIC_WORKSPACE_LABEL) return "虚拟工作区";
+  const normalized = [workspacePath, canonicalPath]
+    .map((value) => String(value || "").replaceAll("\\", "/").replace(/\/+$/, ""))
+    .find((value) => value && value !== workspaceId && !/^ws_[a-z0-9]+$/iu.test(value)) || "";
+  return normalized.split("/").filter(Boolean).at(-1) || "已选工作区";
+}
+
 const CONVERSATION_ROUTE_CHANGED_EVENT = "easywork:conversation-route-changed";
 const WorkbenchDrawer = lazy(() => import("../workbench/WorkbenchDrawer"));
 const conversationScrollPositions = new Map<string, ConversationScrollPosition>();
@@ -276,16 +332,27 @@ function agentOperationAvailable(agent: AgentSummary | undefined, operation: "ap
   return agent?.runtimeCapabilities?.[operation]?.availability === "available";
 }
 
-function MessageAction({ label, icon, onClick }: { label: string; icon: ReactNode; onClick: () => void }) {
-  return <span className={styles.messageAction} data-tooltip={label}>
-    <Button compact iconOnly variant="ghost" aria-label={label} icon={icon} onClick={onClick} />
+function MessageAction({ label, icon, onClick, showLabel = false }: { label: string; icon: ReactNode; onClick: () => void; showLabel?: boolean }) {
+  return <span className={`${styles.messageAction} ${showLabel ? styles.messageActionLabel : ""}`} data-tooltip={label}>
+    <Button compact iconOnly={!showLabel} variant="ghost" aria-label={label} icon={icon} onClick={onClick}>{showLabel ? label : null}</Button>
   </span>;
 }
 
-function Message({ message, latestAssistant, retryableUser = false, revision, timelineEvents, artifacts, timelineLoading = false, timelineMode, taskById, settledTaskIds, response, onApproval, onInput, onBranchCreated, onChanged }: { message: ConversationMessage; latestAssistant: boolean; retryableUser?: boolean; revision: number; timelineEvents?: RealtimeEnvelope[]; artifacts?: ArtifactSummary[]; timelineLoading?: boolean; timelineMode: Mode; taskById: Readonly<Record<string, TaskSummary>>; settledTaskIds: ReadonlySet<string>; response: () => ResponseDescriptor; onApproval?: ApprovalResponder; onInput?: InputResponder; onBranchCreated?: (result: BranchedConversationResult) => Promise<void>; onChanged: () => Promise<void> }) {
+function ConversationReferenceLink({ reference }: { reference: { conversationId: string; title: string } }) {
+  const runtime = useAppRuntime();
+  return <span className={styles.referenceInline}><button type="button" className={styles.referenceInlineLink} title={`打开对话：${reference.title}`} onClick={() => runtime.navigate({ kind: "conversation", conversationId: reference.conversationId })}><MessageCircle size={15} /><span>{reference.title}</span></button></span>;
+}
+
+function Message({ message, latestAssistant, retryableUser = false, revision, timelineEvents, artifacts, artifactHistory, timelineLoading = false, timelineMode, taskById, settledTaskIds, response, onApproval, onInput, onBranchCreated, onChanged }: { message: ConversationMessage; latestAssistant: boolean; retryableUser?: boolean; revision: number; timelineEvents?: RealtimeEnvelope[]; artifacts?: ArtifactSummary[]; artifactHistory?: ArtifactCardData[]; timelineLoading?: boolean; timelineMode: Mode; taskById: Readonly<Record<string, TaskSummary>>; settledTaskIds: ReadonlySet<string>; response: () => ResponseDescriptor; onApproval?: ApprovalResponder; onInput?: InputResponder; onBranchCreated?: (result: BranchedConversationResult) => Promise<void>; onChanged: () => Promise<void> }) {
   const runtime = useAppRuntime();
   const [pendingAction, setPendingAction] = useState<"branch" | "rewind" | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1800);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
   const actionInFlight = useRef(false);
   const user = message.role === "user";
   const directRemoteAppend = !user && isDirectRemoteAppendTimeline(timelineEvents || []);
@@ -293,7 +360,7 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
     ? splitRemoteFinalPresentation(message.content).body
     : message.content;
   const displayedContent = user ? rawDisplayedContent : stripArtifactPlaceholderLines(rawDisplayedContent, artifacts || []);
-  const copy = () => void navigator.clipboard.writeText(displayedContent).then(() => runtime.notify("已复制", "success"));
+  const copy = () => void copyText(displayedContent).then(() => setCopied(true)).catch((reason) => runtime.notify(reason instanceof Error ? reason.message : "复制失败", "error"));
   const action = async (name: "retry" | "branch" | "rewind", confirmed = false) => {
     if ((name === "branch" || name === "rewind") && !confirmed) {
       setPendingAction(name);
@@ -348,11 +415,11 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
     }
   };
   return <><article className={`${styles.message} ${user ? styles.user : styles.assistant}`} id={`message-${message.id}`}>
-    {user ? <div className={styles.messageHead}>你 <span className={styles.dot} /></div> : directRemoteAppend ? null : <div className={styles.messageHead}><span className={styles.dot} /> EasyWork</div>}
+    {user ? <div className={styles.messageHead}>你 <span data-ui-icon="" className={styles.dot} /></div> : directRemoteAppend ? null : <div className={styles.messageHead}><span data-ui-icon="" className={styles.dot} /> EasyWork</div>}
     {!user && (timelineEvents?.length || timelineLoading) ? <ConversationTimeline events={timelineEvents || []} mode={timelineMode} taskIdHint={message.taskId || undefined} finalTextHint={displayedContent} loading={timelineLoading} taskById={taskById} settledTaskIds={settledTaskIds} onApproval={onApproval} onInput={onInput} /> : null}
-    {user ? <div className={styles.userBubble}>{message.content}</div> : <><div className={styles.assistantBody}><MarkdownContent content={displayedContent} /></div><ConversationArtifactCards events={timelineEvents || []} artifacts={artifacts} /></>}
+    {user ? <div className={styles.userBubble}>{message.references?.length ? <span className={styles.messageReferences}>{message.references.map((reference) => <ConversationReferenceLink key={reference.referenceId} reference={reference} />)}</span> : null}{message.content}</div> : <><div className={styles.assistantBody}><ConversationAnswer content={rawDisplayedContent} events={timelineEvents || []} artifacts={artifacts} artifactHistory={artifactHistory} workspaceId={message.taskId ? taskById[message.taskId]?.route.workspaceId : undefined} /></div></>}
     <div className={styles.messageActions}>
-      <MessageAction label={user ? "复制消息" : "复制回复"} icon={<Copy size={15} />} onClick={copy} />
+      <MessageAction label={copied ? "已复制" : user ? "复制消息" : "复制回复"} showLabel={copied} icon={copied ? <Check size={15} /> : <Copy size={15} />} onClick={copy} />
       {user && retryableUser ? <MessageAction label="重新生成本轮回复" icon={<RotateCcw size={15} />} onClick={() => void action("retry")} /> : null}
       {!user ? <>{latestAssistant ? <MessageAction label="重新生成" icon={<RotateCcw size={15} />} onClick={() => void action("retry")} /> : null}<MessageAction label="从这里创建分支对话" icon={<GitBranch size={15} />} onClick={() => void action("branch")} /><MessageAction label="回溯到这里" icon={<History size={16} />} onClick={() => void action("rewind")} /></> : null}
     </div>
@@ -365,16 +432,26 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
       : "会清除这条回复之后的对话记忆，并恢复该对话在后续回合实际修改过的文件；恢复会作用于共享工作区，未被该对话记录的文件不会扫描或改写。"}</p><footer><Button disabled={actionBusy} onClick={() => setPendingAction(null)}>取消</Button><Button variant="primary" disabled={actionBusy} icon={actionBusy ? <LoaderCircle className={styles.spin} size={14} /> : pendingAction === "branch" ? <GitBranch size={14} /> : <History size={14} />} onClick={() => void action(pendingAction, true)}>{actionBusy ? "处理中" : pendingAction === "branch" ? "创建分支" : "确认回溯"}</Button></footer></div></Modal> : null}</>;
 }
 
-function Composer({ conversationId, draftKey, disabled, placeholder, activeTask, pendingWebRun = false, canInterrupt, onInterrupt, onSend }: { conversationId?: string; draftKey: string; disabled?: boolean; placeholder: string; activeTask?: TaskSummary; pendingWebRun?: boolean; canInterrupt?: boolean; onInterrupt?: () => Promise<void>; onSend: (value: string, resources: ComposerResourceSelection, selection: WebModelSelection) => Promise<void> }) {
+function composerMention(value: string) {
+  const match = /(^|\s)@([^@\n]{0,80})$/u.exec(value);
+  return match ? { start: match.index + match[1].length, query: match[2].trim() } : null;
+}
+
+function Composer({ conversationId, referenceMode, draftKey, disabled, placeholder, activeTask, pendingWebRun = false, interruptFailure, canInterrupt, onInterrupt, onSend }: { conversationId?: string; referenceMode: Mode; draftKey: string; disabled?: boolean; placeholder: string; activeTask?: TaskSummary; pendingWebRun?: boolean; interruptFailure?: { eventId: string; occurredAt: string; message: string } | null; canInterrupt?: boolean; onInterrupt?: () => Promise<void>; onSend: (value: string, resources: ComposerResourceSelection, selection: WebModelSelection, references: ConversationReferenceSelection[], submissionId: string) => Promise<void> }) {
   const runtime = useAppRuntime();
   const storageKey = `easywork.composer-draft:${runtime.bootstrap?.actor.id ?? "unresolved"}:${draftKey}`;
+  const referenceStorageKey = `${storageKey}:references`;
+  const submissionStorageKey = `${storageKey}:submission`;
   const [value, setValue] = useState(() => typeof window === "undefined" ? "" : sessionStorage.getItem(storageKey) || "");
   const [busy, setBusy] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [interruptError, setInterruptError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [multiline, setMultiline] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [providerId, setProviderId] = useState<string | null>(() => typeof window === "undefined" ? null : localStorage.getItem("easywork.web-provider"));
+  const [browsingProviderId, setBrowsingProviderId] = useState<string | null>(null);
   const [modelId, setModelId] = useState<string>(() => typeof window === "undefined" ? "" : localStorage.getItem("easywork.web-model") || "");
   const [models, setModels] = useState<Array<{ id: string; name: string }>>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -384,10 +461,28 @@ function Composer({ conversationId, draftKey, disabled, placeholder, activeTask,
   const [contextUsage, setContextUsage] = useState<WebContextUsage | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
   const [resources, setResources] = useState<ComposerResourceSelection>(emptyComposerResources);
+  const [references, setReferences] = useState<ConversationReferenceSelection[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const stored = JSON.parse(sessionStorage.getItem(referenceStorageKey) || "[]") as ConversationReferenceSelection[];
+      return Array.isArray(stored) ? stored.filter((entry) => entry && typeof entry.conversationId === "string" && typeof entry.title === "string") : [];
+    } catch { return []; }
+  });
+  const [referenceOptions, setReferenceOptions] = useState<ConversationReferenceSelection[]>([]);
+  const [referenceLoading, setReferenceLoading] = useState(false);
+  const [referenceOpen, setReferenceOpen] = useState(false);
+  const [referenceIndex, setReferenceIndex] = useState(0);
+  const [resolvingReferences, setResolvingReferences] = useState(false);
+  const referencePastes = useRef(new Set<AbortController>());
   const textarea = useRef<HTMLTextAreaElement>(null);
   const contextRequestSerial = useRef(0);
-  const provider = runtime.bootstrap?.providers.find((item) => item.id === providerId) ?? runtime.bootstrap?.providers[0];
+  const referenceRequestSerial = useRef(0);
+  const interruptErrorTimer = useRef<number | null>(null);
+  const presentedInterruptFailure = useRef<string | null>(null);
+  const selectedProvider = runtime.bootstrap?.providers.find((item) => item.id === providerId) ?? runtime.bootstrap?.providers[0];
+  const provider = runtime.bootstrap?.providers.find((item) => item.id === browsingProviderId) ?? selectedProvider;
   const model = modelId || "选择模型";
+  const inputDisabled = Boolean(disabled || pendingWebRun);
   useEffect(() => {
     if (typeof window === "undefined" || !providerId || !modelId) return;
     // Migrate the former single-value preference into a per-Provider entry.
@@ -396,24 +491,11 @@ function Composer({ conversationId, draftKey, disabled, placeholder, activeTask,
     localStorage.setItem(`easywork.web-model:${providerId}`, modelId);
   }, [modelId, providerId]);
   const inspectProvider = async (id: string) => {
-    const previousProviderId = providerId ?? provider?.id ?? null;
-    const switchedProvider = Boolean(previousProviderId && previousProviderId !== id);
-    const cachedModel = typeof window === "undefined" ? "" : localStorage.getItem(`easywork.web-model:${id}`) || "";
-    const nextModel = switchedProvider ? cachedModel : modelId;
-    setProviderId(id); setModelId(nextModel); setProviderPage(true); setModels([]);
+    setBrowsingProviderId(id); setProviderPage(true); setModels([]);
     setModelsLoading(true); setModelError(null);
-    localStorage.setItem("easywork.web-provider", id);
-    // Merely reopening/refreshing the selected Provider must not clear the
-    // webpage Agent model. This used to look like a server connection reset
-    // because the connection flow refreshes bootstrap data and users commonly
-    // reopen this menu immediately afterwards.
-    if (switchedProvider) {
-      if (nextModel) localStorage.setItem("easywork.web-model", nextModel);
-      else localStorage.removeItem("easywork.web-model");
-    }
     try {
-      const result = await runtime.api.post<{ models: Array<{ id: string; name: string }> }>(`/api/providers/${id}/models`, { purpose: "web" });
-      setModels(result.data.models);
+      const result = await runtime.api.post<{ models: Array<{ id: string; name: string; capabilities?: { toolCalling?: boolean | null } }> }>(`/api/providers/${id}/models`, { purpose: "web" });
+      setModels(result.data.models.filter((item) => referenceMode !== "work" || item.capabilities?.toolCalling !== false));
     } catch (reason) {
       setModelError(reason instanceof Error ? reason.message : "模型读取失败");
     } finally {
@@ -421,13 +503,14 @@ function Composer({ conversationId, draftKey, disabled, placeholder, activeTask,
     }
   };
   const chooseModel = (id: string) => {
+    const chosenProviderId = browsingProviderId ?? providerId ?? selectedProvider?.id;
     setModelId(id); localStorage.setItem("easywork.web-model", id);
-    const chosenProviderId = providerId ?? provider?.id;
     if (chosenProviderId) {
+      setProviderId(chosenProviderId);
       localStorage.setItem("easywork.web-provider", chosenProviderId);
       localStorage.setItem(`easywork.web-model:${chosenProviderId}`, id);
     }
-    setModelOpen(false); setProviderPage(false);
+    setBrowsingProviderId(null); setModelOpen(false); setProviderPage(false);
   };
   const refreshContextUsage = useCallback(async () => {
     const requestSerial = ++contextRequestSerial.current;
@@ -448,29 +531,49 @@ function Composer({ conversationId, draftKey, disabled, placeholder, activeTask,
     }
   }, [conversationId, runtime.api]);
   const send = async () => {
-    if (!value.trim() || busy || disabled) return;
+    if (!value.trim() || busy || inputDisabled || referencePastes.current.size) return;
     const prompt = value.trim();
     const pendingResources = resources;
+    const pendingReferences = references;
     const previousExpanded = expanded;
     const previousMultiline = multiline;
+    const signature = JSON.stringify({
+      prompt,
+      references: pendingReferences.map((entry) => entry.conversationId),
+      files: pendingResources.files.map((file) => [file.name, file.size, file.lastModified]),
+      collections: pendingResources.collections.map((entry) => entry.id),
+      skills: pendingResources.skills.map((entry) => [entry.skillId, entry.version, entry.sha256]),
+    });
+    let submissionId = "";
+    try {
+      const pending = JSON.parse(sessionStorage.getItem(submissionStorageKey) || "null") as { signature?: string; submissionId?: string } | null;
+      if (pending?.signature === signature && pending.submissionId) submissionId = pending.submissionId;
+    } catch { /* create a new stable submission below */ }
+    if (!submissionId) submissionId = commandId("composer-submit");
+    sessionStorage.setItem(submissionStorageKey, JSON.stringify({ signature, submissionId }));
     let cleared = false;
     setBusy(true);
     try {
-      const chosenProviderId = providerId ?? provider?.id;
+      const chosenProviderId = providerId ?? selectedProvider?.id;
       if (!chosenProviderId) throw new Error("请先配置网页模型 API");
       if (!modelId) throw new Error("请先选择网页对话模型");
       setValue("");
       setResources(emptyComposerResources);
+      setReferences([]);
+      setReferenceOpen(false);
       sessionStorage.removeItem(storageKey);
+      sessionStorage.removeItem(referenceStorageKey);
       setExpanded(false);
       setMultiline(false);
       cleared = true;
-      await onSend(prompt, pendingResources, { providerId: chosenProviderId, modelId });
+      await onSend(prompt, pendingResources, { providerId: chosenProviderId, modelId }, pendingReferences, submissionId);
+      sessionStorage.removeItem(submissionStorageKey);
       await refreshContextUsage();
     } catch (reason) {
       if (cleared) {
         setValue(prompt);
         setResources(pendingResources);
+        setReferences(pendingReferences);
         setExpanded(previousExpanded);
         setMultiline(previousMultiline);
       }
@@ -481,10 +584,108 @@ function Composer({ conversationId, draftKey, disabled, placeholder, activeTask,
     const handle = window.setTimeout(() => void refreshContextUsage(), 0);
     return () => window.clearTimeout(handle);
   }, [refreshContextUsage]);
+  useEffect(() => () => {
+    if (interruptErrorTimer.current !== null) window.clearTimeout(interruptErrorTimer.current);
+  }, []);
+  useEffect(() => {
+    if (!interruptFailure || presentedInterruptFailure.current === interruptFailure.eventId) return;
+    presentedInterruptFailure.current = interruptFailure.eventId;
+    // Do not replay an old interrupt warning merely because the user opened a
+    // historical conversation. A fresh event may arrive by SSE or the polling
+    // watchdog, and remains eligible long enough to survive a quick refresh.
+    if (!isRecentEvent(interruptFailure.occurredAt, 15_000)) return;
+    const revealTimer = window.setTimeout(() => {
+      setInterruptError(interruptFailure.message);
+      if (interruptErrorTimer.current !== null) window.clearTimeout(interruptErrorTimer.current);
+      interruptErrorTimer.current = window.setTimeout(() => setInterruptError(null), 5_000);
+    }, 0);
+    return () => window.clearTimeout(revealTimer);
+  }, [interruptFailure]);
   useEffect(() => {
     if (value) sessionStorage.setItem(storageKey, value);
     else sessionStorage.removeItem(storageKey);
   }, [storageKey, value]);
+  useEffect(() => {
+    if (references.length) sessionStorage.setItem(referenceStorageKey, JSON.stringify(references));
+    else sessionStorage.removeItem(referenceStorageKey);
+  }, [referenceStorageKey, references]);
+  const mention = composerMention(value);
+  const mentionActive = Boolean(mention);
+  const mentionQuery = mention?.query || "";
+  const referenceAvailable = Boolean(mention && !inputDisabled && !busy);
+  useEffect(() => {
+    const serial = ++referenceRequestSerial.current;
+    if (!mentionActive || inputDisabled || busy) return;
+    const timer = window.setTimeout(async () => {
+      setReferenceOpen(true);
+      setReferenceLoading(true);
+      try {
+        const query = new URLSearchParams({ query: mentionQuery, mode: referenceMode, limit: "100" });
+        if (conversationId) query.set("conversationId", conversationId);
+        const items: ConversationReferenceSelection[] = [];
+        let cursor = "";
+        do {
+          if (cursor) query.set("cursor", cursor);
+          const result = await runtime.api.get<{ items: ConversationReferenceSelection[]; nextCursor?: string | null }>(`/api/conversation-references/candidates?${query}`);
+          items.push(...(result.data.items || []));
+          cursor = result.data.nextCursor || "";
+        } while (cursor && items.length < 5_000);
+        if (referenceRequestSerial.current !== serial) return;
+        const selected = new Set(references.map((entry) => entry.conversationId));
+        setReferenceOptions(items.filter((entry) => !selected.has(entry.conversationId)));
+        setReferenceIndex(0);
+      } catch (reason) {
+        if (referenceRequestSerial.current === serial) {
+          setReferenceOptions([]);
+          runtime.notify(reason instanceof Error ? reason.message : "引用对话读取失败", "error");
+        }
+      } finally {
+        if (referenceRequestSerial.current === serial) setReferenceLoading(false);
+      }
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [busy, conversationId, inputDisabled, mentionActive, mentionQuery, referenceMode, references, runtime]);
+  const chooseReference = (reference: ConversationReferenceSelection) => {
+    const currentMention = composerMention(value);
+    setReferences((current) => current.some((entry) => entry.conversationId === reference.conversationId) ? current : [...current, reference]);
+    if (currentMention) setValue(value.slice(0, currentMention.start).trimEnd());
+    setReferenceOpen(false);
+    setReferenceOptions([]);
+    window.setTimeout(() => textarea.current?.focus(), 0);
+  };
+  useEffect(() => {
+    const pending = referencePastes.current;
+    return () => { for (const request of pending) request.abort(); pending.clear(); };
+  }, [storageKey]);
+  const pasteReference = async (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const id = pastedConversationId(event.clipboardData.getData("text/plain"), window.location.origin);
+    if (!id) return;
+    event.preventDefault();
+    if (inputDisabled || busy) return;
+    if (activeTask && isActiveTask(activeTask)) {
+      runtime.notify("请等待当前任务结束后再添加对话引用", "error");
+      return;
+    }
+    const input = event.currentTarget;
+    const before = input.value;
+    const start = input.selectionStart, end = input.selectionEnd;
+    const request = new AbortController();
+    referencePastes.current.add(request);
+    setResolvingReferences(true);
+    try {
+      const reference = await resolveConversationReference(runtime.api, id, conversationId, request.signal);
+      if (request.signal.aborted) return;
+      setReferences((current) => current.some((entry) => entry.conversationId === id) ? current : [...current, reference]);
+      setValue((current) => current === before ? before.slice(0, start) + before.slice(end) : current);
+      setReferenceOpen(false);
+      setReferenceOptions([]);
+    } catch (reason) {
+      if (!request.signal.aborted) runtime.notify(reason instanceof Error ? reason.message : "无法引用该对话", "error");
+    } finally {
+      referencePastes.current.delete(request);
+      if (!request.signal.aborted) setResolvingReferences(referencePastes.current.size > 0);
+    }
+  };
   useLayoutEffect(() => {
     const node = textarea.current;
     if (!node) return;
@@ -503,35 +704,67 @@ function Composer({ conversationId, draftKey, disabled, placeholder, activeTask,
   const canExpand = multiline;
   const taskRunning = Boolean(activeTask && ["queued", "preparing", "delivering_context", "running", "waiting_approval", "waiting_input", "waiting_append", "interrupting"].includes(activeTask.status));
   const hasPendingPrompt = Boolean(value.trim());
-  const showStopAction = (taskRunning || pendingWebRun) && Boolean(onInterrupt) && !hasPendingPrompt;
+  // The Web Agent handoff phase has no remote process to interrupt yet. Keep
+  // the ordinary send control disabled/grey during that first-start window;
+  // only show Stop once a real remote Task exists.
+  const showStopAction = taskRunning && Boolean(onInterrupt) && !hasPendingPrompt;
   const stop = async () => {
     if (!onInterrupt || !canInterrupt || stopping || activeTask?.status === "interrupting") return;
     setStopping(true);
+    setInterruptError(null);
     try { await onInterrupt(); }
+    catch (reason) {
+      const message = reason instanceof Error ? reason.message : "任务终止失败";
+      setInterruptError(message);
+      if (interruptErrorTimer.current !== null) window.clearTimeout(interruptErrorTimer.current);
+      interruptErrorTimer.current = window.setTimeout(() => setInterruptError(null), 5_000);
+    }
     finally { setStopping(false); }
   };
   return <div className={styles.composer}>
     <ComposerTaskPlan task={activeTask} />
-    <div data-composer-box className={`${styles.box} ${multiline ? styles.boxMultiline : ""} ${expanded ? styles.boxExpanded : ""} ${hasResources ? styles.boxWithResources : ""} ${taskRunning ? styles.boxTaskRunning : ""}`}>
+    {interruptError ? <div className={styles.composerNotice} role="alert"><X size={15} /><span>{interruptError}</span></div> : null}
+    <div data-composer-box className={`${styles.box} ${multiline ? styles.boxMultiline : ""} ${expanded ? styles.boxExpanded : ""} ${hasResources ? styles.boxWithResources : ""} ${taskRunning ? styles.boxTaskRunning : ""} ${inputFocused || hasPendingPrompt || taskRunning || busy ? styles.mobileComposerActive : ""}`}>
       {hasResources ? <div className={styles.resourceChips}><ComposerResourceChips value={resources} onChange={setResources} /></div> : null}
-      <div className={styles.composerAdd}><ComposerResources value={resources} disabled={disabled || busy || taskRunning} onChange={setResources} /></div>
-      <textarea ref={textarea} className={styles.textarea} value={value} disabled={disabled || busy} placeholder={placeholder} rows={1} onChange={(event) => {
+      <div className={styles.composerAdd}><ComposerResources value={resources} disabled={inputDisabled || busy || taskRunning} onChange={setResources} /></div>
+      <div className={styles.composerInput}>
+        {references.length ? <div className={styles.inlineReferences} aria-label="已引用对话">{references.map((reference) => <ConversationReferenceLink key={reference.conversationId} reference={reference} />)}</div> : null}
+        <textarea ref={textarea} className={styles.textarea} value={value} disabled={inputDisabled || busy} placeholder={placeholder} rows={1} aria-controls="conversation-reference-options" aria-busy={resolvingReferences} onPaste={(event) => void pasteReference(event)} onFocus={() => setInputFocused(true)} onBlur={() => setInputFocused(false)} onChange={(event) => {
         const next = event.target.value;
         setValue(next);
+        const nextMention = composerMention(next);
+        const shouldOpenReferences = Boolean(nextMention && !inputDisabled && !busy);
+        setReferenceOpen(shouldOpenReferences);
+        setReferenceOptions([]);
+        setReferenceLoading(shouldOpenReferences);
         if (!next) { setMultiline(false); setExpanded(false); }
         else if (event.target.scrollHeight > 32) setMultiline(true);
-      }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
-      <button className={styles.model} aria-label="选择模型" aria-expanded={modelOpen} title={model} onClick={() => { setModelOpen((open) => !open); setProviderPage(false); }}><span className={styles.modelName}>{model}</span><WebContextRing value={contextUsage?.ratio ?? 0} used={contextUsage?.usedTokens} limit={contextUsage?.limitTokens} loading={contextLoading} /><ChevronDown size={14} /></button>
+      }} onKeyDown={(event) => {
+        if (event.key === "Backspace" && references.length && event.currentTarget.selectionStart === 0 && event.currentTarget.selectionEnd === 0) { event.preventDefault(); setReferences((current) => current.slice(0, -1)); return; }
+        if (referenceOpen && referenceAvailable && referenceOptions.length) {
+          if (event.key === "ArrowDown") { event.preventDefault(); setReferenceIndex((index) => (index + 1) % referenceOptions.length); return; }
+          if (event.key === "ArrowUp") { event.preventDefault(); setReferenceIndex((index) => (index - 1 + referenceOptions.length) % referenceOptions.length); return; }
+          if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); chooseReference(referenceOptions[referenceIndex] || referenceOptions[0]); return; }
+        }
+        if (event.key === "Escape" && referenceOpen && referenceAvailable) { event.preventDefault(); setReferenceOpen(false); return; }
+        if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); }
+      }} />
+      </div>
+      {referenceOpen && referenceAvailable ? <div className={styles.referenceMenu} id="conversation-reference-options" role="listbox" aria-label="引用其他对话">
+        <div className={styles.referenceMenuHead}>引用对话</div>
+        <div className={styles.referenceList}>{referenceLoading ? <div className={styles.referenceState}><LoaderCircle className={styles.spin} size={14} />正在查找</div> : referenceOptions.length ? referenceOptions.map((reference, index) => <button type="button" role="option" aria-selected={index === referenceIndex} className={index === referenceIndex ? styles.selected : ""} key={reference.conversationId} onMouseDown={(event) => event.preventDefault()} onClick={() => chooseReference(reference)}><strong>{reference.title}</strong></button>) : <div className={styles.referenceState}>没有可引用的对话</div>}</div>
+      </div> : null}
+      <button className={styles.model} aria-label="选择模型" aria-expanded={modelOpen} title={model} onClick={() => { setModelOpen((open) => !open); setProviderPage(false); setBrowsingProviderId(null); }}><span className={styles.modelName}>{model}</span><WebContextRing value={contextUsage?.ratio ?? 0} used={contextUsage?.usedTokens} limit={contextUsage?.limitTokens} loading={contextLoading} /><ChevronDown size={14} /></button>
       <div className={styles.composerSendSlot}>
         {showStopAction ? <span className={styles.composerAction} data-tooltip={canInterrupt ? "终止任务" : "当前 Agent 不支持终止"}>
-          <button className={`${styles.send} ${styles.stop}`} disabled={!canInterrupt || stopping || activeTask?.status === "interrupting"} aria-label="终止任务" onClick={() => void stop()}><Square size={14} fill="currentColor" /></button>
+          <button className={`${styles.send} ${styles.stop}`} disabled={!canInterrupt || stopping || activeTask?.status === "interrupting"} aria-label={stopping || activeTask?.status === "interrupting" ? "正在终止任务" : "终止任务"} onClick={() => void stop()}>{stopping || activeTask?.status === "interrupting" ? <LoaderCircle className={styles.spin} size={17} /> : <Square size={14} fill="currentColor" />}</button>
         </span> : <span className={styles.composerAction} data-tooltip={busy ? "正在发送" : "发送消息"}>
-          <button className={styles.send} disabled={!value.trim() || disabled || busy} aria-label={busy ? "正在发送" : "发送消息"} onClick={() => void send()}>{busy ? <LoaderCircle className={styles.spin} size={17} /> : <Send size={17} />}</button>
+          <button className={styles.send} disabled={!value.trim() || inputDisabled || busy || resolvingReferences} aria-label={busy ? "正在发送" : "发送消息"} onClick={() => void send()}>{busy || resolvingReferences ? <LoaderCircle className={styles.spin} size={17} /> : <Send size={17} />}</button>
         </span>}
       </div>
       {value && (expanded || canExpand) ? <Button className={styles.expand} compact iconOnly variant="ghost" aria-label={expanded ? "收回编辑器" : "展开编辑器"} icon={expanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />} onClick={() => setExpanded((state) => !state)} /> : null}
       {modelOpen ? <div className={styles.modelMenu}>
-        <div className={styles.modelMenuHead}>{providerPage ? <Button compact iconOnly variant="ghost" aria-label="返回模型 API" icon={<ChevronLeft size={15} />} onClick={() => setProviderPage(false)} /> : null}<span>{providerPage ? provider?.name || "模型" : "选择模型"}</span>{providerPage ? <button className={styles.modelRefresh} type="button" aria-label="重新检测模型" disabled={modelsLoading || !provider} onClick={() => provider && void inspectProvider(provider.id)}><RefreshCw className={modelsLoading ? styles.spin : ""} size={14} /></button> : null}</div>
+        <div className={styles.modelMenuHead}>{providerPage ? <Button compact iconOnly variant="ghost" aria-label="返回模型 API" icon={<ChevronLeft size={15} />} onClick={() => { setProviderPage(false); setBrowsingProviderId(null); }} /> : null}<span>{providerPage ? provider?.name || "模型" : "选择模型"}</span>{providerPage ? <button className={styles.modelRefresh} type="button" aria-label="重新检测模型" disabled={modelsLoading || !provider} onClick={() => provider && void inspectProvider(provider.id)}><RefreshCw className={modelsLoading ? styles.spin : ""} size={14} /></button> : null}</div>
         <div className={styles.modelList}>{providerPage ? modelsLoading ? <div className={styles.modelState}><LoaderCircle className={styles.spin} size={15} />正在读取模型</div> : modelError ? <div className={styles.modelState}><span>{modelError}</span><button onClick={() => provider && void inspectProvider(provider.id)}>重新检测</button></div> : models.length ? models.map((item) => <button key={item.id} className={`${styles.modelOption} ${modelId === item.id ? styles.selected : ""}`} onClick={() => chooseModel(item.id)}><span>{item.name}</span>{modelId === item.id ? <Check size={15} /> : null}</button>) : <div className={styles.modelState}>暂无可用模型</div> : runtime.bootstrap?.providers.length ? runtime.bootstrap.providers.map((item) => <button key={item.id} disabled={!item.configured} className={`${styles.modelOption} ${styles.providerOption}`} onClick={() => void inspectProvider(item.id)}><span className={styles.providerCopy}><strong>{item.name}</strong><small>{item.configured ? item.baseUrl || "已配置" : "未配置"}</small></span><ChevronRight size={15} /></button>) : <div className={styles.modelState}>请先配置模型 API</div>}</div>
         <div className={styles.modelManage}><Button compact variant="ghost" icon={<Brain size={15} />} onClick={() => { setModelOpen(false); setContextOpen(true); }}>管理网页对话上下文配置</Button></div>
       </div> : null}
@@ -583,6 +816,9 @@ function ManualAgentDialog({ serverId, agents, onClose, onAdded }: { serverId: s
 function ConversationScreen({ conversationId, initialProjectId, initialMode, initialPanel }: Props) {
   const runtime = useAppRuntime();
   const { api, notify, realtime, refreshBootstrap } = runtime;
+  const searchTargetMessageId = runtime.view.kind === "conversation" && runtime.view.conversationId === conversationId
+    ? runtime.view.messageId
+    : undefined;
   const actorId = runtime.bootstrap?.actor.id;
   const [draftConfigScope] = useState(workDraftConfigScope);
   const configScope = conversationId || draftConfigScope;
@@ -613,10 +849,15 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   const [events, setEvents] = useState<RealtimeEnvelope[]>(initialConversationCache?.events ?? []);
   const [artifacts, setArtifacts] = useState<ArtifactSummary[]>(initialConversationCache?.artifacts ?? []);
   const [eventsHydrated, setEventsHydrated] = useState(!conversationId || Boolean(initialConversationCache?.eventsHydrated));
-  const [tasks, setTasks] = useState<Record<string, TaskSummary>>(initialConversationCache?.tasks ?? {});
+  const [tasks, setTaskRecords] = useState<Record<string, TaskSummary>>(initialConversationCache?.tasks ?? {});
+  const setTasks = useCallback((update: (current: Record<string, TaskSummary>) => Record<string, TaskSummary>) => {
+    setTaskRecords((current) => Object.fromEntries(mergeTaskSnapshots(Object.values(current), Object.values(update(current))).map((task) => [task.id, task])));
+  }, []);
+  const [interruptingTaskId, setInterruptingTaskId] = useState<string | null>(null);
   const [loading, setLoading] = useState(Boolean(conversationId && !initialConversationCache));
   const [setupLoading, setSetupLoading] = useState(Boolean(initialSetupRoute.serverId && !initialServerCache));
   const [setupRetryRevision, setSetupRetryRevision] = useState(0);
+  const [responseRecoveryMessageId, setResponseRecoveryMessageId] = useState<string | null>(null);
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [workbenchHeight, setWorkbenchHeight] = useState(initialWorkbenchHeight);
   const [serverId, setServerId] = useState<string | null>(initialSetupRoute.serverId ?? null);
@@ -738,21 +979,27 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return () => window.removeEventListener(CONVERSATION_ROUTE_CHANGED_EVENT, changed);
   }, [conversationId]);
 
-  const bootstrapSummary = runtime.bootstrap?.recentConversations.find((item) => item.id === conversationId);
+  const bootstrapSummary = runtime.bootstrap?.recentConversations.find((item) => item.id === conversationId)
+    ?? (conversationId && runtime.bootstrap?.conversationNavigation?.conversationId === conversationId ? runtime.bootstrap.conversationNavigation.conversation : undefined);
   const bootstrapServerIdKey = (runtime.bootstrap?.servers ?? []).map((server) => server.id).sort().join("\n");
   const summary = bootstrapSummary ?? (detail ? { ...detail.summary, runningTaskId: null } : undefined);
   const activeMode = detail?.summary.mode ?? summary?.mode ?? mode;
   const loadedConversationId = detail?.summary.id;
   const liveTask = runtime.bootstrap?.runningTasks.find((task) => task.conversationId === conversationId || task.id === summary?.runningTaskId);
-  const latestConversationTask = Object.values(tasks)
+  const mergedConversationTasks = mergeTaskSnapshots(Object.values(tasks), runtime.bootstrap?.runningTasks ?? [])
+    .filter((task) => task.conversationId === conversationId);
+  const latestConversationTask = mergedConversationTasks
     .filter((task) => task.conversationId === conversationId)
     .sort((left, right) => (right.startedAt || right.updatedAt).localeCompare(left.startedAt || left.updatedAt))[0];
-  const activeTask = [liveTask, latestConversationTask]
-    .filter((task): task is TaskSummary => Boolean(task && !["completed", "failed", "cancelled", "interrupted"].includes(task.status)))
+  const activeTaskSnapshot = mergedConversationTasks
+    .filter(isActiveTask)
     .sort((left, right) => {
       if (left.id === right.id) return right.revision - left.revision || right.updatedAt.localeCompare(left.updatedAt);
       return (right.startedAt || right.updatedAt).localeCompare(left.startedAt || left.updatedAt);
     })[0];
+  const activeTask = activeTaskSnapshot?.id === interruptingTaskId
+    ? { ...activeTaskSnapshot, status: "interrupting" as const } : activeTaskSnapshot;
+  const interruptFailure = latestInterruptFailure(events);
   const isEmpty = !conversationId;
   const projectContextName = initialProjectId
     ? runtime.bootstrap?.projects.find((project) => project.id === initialProjectId)?.name.trim() || null
@@ -851,7 +1098,6 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     if (!conversationId || current?.conversationId !== conversationId) return;
     if (!workspaceDirectoryReady || !serverId || !routedWorkspaceId || !workbenchWorkspacePath || !serverCapabilities) {
       runtime.setWorkspaceSidebar(null);
-      runtime.closeWorkspacePreviews(conversationId);
       return;
     }
     if (current.serverId === serverId
@@ -866,7 +1112,6 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       branchId: detail?.summary.activeBranchId,
       capabilities: serverCapabilities,
     });
-    runtime.closeWorkspacePreviews(conversationId);
   }, [conversationId, detail?.summary.activeBranchId, routedWorkspaceId, runtime, serverCapabilities, serverId, workbenchWorkspacePath, workspaceDirectoryReady]);
 
   useEffect(() => {
@@ -887,9 +1132,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     setEvents((current) => mergeConversationEvents(current, incoming));
   }, []);
 
-  const fetchTaskSummary = useCallback(async (taskId: string) => {
+  const fetchTaskSummary = useCallback(async (taskId: string, refresh = false) => {
     const cached = tasksRef.current[taskId];
-    if (cached) return cached;
+    if (cached && !refresh) return cached;
     const active = taskSummaryRequests.current.get(taskId);
     if (active) return active;
     const request = api.get<TaskSummary>(`/api/tasks/${encodeURIComponent(taskId)}`)
@@ -901,17 +1146,18 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return request;
   }, [api]);
 
-  const replayCompleteTaskHistory = useCallback(async (taskId: string) => {
+  const replayCompleteTaskHistory = useCallback(async (taskId: string, onPage?: (page: RealtimeEnvelope[]) => void) => {
     const active = taskReplayRequests.current.get(taskId);
     if (active) return active;
     const request = (async () => {
       const collected: RealtimeEnvelope[] = [];
       let after = taskReplayCursors.current.get(taskId) ?? 0;
       while (true) {
-        const replay = await api.get<{ events: RealtimeEnvelope[] }>(`/api/tasks/${encodeURIComponent(taskId)}/events?after=${after}&limit=2000`);
+        const replay = await api.get<{ events: RealtimeEnvelope[] }>(`/api/tasks/${encodeURIComponent(taskId)}/events?view=summary&after=${after}&limit=2000`);
         const page = replay.data.events;
         if (!page.length) break;
         collected.push(...page);
+        onPage?.(page);
         const next = Math.max(after, ...page.map((event) => event.sequence));
         if (next <= after) break;
         after = next;
@@ -925,6 +1171,20 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     taskReplayRequests.current.set(taskId, request);
     return request;
   }, [api]);
+
+  const reconcileTaskHistory = useCallback(async (taskId: string, isActive: () => boolean) => {
+    // Publish each task and each outline page independently. A slow history
+    // stream must not hold back another call's headings or its current status.
+    await Promise.allSettled([
+      fetchTaskSummary(taskId).then((task) => {
+        if (isActive()) setTasks((current) => ({ ...current, [task.id]: task }));
+      }),
+      replayCompleteTaskHistory(taskId, (page) => { if (isActive()) mergeEvents(page); }).then((history) => {
+        // Another caller may share the request without owning its page callback.
+        if (isActive() && history.length) mergeEvents(history);
+      }),
+    ]);
+  }, [fetchTaskSummary, mergeEvents, replayCompleteTaskHistory, setTasks]);
 
   const retainEventsForMessages = useCallback((nextMessages: ConversationMessage[]) => {
     if (!conversationId) return;
@@ -1026,7 +1286,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId) return;
     const controller = new AbortController();
-    void api.get<{ events: RealtimeEnvelope[] }>(`/api/conversations/${encodeURIComponent(conversationId)}/events?limit=2000`, controller.signal)
+    void api.get<{ events: RealtimeEnvelope[] }>(`/api/conversations/${encodeURIComponent(conversationId)}/events?view=summary&limit=2000`, controller.signal)
       .then((result) => mergeEvents(result.data.events))
       .catch((reason) => {
         if (!controller.signal.aborted && !recoverMissingConversation(reason)) notify(reason instanceof Error ? reason.message : "对话活动读取失败", "error");
@@ -1048,23 +1308,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     if (!referencedTaskIdsKey || activeMode !== "work") return;
     const controller = new AbortController();
     const taskIds = referencedTaskIdsKey.split("\n");
-    void Promise.allSettled(taskIds.map(async (taskId) => {
-      const task = await fetchTaskSummary(taskId);
-      const taskEvents = await replayCompleteTaskHistory(taskId);
-      return { task, events: taskEvents };
-    })).then((settled) => {
-      if (controller.signal.aborted) return;
-      const referencedTasks: Record<string, TaskSummary> = {};
-      const history: RealtimeEnvelope[] = [];
-      for (const result of settled) if (result.status === "fulfilled") {
-        referencedTasks[result.value.task.id] = result.value.task;
-        history.push(...result.value.events);
-      }
-      if (Object.keys(referencedTasks).length) setTasks((current) => ({ ...current, ...referencedTasks }));
-      if (history.length) mergeEvents(history);
-    });
+    for (const taskId of taskIds) void reconcileTaskHistory(taskId, () => !controller.signal.aborted);
     return () => controller.abort();
-  }, [activeMode, fetchTaskSummary, mergeEvents, referencedTaskIdsKey, replayCompleteTaskHistory]);
+  }, [activeMode, referencedTaskIdsKey, reconcileTaskHistory]);
   const handedOffTaskIds = [...new Set(events
     .filter((event) => event.kind === "run.handoff.dispatched")
     .map((event) => String(event.ids.taskId || ""))
@@ -1073,26 +1319,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   useEffect(() => {
     if (!handedOffTaskIdsKey) return;
     let active = true;
-    void Promise.allSettled(handedOffTaskIdsKey.split("\n").map(async (taskId) => {
-      const [task, replay] = await Promise.all([
-        fetchTaskSummary(taskId),
-        replayCompleteTaskHistory(taskId),
-      ]);
-      return { task, events: replay };
-    }))
-      .then((settled) => {
-        if (!active) return;
-        const discovered: Record<string, TaskSummary> = {};
-        const replayed: RealtimeEnvelope[] = [];
-        for (const result of settled) if (result.status === "fulfilled") {
-          discovered[result.value.task.id] = result.value.task;
-          replayed.push(...result.value.events);
-        }
-        if (Object.keys(discovered).length) setTasks((current) => ({ ...current, ...discovered }));
-        if (replayed.length) mergeEvents(replayed);
-      });
+    for (const taskId of handedOffTaskIdsKey.split("\n")) void reconcileTaskHistory(taskId, () => active);
     return () => { active = false; };
-  }, [fetchTaskSummary, handedOffTaskIdsKey, mergeEvents, replayCompleteTaskHistory]);
+  }, [handedOffTaskIdsKey, reconcileTaskHistory]);
   // A fast remote run can finish after the initial event replay but before the
   // task-topic subscription is established.  Conversation terminal events are
   // durable, so use them to reconcile the Task snapshot even when the running
@@ -1104,26 +1333,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   useEffect(() => {
     if (!settledTaskIdsKey) return;
     let active = true;
-    void Promise.allSettled(settledTaskIdsKey.split("\n").map(async (taskId) => {
-      const [task, replay] = await Promise.all([
-        fetchTaskSummary(taskId),
-        replayCompleteTaskHistory(taskId),
-      ]);
-      return { task, events: replay };
-    }))
-      .then((settled) => {
-        if (!active) return;
-        const reconciled: Record<string, TaskSummary> = {};
-        const replayed: RealtimeEnvelope[] = [];
-        for (const result of settled) if (result.status === "fulfilled") {
-          reconciled[result.value.task.id] = result.value.task;
-          replayed.push(...result.value.events);
-        }
-        if (Object.keys(reconciled).length) setTasks((current) => ({ ...current, ...reconciled }));
-        if (replayed.length) mergeEvents(replayed);
-      });
+    for (const taskId of settledTaskIdsKey.split("\n")) void reconcileTaskHistory(taskId, () => active);
     return () => { active = false; };
-  }, [fetchTaskSummary, mergeEvents, replayCompleteTaskHistory, settledTaskIdsKey]);
+  }, [reconcileTaskHistory, settledTaskIdsKey]);
   useEffect(() => {
     const actorId = runtime.bootstrap?.actor.id;
     if (conversationId || mode !== "work" || !actorId || workDraftActor.current === actorId) return;
@@ -1156,8 +1368,15 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return realtime.subscribe(`conversation:${conversationId}`, (event) => {
       mergeEvents([event]);
       if (event.kind === "run.handoff.dispatched") setAgentConfigAgentId(null);
-      if (event.kind === "run.persisted" || event.kind === "message.created") void reload().catch((reason) => notify(reason instanceof Error ? reason.message : "对话刷新失败", "error"));
-      if (event.kind === "conversation.title.updated") void refreshBootstrap().catch(() => undefined);
+      if (event.kind === "run.persisted" || event.kind === "message.created") {
+        announceConversationsChanged({ conversationId, kind: "updated" });
+        void reload().catch((reason) => notify(reason instanceof Error ? reason.message : "对话刷新失败", "error"));
+      }
+      if (event.kind === "conversation.title.updated") {
+        void api.get<ConversationDetail>(`/api/conversations/${encodeURIComponent(conversationId)}`).then((result) => {
+          setDetail((current) => current?.summary.id === conversationId && current.summary.revision <= result.data.summary.revision ? result.data : current);
+        }).catch(() => undefined);
+      }
       if (["run.handoff.dispatched", "run.persisted", "run.suspended", "run.failed", "run.superseded"].includes(event.kind)) {
         const taskId = String(event.ids.taskId || "");
         if (taskId) {
@@ -1196,7 +1415,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         const after = taskReplayCursors.current.get(taskId) ?? 0;
         const [task, replay] = await Promise.all([
           api.get<TaskSummary>(`/api/tasks/${encodeURIComponent(taskId)}`),
-          api.get<{ events: RealtimeEnvelope[] }>(`/api/tasks/${encodeURIComponent(taskId)}/events?after=${after}&limit=500`),
+          api.get<{ events: RealtimeEnvelope[] }>(`/api/tasks/${encodeURIComponent(taskId)}/events?view=summary&after=${after}&limit=500`),
         ]);
         return { task: task.data, events: replay.data.events, after };
       }));
@@ -1263,7 +1482,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         setSetupLoading(false);
         return;
       }
-      if (cacheFresh) return;
+      if (cacheFresh && setupRetryRevision === 0) return;
       const readSetup = async <T,>(path: string, label: string) => {
         const controller = new AbortController();
         setupRequests.add(controller);
@@ -1296,14 +1515,14 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
           const nextAgents = mergeCachedAgentConfigurations(
             agentResult.status === "fulfilled" && agentResult.value && Array.isArray(agentResult.value.data.items)
               ? agentResult.value.data.items
-              : cached?.agents ?? [],
+              : [],
             actorId,
             serverId,
             configScope,
           );
           const nextWorkspaces = workspaceResult.status === "fulfilled" && workspaceResult.value && Array.isArray(workspaceResult.value.data.workspaces)
             ? workspaceResult.value.data.workspaces
-            : cached?.workspaces ?? [];
+            : [];
           setAgentOptions(nextAgents);
           setWorkspaceOptions(nextWorkspaces);
           setCapabilityError(null);
@@ -1313,7 +1532,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
           setWorkspaceLoadError(workspaceResult.status === "rejected"
             ? workspaceResult.reason instanceof Error ? workspaceResult.reason.message : "工作区列表读取失败"
             : null);
-          if (currentServerCacheKey) rememberServerSetup(currentServerCacheKey, {
+          if (currentServerCacheKey && agentResult.status === "fulfilled" && workspaceResult.status === "fulfilled") rememberServerSetup(currentServerCacheKey, {
             capabilities: profile,
             agents: nextAgents,
             workspaces: nextWorkspaces,
@@ -1323,6 +1542,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
           setSetupLoading(false);
         } catch (reason) {
           if (!active) return;
+          setServerCapabilities(null);
+          setAgentOptions([]);
+          setWorkspaceOptions([]);
           setCapabilityError(reason instanceof Error ? reason.message : "服务器能力检测失败");
           setAgentLoadError(null);
           setWorkspaceLoadError(null);
@@ -1455,13 +1677,43 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     if (activeMode === "work") {
       if (scopeOverride) scope = scopeOverride;
       else {
-        if (!serverId || !agentId || !workspace || workspace === VIRTUAL_WORKSPACE) throw new Error("工作环境尚未完成绑定");
-        scope = { serverId, workspaceId: workspace, agentId };
+        if (!serverId || !agentId || !workspace) throw new Error("工作环境尚未完成绑定");
+        if (workspace === VIRTUAL_WORKSPACE) {
+          const branchId = detail?.summary.activeBranchId;
+          if (!branchId) throw new Error("工作环境尚未完成绑定");
+          // A first Web Agent attempt can fail before its deterministic virtual
+          // workspace is materialized. Retrying must replay the same preparation
+          // descriptor instead of requiring a Task that never got created.
+          scope = {
+            serverId,
+            agentId,
+            workspacePreparation: { kind: "virtual", branchId },
+            agentConfigSourceScope: configScope,
+            agentConfigIds: [agentId],
+          };
+        } else scope = { serverId, workspaceId: workspace, agentId };
       }
       const semanticWorkspacePath = String(scope.workspacePath || workspacePath || "").trim();
-      if (semanticWorkspacePath && semanticWorkspacePath !== AUTOMATIC_WORKSPACE_LABEL) scope.workspacePath = semanticWorkspacePath;
+      const semanticWorkspaceId = String(scope.workspaceId || workspace || "").trim();
+      if (
+        semanticWorkspacePath
+        && semanticWorkspacePath !== AUTOMATIC_WORKSPACE_LABEL
+        && semanticWorkspacePath !== semanticWorkspaceId
+        && !/^ws_[a-z0-9]+$/iu.test(semanticWorkspacePath)
+      ) scope.workspacePath = semanticWorkspacePath;
+      else delete scope.workspacePath;
       const scheduler = serverCapabilities?.features.scheduler.type;
       if (scheduler && ["slurm", "pbs", "generic", "none"].includes(scheduler)) scope.scheduler = scheduler;
+      scope.serverLabel = selectedServer?.name || "已选服务器";
+      const selectedAgentLabel = effectiveAgentOptions.find((agent) => agent.agentId === String(scope.agentId || agentId || ""))?.displayName
+        || selectedAgent?.displayName;
+      if (selectedAgentLabel) scope.agentLabel = selectedAgentLabel;
+      else delete scope.agentLabel;
+      scope.workspaceLabel = selectedWorkspaceLabel(
+        String(scope.workspaceId || workspace || "") || null,
+        String(scope.workspacePath || workspacePath || selectedWorkspace?.canonicalPath || "") || null,
+        selectedWorkspace?.canonicalPath || null,
+      );
       const agentProviderId = typeof window === "undefined" ? "" : localStorage.getItem(`easywork.agent-provider:${serverId}:${agentId}`) || "";
       const agentModelId = typeof window === "undefined" ? "" : localStorage.getItem(`easywork.agent-model:${serverId}:${agentId}`) || "";
       if (agentProviderId && agentModelId) scope = { ...scope, agentProviderId, agentModelId };
@@ -1475,21 +1727,25 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return { providerId, modelId: selectedModel, scope };
   };
 
-  const uploadConversationFiles = async (targetConversationId: string, files: File[]) => {
+  const uploadConversationFiles = async (targetConversationId: string, files: File[], submissionId: string) => {
     if (!files.length) return;
     const inspected = await api.get<{ revision: number }>(`/api/resources?ownerType=conversation&ownerId=${encodeURIComponent(targetConversationId)}&limit=1`);
     let expectedRevision = inspected.data.revision;
-    for (const file of files) {
-      const uploaded = await uploadResource(api, file, { ownerType: "conversation", ownerId: targetConversationId, path: file.name }, expectedRevision);
+    for (const [index, file] of files.entries()) {
+      const uploaded = await uploadResource(api, file, { ownerType: "conversation", ownerId: targetConversationId, path: file.name }, expectedRevision, `${submissionId}:resource:${index}`);
       expectedRevision = uploaded.data.revision;
     }
   };
 
-  const appendConversationMessage = async (content: string, idempotencyKey: string) => {
+  const appendConversationMessage = async (content: string, idempotencyKey: string, references: ConversationReferenceSelection[] = []) => {
     if (!conversationId) throw new Error("对话尚未创建");
     const append = (expectedRevision: number) => runtime.api.post<{ conversation: ConversationSummary; messageId: string }>(
       `/api/conversations/${conversationId}/messages`,
-      { content, role: "user" },
+      {
+        content,
+        role: "user",
+        ...(references.length ? { references: references.map(({ conversationId: referencedConversationId }): ConversationReferenceRequest => ({ type: "conversation", conversationId: referencedConversationId })) } : {}),
+      },
       { expectedRevision, idempotencyKey },
     );
     const expectedRevision = summary?.revision;
@@ -1503,20 +1759,22 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     }
   };
 
-  const send = async (content: string, resources: ComposerResourceSelection, selection: WebModelSelection) => {
+  const send = async (content: string, resources: ComposerResourceSelection, selection: WebModelSelection, references: ConversationReferenceSelection[], submissionId: string) => {
     if (!conversationId) {
       if (mode === "chat") {
         const result = await api.post<{ conversation: ConversationSummary; messageId: string }>("/api/conversations", {
           content,
           mode,
           projectId: initialProjectId ?? null,
-        }, { expectedRevision: 0, idempotencyKey: commandId("conversation") });
+          ...(references.length ? { references: references.map(({ conversationId: referencedConversationId }): ConversationReferenceRequest => ({ type: "conversation", conversationId: referencedConversationId })) } : {}),
+        }, { expectedRevision: 0, idempotencyKey: `${submissionId}:conversation` });
+        announceConversationsChanged({ conversationId: result.data.conversation.id, kind: "created" });
         try {
-          await uploadConversationFiles(result.data.conversation.id, resources.files);
+          await uploadConversationFiles(result.data.conversation.id, resources.files, submissionId);
           await api.post(`/api/conversations/${encodeURIComponent(result.data.conversation.id)}/respond`, {
             messageId: result.data.messageId,
             ...responseDescriptor(undefined, resources, selection),
-          }, { idempotencyKey: commandId("respond") });
+          }, { idempotencyKey: `${submissionId}:respond` });
         } catch (reason) {
           notify(reason instanceof Error ? reason.message : "消息资源处理失败", "error");
         }
@@ -1529,8 +1787,10 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         content,
         mode,
         projectId: initialProjectId ?? null,
-      }, { expectedRevision: 0, idempotencyKey: commandId("conversation") });
+        ...(references.length ? { references: references.map(({ conversationId: referencedConversationId }): ConversationReferenceRequest => ({ type: "conversation", conversationId: referencedConversationId })) } : {}),
+      }, { expectedRevision: 0, idempotencyKey: `${submissionId}:conversation` });
       const id = result.data.conversation.id;
+      announceConversationsChanged({ conversationId: id, kind: "created" });
       const branchId = result.data.branchId;
       let workspaceId = workspace;
       let resolvedPath = workspacePath ?? selectedWorkspace?.canonicalPath;
@@ -1543,28 +1803,35 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         writeStoredRoute(id, { serverId, agentId, workspaceId, workspacePath: resolvedPath });
         runtime.navigate({ kind: "conversation", conversationId: id }, { replace: true });
         conversationOpened = true;
-        await api.post(`/api/conversations/${encodeURIComponent(id)}/server-binding`, { serverId });
         // A native conversation only uses its selected Agent. Other Agent
         // configurations are materialized lazily when the user switches to
         // them, avoiding three sequential SSH configuration copies here.
         const configuredAgentIds = [agentId];
         copyAgentConfigurationCache(actorId, serverId, configScope, id, configuredAgentIds);
         let workspacePreparation: { kind: "virtual"; branchId: string } | null = null;
+        const bindServer = api.post(`/api/conversations/${encodeURIComponent(id)}/server-binding`, { serverId });
+        const uploadFiles = uploadConversationFiles(id, resources.files, submissionId);
+        let registerWorkspace: Promise<{ data: { workspace: WorkspaceSummary } }> | null = null;
         if (workspace === VIRTUAL_WORKSPACE) {
           // The response worker owns deterministic virtual-workspace creation.
           // Supplying the preparation descriptor lets Web Agent reasoning start
           // immediately while the remote route is prepared in parallel.
           workspacePreparation = { kind: "virtual", branchId };
         } else if (workspace === PENDING_USER_WORKSPACE_SELECTION && workspacePath) {
-          const registered = await api.post<{ workspace: WorkspaceSummary }>(`/api/servers/${encodeURIComponent(serverId)}/workspaces/user`, {
+          registerWorkspace = api.post<{ workspace: WorkspaceSummary }>(`/api/servers/${encodeURIComponent(serverId)}/workspaces/user`, {
             conversationId: id,
             path: workspacePath,
             expectedRevision: 0,
-          }, { expectedRevision: 0, idempotencyKey: commandId("workspace-user") });
+          }, { expectedRevision: 0, idempotencyKey: `${submissionId}:workspace-user` });
+        }
+        // Server binding, resource hashing/upload and a user-workspace probe
+        // are independent. Starting them together removes two remote round
+        // trips from the first Work turn without weakening either contract.
+        const [, , registered] = await Promise.all([bindServer, uploadFiles, registerWorkspace]);
+        if (registered) {
           workspaceId = registered.data.workspace.id;
           resolvedPath = registered.data.workspace.canonicalPath;
         }
-        await uploadConversationFiles(id, resources.files);
         writeStoredRoute(id, { serverId, agentId, workspaceId, workspacePath: resolvedPath });
         await api.post(`/api/conversations/${encodeURIComponent(id)}/respond`, {
           messageId: result.data.messageId,
@@ -1577,9 +1844,17 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
             agentConfigSourceScope: configScope,
             agentConfigIds: configuredAgentIds,
           }, resources, selection),
-        }, { idempotencyKey: commandId("respond") });
+        }, { idempotencyKey: `${submissionId}:respond` });
       } catch (reason) {
-        notify(reason instanceof Error ? reason.message : "工作任务启动失败", "error");
+        const message = reason instanceof Error ? reason.message : "工作任务启动失败";
+        await api.post(`/api/conversations/${encodeURIComponent(id)}/startup-failure`, {
+          messageId: result.data.messageId,
+          failure: {
+            code: reason instanceof GatewayError ? reason.code : "WORK_STARTUP_FAILED",
+            message,
+            retryable: reason instanceof GatewayError ? reason.retryable : true,
+          },
+        }, { idempotencyKey: `${submissionId}:startup-failure` }).catch(() => undefined);
       } finally {
         writeStoredRoute(id, { serverId, agentId, workspaceId, workspacePath: resolvedPath });
         await clearWorkDraft().catch(() => undefined);
@@ -1594,71 +1869,77 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       const capability = selectedAgent?.runtimeCapabilities?.append;
       if (capability?.availability !== "available") throw new Error(capability?.reason || "当前 Agent 不支持运行中追加");
       if (resources.files.length || resources.collections.length || resources.skills.length) throw new Error("运行中的原生 Agent 会话不能重新绑定文件、文件集或 Skill");
-      const sent = await appendConversationMessage(content, commandId("message-append"));
+      if (references.length) throw new Error("运行中的原生 Agent 会话不能追加新的对话引用，请等待当前任务结束");
+      const response = responseDescriptor({
+        serverId: activeTask.route.serverId,
+        workspaceId: activeTask.route.workspaceId,
+        agentId: activeTask.route.agentId,
+        directRemoteTaskId: activeTask.id,
+      }, resources, selection);
+      const sent = await appendConversationMessage(content, `${submissionId}:message-append`, references);
+      announceConversationsChanged({ conversationId, kind: "updated" });
       await runtime.api.post(`/api/conversations/${conversationId}/respond`, {
         messageId: sent.data.messageId,
-        ...responseDescriptor({
-          serverId: activeTask.route.serverId,
-          workspaceId: activeTask.route.workspaceId,
-          agentId: activeTask.route.agentId,
-          directRemoteTaskId: activeTask.id,
-        }, resources, selection),
-      }, { idempotencyKey: commandId("respond-append") });
+        ...response,
+      }, { idempotencyKey: `${submissionId}:respond-append` });
       await reload();
       return;
     }
-    const sent = await appendConversationMessage(content, commandId("message"));
-    await uploadConversationFiles(conversationId, resources.files);
-    await runtime.api.post(`/api/conversations/${conversationId}/respond`, { messageId: sent.data.messageId, ...responseDescriptor(undefined, resources, selection) }, { idempotencyKey: commandId("respond") });
+    // Validate the complete response route before persisting the user message.
+    // A missing model or Work binding therefore cannot leave an orphaned turn
+    // that looks permanently active but has no Web Agent run behind it.
+    const response = responseDescriptor(undefined, resources, selection);
+    const sent = await appendConversationMessage(content, `${submissionId}:message`, references);
+    announceConversationsChanged({ conversationId, kind: "updated" });
+    await uploadConversationFiles(conversationId, resources.files, submissionId);
+    await runtime.api.post(`/api/conversations/${conversationId}/respond`, { messageId: sent.data.messageId, ...response }, { idempotencyKey: `${submissionId}:respond` });
     await reload();
   };
 
   const interrupt = async () => {
     if (!conversationId) return;
     if (activeTask && !agentOperationAvailable(selectedAgent, "interrupt")) {
-      notify(selectedAgent?.runtimeCapabilities?.interrupt?.reason || "当前 Agent 不支持中断", "error");
-      return;
+      throw new Error(selectedAgent?.runtimeCapabilities?.interrupt?.reason || "当前 Agent 不支持中断");
     }
     const previous = activeTask;
-    if (previous) setTasks((current) => ({ ...current, [previous.id]: { ...previous, status: "interrupting" } }));
+    if (previous) setInterruptingTaskId(previous.id);
     try {
       const result = await runtime.api.post<{ taskId?: string; runId?: string; status: string }>(`/api/conversations/${encodeURIComponent(conversationId)}/interrupt`, {}, { idempotencyKey: commandId("conversation-interrupt") });
-      if (result.data.taskId) setTasks((current) => {
-        const currentTask = current[result.data.taskId!] || previous;
-        return currentTask ? { ...current, [result.data.taskId!]: { ...currentTask, status: result.data.status as TaskSummary["status"] } } : current;
-      });
+      if (result.data.taskId) {
+        const snapshot = await fetchTaskSummary(result.data.taskId, true);
+        setTasks((current) => ({ ...current, [snapshot.id]: snapshot }));
+      }
       void refreshBootstrap().catch(() => undefined);
     } catch (reason) {
-      if (previous) setTasks((current) => ({ ...current, [previous.id]: previous }));
-      notify(reason instanceof Error ? reason.message : "任务中断失败", "error");
+      throw reason instanceof Error ? reason : new Error("任务中断失败");
+    } finally {
+      setInterruptingTaskId(null);
     }
   };
 
   const respondApproval: ApprovalResponder = async (taskId, requestId, decision) => {
     const task = tasks[taskId];
     const approvalAgent = effectiveAgentOptions.find((item) => item.agentId === task?.route.agentId) ?? selectedAgent;
-    if (approvalAgent?.runtimeCapabilities?.respondApproval?.availability !== "available") {
+    // A live request is stronger evidence than a stale setup-capability cache.
+    // The backend still validates the task, binding and pending request ID.
+    if (task?.status !== "waiting_approval" && approvalAgent?.runtimeCapabilities?.respondApproval?.availability !== "available") {
       throw new Error(approvalAgent?.runtimeCapabilities?.respondApproval?.reason || "当前 Agent 不支持网页审批响应");
     }
     await api.post(`/api/tasks/${encodeURIComponent(taskId)}/approval`, { requestId, decision }, { idempotencyKey: commandId("task-approval") });
-    setTasks((current) => {
-      const existing = current[taskId];
-      return existing?.status === "waiting_approval" ? { ...current, [taskId]: { ...existing, status: "running" } } : current;
-    });
+    const snapshot = await fetchTaskSummary(taskId, true);
+    setTasks((current) => ({ ...current, [snapshot.id]: snapshot }));
     notify(decision === "reject" ? "已拒绝该操作" : decision === "approve_session" ? "已在本次 Agent 会话中允许" : "已允许该操作", "neutral");
   };
 
   const respondInput: InputResponder = async (taskId, requestId, answers) => {
     const task = tasks[taskId];
     const inputAgent = effectiveAgentOptions.find((item) => item.agentId === task?.route.agentId) ?? selectedAgent;
-    if (inputAgent?.runtimeCapabilities?.respondInput?.availability !== "available") {
+    if (task?.status !== "waiting_input" && inputAgent?.runtimeCapabilities?.respondInput?.availability !== "available") {
       throw new Error(inputAgent?.runtimeCapabilities?.respondInput?.reason || "当前 Agent 不支持网页回答原生问题");
     }
     await api.post(`/api/tasks/${encodeURIComponent(taskId)}/input`, { requestId, answers }, { idempotencyKey: commandId("task-input") });
-    setTasks((current) => {
-      const existing = current[taskId];
-      return existing?.status === "waiting_input" ? { ...current, [taskId]: { ...existing, status: "running" } } : current;
-    });
+    const snapshot = await fetchTaskSummary(taskId, true);
+    setTasks((current) => ({ ...current, [snapshot.id]: snapshot }));
     notify("回答已提交，Agent 将继续当前会话", "neutral");
   };
 
@@ -1813,12 +2094,22 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     runtime.navigate({ kind: "conversation", conversationId: targetConversationId });
   };
 
+  const verifyAgentSelection = async (targetAgentId: string) => {
+    if (!serverId) throw new Error("请先选择服务器");
+    const target = effectiveAgentOptions.find((agent) => agent.agentId === targetAgentId);
+    await api.post(`/api/servers/${encodeURIComponent(serverId)}/agents/${encodeURIComponent(targetAgentId)}/readiness`, {
+      configScope,
+      ...(target?.source ? { source: target.source } : {}),
+    }, { idempotencyKey: commandId("agent-readiness") });
+  };
+
   const switchAgent = async (nextAgentId: string) => {
     const branchId = detail?.summary.activeBranchId;
     const currentWorkspaceId = routedWorkspaceId;
     const currentWorkspacePath = workbenchWorkspacePath;
     if (!conversationId || !branchId || !serverId || !currentWorkspaceId || currentWorkspaceId === VIRTUAL_WORKSPACE || nextAgentId === routedAgentId) return;
     if (activeTask && !["completed", "failed", "cancelled", "interrupted"].includes(activeTask.status)) throw new Error("当前任务结束或中断后才能切换 Agent");
+    await verifyAgentSelection(nextAgentId);
     setSwitchingWorkspace(true);
     try {
       // A freshly created automatic workspace can already be authoritative in
@@ -1894,62 +2185,8 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     : latestAssistantPosition > latestUserPosition && messages[latestAssistantPosition]?.content === classifiedOutput.streamingFinal;
   const visibleStreamingFinal = streamingMessagePersisted ? "" : classifiedOutput.streamingFinal;
   const userMessages = messages.filter((message) => message.role === "user");
-  const taskIdByUserMessage = new Map<string, string>();
-  let taskOwnerUserId: string | null = null;
-  for (const message of messages) {
-    if (message.role === "user") {
-      taskOwnerUserId = message.id;
-      continue;
-    }
-    if (taskOwnerUserId && message.taskId) taskIdByUserMessage.set(taskOwnerUserId, message.taskId);
-    taskOwnerUserId = null;
-  }
-  const runStartByUserMessage = new Map<string, RealtimeEnvelope>();
-  const userRecords = userMessages.map((message) => {
-    const exactRuns = events
-      .filter((event) => event.kind === "run.started" && event.ids.sourceMessageId === message.id)
-      .sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.sequence - right.sequence);
-    const runStart = exactRuns.at(-1);
-    if (runStart) runStartByUserMessage.set(message.id, runStart);
-    const handoff = runStart?.ids.runId
-      ? events.find((event) => event.kind === "run.handoff.dispatched" && event.ids.runId === runStart.ids.runId)
-      : undefined;
-    const exactTaskId = String(handoff?.ids.taskId || taskIdByUserMessage.get(message.id) || "");
-    if (exactTaskId) taskIdByUserMessage.set(message.id, exactTaskId);
-    const task = exactTaskId ? tasks[exactTaskId] ?? null : null;
-    return { message, task };
-  });
-  const timelineByUserMessage = new Map<string, RealtimeEnvelope[]>();
-  for (let index = 0; index < userMessages.length; index += 1) {
-    const message = userMessages[index];
-    const runStart = runStartByUserMessage.get(message.id);
-    const runId = runStart?.ids.runId;
-    const referencedTaskId = taskIdByUserMessage.get(message.id) || null;
-    const scopedEvents = events.filter((event) => {
-      if (referencedTaskId && event.ids.taskId) {
-        if (event.ids.taskId !== referencedTaskId) return false;
-        // Native append keeps one remote Task alive across several webpage
-        // user turns. The orchestrator stamps every immutable Task event with
-        // the webpage message/run that owned it at emission time; use that
-        // identity to split continuations without replaying earlier events or
-        // guessing boundaries from clocks and adjacency.
-        if (event.ids.sourceMessageId !== message.id) return false;
-        return !runId || !event.ids.runId || event.ids.runId === runId;
-      }
-      if (event.ids.sourceMessageId) {
-        if (event.ids.sourceMessageId !== message.id) return false;
-        if (runId && event.ids.runId) return event.ids.runId === runId;
-        return !runId;
-      }
-      if (runId && event.ids.runId === runId) return true;
-      const linkedTask = event.ids.taskId ? tasks[String(event.ids.taskId)] : null;
-      if (linkedTask?.sourceMessageId) return linkedTask.sourceMessageId === message.id;
-      if (runId && linkedTask?.conversationRunId === runId) return true;
-      return false;
-    });
-    if (scopedEvents.length) timelineByUserMessage.set(message.id, scopedEvents);
-  }
-  const timelineByAssistantMessage = new Map<string, RealtimeEnvelope[]>();
+  const { userRecords, timelineByUserMessage, timelineByAssistantMessage, usersWithAssistant } = groupConversationTimeline(messages, events, tasks);
+  const artifactHistory: ArtifactCardData[] = conversationArtifactCards(events, artifacts);
   const artifactsByTaskId = new Map<string, ArtifactSummary[]>();
   for (const artifact of artifacts) {
     const current = artifactsByTaskId.get(artifact.taskId) || [];
@@ -1963,20 +2200,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     const referenced = owned.length ? owned : referencedArtifactsForDownloadReply(message.content, artifacts);
     if (referenced.length) artifactsByAssistantMessage.set(message.id, referenced);
   }
-  const usersWithAssistant = new Set<string>();
-  const latestResponseUserId = userMessages.at(-1)?.id ?? null;
-  let responseUserId: string | null = null;
-  for (const message of messages) {
-    if (message.role === "user") {
-      responseUserId = message.id;
-      continue;
-    }
-    if (!responseUserId) continue;
-    usersWithAssistant.add(responseUserId);
-    const timeline = timelineByUserMessage.get(responseUserId);
-    if (timeline?.length) timelineByAssistantMessage.set(message.id, timeline);
-    responseUserId = null;
-  }
+  const latestResponseUser = userMessages.at(-1) ?? null;
+  const latestResponseUserId = latestResponseUser?.id ?? null;
+  const latestResponseHasAssistant = Boolean(latestResponseUserId && usersWithAssistant.has(latestResponseUserId));
   const pendingTimelineEvents = latestResponseUserId && !usersWithAssistant.has(latestResponseUserId) ? timelineByUserMessage.get(latestResponseUserId) : undefined;
   const directRemoteAppendUserMessageIds = new Set([...timelineByUserMessage]
     .filter(([, ownedEvents]) => isDirectRemoteAppendTimeline(ownedEvents))
@@ -1987,21 +2213,47 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   const latestResponseRunSettled = latestResponseWebRunEvents.some((event) =>
     ["run.persisted", "run.suspended", "run.failed", "run.aborted", "run.superseded"].includes(event.kind),
   );
+  const latestResponseHasActivity = Boolean(pendingTimelineEvents?.length)
+    || latestConversationTask?.sourceMessageId === latestResponseUserId;
+  const latestResponseCreatedAt = Date.parse(latestResponseUser?.createdAt || "");
+  const latestResponseOrphaned = activeMode === "work"
+    && Boolean(latestResponseUserId)
+    && !latestResponseHasAssistant
+    && !activeTask
+    && !latestResponseHasActivity
+    && Number.isFinite(latestResponseCreatedAt)
+    && responseRecoveryMessageId === latestResponseUserId;
+  useEffect(() => {
+    if (
+      activeMode !== "work"
+      || !latestResponseUserId
+      || latestResponseHasAssistant
+      || activeTask
+      || latestResponseHasActivity
+      || !Number.isFinite(latestResponseCreatedAt)
+    ) return undefined;
+    const timer = window.setTimeout(
+      () => setResponseRecoveryMessageId(latestResponseUserId),
+      orphanRecoveryDelay(latestResponseCreatedAt) + 50,
+    );
+    return () => window.clearTimeout(timer);
+  }, [activeMode, activeTask, latestResponseCreatedAt, latestResponseHasActivity, latestResponseHasAssistant, latestResponseUserId]);
   const pendingWorkHandoff = activeMode === "work"
     && Boolean(latestResponseUserId)
-    && !usersWithAssistant.has(latestResponseUserId!)
+    && !latestResponseHasAssistant
     && !activeTask
     && !latestResponseTaskSettled
-    && !latestResponseRunSettled;
+    && !latestResponseRunSettled
+    && !latestResponseOrphaned;
   const orphanTimelineByUserMessage = new Map(
     [...timelineByUserMessage].filter(([userMessageId]) => userMessageId !== latestResponseUserId && !usersWithAssistant.has(userMessageId)),
   );
   const showPendingAssistant = Boolean(visibleStreamingFinal || pendingTimelineEvents?.length);
   const retryableAssistantMessageId = latestAssistantPosition > latestUserPosition ? latestAssistant : null;
   const retryableUserMessageId = latestResponseUserId
-    && !usersWithAssistant.has(latestResponseUserId)
+    && !latestResponseHasAssistant
     && !activeTask
-    && (latestResponseTaskSettled || latestResponseRunSettled)
+    && (latestResponseTaskSettled || latestResponseRunSettled || latestResponseOrphaned)
     ? latestResponseUserId
     : null;
   // A persisted assistant message is written only after its remote Task has
@@ -2022,9 +2274,18 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       (position) => conversationScrollPositions.set(conversationId, position));
   }, [conversationId, initialPanel, loading]);
 
-  if (loading) return <LoadingState label="正在载入对话" />;
+  const searchTargetAvailable = Boolean(searchTargetMessageId && messages.some((message) => message.id === searchTargetMessageId));
+  useLayoutEffect(() => {
+    if (!searchTargetAvailable || loading) return undefined;
+    const node = document.getElementById(`message-${searchTargetMessageId}`);
+    if (!node) return undefined;
+    node.scrollIntoView({ behavior: "smooth", block: "center" });
+    node.classList.add(styles.searchTarget);
+    const timer = window.setTimeout(() => node.classList.remove(styles.searchTarget), 4_000);
+    return () => { window.clearTimeout(timer); node.classList.remove(styles.searchTarget); };
+  }, [loading, searchTargetAvailable, searchTargetMessageId]);
 
-  const panelLabel = initialPanel?.kind === "file" ? "文件" : initialPanel?.kind === "task" ? "任务" : initialPanel?.kind === "artifact" ? "产物" : "变更";
+  const panelLabel = initialPanel?.kind === "file" ? "文件" : initialPanel?.kind === "task" ? "任务" : initialPanel?.kind === "artifact" ? "文件" : "变更";
   const taskInputAvailable = !pendingWorkHandoff && (!activeTask
     || (activeTask.status === "running" && agentOperationAvailable(selectedAgent, "append")));
   const taskPlaceholder = pendingWorkHandoff
@@ -2039,6 +2300,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   const toggleWorkspaceDirectory = async () => {
     if (!conversationId) return;
     if (workspaceDirectoryActive) {
+      if (window.innerWidth <= 719 && !runtime.sidebarOpen) { runtime.setSidebarOpen(true); return; }
       const returnToConversation = () => runtime.setWorkspaceSidebar(null);
       if (workspacePreviewRef.current) workspacePreviewRef.current.requestCloseAll(returnToConversation);
       else returnToConversation();
@@ -2080,24 +2342,21 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       branchId: detail?.summary.activeBranchId,
       capabilities: serverCapabilities,
     });
+    if (window.innerWidth <= 719) runtime.setSidebarOpen(true);
   };
-  const expandedWorkHeader = Boolean(
-    !isEmpty
-      && activeMode === "work"
-      && serverId
-      && selectedServer?.status === "connected"
-      && conversationConnectionEnabled,
-  );
+  if (loading) return <LoadingState label="正在载入对话" />;
+
   return <div className={`${styles.view} ${runtime.rightRailOpen && conversationId ? styles.withRail : ""}`}>
     <section className={styles.stage}>
-      <div className={`${styles.stageContent} ${initialPanel ? styles.stageWithPanel : ""} ${expandedWorkHeader ? styles.stageWithExpandedWorkHeader : ""}`}>
-      {isEmpty ? <div className={styles.modeSwitch} role="group" aria-label="选择对话类型"><button className={`${styles.modeButton} ${mode === "chat" ? styles.selected : ""}`} onClick={() => setMode("chat")}><MessageCircle size={14} />聊天</button><button className={`${styles.modeButton} ${mode === "work" ? styles.selected : ""}`} onClick={() => setMode("work")}><Terminal size={14} />工作</button></div> : <header className={`${styles.header} ${expandedWorkHeader ? styles.expandedWorkHeader : ""}`}>
+      <div className={`${styles.stageContent} ${initialPanel ? styles.stageWithPanel : ""}`}>
+      {isEmpty ? <div className={styles.modeSwitch} role="group" aria-label="选择对话类型"><button className={`${styles.modeButton} ${mode === "chat" ? styles.selected : ""}`} onClick={() => setMode("chat")}><MessageCircle size={14} />聊天</button><button className={`${styles.modeButton} ${mode === "work" ? styles.selected : ""}`} onClick={() => setMode("work")}><Terminal size={14} />工作</button></div> : <header className={styles.header}>
         <span className={styles.modeControl}>
-          {activeMode === "work" ? <button type="button" className={styles.modePill} aria-pressed={workspaceDirectoryActive} aria-busy={workspaceDirectoryLoading} disabled={workspaceDirectoryLoading || (!workspaceDirectoryActive && (!boundServerId || !conversationConnectionEnabled || selectedServer?.status !== "connected"))} onClick={() => void toggleWorkspaceDirectory()}><Terminal size={15} />工作</button> : <span className={`${styles.modePill} ${styles.modePillStatic}`}><MessageCircle size={15} />聊天</span>}
+          {activeMode === "work" ? <button type="button" className={styles.modePill} aria-label="工作文件" title="工作文件" aria-pressed={workspaceDirectoryActive} aria-busy={workspaceDirectoryLoading} disabled={workspaceDirectoryLoading || (!workspaceDirectoryActive && (!boundServerId || !conversationConnectionEnabled || selectedServer?.status !== "connected"))} onClick={() => void toggleWorkspaceDirectory()}><Terminal size={15} /><span>工作</span></button> : <span className={`${styles.modePill} ${styles.modePillStatic}`} aria-label="聊天" title="聊天"><MessageCircle size={15} /><span>聊天</span></span>}
         </span>
         <span className={styles.headerSpacer} />
+        <div className={styles.headerControls}>
         {activeMode === "work" ? <>
-          {serverId && selectedServer?.status === "connected" && conversationConnectionEnabled && workbenchAvailable ? <button className={styles.workbenchButton} disabled={!workbenchReady} aria-expanded={workbenchOpen} onClick={() => setWorkbenchOpen(true)}><SquareTerminal size={15} />工作台</button> : null}
+          {serverId && selectedServer?.status === "connected" && conversationConnectionEnabled && workbenchAvailable ? <button data-workbench-trigger="" className={styles.workbenchButton} disabled={!workbenchReady} aria-label="工作台" title="工作台" aria-expanded={workbenchOpen} onClick={() => setWorkbenchOpen((current) => window.innerWidth <= 719 ? !current : true)}><SquareTerminal size={15} /><span>工作台</span></button> : null}
           {serverId && selectedServer?.status === "connected" && conversationConnectionEnabled ? <span className={styles.agentHeaderControl}><AgentControl
             serverId={serverId}
             agents={effectiveAgentOptions}
@@ -2120,13 +2379,14 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
             loadError={agentLoadError || capabilityError}
             onRetry={() => setSetupRetryRevision((revision) => revision + 1)}
           /></span> : null}
-          {!runtime.rightRailOpen ? <button className={`${styles.connection} ${selectedServer?.status !== "connected" || !conversationConnectionEnabled ? styles.off : ""}`} aria-label={selectedServer?.status === "connected" && conversationConnectionEnabled ? "远程服务器已连接，打开连接详情" : "远程服务器未连接，打开连接设置"} disabled={serverBindingLoading} onClick={openConversationConnection}>{serverBindingLoading ? <LoaderCircle className={styles.spin} size={14} /> : selectedServer?.status === "connected" && conversationConnectionEnabled ? <Wifi size={14} /> : <WifiOff size={14} />}{serverBindingLoading ? "读取中" : selectedServer?.status === "connected" && conversationConnectionEnabled ? "已连接" : "未连接"}</button> : null}
+          <button className={`${styles.connection} ${selectedServer?.status !== "connected" || !conversationConnectionEnabled ? styles.off : ""}`} aria-label={selectedServer?.status === "connected" && conversationConnectionEnabled ? "远程服务器已连接，打开连接详情" : "远程服务器未连接，打开连接设置"} disabled={serverBindingLoading} onClick={openConversationConnection}>{serverBindingLoading ? <LoaderCircle className={styles.spin} size={14} /> : selectedServer?.status === "connected" && conversationConnectionEnabled ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{serverBindingLoading ? "读取中" : selectedServer?.status === "connected" && conversationConnectionEnabled ? "已连接" : "未连接"}</span></button>
         </> : null}
+        </div>
       </header>}
       {conversationId && initialPanel ? <div className={styles.mainTabs}><button onClick={() => runtime.navigate({ kind: "conversation", conversationId })}>对话</button><span className={styles.activeMainTab}>{panelLabel}<button aria-label={`关闭${panelLabel}`} onClick={() => runtime.navigate({ kind: "conversation", conversationId })}><X size={13} /></button></span></div> : null}
-      {conversationId && initialPanel ? <ConversationObjectPanel panel={initialPanel} /> : isEmpty ? <div className={styles.empty}><div className={styles.emptyInner}>
-        <h1 className={styles.emptyTitle}>{projectContextName ? `我们应该在${projectContextName}中做些什么？` : mode === "work" ? "准备好后，开始工作" : "有什么可以帮你？"}</h1>
-        <div className={styles.emptyComposer}><Composer key={`new:${initialProjectId ?? "standalone"}:${mode}`} conversationId={conversationId} draftKey={`new:${initialProjectId ?? "standalone"}:${mode}`} disabled={!workReady} placeholder={mode === "work" ? workReady ? "描述要在远端完成的工作" : "请先完成工作环境设置" : "给 EasyWork 发消息"} onSend={send} /></div>
+      {conversationId && initialPanel ? <ConversationObjectPanel panel={initialPanel} /> : isEmpty ? <div className={styles.empty}><div className={styles.emptyInner} onFocusCapture={(event) => { if (event.target instanceof HTMLTextAreaElement) event.currentTarget.setAttribute("data-composer-focused", ""); }} onBlurCapture={(event) => { if (event.target instanceof HTMLTextAreaElement) event.currentTarget.removeAttribute("data-composer-focused"); }}>
+        <h1 key={mode} className={styles.emptyTitle}>{projectContextName ? `我们应该在${projectContextName}中做些什么？` : mode === "work" ? "准备好后，开始工作" : "有什么可以帮你？"}</h1>
+        <div className={styles.emptyComposer}><Composer key={`new:${initialProjectId ?? "standalone"}:${mode}`} conversationId={conversationId} referenceMode={mode} draftKey={`new:${initialProjectId ?? "standalone"}:${mode}`} disabled={!workReady} placeholder={mode === "work" ? workReady ? "描述要在远端完成的工作" : "请先完成工作环境设置" : "给 EasyWork 发消息"} onSend={send} /></div>
         {mode === "work" ? <>
           <div className={styles.setup}>
             <button className={`${styles.setupStep} ${serverId ? styles.done : ""}`} onClick={() => setConnectionDialogOpen(true)}><Server size={16} />{selectedServer ? selectedServer.name : "连接远程服务器"}</button>
@@ -2144,7 +2404,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
               triggerVariant="setup"
               triggerLabel={selectedAgent?.installed && selectedAgent.status === "ready" && (!selectedAgent.managed || selectedAgent.configured) ? `${selectedAgent.displayName}${selectedAgent.model ? ` · ${selectedAgent.model}` : ""}` : "配置 Agent"}
               initialPage={selectedAgent?.installed && selectedAgent.status === "ready" ? "config" : "root"}
-              onSelect={async (nextAgentId) => { choose("agent", nextAgentId); }}
+              onSelect={async (nextAgentId) => { await verifyAgentSelection(nextAgentId); choose("agent", nextAgentId); }}
               onInstall={installAgent}
               onManualAdd={() => setManualAgentOpen(true)}
               onConfigure={(agent) => setAgentConfigAgentId(agent.agentId)}
@@ -2159,32 +2419,36 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         </> : null}
       </div><div className={styles.emptyDisclaimer}>EasyWork 可能会出错，请核对重要信息。</div></div> : <>
         <div className={styles.messages} ref={scroll}><div className={styles.messageList} ref={messageContent}>
+          {detail?.summary.origin ? <div className={styles.conversationOrigin}><span className={styles.originSystem}>该对话基于</span>
+            <button type="button" onClick={() => runtime.navigate({ kind: "conversation", conversationId: detail.summary.origin!.conversationId, messageId: detail.summary.origin!.messageId })}>{detail.summary.origin.title}</button>
+            {detail.summary.origin.questionPreview ? <span className={styles.originPreview}>（<span>{detail.summary.origin.questionPreview}…</span>）</span> : null}<span className={styles.originSystem}>创建</span>
+          </div> : null}
           {messages.map((message, messageIndex) => {
             const directRemoteAppendTurn = message.role === "user" && directRemoteAppendUserMessageIds.has(message.id);
             const nextMessage = messages[messageIndex + 1];
             const beforeDirectRemoteAppendTurn = nextMessage?.role === "user" && directRemoteAppendUserMessageIds.has(nextMessage.id);
             return <div className={`${styles.turn} ${directRemoteAppendTurn ? styles.directRemoteAppendTurn : ""} ${beforeDirectRemoteAppendTurn ? styles.beforeDirectRemoteAppendTurn : ""}`} key={message.id}>
-              <Message message={message} latestAssistant={message.id === retryableAssistantMessageId} retryableUser={message.id === retryableUserMessageId} revision={summary?.revision ?? 0} timelineEvents={timelineByAssistantMessage.get(message.id)} artifacts={artifactsByAssistantMessage.get(message.id)} timelineLoading={activeMode === "work" && Boolean(message.taskId) && !eventsHydrated} timelineMode={activeMode} taskById={tasks} settledTaskIds={settledTaskIds} response={responseDescriptor} onApproval={respondApproval} onInput={respondInput} onBranchCreated={openBranchedConversation} onChanged={reload} />
-              {message.role === "user" && orphanTimelineByUserMessage.has(message.id) ? <article className={`${styles.message} ${styles.assistant}`}>{isDirectRemoteAppendTimeline(orphanTimelineByUserMessage.get(message.id) || []) ? null : <div className={styles.messageHead}><span className={styles.dot} /> EasyWork</div>}<ConversationTimeline events={orphanTimelineByUserMessage.get(message.id) || []} mode={activeMode} taskById={tasks} settledTaskIds={settledTaskIds} onApproval={respondApproval} onInput={respondInput} /><ConversationArtifactCards events={orphanTimelineByUserMessage.get(message.id) || []} /></article> : null}
+              <Message message={message} latestAssistant={message.id === retryableAssistantMessageId} retryableUser={message.id === retryableUserMessageId} revision={summary?.revision ?? 0} timelineEvents={timelineByAssistantMessage.get(message.id)} artifacts={artifactsByAssistantMessage.get(message.id)} artifactHistory={artifactHistory} timelineLoading={activeMode === "work" && Boolean(message.taskId) && !eventsHydrated} timelineMode={activeMode} taskById={tasks} settledTaskIds={settledTaskIds} response={responseDescriptor} onApproval={respondApproval} onInput={respondInput} onBranchCreated={openBranchedConversation} onChanged={reload} />
+              {message.role === "user" && orphanTimelineByUserMessage.has(message.id) ? <article className={`${styles.message} ${styles.assistant}`}>{isDirectRemoteAppendTimeline(orphanTimelineByUserMessage.get(message.id) || []) ? null : <div className={styles.messageHead}><span data-ui-icon="" className={styles.dot} /> EasyWork</div>}<ConversationTimeline events={orphanTimelineByUserMessage.get(message.id) || []} mode={activeMode} taskById={tasks} settledTaskIds={settledTaskIds} onApproval={respondApproval} onInput={respondInput} /><ConversationArtifactCards events={orphanTimelineByUserMessage.get(message.id) || []} /></article> : null}
             </div>;
           })}
-          {showPendingAssistant ? <article key={classifiedOutput.streamingKey || "streaming-response"} className={`${styles.message} ${styles.assistant} ${styles.streamingMessage}`}>{isDirectRemoteAppendTimeline(pendingTimelineEvents || []) ? null : <div className={styles.messageHead}><span className={styles.dot} /> EasyWork</div>}{pendingTimelineEvents?.length ? <ConversationTimeline events={pendingTimelineEvents} mode={activeMode} taskById={tasks} settledTaskIds={settledTaskIds} onApproval={respondApproval} onInput={respondInput} /> : null}{visibleStreamingFinal ? <div className={styles.assistantBody}><MarkdownContent content={visibleStreamingFinal} /></div> : null}<ConversationArtifactCards events={pendingTimelineEvents || []} /></article> : null}
+          {showPendingAssistant ? <article key={latestResponseUserId || "streaming-response"} className={`${styles.message} ${styles.assistant} ${styles.streamingMessage}`}>{isDirectRemoteAppendTimeline(pendingTimelineEvents || []) ? null : <div className={styles.messageHead}><span data-ui-icon="" className={styles.dot} /> EasyWork</div>}{pendingTimelineEvents?.length ? <ConversationTimeline events={pendingTimelineEvents} mode={activeMode} taskById={tasks} settledTaskIds={settledTaskIds} onApproval={respondApproval} onInput={respondInput} /> : null}<div className={styles.assistantBody}><ConversationAnswer content={visibleStreamingFinal || ""} events={pendingTimelineEvents || []} artifactHistory={artifactHistory} workspaceId={latestConversationTask?.route.workspaceId} /></div></article> : null}
         </div></div>
-        <div className={styles.composerWrap}><Composer conversationId={conversationId} draftKey={`conversation:${conversationId}`} disabled={activeMode === "work" && (!taskInputAvailable || !conversationWorkConnected)} activeTask={activeMode === "work" ? activeTask : undefined} pendingWebRun={activeMode === "work" && pendingWorkHandoff} canInterrupt={pendingWorkHandoff || agentOperationAvailable(selectedAgent, "interrupt")} onInterrupt={interrupt} placeholder={activeMode === "work" ? conversationWorkConnected ? taskPlaceholder : "请先连接远程服务器" : "继续对话"} onSend={send} /></div>
+        <div className={styles.composerWrap}><Composer conversationId={conversationId} referenceMode={activeMode} draftKey={`conversation:${conversationId}`} disabled={activeMode === "work" && (!taskInputAvailable || !conversationWorkConnected)} activeTask={activeMode === "work" ? activeTask : undefined} pendingWebRun={activeMode === "work" && pendingWorkHandoff} interruptFailure={activeMode === "work" ? interruptFailure : null} canInterrupt={pendingWorkHandoff || agentOperationAvailable(selectedAgent, "interrupt")} onInterrupt={interrupt} placeholder={activeMode === "work" ? conversationWorkConnected ? taskPlaceholder : "请先连接远程服务器" : "继续对话"} onSend={send} /></div>
       </>}
       {conversationId ? <ConversationWorkspacePreview ref={workspacePreviewRef} conversationId={conversationId} /> : null}
       </div>
-      {workbenchOpen && workbenchReady && serverId && routedWorkspaceId && workbenchWorkspacePath ? <Suspense fallback={null}><WorkbenchDrawer serverId={serverId} workspaceId={routedWorkspaceId} workspacePath={workbenchWorkspacePath} conversationId={conversationId} height={workbenchHeight} onHeightChange={setWorkbenchHeight} onClose={() => setWorkbenchOpen(false)} /></Suspense> : null}
+      {workbenchOpen && workbenchReady && serverId && routedWorkspaceId && workbenchWorkspacePath ? <Suspense fallback={null}><WorkbenchDrawer serverId={serverId} workspaceId={routedWorkspaceId} workspacePath={workbenchWorkspacePath} conversationId={conversationId} branchId={detail?.summary.activeBranchId} height={workbenchHeight} onHeightChange={setWorkbenchHeight} onClose={() => setWorkbenchOpen(false)} /></Suspense> : null}
       {!activeTask && agentConfigAgentId && serverId && effectiveAgentOptions.find((agent) => agent.agentId === agentConfigAgentId) && serverCapabilities?.features.agents.configure ? <AgentConfigDialog serverId={serverId} configScope={configScope} agent={effectiveAgentOptions.find((agent) => agent.agentId === agentConfigAgentId)!} onChanged={refreshAgents} onClose={() => setAgentConfigAgentId(null)} /> : null}
       {workspacePickerOpen && serverId && agentId ? <WorkspaceDialog serverId={serverId} serverName={selectedServer?.name || "远程服务器"} conversationId={conversationId} branchId={detail?.summary.activeBranchId} options={workspaceOptions} current={workspace} allowVirtual={Boolean(serverCapabilities?.features.workspaces.virtual)} busy={switchingWorkspace} onClose={() => setWorkspacePickerOpen(false)} onSelect={async (nextWorkspaceId, nextWorkspace, nextWorkspacePath) => { if (nextWorkspace) setWorkspaceOptions((current) => current.some((item) => item.id === nextWorkspace.id) ? current : [...current, nextWorkspace]); if (conversationId) await switchWorkspace(nextWorkspaceId, nextWorkspace); else { choose("workspace", nextWorkspaceId, nextWorkspacePath); setWorkspacePickerOpen(false); } }} /> : null}
-      {routeSwitchConfirmation ? <Modal title={routeSwitchConfirmation === "workspace" ? "切换工作区？" : "切换 Agent？"} size="compact" onClose={() => settleRouteSwitchConfirmation(false)}><div className={styles.modeConfirm}><p>{routeSwitchConfirmation === "workspace" ? "切换后会更换当前 Agent 会话，网页对话内容和记忆仍会完整保留。" : "切换后会更换原生 Agent 会话；网页对话记忆会保留，再次使用该 Agent 时仅补发它尚未收到的内容。"}</p><footer><Button onClick={() => settleRouteSwitchConfirmation(false)}>取消</Button><Button variant="primary" onClick={() => settleRouteSwitchConfirmation(true)}>确认切换</Button></footer></div></Modal> : null}
+      {routeSwitchConfirmation ? <Modal title={routeSwitchConfirmation === "workspace" ? "切换工作区？" : "切换 Agent？"} size="compact" onClose={() => settleRouteSwitchConfirmation(false)}><div className={styles.modeConfirm}><p>{routeSwitchConfirmation === "workspace" ? "后续请求将在所选工作区执行，当前网页对话会保留。" : "后续请求将由所选 Agent 处理，当前网页对话会保留。"}</p><footer><Button onClick={() => settleRouteSwitchConfirmation(false)}>取消</Button><Button variant="primary" onClick={() => settleRouteSwitchConfirmation(true)}>确认切换</Button></footer></div></Modal> : null}
       {connectionDialogOpen ? <ConversationConnectionDialog selectedServerId={serverId} conversationId={conversationId} conversationEnabled={conversationConnectionEnabled} conversationScoped={Boolean(conversationId && boundServerId)} onClose={() => setConnectionDialogOpen(false)} onChanged={async () => { await refreshBootstrap(); }} onConversationConnectionChanged={async (enabled, connectedId) => { setConversationConnectionEnabled(enabled); if (connectedId) { setBoundServerId(connectedId); setServerId(connectedId); } }} onConnected={async (connectedId) => { await refreshBootstrap(); if (!conversationId) choose("server", connectedId); else setServerId(connectedId); }} /> : null}
       {manualAgentOpen && serverId ? <ManualAgentDialog serverId={serverId} agents={effectiveAgentOptions} onClose={() => setManualAgentOpen(false)} onAdded={async (nextAgentId) => { await refreshAgents(); if (!conversationId) choose("agent", nextAgentId); }} /> : null}
     </section>
-    {conversationId && runtime.rightRailOpen ? <aside className={`${styles.rail} ${activeMode === "chat" ? styles.chatRail : ""}`}>
+    {conversationId ? <><button type="button" className={`${styles.railScrim} ${runtime.rightRailOpen ? styles.railOpen : ""}`} aria-label="收起功能栏" onClick={() => runtime.setRightRailOpen(false)} /><aside data-mobile-drawer-panel="right" inert={!runtime.rightRailOpen} aria-hidden={!runtime.rightRailOpen} className={`${styles.rail} ${runtime.rightRailOpen ? styles.railOpen : styles.railClosed} ${activeMode === "chat" ? styles.chatRail : ""}`}>
       {activeMode === "work" ? <>
         <section className={`${styles.railCard} ${selectedServer?.status === "connected" && conversationConnectionEnabled ? styles.railConnected : styles.railDisconnected}`}>
-          <div className={styles.railConnectionHeading}><span>远程连接</span><span className={styles.railConnectionState}><i />{selectedServer?.status === "connected" && conversationConnectionEnabled ? "已连接" : "未连接"}</span></div>
+          <div className={styles.railConnectionHeading}><span>远程连接</span><span className={styles.railConnectionState}><i data-ui-icon="" />{selectedServer?.status === "connected" && conversationConnectionEnabled ? "已连接" : "未连接"}</span></div>
           <strong className={styles.railValue}>{selectedServer?.name || "未连接"}</strong>
           <span className={styles.railSub}>{selectedServer ? selectedServer.status === "connected" && conversationConnectionEnabled ? `${selectedServer.username}@${selectedServer.host}` : selectedServer.host : ""}</span>
           <div className={styles.railActions}>
@@ -2193,7 +2457,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         </section>
         <section className={styles.railCard}>
           <div className={styles.railTitle}><span>当前工作区</span><button className={styles.railAction} disabled={!serverId || !agentId || switchingWorkspace} onClick={() => setWorkspacePickerOpen(true)}>{switchingWorkspace ? "切换中" : "更改"}</button></div>
-          <div className={`${styles.railValue} ${styles.railWorkspaceValue}`} title={workbenchWorkspacePath ?? undefined}>{workbenchWorkspacePath ?? (workspace === VIRTUAL_WORKSPACE ? "正在分配工作区…" : "未设置")}</div>
+          <div className={`${styles.railValue} ${styles.railWorkspaceValue}`} title={workbenchWorkspacePath ?? undefined}>{workbenchWorkspacePath ? <bdi dir="ltr">{workbenchWorkspacePath}</bdi> : workspace === VIRTUAL_WORKSPACE ? "正在分配工作区…" : "未设置"}</div>
         </section>
       </> : null}
       <section className={`${styles.railCard} ${styles.recordList}`}><div className={styles.railTitle}>对话记录</div><div className={styles.records}>{userRecords.map(({ message, task }) => {
@@ -2207,7 +2471,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
           {hasPlan && task && expanded ? <div className={`${styles.recordPlan} ${styles.recordPlanOpen}`}><div><TaskPlanList task={task} /></div></div> : null}
         </div>;
       })}</div></section>
-    </aside> : null}
+    </aside></> : null}
     {conversationId ? <button className={styles.railToggle} aria-label={runtime.rightRailOpen ? "收起对话记录" : "展开对话记录"} onClick={() => runtime.setRightRailOpen(!runtime.rightRailOpen)}>{runtime.rightRailOpen ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}</button> : null}
   </div>;
 }

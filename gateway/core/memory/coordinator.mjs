@@ -40,11 +40,15 @@ export function parseMemoryToolCalls(value, available = LEVELS) {
     const level = TOOL_LEVEL[String(call?.name || "")];
     const input = call?.input;
     if (!level || !allowed.has(level) || !input || typeof input !== "object" || Array.isArray(input)) return [];
-    if (!Object.keys(input).every((key) => ["subject", "content"].includes(key))) return [];
+    if (!Object.keys(input).every((key) => ["subject", "content", "kind", "evidence"].includes(key))) return [];
     const semanticKey = normalizedSemanticKey(input.subject);
     const content = String(input.content || "").trim();
     if (!semanticKey || semanticKey.length > 512 || !content || content.length > 20_000) return [];
-    return [{ level, semanticKey, content }];
+    if (input.kind !== undefined && !["user-preference", "observed-fact"].includes(input.kind)) return [];
+    if (input.evidence !== undefined && (!input.evidence || !["user", "assistant"].includes(input.evidence.role)
+      || typeof input.evidence.quote !== "string" || !input.evidence.quote.trim()
+      || Object.keys(input.evidence).some((key) => !["role", "quote"].includes(key)))) return [];
+    return [{ level, semanticKey, content, ...(input.kind ? { kind: input.kind } : {}), ...(input.evidence ? { evidence: structuredClone(input.evidence) } : {}) }];
   });
 }
 
@@ -150,12 +154,11 @@ export class MemoryCoordinator {
       });
     }
 
-    const baseline = await this.memory.select(canonicalScope, {
+    const baseline = await this.memory.snapshot(canonicalScope, {
       asOfSequence: branch.memorySequence,
       versionIds: [],
     });
-    const pinnedVersionIds = baseline.entries.map((entry) => entry.version.id);
-    const allowed = new Set(pinnedVersionIds);
+    const allowed = new Set(baseline.versionIds);
     const family = branchFamily(ledger.data.branches, scope.conversationId, scope.branchId);
     for (const completed of Object.values(ledger.data.completed)) {
       const origin = completed?.origin;
@@ -167,7 +170,7 @@ export class MemoryCoordinator {
       if (family.has(originBranchKey) && originBranchKey !== currentBranchKey) continue;
       for (const versionId of completed.result?.storedVersionIds || []) allowed.add(String(versionId));
     }
-    const selected = await this.memory.select({
+    const selected = await this.memory.snapshot({
       ...canonicalScope,
       memoryBaselineSequence: branch.memorySequence,
       memorySnapshotSequence: live.sequence,
@@ -180,7 +183,7 @@ export class MemoryCoordinator {
       ...scope,
       memoryBaselineSequence: branch.memorySequence,
       memorySnapshotSequence: live.sequence,
-      memorySnapshotVersionIds: Object.freeze(selected.entries.map((entry) => entry.version.id)),
+      memorySnapshotVersionIds: Object.freeze([...selected.versionIds]),
     });
   }
 
@@ -398,7 +401,7 @@ export class MemoryCoordinator {
     });
     const knowledgeEvidence = normalizedObservedKnowledge(observedKnowledge);
     const candidates = parseMemoryToolCalls(output, levels)
-      .filter((candidate) => durableMemoryCandidate(candidate, { userMessage, observedKnowledge: knowledgeEvidence, mode }));
+      .filter((candidate) => durableMemoryCandidate(candidate, { userMessage, assistantMessage, observedKnowledge: knowledgeEvidence, mode }));
     const stored = [];
     for (const candidate of candidates) {
       if (!levels.includes(candidate.level)) continue;
@@ -416,7 +419,7 @@ export class MemoryCoordinator {
             semanticKey: candidate.semanticKey,
             content: candidate.content,
             authority,
-            confidence: authority === "agent-observed" ? 1 : 0.9,
+            confidence: 0.9,
             sensitivity: "private",
             portability: PORTABILITY[candidate.level],
             source: {
@@ -438,6 +441,11 @@ export class MemoryCoordinator {
     await this.#update((data) => {
       data.completed[dedupeKey] = {
         result: { extracted: result.extracted, storedVersionIds: stored.map((entry) => entry.version.id) },
+        evidence: candidates.map((candidate) => ({
+          semanticKey: candidate.semanticKey,
+          kind: candidate.kind || "legacy-extraction",
+          ...(candidate.evidence ? { ...candidate.evidence, messageId: candidate.evidence.role === "user" ? parentMessageId : source?.id } : {}),
+        })),
         memorySequence: snapshot.sequence,
         origin: {
           conversationId: String(scope.conversationId),

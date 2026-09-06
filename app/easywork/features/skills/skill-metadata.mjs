@@ -1,20 +1,7 @@
-const FRONTMATTER = /^\uFEFF?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
-const FIELD_LIMITS = Object.freeze({ name: 256, description: 8192 });
+import { parse } from "yaml";
+import { extractSkillFrontmatter } from "../../../../shared/skill-frontmatter.mjs";
 
-function parseQuotedScalar(value) {
-  if (value.startsWith('"')) {
-    if (!value.endsWith('"')) return null;
-    try {
-      const parsed = JSON.parse(value);
-      return typeof parsed === "string" ? parsed : null;
-    } catch {
-      return null;
-    }
-  }
-  if (value.startsWith("'")) return value.endsWith("'") ? value.slice(1, -1).replace(/''/g, "'") : null;
-  if (/^[\[\]{}&*!%@`]/.test(value) || /:\s/.test(value)) return null;
-  return value.replace(/[ \t]+#.*$/, "").trim();
-}
+const FIELD_LIMITS = Object.freeze({ name: 256, description: 8192 });
 
 function normalizedField(field, value) {
   if (typeof value !== "string") return null;
@@ -23,36 +10,30 @@ function normalizedField(field, value) {
 }
 
 export function parseSkillFrontmatter(content) {
-  if (typeof content !== "string") return {};
-  const match = FRONTMATTER.exec(content);
-  if (!match) return {};
-  const lines = match[1].split(/\r?\n/);
-  const result = {};
-  for (let index = 0; index < lines.length; index += 1) {
-    const fieldMatch = /^(name|description)[ \t]*:[ \t]*(.*)$/.exec(lines[index]);
-    if (!fieldMatch) continue;
-    const field = fieldMatch[1];
-    let raw = fieldMatch[2].trim();
-    if (/^[>|][+-]?$/.test(raw)) {
-      const folded = raw.startsWith(">");
-      const chunks = [];
-      while (index + 1 < lines.length && /^(?:[ \t]+|$)/.test(lines[index + 1])) {
-        index += 1;
-        chunks.push(lines[index].replace(/^[ \t]+/, ""));
-      }
-      raw = folded ? chunks.join(" ") : chunks.join("\n");
-    }
-    const value = normalizedField(field, parseQuotedScalar(raw));
-    if (value) result[field] = value;
-  }
-  return result;
+  const frontmatter = extractSkillFrontmatter(content);
+  if (!frontmatter) return {};
+  try {
+    const metadata = parse(frontmatter.yaml, { uniqueKeys: true, maxAliasCount: 0 });
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return {};
+    return Object.fromEntries(Object.keys(FIELD_LIMITS)
+      .map((field) => [field, normalizedField(field, metadata[field])])
+      .filter(([, value]) => value));
+  } catch { return {}; }
 }
 
 export function readSkillMetadata(files) {
   if (!Array.isArray(files)) return {};
   const skillFile = files.find((file) => /^SKILL\.md$/i.test(file?.path))
     || files.find((file) => /(?:^|\/)SKILL\.md$/i.test(file?.path));
-  return skillFile ? parseSkillFrontmatter(skillFile.content) : {};
+  if (skillFile) return parseSkillFrontmatter(skillFile.content);
+  const candidates = files
+    .filter((file) => /\.(?:md|mdx)$/i.test(file?.path))
+    .map((file) => ({ path: file.path, metadata: parseSkillFrontmatter(file.content) }))
+    .filter(({ metadata }) => metadata.name || metadata.description);
+  const rootCandidates = candidates.filter((file) => !file.path.includes("/"));
+  const matches = rootCandidates.length ? rootCandidates : candidates;
+  // Several distinct skill documents are ambiguous; never mix their fields.
+  return matches.length === 1 ? matches[0].metadata : {};
 }
 export function splitServerRules(value) {
   return [...new Set(String(value).split(/[,，;；\r\n]/).map((entry) => entry.trim()).filter(Boolean))];

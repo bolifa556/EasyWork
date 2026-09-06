@@ -103,6 +103,7 @@ function validatePlatformData(value) {
       expose: false,
     });
     normalizeProtocol(provider.protocol, purpose);
+    if (purpose === "embedding") normalizeEmbeddingSettings(provider.embedding);
   }
   if (value.providers.ocr) {
     const provider = value.providers.ocr;
@@ -140,9 +141,29 @@ function providerPublic(record, vault, revision) {
   };
   if (record.audience) result.audience = record.audience;
   if (record.purpose === "embedding") {
-    result.embedding = clone(record.embedding);
-    result.embeddingProfileId = record.baseUrl && record.embedding?.model
-      ? `emb_${stableFingerprint({ baseUrl: record.baseUrl, protocol: record.protocol, ...record.embedding }).slice(0, 24)}`
+    const embedding = normalizeEmbeddingSettings(record.embedding);
+    result.embedding = clone(embedding);
+    result.embeddingProfileId = record.baseUrl && embedding.model
+      ? `emb_${stableFingerprint({
+          baseUrl: record.baseUrl,
+          protocol: record.protocol,
+          model: embedding.model,
+          dimensions: embedding.dimensions,
+          chunkStrategy: embedding.chunkStrategy,
+          chunkSize: embedding.chunkSize,
+          chunkOverlap: embedding.chunkOverlap,
+        }).slice(0, 24)}`
+      : null;
+    result.memoryEmbeddingProfileId = record.baseUrl && embedding.model
+      ? `mem_emb_${stableFingerprint({
+          baseUrl: record.baseUrl,
+          protocol: record.protocol,
+          model: embedding.model,
+          dimensions: embedding.dimensions,
+        }).slice(0, 24)}`
+      : null;
+    result.memoryRetrievalProfileId = result.memoryEmbeddingProfileId
+      ? `mem_ret_${stableFingerprint({ embeddingProfileId: result.memoryEmbeddingProfileId, settings: embedding.memory }).slice(0, 24)}`
       : null;
   }
   if (record.purpose === "ocr") result.ocr = clone(record.ocr);
@@ -250,7 +271,7 @@ export class PlatformConfigurationService {
     invariant(!(Object.hasOwn(input, "apiKey") && input.clearApiKey), "PROVIDER_KEY_UPDATE_INVALID", "不能同时设置和清除 API Key", { status: 400 });
     const patch = input.patch || {};
     const allowedPatch = purpose === "embedding"
-      ? ["name", "baseUrl", "protocol", "model", "dimensions", "chunkStrategy", "chunkSize", "chunkOverlap", "batchSize", "hybridEnabled"]
+      ? ["name", "baseUrl", "protocol", "model", "dimensions", "chunkStrategy", "chunkSize", "chunkOverlap", "batchSize", "hybridEnabled", "memory"]
       : purpose === "ocr"
         ? ["name", "baseUrl", "protocol", "model", "maxOutputTokens"]
         : ["name", "baseUrl", "protocol"];
@@ -644,13 +665,37 @@ export class ProviderService {
     };
   }
 
+  async detectUserModelsFromDraft(actor, input) {
+    requireAuthenticatedActor(actor);
+    exactKeys(input, ["providerId", "baseUrl", "apiKey", "signal"], "检测未保存用户 Provider");
+    const providerId = input.providerId ? assertProviderId(input.providerId) : null;
+    const repository = this.#repository(actor);
+    const envelope = await repository.read();
+    const current = providerId ? envelope.data.providers.find((entry) => entry.id === providerId) : null;
+    invariant(!providerId || current, "PROVIDER_NOT_FOUND", "用户 Provider 不存在", { status: 404 });
+    const storedKey = current?.sealedKey ? this.#vault(actor).open(current.sealedKey, current.id) : "";
+    const apiKey = Object.hasOwn(input, "apiKey") ? normalizeApiKey(input.apiKey) : storedKey;
+    invariant(apiKey, "PROVIDER_API_KEY_REQUIRED", "请填写 API Key 后再检查", { status: 400 });
+    const detected = await this.#detect({
+      baseUrl: normalizeBaseUrl(input.baseUrl),
+      apiKey,
+      purpose: "web",
+      signal: input.signal,
+    });
+    const models = normalizedDetectedModels(detected, "web");
+    invariant(models.length > 0, "PROVIDER_NO_CHAT_MODELS", "API 可连接，但没有发现可用于对话的模型", { status: 409 });
+    return { provider: null, detectedAt: nowIso(this.clock), models };
+  }
+
   async detectModelsFromDraft(actor, input) {
     exactKeys(input, ["purpose", "baseUrl", "apiKey", "signal"], "检测未保存 Provider 模型");
     const purpose = assertProviderPurpose(input.purpose);
     requireRole(actor, "admin");
+    const current = Object.hasOwn(input, "apiKey") ? null : await this.platform.resolveProvider(purpose);
+    const apiKey = Object.hasOwn(input, "apiKey") ? normalizeApiKey(input.apiKey) : current.credential.apiKey;
     const detected = await this.#detect({
       baseUrl: normalizeBaseUrl(input.baseUrl),
-      apiKey: normalizeApiKey(input.apiKey),
+      apiKey,
       purpose,
       signal: input.signal,
     });
@@ -675,10 +720,10 @@ function modelPurposes(model) {
   const type = String(model.type || model.objectType || "").toLowerCase();
   const embedding = model.capabilities?.embeddings === true || /(^|[-_.])(embed|embedding|bge|e5|gte|nomic|jina)([-_.]|$)/i.test(id) || type.includes("embedding");
   if (embedding) return ["embedding"];
-  const nonText = /(image|audio|whisper|tts|moderation|realtime|transcri)/i.test(`${id} ${type}`);
+  const nonText = /(image|audio|speech|whisper|tts|asr|ocr|mineru|video|moderation|realtime|transcri|rerank|ranker|cross[-_. ]?encoder|reward[-_. ]?model)/i.test(`${id} ${type}`);
   if (nonText) return [];
   const purposes = ["web", "agent"];
-  const vision = model.capabilities?.vision === true || model.supports_vision === true || /(^|[-_.])(vision|ocr|vl|gpt-4o|gemini|claude)([-_.]|$)/i.test(id);
+  const vision = model.capabilities?.vision === true || model.supports_vision === true || /(^|[-_.])(vision|vl|gpt-4o|gemini|claude)([-_.]|$)/i.test(id);
   if (vision) purposes.push("ocr");
   return purposes;
 }

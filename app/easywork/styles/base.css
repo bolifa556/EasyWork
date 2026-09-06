@@ -89,6 +89,21 @@ a { color: inherit; }
   pointer-events: none;
 }
 
+/* UI icons and graphics must not acquire a text caret, including in caret browsing. */
+:where([role="status"],[data-loading-spinner],[data-ui-icon],[data-context-ring],svg.lucide) {
+  -webkit-user-select: none;
+  user-select: none;
+  caret-color: transparent;
+}
+
+:where([data-loading-spinner],.lucide-loader-circle,.lucide-refresh-cw) {
+  pointer-events: none;
+}
+
+:where([role="status"]) {
+  cursor: default;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -111,6 +126,7 @@ a { color: inherit; }
     --ew-mobile-touch-compact: 40px;
   }
 
+  html,
   body { overscroll-behavior: none; }
 
   button,
@@ -127,13 +143,14 @@ a { color: inherit; }
   }
 
   * {
-    scrollbar-color: rgba(99, 108, 98, 0.32) transparent;
-    scrollbar-width: thin;
+    scrollbar-width: none !important;
+    scrollbar-gutter: auto !important;
   }
 
   *::-webkit-scrollbar {
-    width: 5px;
-    height: 5px;
+    display: none !important;
+    width: 0 !important;
+    height: 0 !important;
   }
 
   *::-webkit-scrollbar-button {
@@ -149,4 +166,12 @@ a { color: inherit; }
 
   *::-webkit-scrollbar-track,
   *::-webkit-scrollbar-corner { background: transparent; }
+
+  input,textarea,[contenteditable="true"] {
+    -webkit-user-select:text !important;
+    user-select:text !important;
+    -webkit-touch-callout:default;
+    touch-action:auto;
+    caret-color:var(--ew-ink);
+  }
 }

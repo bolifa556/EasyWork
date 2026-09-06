@@ -7,6 +7,7 @@ import {
   CONVERSATION_SCHEMA_VERSION,
   assertBranchId,
   assertCommandId,
+  assertConversationReferenceRequests,
   assertConversationId,
   assertConversationMode,
   assertExpectedConversationRevision,
@@ -76,8 +77,10 @@ function createMessage(input) {
     role: input.role,
     content: input.content,
     taskId: input.taskId,
+    ...(input.originMessageId ? { originMessageId: input.originMessageId } : {}),
     replyToMessageId: input.replyToMessageId,
     createdAt: input.createdAt,
+    ...(Array.isArray(input.references) && input.references.length ? { references: clone(input.references) } : {}),
   };
 }
 
@@ -119,6 +122,57 @@ function queryDigest(value) {
   return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function normalizedSearchText(value) {
+  return String(value || "").normalize("NFKC").toLocaleLowerCase("zh-CN").replace(/\s+/g, " ").trim();
+}
+
+function searchTerms(value) {
+  const text = normalizedSearchText(value);
+  const words = text.match(/[\p{L}\p{N}_-]+/gu) || [];
+  const han = [...text.replace(/[^\p{Script=Han}]/gu, "")];
+  return [...new Set([...words, ...han.slice(0, -1).map((character, index) => character + han[index + 1])])];
+}
+
+function referenceSearchScore(query, title, preview = "") {
+  const normalizedQuery = normalizedSearchText(query);
+  if (!normalizedQuery) return 1;
+  const normalizedTitle = normalizedSearchText(title);
+  const normalizedBody = normalizedSearchText(preview);
+  let score = normalizedTitle === normalizedQuery ? 100 : normalizedTitle.startsWith(normalizedQuery) ? 60 : normalizedTitle.includes(normalizedQuery) ? 40 : 0;
+  for (const term of searchTerms(normalizedQuery)) {
+    if (normalizedTitle.includes(term)) score += term.length > 1 ? 5 : 1;
+    else if (normalizedBody.includes(term)) score += term.length > 1 ? 2 : 0.25;
+  }
+  return score;
+}
+
+function conversationSearchExcerpt(content, query) {
+  const normalizedQuery = normalizedSearchText(query);
+  if (!normalizedQuery) return null;
+  const compact = String(content || "").replace(/\s+/gu, " ").trim();
+  if (!compact) return null;
+  let display = compact;
+  let lowered = display.toLocaleLowerCase("zh-CN");
+  let start = lowered.indexOf(normalizedQuery);
+  if (start < 0) {
+    // NFKC makes full-width Latin text and compatibility characters searchable.
+    // Use that normalized rendering only for the rare case where its indices
+    // cannot be projected safely onto the original string.
+    display = compact.normalize("NFKC");
+    lowered = display.toLocaleLowerCase("zh-CN");
+    start = lowered.indexOf(normalizedQuery);
+  }
+  if (start < 0) return null;
+  const matched = display.slice(start, start + normalizedQuery.length);
+  const beforeStart = Math.max(0, start - 52);
+  const afterEnd = Math.min(display.length, start + matched.length + 72);
+  return {
+    before: `${beforeStart > 0 ? "…" : ""}${display.slice(beforeStart, start)}`,
+    match: matched,
+    after: `${display.slice(start + matched.length, afterEnd)}${afterEnd < display.length ? "…" : ""}`,
+  };
+}
+
 export class ConversationService {
   constructor(options) {
     invariant(options?.actor?.actorType && options?.actor?.actorId, "ACTOR_CONTEXT_REQUIRED", "ConversationService 需要 ActorContext", { status: 500, expose: false });
@@ -145,6 +199,28 @@ export class ConversationService {
 
   #id(prefix) {
     return createIdentifier(prefix, () => this.idFactory(prefix));
+  }
+
+  async #assertReferenceAllowed(current, target) {
+    invariant(target && !target.deletedAt, "CONVERSATION_REFERENCE_NOT_FOUND", "引用的对话不存在", { status: 404 });
+    invariant(current.id !== target.id, "CONVERSATION_REFERENCE_SELF", "不能引用当前对话", { status: 400 });
+  }
+
+  async #bindReferences({ summaries, current, requests, messageId }) {
+    const references = [];
+    for (const request of requests) {
+      const target = findSummary(summaries, request.conversationId);
+      await this.#assertReferenceAllowed(current, target);
+      references.push(Object.freeze({
+        type: "conversation",
+        referenceId: `cref_${crypto.createHash("sha256").update(`${messageId}\0${target.id}\0${target.snapshotId}`).digest("hex").slice(0, 32)}`,
+        conversationId: target.id,
+        snapshotId: target.snapshotId,
+        branchId: target.activeBranchId,
+        title: target.title,
+      }));
+    }
+    return references;
   }
 
   async #readIndex() {
@@ -238,6 +314,7 @@ export class ConversationService {
       updatedAt: meta.updatedAt,
       lastMessageAt: meta.lastMessageAt,
       deletedAt: meta.deletedAt,
+      ...(meta.origin ? { origin: clone(meta.origin) } : {}),
     };
   }
 
@@ -283,10 +360,177 @@ export class ConversationService {
     };
   }
 
+  async searchConversations(options = {}) {
+    assertInputKeys(options, ["query", "cursor", "limit", "messageLimit", "projectId", "unassigned"], "SearchConversationsInput");
+    const query = normalizedSearchText(options.query).slice(0, 240);
+    invariant(query, "CONVERSATION_SEARCH_QUERY_REQUIRED", "请输入要搜索的内容", { status: 400 });
+    const limit = assertLimit(options.limit, 20);
+    const messageLimit = Math.min(20, assertLimit(options.messageLimit, 8));
+    const projectId = options.projectId === undefined ? undefined : assertOptionalProjectId(options.projectId);
+    const unassigned = options.unassigned === true;
+    invariant(!(unassigned && projectId), "CONVERSATION_SEARCH_SCOPE_INVALID", "搜索范围无效", { status: 400 });
+    if (projectId && this.authorizeProject) invariant(await this.authorizeProject(projectId), "CONVERSATION_PROJECT_FORBIDDEN", "项目不存在或不可访问", { status: 404 });
+    const root = await this.storage.readIndexRoot();
+    let generationId = root.data.generationId;
+    let offset = 0;
+    const digest = queryDigest({ query, projectId, unassigned, messageLimit });
+    if (options.cursor) {
+      const cursor = this.cursorCodec.decode(options.cursor);
+      invariant(cursor.actorType === this.actor.actorType && cursor.actorId === this.actor.actorId && cursor.kind === "conversation-search" && cursor.filterDigest === digest, "CURSOR_INVALID", "游标不属于当前搜索", { status: 400 });
+      generationId = cursor.generationId;
+      offset = cursor.offset;
+    }
+    const summaries = (await this.storage.readIndexGeneration(generationId)).filter((summary) => (
+      !summary.deletedAt
+      && (projectId === undefined || summary.projectId === projectId)
+      && (!unassigned || summary.projectId === null)
+    ));
+    const matched = [];
+    for (let batchStart = 0; batchStart < summaries.length; batchStart += 20) {
+      const batch = await Promise.all(summaries.slice(batchStart, batchStart + 20).map(async (summary) => {
+        const titleMatched = normalizedSearchText(summary.title).includes(query);
+        const chain = await this.storage.readBranchChain(summary.id, summary.snapshotId, summary.activeBranchId);
+        const messages = await Promise.all(chain.map((messageId) => this.storage.readMessage(summary.id, messageId)));
+        const matches = messages.flatMap((message) => {
+          if (!["user", "assistant"].includes(message.role)) return [];
+          const excerpt = conversationSearchExcerpt(message.content, query);
+          return excerpt ? [{ messageId: message.id, role: message.role, createdAt: message.createdAt, excerpt }] : [];
+        }).slice(0, messageLimit);
+        if (!titleMatched && !matches.length) return null;
+        return {
+          conversationId: summary.id,
+          title: summary.title,
+          projectId: summary.projectId,
+          mode: summary.mode,
+          updatedAt: summary.updatedAt,
+          titleMatched,
+          matches,
+        };
+      }));
+      matched.push(...batch.filter(Boolean));
+    }
+    const items = matched.slice(offset, offset + limit);
+    const nextOffset = offset + items.length;
+    return {
+      items,
+      nextCursor: nextOffset < matched.length ? this.cursorCodec.encode({
+        actorType: this.actor.actorType,
+        actorId: this.actor.actorId,
+        kind: "conversation-search",
+        filterDigest: digest,
+        generationId,
+        offset: nextOffset,
+      }) : null,
+    };
+  }
+
+  async searchReferenceCandidates(options = {}) {
+    assertInputKeys(options, ["conversationId", "projectId", "mode", "query", "cursor", "limit"], "SearchConversationReferencesInput");
+    const conversationId = options.conversationId ? assertConversationId(options.conversationId) : null;
+    const query = normalizedSearchText(options.query).slice(0, 240);
+    const limit = assertLimit(options.limit, 20);
+    const root = await this.storage.readIndexRoot();
+    let generationId = root.data.generationId;
+    let offset = 0;
+    const summaries = await this.storage.readIndexGeneration(generationId);
+    if (conversationId) assertVisibleSummary(findSummary(summaries, conversationId));
+    const digest = queryDigest({ conversationId, query });
+    if (options.cursor) {
+      const cursor = this.cursorCodec.decode(options.cursor);
+      invariant(cursor.actorType === this.actor.actorType && cursor.actorId === this.actor.actorId && cursor.kind === "conversation-reference-search" && cursor.filterDigest === digest, "CURSOR_INVALID", "游标不属于当前对话引用搜索", { status: 400 });
+      generationId = cursor.generationId;
+      offset = cursor.offset;
+    }
+    const generation = generationId === root.data.generationId ? summaries : await this.storage.readIndexGeneration(generationId);
+    const matched = [];
+    for (const summary of generation) {
+      if (summary.deletedAt || summary.id === conversationId) continue;
+      if (query && !normalizedSearchText(summary.title).includes(query)) continue;
+      matched.push(summary);
+    }
+    const items = matched.slice(offset, offset + limit).map((summary) => ({
+      conversationId: summary.id,
+      title: summary.title,
+      mode: summary.mode,
+      projectId: summary.projectId,
+      updatedAt: summary.updatedAt,
+    }));
+    const nextOffset = offset + items.length;
+    return {
+      items,
+      nextCursor: nextOffset < matched.length ? this.cursorCodec.encode({
+        actorType: this.actor.actorType,
+        actorId: this.actor.actorId,
+        kind: "conversation-reference-search",
+        filterDigest: digest,
+        generationId,
+        offset: nextOffset,
+      }) : null,
+    };
+  }
+
+  async readConversationReference(options = {}) {
+    assertInputKeys(options, ["conversationId", "messageId", "referenceId", "query", "roles", "cursor", "limit"], "ReadConversationReferenceInput");
+    const conversationId = assertConversationId(options.conversationId);
+    const messageId = assertMessageId(options.messageId);
+    const referenceId = String(options.referenceId || "");
+    invariant(/^cref_[a-f0-9]{32}$/.test(referenceId), "CONVERSATION_REFERENCE_ID_INVALID", "对话引用 ID 无效", { status: 400 });
+    const query = normalizedSearchText(options.query).slice(0, 1000);
+    const roles = [...new Set((Array.isArray(options.roles) ? options.roles : []).map(String))].filter((role) => ["user", "assistant", "system", "tool"].includes(role));
+    const limit = assertLimit(options.limit, 20);
+    const { summaries } = await this.#readIndex();
+    const current = assertVisibleSummary(findSummary(summaries, conversationId));
+    const sourceMessage = await this.storage.readMessage(conversationId, messageId);
+    const reference = (sourceMessage.references || []).find((entry) => entry.referenceId === referenceId);
+    invariant(reference, "CONVERSATION_REFERENCE_NOT_BOUND", "该引用不属于当前消息", { status: 404 });
+    const target = findSummary(summaries, reference.conversationId);
+    await this.#assertReferenceAllowed(current, target);
+    const filterDigest = queryDigest({ conversationId, messageId, referenceId, query, roles });
+    let offset = 0;
+    if (options.cursor) {
+      const cursor = this.cursorCodec.decode(options.cursor);
+      invariant(cursor.actorType === this.actor.actorType && cursor.actorId === this.actor.actorId && cursor.kind === "conversation-reference-read" && cursor.filterDigest === filterDigest, "CURSOR_INVALID", "游标不属于当前对话引用", { status: 400 });
+      offset = cursor.offset;
+    }
+    const chain = await this.storage.readBranchChain(reference.conversationId, reference.snapshotId, reference.branchId);
+    const messages = (await Promise.all(chain.map((id) => this.storage.readMessage(reference.conversationId, id))))
+      .filter((message) => !roles.length || roles.includes(message.role));
+    const selected = query
+      ? messages.map((message) => ({ message, score: referenceSearchScore(query, "", message.content) }))
+        .filter((entry) => entry.score > 0)
+        .sort((left, right) => right.score - left.score || left.message.createdAt.localeCompare(right.message.createdAt))
+        .map((entry) => entry.message)
+      : messages;
+    const page = selected.slice(offset, offset + limit);
+    const items = page.map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      createdAt: message.createdAt,
+      referenceId,
+      referenceTitle: reference.title,
+      sourceConversationId: reference.conversationId,
+      sourceSnapshotId: reference.snapshotId,
+    }));
+    const nextOffset = offset + items.length;
+    return {
+      reference: clone(reference),
+      items,
+      nextCursor: nextOffset < selected.length ? this.cursorCodec.encode({
+        actorType: this.actor.actorType,
+        actorId: this.actor.actorId,
+        kind: "conversation-reference-read",
+        filterDigest,
+        offset: nextOffset,
+      }) : null,
+    };
+  }
+
   async bootstrapOverview(options = {}) {
-    assertInputKeys(options, ["limit", "projectId"], "ConversationBootstrapOverviewInput");
+    assertInputKeys(options, ["limit", "projectId", "activeConversationId"], "ConversationBootstrapOverviewInput");
     const limit = assertLimit(options.limit, 30);
     const projectId = options.projectId === undefined ? undefined : assertOptionalProjectId(options.projectId);
+    const activeConversationId = options.activeConversationId === undefined ? undefined : assertConversationId(options.activeConversationId);
     const root = await this.storage.readIndexRoot();
     const summaries = (await this.storage.readIndexGeneration(root.data.generationId))
       .filter((summary) => !summary.deletedAt);
@@ -300,7 +544,32 @@ export class ConversationService {
       projectConversationCounts[summary.projectId] = (projectConversationCounts[summary.projectId] || 0) + 1;
     }
     const filterDigest = queryDigest({ projectId, mode: undefined, pinned: undefined });
+    // Read navigation from the same account-scoped index generation. No message
+    // bodies or remote server probes belong on the bootstrap critical path.
+    let conversationNavigation;
+    if (activeConversationId) {
+      const conversation = summaries.find((item) => item.id === activeConversationId) || null;
+      const projectItems = conversation?.projectId ? summaries.filter((item) => item.projectId === conversation.projectId) : [];
+      const page = projectItems.slice(0, 4);
+      conversationNavigation = {
+        conversationId: activeConversationId,
+        conversation: conversation ? clone(conversation) : null,
+        projectConversations: conversation?.projectId ? {
+          projectId: conversation.projectId,
+          items: page.map(clone),
+          nextCursor: page.length < projectItems.length ? this.cursorCodec.encode({
+            actorType: this.actor.actorType,
+            actorId: this.actor.actorId,
+            kind: "conversation-list",
+            filterDigest: queryDigest({ projectId: conversation.projectId, mode: undefined, pinned: undefined }),
+            generationId: root.data.generationId,
+            offset: page.length,
+          }) : null,
+        } : null,
+      };
+    }
     return {
+      ...(conversationNavigation ? { conversationNavigation } : {}),
       items,
       nextCursor: items.length < filtered.length ? this.cursorCodec.encode({
         actorType: this.actor.actorType,
@@ -358,7 +627,8 @@ export class ConversationService {
     }
     const chain = await this.storage.readBranchChain(conversationId, snapshotId, branchId);
     const ids = chain.slice(offset, offset + limit);
-    const items = await Promise.all(ids.map((messageId) => this.storage.readMessage(conversationId, messageId)));
+    const storedItems = await Promise.all(ids.map((messageId) => this.storage.readMessage(conversationId, messageId)));
+    const items = await this.#projectLegacyOrigins(summaries, summary, storedItems);
     const nextOffset = offset + items.length;
     return {
       items,
@@ -376,8 +646,33 @@ export class ConversationService {
     };
   }
 
+  async #projectLegacyOrigins(summaries, summary, items, visited = new Set()) {
+    // Old forks predate originMessageId. Recover only unambiguous immutable
+    // messages from the recorded ancestor, preserving exact event ownership
+    // (including multiple user messages that append to one remote Task).
+    const sourceId = summary.origin?.conversationId;
+    const inherited = (item) => !item.originMessageId && item.createdAt <= summary.createdAt;
+    if (!sourceId || !items.some(inherited) || visited.has(sourceId) || visited.size >= 32) return items;
+    const source = summaries.find((entry) => entry.id === sourceId);
+    if (!source) return items;
+    const { chains } = await this.#loadConversation(summaries, sourceId, { includeDeleted: true });
+    const ids = [...new Set([...chains.values()].flat())];
+    const stored = await Promise.all(ids.map((id) => this.storage.readMessage(sourceId, id)));
+    const originals = await this.#projectLegacyOrigins(summaries, source, stored, new Set([...visited, sourceId]));
+    const key = (item) => JSON.stringify([item.role, item.content, item.createdAt, item.taskId || null]);
+    const matches = new Map();
+    for (const original of originals) {
+      const identity = key(original);
+      matches.set(identity, matches.has(identity) ? null : original);
+    }
+    return items.map((item) => {
+      const original = matches.get(key(item));
+      return inherited(item) && original ? { ...item, originMessageId: original.originMessageId || original.id } : item;
+    });
+  }
+
   async sendMessage(input) {
-    assertInputKeys(input, ["conversationId", "branchId", "role", "content", "taskId", "mode", "projectId", "title", "expectedRevision", "commandId"], "SendMessageInput");
+    assertInputKeys(input, ["conversationId", "branchId", "role", "content", "taskId", "mode", "projectId", "title", "references", "expectedRevision", "commandId"], "SendMessageInput");
     const isNew = !input?.conversationId;
     const expectedRevision = assertExpectedConversationRevision(input?.expectedRevision);
     const role = assertMessageRole(input?.role ?? "user");
@@ -389,7 +684,9 @@ export class ConversationService {
     invariant(!isNew || requestedMode, "CONVERSATION_MODE_REQUIRED", "新对话必须指定模式", { status: 400 });
     const projectId = isNew ? assertOptionalProjectId(input?.projectId) : undefined;
     const title = isNew && input?.title !== undefined ? assertTitle(input.title) : undefined;
-    const digestInput = { conversationId: input?.conversationId || null, branchId: input?.branchId || null, expectedRevision, role, content, taskId, mode: requestedMode || null, projectId, title: title || null };
+    const referenceRequests = assertConversationReferenceRequests(input?.references);
+    invariant(role === "user" || referenceRequests.length === 0, "CONVERSATION_REFERENCES_USER_ONLY", "只有用户消息可以引用其他对话", { status: 400 });
+    const digestInput = { conversationId: input?.conversationId || null, branchId: input?.branchId || null, expectedRevision, role, content, taskId, mode: requestedMode || null, projectId, title: title || null, references: referenceRequests };
 
     return this.#runMutation("conversation.send_message", input?.commandId, digestInput, async ({ summaries, timestamp }) => {
       if (isNew) {
@@ -398,7 +695,8 @@ export class ConversationService {
         const branchId = this.#id("branch");
         const messageId = this.#id("msg");
         const snapshotId = this.#id("csnap");
-        const message = createMessage({ id: messageId, conversationId, branchId, role, content, taskId, replyToMessageId: null, createdAt: timestamp });
+        const references = await this.#bindReferences({ summaries, current: { id: conversationId, projectId, mode: requestedMode }, requests: referenceRequests, messageId });
+        const message = createMessage({ id: messageId, conversationId, branchId, role, content, taskId, replyToMessageId: null, references, createdAt: timestamp });
         const chains = new Map([[branchId, [messageId]]]);
         const meta = {
           schemaVersion: CONVERSATION_SCHEMA_VERSION,
@@ -432,7 +730,8 @@ export class ConversationService {
       const messageId = this.#id("msg");
       const snapshotId = this.#id("csnap");
       const replyToMessageId = chain.at(-1) || null;
-      const message = createMessage({ id: messageId, conversationId, branchId, role, content, taskId, replyToMessageId, createdAt: timestamp });
+      const references = await this.#bindReferences({ summaries, current: loaded.summary, requests: referenceRequests, messageId });
+      const message = createMessage({ id: messageId, conversationId, branchId, role, content, taskId, replyToMessageId, references, createdAt: timestamp });
       chain.push(messageId);
       const meta = nextSnapshotMeta(loaded.meta, loaded.summary.snapshotId, timestamp);
       meta.activeBranchId = branchId;
@@ -541,8 +840,10 @@ export class ConversationService {
       const forkIndex = sourceChain.indexOf(atMessageId);
       invariant(forkIndex >= 0, "BRANCH_FORK_MESSAGE_NOT_FOUND", "分支起点不在来源消息链中", { status: 404 });
 
-      const sourceMessages = await Promise.all(sourceChain.slice(0, forkIndex + 1)
+      const storedSourceMessages = await Promise.all(sourceChain.slice(0, forkIndex + 1)
         .map((messageId) => this.storage.readMessage(sourceConversationId, messageId)));
+      const sourceMessages = await this.#projectLegacyOrigins(summaries, loaded.summary, storedSourceMessages);
+      const recentQuestion = [...sourceMessages].reverse().find((message) => message.role === "user") || null;
       const conversationId = this.#id("conv");
       const branchId = this.#id("branch");
       const snapshotId = this.#id("csnap");
@@ -559,7 +860,9 @@ export class ConversationService {
         // the child render the complete pre-fork reasoning and Agent activity
         // without copying or mutating the source run.
         taskId: message.taskId,
+        originMessageId: message.originMessageId || message.id,
         replyToMessageId: message.replyToMessageId ? idMap.get(message.replyToMessageId) || null : null,
+        references: message.references || [],
         createdAt: message.createdAt,
       }));
       const chain = newMessages.map((message) => message.id);
@@ -582,6 +885,12 @@ export class ConversationService {
         updatedAt: timestamp,
         lastMessageAt: timestamp,
         deletedAt: null,
+        origin: {
+          conversationId: sourceConversationId,
+          title: loaded.meta.title,
+          messageId: recentQuestion?.id || atMessageId,
+          questionPreview: Array.from(String(recentQuestion?.content || "").replace(/\s+/gu, " ").trim()).slice(0, 72).join(""),
+        },
       };
       const summary = await this.#summaryFrom(meta, snapshotId, chains, newMessages);
       return {

@@ -3,6 +3,58 @@ import crypto from "node:crypto";
 import test from "node:test";
 
 import { VersioningService } from "../gateway/core/versioning/index.mjs";
+import { withVersionScope } from "../gateway/core/versioning/publication-gate.mjs";
+import { RemoteAgentConversationGarbageCollector } from "../gateway/core/runtime/agent-conversation-gc.mjs";
+import { createActorContext } from "../gateway/core/actor.mjs";
+
+test("actual GC and checkpoint publication cannot interleave, and pending native hooks defer sweeping", async () => {
+  const { remoteFs, service } = fixture();
+  const retained = await openWithBranch(service);
+  await openWithBranch(service, { conversationId: CONVERSATION_B });
+  const file = "/home/user/workspace/gc-protected.txt";
+  await runTask(service, retained.locator, { taskId: "gc-one", branchId: retained.branchId, conversationId: CONVERSATION_A, paths: [{ path: file, workspaceId: WORKSPACE_A }], mutate: () => remoteFs.put(file, "one") });
+  let release, entered;
+  const barrier = new Promise((resolve) => { release = resolve; });
+  const scanned = new Promise((resolve) => { entered = resolve; });
+  const fixturePath = (value) => value.replace(/^\/home\/user(?=\/)/, "~");
+  let paused = false, keep = "", sweeps = 0;
+  const executor = {
+    async home() { return "/home/user"; },
+    async readFile(file) {
+      const value = remoteFs.json.get(fixturePath(file));
+      if (!value) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      const bytes = Buffer.from(JSON.stringify(value));
+      if (!paused && file.endsWith(`/${retained.locator.versionDomainId}/ledger.json`)) { paused = true; entered(); await barrier; }
+      return bytes;
+    },
+    async writeAtomic(file, bytes) {
+      if (file.includes("/.gc-live-objects-")) keep = bytes.toString();
+      else remoteFs.json.set(fixturePath(file), JSON.parse(bytes.toString()));
+    },
+    async exec(command) {
+      if (command.includes("easywork-version-gc")) {
+        sweeps += 1; const live = new Set(keep.trim().split("\n"));
+        for (const object of remoteFs.objects.keys()) if (!live.has(object.split("/").at(-1))) remoteFs.objects.delete(object);
+      }
+      return { code: 0, stdout: "" };
+    },
+  };
+  const actor = createActorContext({ actorType: "user", actorId: ACTOR_ID, deviceId: "fixture", sessionId: "fixture", roles: [] });
+  const gc = new RemoteAgentConversationGarbageCollector({ executor, actor, serverIdentity: SERVER_IDENTITY });
+  const collecting = gc.reconcile({ conversationIds: [CONVERSATION_B] });
+  await scanned;
+  let published = false;
+  const publishing = runTask(service, retained.locator, { taskId: "gc-two", branchId: retained.branchId, conversationId: CONVERSATION_A, paths: [{ path: file, workspaceId: WORKSPACE_A }], mutate: () => remoteFs.put(file, "two") }).then((value) => { published = true; return value; });
+  await new Promise((resolve) => setImmediate(resolve)); assert.equal(published, false);
+  release(); await collecting; const second = await publishing;
+  const domain = await service.getDomain(retained.locator);
+  const after = domain.checkpoints.find((entry) => entry.id === second.afterCheckpointId).changes[0].after;
+  assert.ok(remoteFs.objects.has(`${domain.storage.objectsRoot}/${after.objectId}`));
+  await service.beginTask(retained.locator, { taskId: "native-pending", branchId: retained.branchId, conversationId: CONVERSATION_A, agentId: "codex", agentBindingId: "binding-hook", workspaceId: WORKSPACE_A });
+  const beforeSweeps = sweeps;
+  await gc.reconcile({ conversationIds: [CONVERSATION_B] });
+  assert.equal(sweeps, beforeSweeps);
+});
 
 const SERVER_IDENTITY = `ssh_${crypto.createHash("sha256").update("fixture-host-key").digest("base64url")}`;
 const ACTOR_ID = "user-1";
@@ -531,4 +583,44 @@ test("task finalization drains unconsumed hooks chronologically and keeps the fi
   assert.equal(after.changes[0].before.sha256, fileSnapshot("one").sha256);
   assert.equal(after.changes[0].after.sha256, fileSnapshot("three").sha256);
   assert.equal(remoteFs.hookOperations.size, 0);
+});
+
+
+for (const operation of ["rewind", "switch"]) test(operation + " rolls back ledger, files and index after a late write failure, including restart recovery", async () => {
+  for (const restart of [false, true]) {
+    const { service, remoteFs } = fixture();
+    const source = await openWithBranch(service);
+    const file = "/home/user/workspace/recovery.txt";
+    const one = await runTask(service, source.locator, { taskId: "one", branchId: source.branchId, conversationId: CONVERSATION_A, paths: [{path:file,workspaceId:WORKSPACE_A}], mutate: () => remoteFs.put(file, "one") });
+    await runTask(service, source.locator, { taskId: "two", branchId: source.branchId, conversationId: CONVERSATION_A, paths: [{path:file,workspaceId:WORKSPACE_A}], mutate: () => remoteFs.put(file, "two") });
+    const write = remoteFs.writeJsonAtomic.bind(remoteFs); let failed = false;
+    remoteFs.writeJsonAtomic = async (filename, value, options) => {
+      if (filename.endsWith("/path-heads.json") && (!failed || restart)) { failed = true; throw Object.assign(new Error("disk fault"), {code:"TEST_DISK_FAULT"}); }
+      return write(filename,value,options);
+    };
+    const invoke = (target) => operation === "rewind"
+      ? target.rewind(source.locator,{branchId:source.branchId,targetCheckpointId:one.afterCheckpointId,rewindId:"retry"})
+      : target.switchToCheckpoint(source.locator,{targetCheckpointId:one.afterCheckpointId,switchId:"retry"});
+    await assert.rejects(() => invoke(service), {code:"TEST_DISK_FAULT"});
+    remoteFs.writeJsonAtomic = write;
+    const recovered = restart ? new VersioningService({remoteFs}) : service;
+    const state = await recovered.getDomain(source.locator);
+    assert.equal(remoteFs.read(file), "two");
+    assert.equal(state.rewinds.some((entry)=>entry.id === "retry"), false);
+    assert.equal(state.switches.some((entry)=>entry.id === "retry"), false);
+    const result = await invoke(recovered);
+    assert.equal(result.applied,true); assert.equal(result.duplicate,false); assert.equal(remoteFs.read(file),"one");
+  }
+});
+
+test("object publication holds the same actor/server gate used by remote garbage collection", async () => {
+  const {service,remoteFs}=fixture(); const source=await openWithBranch(service); const file="/home/user/workspace/gated.txt";
+  let release, entered; const barrier=new Promise((resolve)=>{release=resolve;}); const captured=new Promise((resolve)=>{entered=resolve;});
+  const original=remoteFs.capturePaths.bind(remoteFs);
+  remoteFs.capturePaths=async (input)=>{const result=await original(input);entered();await barrier;return result;};
+  const publishing=runTask(service,source.locator,{taskId:"gated",branchId:source.branchId,conversationId:CONVERSATION_A,paths:[{path:file,workspaceId:WORKSPACE_A}],mutate:()=>remoteFs.put(file,"protected")});
+  await captured; let collected=false;
+  const collecting=withVersionScope(source.locator,async()=>{collected=true;const state=await service.getDomain(source.locator);assert.ok(state.checkpoints.some((entry)=>entry.id==="checkpoint_gated_after"));});
+  await new Promise((resolve)=>setImmediate(resolve)); assert.equal(collected,false);
+  release(); await publishing; await collecting; assert.equal(collected,true);
 });

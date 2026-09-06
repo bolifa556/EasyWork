@@ -130,6 +130,47 @@ test("Slurm capability profile is persisted from explicit command probes", async
   assert.equal(JSON.stringify(stored).includes("password"), false);
 });
 
+test("submit and cancel invalidate the cached job dashboard immediately", async (t) => {
+  const { service, executor } = await fixture(t);
+  const run = executor.run.bind(executor);
+  let queued = false;
+  executor.run = async (descriptor) => {
+    const result = await run(descriptor);
+    if (descriptor.parser === "slurm.submit.v1") queued = true;
+    if (descriptor.parser === "slurm.cancel.v1") queued = false;
+    if (descriptor.parser === "slurm.jobs.v1") result.stdout = queued ? "301|short|cpu|RUNNING|00:00:01|00:00:59|1|1|node04|2026-01-01T00:00:00|2026-01-01T00:01:00" : "";
+    return result;
+  };
+  assert.deepEqual((await service.dashboard()).jobs, []);
+  await service.submit({ commandId: "submit-short", partition: "cpu", scriptPath: "/home/alice/short.sh", args: [] });
+  assert.deepEqual((await service.dashboard()).jobs.map((job) => job.id), ["301"]);
+  await service.cancelJob({ commandId: "cancel-short", jobId: "301" });
+  assert.deepEqual((await service.dashboard()).jobs, []);
+});
+
+test("an old dashboard response cannot restore a cache invalidated by a job change", async (t) => {
+  const { service, executor } = await fixture(t);
+  const run = executor.run.bind(executor);
+  let release, started, first = true;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const entered = new Promise((resolve) => { started = resolve; });
+  executor.run = async (descriptor) => {
+    const result = await run(descriptor);
+    if (descriptor.parser === "slurm.jobs.v1") {
+      if (first) { first = false; started(); await blocked; }
+      else result.stdout = "";
+    }
+    return result;
+  };
+  const old = service.dashboard();
+  await entered;
+  service.invalidateJobs();
+  assert.deepEqual((await service.dashboard()).jobs, []);
+  release();
+  assert.equal((await old).jobs.length, 2);
+  assert.deepEqual((await service.dashboard()).jobs, []);
+});
+
 test("accessible partitions and resource summary stay inside the current SSH user's scope", async (t) => {
   const { service } = await fixture(t);
   await service.inspectCapabilities();
@@ -376,4 +417,20 @@ test("PBS is explicitly unavailable instead of emulating Slurm or parsing Agent 
 test("server authorization and authenticated Actor remain mandatory", async (t) => {
   const { service } = await fixture(t, { authorized: false });
   await assert.rejects(service.inspectCapabilities(), (error) => error?.code === "SERVER_FORBIDDEN");
+});
+
+
+test("scheduler persists an intent before submission and never resubmits an uncertain command after restart", async (t) => {
+  const dataRoot=await fs.mkdtemp(path.join(os.tmpdir(),"easywork-scheduler-repair-"));t.after(()=>fs.rm(dataRoot,{recursive:true,force:true}));
+  const currentActor=createActorContext({actorType:"user",actorId:"alice",deviceId:"d",sessionId:"s",roles:[]});
+  const executor=new FixtureExecutor(); let submitted=false;
+  const run=executor.run.bind(executor);executor.run=async(descriptor)=>{const result=await run(descriptor);if(descriptor.parser==="slurm.submit.v1")submitted=true;return result;};
+  const options={actor:currentActor,dataRoot,serverIdentity:SERVER_IDENTITY,username:"alice",authorizeServer:async()=>true,adapter:new SlurmSchedulerAdapter(),executor};
+  const service=new SchedulerService(options);await service.inspectCapabilities();
+  const update=service.repository.update.bind(service.repository);service.repository.update=async(...args)=>{if(submitted)throw Object.assign(new Error("receipt disk fault"),{code:"TEST_RECEIPT_FAULT"});return update(...args);};
+  const request={commandId:"once",partition:"cpu",scriptPath:"/home/alice/run.sh",args:[]};
+  await assert.rejects(()=>service.submit(request),{code:"TEST_RECEIPT_FAULT"});
+  const restarted=new SchedulerService(options);
+  await assert.rejects(()=>restarted.submit(request),{code:"SCHEDULER_RESULT_UNKNOWN"});
+  assert.equal(executor.calls.filter((call)=>call.parser==="slurm.submit.v1").length,1);
 });

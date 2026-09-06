@@ -57,6 +57,8 @@ export class OpenAIEmbeddingAdapter {
     this.fetchImpl = fetchImpl;
     this.batchSize = batchSize;
     this.dimensions = dimensions;
+    invariant(dimensions === null || (Number.isSafeInteger(dimensions) && dimensions > 0), "EMBEDDING_DIMENSION_INVALID", "Embedding 配置维度无效", { status: 400 });
+    this.observedDimensions = dimensions;
     this.profileId = profileId || `embedding_${crypto.createHash("sha256").update(`${this.url}\0${this.model}\0${dimensions || "auto"}`).digest("hex").slice(0, 24)}`;
     this.hybridEnabled = hybridEnabled !== false;
   }
@@ -75,6 +77,12 @@ export class OpenAIEmbeddingAdapter {
       invariant(response.ok && Array.isArray(body?.data), "EMBEDDING_REQUEST_FAILED", body?.error?.message || `Embedding API 返回 ${response.status}`, { status: 502, retryable: response.status >= 500 });
       const ordered = [...body.data].sort((left, right) => Number(left.index) - Number(right.index));
       invariant(ordered.length === batch.length, "EMBEDDING_RESPONSE_INVALID", "Embedding API 返回数量不一致", { status: 502 });
+      const expectedDimensions = this.observedDimensions ?? ordered[0]?.embedding?.length;
+      invariant(Number.isSafeInteger(expectedDimensions) && expectedDimensions > 0 && ordered.every((entry, index) =>
+        entry.index === index && Array.isArray(entry.embedding) && entry.embedding.length === expectedDimensions
+        && entry.embedding.every((value) => typeof value === "number" && Number.isFinite(value))),
+      "EMBEDDING_RESPONSE_INVALID", "Embedding API 返回索引、向量或维度无效", { status: 502, retryable: true });
+      this.observedDimensions = expectedDimensions;
       output.push(...ordered.map((entry) => entry.embedding));
     }
     return output;
@@ -92,6 +100,15 @@ export class OpenAIEmbeddingAdapter {
         dimensions: vectors[0]?.length || 0,
         chunks: chunks.map((chunk, index) => ({ chunkId: chunk.chunkId, text: chunk.text, vector: vectors[index] })),
       },
+    };
+  }
+
+  async embedTexts(inputs) {
+    invariant(Array.isArray(inputs) && inputs.length > 0 && inputs.every((input) => typeof input === "string" && input.trim()), "EMBEDDING_INPUT_EMPTY", "没有可向量化的文本", { status: 422 });
+    return {
+      profileId: this.profileId,
+      model: this.model,
+      vectors: await this.#vectors(inputs),
     };
   }
 

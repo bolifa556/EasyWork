@@ -17,6 +17,7 @@ const webContextDialogPath = new URL("../app/easywork/features/conversation/WebC
 const serverManagerPath = new URL("../app/easywork/features/servers/ServerManager.tsx", import.meta.url);
 const cacheEventsPath = new URL("../app/easywork/runtime/cacheEvents.ts", import.meta.url);
 const timelinePath = new URL("../app/easywork/features/conversation/ConversationTimeline.tsx", import.meta.url);
+const copySource = await readFile(new URL("../app/easywork/features/conversation/conversation-copy.mjs", import.meta.url), "utf8");
 const timelineStylePath = new URL("../app/easywork/features/conversation/ConversationTimeline.module.css", import.meta.url);
 const markdownPath = new URL("../app/easywork/features/conversation/MarkdownContent.tsx", import.meta.url);
 const markdownStylePath = new URL("../app/easywork/features/conversation/MarkdownContent.module.css", import.meta.url);
@@ -56,9 +57,10 @@ test("EasyWork Conversation 使用持久事件回放与唯一 Timeline，并保�
   assert.match(runtime, /\/api\/tasks\/:id\/events/);
   assert.match(view, /timelineEvents=\{timelineByAssistantMessage\.get\(message\.id\)\}/);
   assert.match(view, /orphanTimelineByUserMessage/);
-  assert.match(view, /const runStartByUserMessage = new Map[\s\S]+?event\.kind === "run\.started" && event\.ids\.sourceMessageId === message\.id/);
-  assert.match(view, /if \(referencedTaskId && event\.ids\.taskId\) \{[\s\S]+?event\.ids\.taskId !== referencedTaskId/);
-  assert.match(view, /if \(event\.ids\.sourceMessageId\)[\s\S]+?event\.ids\.sourceMessageId !== message\.id/);
+  assert.match(view, /groupConversationTimeline\(messages, events, tasks\)/);
+  assert.match(copySource, /const runStartByUserMessage = new Map[\s\S]+?event\.kind === "run\.started" && event\.ids\.sourceMessageId === sourceId/);
+  assert.match(copySource, /if \(taskId && event\.ids\.taskId\)[\s\S]+?event\.ids\.taskId === taskId && event\.ids\.sourceMessageId === sourceId/);
+  assert.match(copySource, /if \(event\.ids\.sourceMessageId\)[\s\S]+?event\.ids\.sourceMessageId !== sourceId/);
   assert.match(view, /message\.role === "user" && orphanTimelineByUserMessage\.has\(message\.id\)/);
   assert.match(view, /!user && \(timelineEvents\?\.length \|\| timelineLoading\) \? <ConversationTimeline/);
   assert.doesNotMatch(view, /message\.role === "user" && timelineByUserMessage\.has/);
@@ -91,6 +93,12 @@ test("对话删除或重命名只按事件失效服务器详情缓存，不引�
   assert.doesNotMatch(servers, /setInterval/);
 });
 
+test("远程服务器页标题不重复展示列表数量", async () => {
+  const servers = await readFile(serverManagerPath, "utf8");
+  assert.match(servers, /<h1>远程服务器<\/h1><\/div>/);
+  assert.doesNotMatch(servers, /<h1>远程服务器<\/h1><span>\{servers\.length\}<\/span>/);
+});
+
 test("恢复后的终态任务不会把工作输入框永久误判为正在思考", async () => {
   const [view, timeline] = await Promise.all([readFile(viewPath, "utf8"), readFile(timelinePath, "utf8")]);
   assert.match(view, /latestConversationTask\?\.sourceMessageId === latestResponseUserId/);
@@ -118,12 +126,12 @@ test("工作目录切换只同步共享路由，不因打开网页对话自动�
   assert.match(view, /setWorkspaceDirectoryLoading\(true\)/);
   assert.match(view, /finally \{\s*setWorkspaceDirectoryLoading\(false\)/);
   assert.match(view, /aria-pressed=\{workspaceDirectoryActive\} aria-busy=\{workspaceDirectoryLoading\}/);
-  assert.match(view, /onClick=\{\(\) => void toggleWorkspaceDirectory\(\)\}><Terminal size=\{15\} \/>工作<\/button>/);
+  assert.match(view, /onClick=\{\(\) => void toggleWorkspaceDirectory\(\)\}/);
   assert.doesNotMatch(view, /modeMenuOpen|modePopover|requestWorkToChat|convertWorkToChat|转换为聊天|正在切换工作目录/);
   assert.match(view, /disabled=\{workspaceDirectoryLoading \|\| \(!workspaceDirectoryActive/);
 });
 
-test("聊天内容和输入框在工作台上方独立排布，跟随逻辑监听真实内容尺寸", async () => {
+test("聊天内容和输入框独立排布，文件预览限制在右侧主内容区", async () => {
   const [view, styles, preview] = await Promise.all([
     readFile(viewPath, "utf8"), readFile(viewStylePath, "utf8"),
     readFile(new URL("../app/easywork/features/workspace/ConversationWorkspacePreview.module.css", import.meta.url), "utf8"),
@@ -134,18 +142,22 @@ test("聊天内容和输入框在工作台上方独立排布，跟随逻辑监�
   assert.match(styles, /\.stageContent\s*\{[^}]*min-height:0;[^}]*grid-template-rows:minmax\(0,1fr\) auto;/s);
   assert.match(styles, /\.composerWrap\s*\{[^}]*position:relative;/s);
   assert.doesNotMatch(styles, /conversation-workbench-height/);
-  assert.match(preview, /inset:var\(--conversation-header-height,0\) 0 0/);
+  assert.match(preview, /\.previewPanel\s*\{[^}]*position:absolute;[^}]*inset:0;[^}]*width:100%;[^}]*height:100%;/s);
+  assert.doesNotMatch(preview, /position:fixed|width:100vw|height:100dvh/);
+  assert.doesNotMatch(preview, /inset:var\(--conversation-header-height,0\) 0 0/);
 });
 
 test("工作入口切回对话时复用文件预览的未保存修改确认", async () => {
-  const [view, preview] = await Promise.all([
+  const [view, controller, preview] = await Promise.all([
     readFile(viewPath, "utf8"),
     readFile(new URL("../app/easywork/features/workspace/ConversationWorkspacePreview.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/easywork/features/viewers/FilePreviewPanel.tsx", import.meta.url), "utf8"),
   ]);
   assert.match(view, /workspacePreviewRef\.current\.requestCloseAll\(returnToConversation\)/);
-  assert.match(preview, /requestCloseAll: \(afterClose\) => requestClose\(\{ kind: "all", afterClose \}\)/);
-  assert.match(preview, /if \(dirty\) setPendingClose\(request\); else performClose\(request\)/);
-  assert.match(preview, /runtime\.closeWorkspacePreviews\(conversationId\);\s*request\.afterClose\?\.\(\)/);
+  assert.match(controller, /requestCloseAll: \(afterClose\) => requestCloseFilePreviews\(conversationId, afterClose\)/);
+  assert.match(preview, /statuses\[id\]\?\.dirty/);
+  assert.match(preview, /setPendingClose\(\{ ids, afterClose \}\)/);
+  assert.match(preview, /ids\.forEach\(closeFilePreview\); afterClose\?\.\(\)/);
 });
 
 test("自动工作区建立后切换 Agent 使用当前真实路由而不要求刷新页面", async () => {
@@ -195,7 +207,7 @@ test("网页工具只发布语义结果，远端失败原因进入对话时间�
   assert.match(styles, /\.runFailure/);
   assert.match(styles, /\.handoff\s*\{[^}]*margin:\s*1px 0 3px;/s);
   assert.match(styles, /\.handoffHeading\s*\{[^}]*width:max-content;[^}]*grid-template-columns:22px minmax\(0,auto\) 14px;[^}]*border:0;[^}]*background:transparent;/s);
-  assert.match(styles, /\.handoffRail\s*\{[^}]*margin-left:28px;[^}]*border:0;[^}]*padding:0;/s);
+  assert.match(styles, /\.handoffRail\s*\{[^}]*margin-left:var\(--timeline-detail-inset\);[^}]*border:0;[^}]*padding:0;/s);
   assert.match(timeline, /className=\{styles\.handoffBody\}/);
   assert.match(timeline, /className=\{styles\.handoffHeading\} aria-expanded=\{open\}/);
   assert.match(timeline, /className=\{styles\.handoffChevron\}/);
@@ -204,11 +216,21 @@ test("网页工具只发布语义结果，远端失败原因进入对话时间�
   assert.match(styles, /\.handoffLabel\s*\{[^}]*font-size:var\(--timeline-title-size\);[^}]*font-weight:400;/s);
   assert.match(styles, /\.backgroundHeading\s*\{[^}]*grid-template-columns:22px minmax\(0,auto\) 14px;[^}]*font-weight:400;/s);
   assert.doesNotMatch(styles, /\.webSearch|\.searchResult|\.searchError/);
-  assert.match(styles, /\.handoff p\s*\{[^}]*font-size:var\(--timeline-body-size\);[^}]*line-height:var\(--timeline-body-leading\);/s);
+  assert.match(styles, /\.handoff p\s*\{[^}]*font-size:var\(--timeline-detail-size\);[^}]*line-height:var\(--timeline-body-leading\);/s);
   assert.match(styles, /\.groupHeading strong\s*\{[^}]*font-size:var\(--activity-title-size\);[^}]*font-weight:630;/s);
 });
 
-test("表格保留原生滚动链，远端 Skill 逐项展示并可展开详情", async () => {
+test("远端中断异步失败会在输入栏上方短暂提示且不重放历史告警", async () => {
+  const [view, styles] = await Promise.all([readFile(viewPath, "utf8"), readFile(viewStylePath, "utf8")]);
+  assert.match(view, /operation !== "interrupt" && operation !== "startup-interrupt-cleanup"/);
+  assert.match(view, /failureMessage\(payload\.warning\) \|\| failureMessage\(payload\.failure\)/);
+  assert.match(view, /function isRecentEvent[\s\S]+?Date\.now\(\) - timestamp <= lifetimeMs/);
+  assert.match(view, /window\.setTimeout\(\(\) => setInterruptError\(null\), 5_000\)/);
+  assert.match(view, /<div className=\{styles\.composerNotice\} role="alert">/);
+  assert.match(styles, /\.composerNotice\s*\{/);
+});
+
+test("表格自适应列宽且不产生横向滚动条，远端 Skill 逐项展示并可展开详情", async () => {
   const [markdown, markdownStyles, timeline, timelineStyles] = await Promise.all([
     readFile(markdownPath, "utf8"),
     readFile(markdownStylePath, "utf8"),
@@ -216,7 +238,8 @@ test("表格保留原生滚动链，远端 Skill 逐项展示并可展开详情"
     readFile(timelineStylePath, "utf8"),
   ]);
   assert.doesNotMatch(markdown, /passVerticalWheelToPage|onWheel=/);
-  assert.match(markdownStyles, /\.tableWrap[^}]+overflow-x:\s*auto[^}]+overscroll-behavior-y:\s*auto/s);
+  assert.match(markdownStyles, /\.tableWrap[^}]+overflow:\s*hidden/s);
+  assert.match(markdownStyles, /\.tableStacked td::before[^}]+data-column-label/s);
   assert.match(timeline, /function mergeHandoffSkillDetails[\s\S]+?semanticResultText\("skills", skill\)/);
   assert.match(timeline, /const eventDetail = String\(record\.detail \|\| ""\)\.trim\(\)/);
   assert.match(timeline, /nonSkillReferences\.length === 1 && !nonSkillReferences\[0\]\.detail/);
@@ -224,9 +247,9 @@ test("表格保留原生滚动链，远端 Skill 逐项展示并可展开详情"
   assert.match(timeline, /kind\.toLocaleLowerCase\(\) === "skill"[\s\S]+?HandoffDetailReference/);
   assert.match(timeline, /function HandoffDetailReference[\s\S]+?reference\.detail[\s\S]+?<MarkdownContent content=\{reference\.detail!\} compact activity \/>/);
   assert.match(timeline, /if \(kind\.toLocaleLowerCase\(\) === "skill"\) return <>\{references\.map/);
-  assert.match(timelineStyles, /\.handoffRail\s*\{[^}]*margin-left:\s*28px/);
-  assert.match(timelineStyles, /\.handoffReference\s*\{[^}]*padding:0 38px 0 12px;[^}]*font-size:var\(--timeline-body-size\);[^}]*white-space:\s*nowrap/s);
-  assert.match(timelineStyles, /\.handoffReferenceKind\s*\{[^}]*font-size:var\(--timeline-body-size\);/s);
+  assert.match(timelineStyles, /\.handoffRail\s*\{[^}]*margin-left:var\(--timeline-detail-inset\);/);
+  assert.match(timelineStyles, /\.handoffReference\s*\{[^}]*padding:0 38px 0 12px;[^}]*font-size:var\(--timeline-detail-size\);[^}]*white-space:\s*nowrap/s);
+  assert.match(timelineStyles, /\.handoffReferenceKind\s*\{[^}]*font-size:var\(--timeline-detail-size\);/s);
   assert.match(timelineStyles, /\.handoffSkillHeading\s*\{[^}]*grid-template-columns:auto minmax\(0,auto\) 14px;[^}]*border-left:3px solid #9dbba4;/s);
   assert.match(timelineStyles, /\.handoffSkillReferenceOpen \.handoffSkillMotion\s*\{[^}]*grid-template-rows:1fr;/s);
 });
@@ -254,7 +277,8 @@ test("对话输入区不遮挡两侧内容，滚动条沿用透明细轨道", as
     readFile(viewStylePath, "utf8"),
     readFile(controlStylePath, "utf8"),
   ]);
-  assert.match(styles, /\.composerWrap\s*\{[^}]*position:relative;[^}]*background:var\(--ew-canvas\);/s);
+  assert.match(styles, /\.composerWrap\s*\{[^}]*position:relative;[^}]*background:transparent;/s);
+  assert.match(styles, /\.composerWrap::before\s*\{[^}]*pointer-events:none;[^}]*background:linear-gradient\(/s);
   assert.match(styles, /\.messages\s*\{[^}]*overflow-x:\s*hidden;[^}]*overflow-y:\s*auto;[^}]*scrollbar-color:\s*rgb\(99 108 98 \/ 30%\) transparent;[^}]*scrollbar-width:\s*thin;/s);
   assert.match(styles, /\.messages::-webkit-scrollbar\s*\{[^}]*width:\s*9px;[^}]*height:\s*9px;[^}]*background:\s*transparent;/s);
   assert.match(styles, /\.messages::-webkit-scrollbar-thumb\s*\{[^}]*border:\s*3px solid transparent;[^}]*border-radius:\s*999px;[^}]*background:\s*rgb\(99 108 98 \/ 30%\);[^}]*background-clip:\s*padding-box;/s);
@@ -279,13 +303,23 @@ test("三种 Agent 的统一计划条与左侧菜单同字号，只有存在计�
   assert.match(view, /<TaskPlanList task=\{task\}/);
   assert.match(view, /hasPlan && task && expanded \? <div className=\{`\$\{styles\.recordPlan\} \$\{styles\.recordPlanOpen\}`\}/);
   assert.match(viewStyles, /\.composerPlan\s*\{[^}]*width:66\.666%;[^}]*font-size:var\(--rail-font-size,13\.5px\);/s);
-  assert.match(viewStyles, /\.composerPlanExpanded\s*\{[^}]*display:grid;[^}]*grid-template-rows:0fr;/s);
-  assert.match(viewStyles, /\.composerPlanOpen \.composerPlanExpanded\s*\{[^}]*grid-template-rows:1fr;/s);
+  assert.doesNotMatch(view, /styles\.composerPlanExpanded/);
+  assert.match(viewStyles, /\.composerPlanOpen \.composerPlanCurrent\s*\{[^}]*height:calc\(var\(--plan-count\)/s);
   assert.match(viewStyles, /\.taskPlanStep\s*\{[^}]*font-size:var\(--rail-font-size,13\.5px\);/s);
   assert.match(timeline, /event\.kind === "plan" \|\| event\.kind === "plan_state"/);
   assert.match(view, /const hasPlan = Boolean\(task && Array\.isArray\(task\.plan\) && task\.plan\.length > 0\);/);
   assert.match(view, /\{hasPlan \? <button className=\{styles\.recordExpand\}/);
   assert.match(view, /\{hasPlan && task && expanded \? <div className=\{`\$\{styles\.recordPlan\}/);
+});
+
+test("当前工作区保留完整路径，并从路径前端省略以优先显示末尾目录", async () => {
+  const [view, viewStyles] = await Promise.all([readFile(viewPath, "utf8"), readFile(viewStylePath, "utf8")]);
+  assert.doesNotMatch(view, /compactWorkspacePath/);
+  assert.match(view, /workbenchWorkspacePath \? <bdi dir="ltr">\{workbenchWorkspacePath\}<\/bdi>/);
+  assert.match(viewStyles, /\.railValue\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:ellipsis;[^}]*white-space:nowrap;/s);
+  assert.match(viewStyles, /\.railWorkspaceValue\s*\{[^}]*direction:rtl;[^}]*text-align:left;/s);
+  assert.match(viewStyles, /\.railWorkspaceValue > bdi\s*\{[^}]*direction:ltr;[^}]*unicode-bidi:isolate;/s);
+  assert.match(viewStyles, /@media \(max-width: 719px\)[\s\S]+?\.rail\s*\{[^}]*width:calc\(100% - 40px\)/s);
 });
 
 test("对话最终内容原子交接，历史读取和滚动恢复不会随消息反复触发", async () => {
@@ -352,7 +386,7 @@ test("已安装技能把名称、简介与绿色引用线收为同一行", async
   assert.match(markdown, /\{ type: "strong", children: nameChildren \}/);
   assert.match(markdown, /root\.children\.splice\(index, 2, row\)/);
   assert.match(markdown, /className: "skill-summary-row"/);
-  assert.match(markdown, /remarkPlugins=\{\[remarkGfm, remarkMath, remarkPlainUrlBoundaries, remarkLooseStrongMarkers, remarkInstalledSkillRows\]\}/);
+  assert.match(markdown, /remarkPlugins=\{\[remarkGfm, remarkMath, remarkPlainUrlBoundaries, remarkLooseStrongMarkers, remarkInstalledSkillRows,/);
   assert.match(markdown, /styles\.skillSummaryRow/);
   assert.match(styles, /\.skillSummaryRow\s*\{[^}]*border-left-color:\s*#9dbba4;[^}]*padding-top:\s*\.12em;[^}]*padding-bottom:\s*\.12em;[^}]*white-space:\s*normal;/s);
   assert.match(styles, /\.skillSummaryRow > p\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
@@ -365,7 +399,7 @@ test("正文解析普通、带空格和被转义的粗体标记，且不改写�
   assert.match(markdown, /marker === "__" && \(\/\\w\/\.test\(before\) \|\| \/\\w\/\.test\(after\)\)/);
   assert.match(markdown, /nodes\.push\(\{ type: "strong", children: \[\{ type: "text", value: content\.trim\(\) \}\] \}\)/);
   assert.match(markdown, /const opaqueNodes = new Set\(\["code", "inlineCode", "html", "math", "inlineMath"\]\)/);
-  assert.match(markdown, /remarkPlugins=\{\[remarkGfm, remarkMath, remarkPlainUrlBoundaries, remarkLooseStrongMarkers, remarkInstalledSkillRows\]\}/);
+  assert.match(markdown, /remarkPlugins=\{\[remarkGfm, remarkMath, remarkPlainUrlBoundaries, remarkLooseStrongMarkers, remarkInstalledSkillRows,/);
   assert.match(styles, /\.markdown\s*\{[^}]*font-family:\s*var\(--ew-font\);[^}]*font-size:\s*17px;/s);
   assert.match(styles, /\.markdown :where\(strong,b,em,i,a,del\)\s*\{[^}]*font-family:\s*inherit;[^}]*font-size:\s*inherit;/s);
   assert.match(styles, /\.markdown strong,\.markdown b\s*\{[^}]*font-weight:\s*700;/s);
@@ -380,7 +414,7 @@ test("代码块使用正文排版、单色暖背景并在块内横向滚动", as
   assert.match(markdown, /const blockRef = useRef<HTMLDivElement>\(null\)/);
   assert.match(markdown, /block\.addEventListener\("wheel", handleWheel, \{ passive: false \}\)/);
   assert.match(markdown, /<div ref=\{blockRef\} className=\{`\$\{styles\.copyableCodeBlock\}/);
-  assert.match(markdown, /const next = Math\.min[\s\S]+?event\.preventDefault\(\);[\s\S]+?event\.stopPropagation\(\);[\s\S]+?if \(next === viewport\.scrollLeft\) return;[\s\S]+?viewport\.scrollLeft = next;/);
+  assert.match(markdown, /const next = codeWheelPosition\(viewport, event\);\s*if \(next === null\) return;\s*event\.preventDefault\(\);\s*event\.stopPropagation\(\);\s*viewport\.scrollLeft = next;/);
   assert.match(styles, /\.copyableCodeBlock\s*\{[^}]*display:\s*block;[^}]*width:\s*100%;[^}]*min-width:\s*0;[^}]*max-width:\s*100%;[^}]*overflow:\s*hidden;[^}]*background:\s*var\(--code-block-surface\);[^}]*margin:\s*0;/s);
   assert.match(styles, /\.remoteTerminal\s*\{[^}]*min-width:\s*0;[^}]*max-width:\s*100%;[^}]*overflow-x:\s*auto;[^}]*scrollbar-width:\s*none;[^}]*background:\s*transparent;[^}]*padding:\s*3px 4px 7px 12px;[^}]*font-family:\s*inherit;[^}]*font-size:\s*inherit;[^}]*font-weight:\s*400;/s);
   assert.match(styles, /\.remoteTerminal code\s*\{[^}]*width:\s*max-content;[^}]*min-width:\s*100%;[^}]*max-width:\s*none;[^}]*font-family:\s*inherit;[^}]*font-weight:\s*400;[^}]*padding-right:\s*60px;[^}]*white-space:\s*pre;[^}]*overflow-wrap:\s*normal;[^}]*word-break:\s*normal;/s);
@@ -396,7 +430,7 @@ test("代码块使用正文排版、单色暖背景并在块内横向滚动", as
 
 test("Agent 调用中的操作、文件与阶段文本使用紧凑垂直节奏", async () => {
   const styles = await readFile(timelineStylePath, "utf8");
-  assert.match(styles, /\.agentActivity\s*\{[^}]*gap:2px;[^}]*padding:1px 0 0 16px;/s);
+  assert.match(styles, /\.agentActivity\s*\{[^}]*gap:2px;[^}]*padding:1px 0 0 var\(--activity-content-inset\);/s);
   assert.match(styles, /\.groupHeading\s*\{[^}]*min-height:29px;[^}]*padding:2px 0;/s);
   assert.match(styles, /\.commandList\s*\{[^}]*margin:0 7px 3px 11px;/s);
   assert.match(styles, /\.commandSummary,\.fileSummary\s*\{[^}]*min-height:28px;[^}]*padding:1px 0;/s);
@@ -450,7 +484,7 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(timeline, /const \[open, toggleOpen\] = useTimelineDisclosure\(disclosureId, trace\.running, hasBody\)/);
   assert.match(timeline, /className=\{styles\.webThoughtHeading\}[\s\S]+?aria-expanded=\{hasBody \? open : undefined\}/);
   assert.match(timeline, /entry\.type === "reasoning"[\s\S]+?<ReasoningTrace key=\{entry\.id\} entry=\{entry\} running=\{trace\.running\}/);
-  assert.match(timeline, /function AgentCall[\s\S]+?useTimelineDisclosure\(disclosureId, disclosureRunning, hasDetails && !detailsLoading\)/);
+  assert.match(timeline, /function AgentCall[\s\S]+?useTimelineDisclosure\(disclosureId, disclosureRunning, hasDetails\)/);
   assert.match(timeline, /trace\.running \? "正在思考"/);
   assert.match(timeline, /trace\.aborted \? "思考已停止" : "思考完成"/);
   assert.match(timeline, /rawAbortReason\.trim\(\) === "请求已停止" \? "" : rawAbortReason/);
@@ -459,7 +493,7 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(timeline, /className=\{styles\.activityHeadingLabel\}>\{label\}<\/span>[\s\S]+?styles\.webThoughtChevron/);
   assert.match(timeline, /className=\{styles\.handoffGlyph\}><Send size=\{15\} \/>/);
   assert.match(timeline, /<span className=\{styles\.handoffLabel\}>发给远端 Agent<\/span>/);
-  assert.match(timeline, /function WorkHandoff[\s\S]+?useState\(true\)[\s\S]+?styles\.handoffMotion/);
+  assert.match(timeline, /function WorkHandoff[\s\S]+?useState\(false\)[\s\S]+?styles\.handoffMotion/);
   assert.match(timeline, /<WebThought events=\{events\} handoff=\{showHandoff \? webTrace\.handoff : null\} \/>/);
   assert.doesNotMatch(timeline, /!showThought && showHandoff \? <WorkHandoff/);
   assert.doesNotMatch(timeline, /思考未完成|trace\.activeLabel/);
@@ -470,7 +504,7 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.doesNotMatch(webAgentRuntime, /mode === "work" \? \{ provisional: true \} : \{\}/);
   assert.doesNotMatch(webAgentRuntime, /mode === "work" && nextContent && result\.toolCalls\.length[\s\S]+?source: "content"/);
   assert.match(webAgentRuntime, /const onlySubmitAvailable = mode === "work"[\s\S]+?availableTools\[0\]\.name === "handoff_submit"/);
-  assert.match(webAgentRuntime, /mode === "work" \? \{ toolChoice: forceSubmit \|\| onlySubmitAvailable \? "handoff_submit" : "required" \} : \{\}/);
+  assert.match(webAgentRuntime, /mode === "work" \? \{ toolChoice: onlySubmitAvailable \? "handoff_submit" : "required" \} : \{\}/);
   assert.match(webAgentRuntime, /let submittedCandidateIds = null[\s\S]+?submittedCandidateIds = input\.candidateIds[\s\S]+?return completeWork\(iteration \+ 1, submittedCandidateIds\)/);
   assert.match(webAgentRuntime, /tool\.timelineRead && rendered[\s\S]+?emit\("run\.context\.read"/);
   assert.doesNotMatch(webAgentRuntime, /run\.tool\.(?:started|completed|failed)/);
@@ -481,7 +515,7 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(styles, /\.backgroundHeading\s*\{[^}]*align-items:center;/s);
   assert.match(styles, /\.backgroundChevron\s*\{[^}]*rotate\(0deg\)/s);
   assert.match(styles, /\.reasoningText,.activityText[^}]*font-size:var\(--timeline-body-size\);[^}]*line-height:var\(--timeline-body-leading\);/s);
-  assert.match(styles, /\.reasoningText\s*\{[^}]*border-left:0;[^}]*padding-left:0;/s);
+  assert.match(styles, /\.reasoningText\s*\{[^}]*border-left:0;[^}]*padding-left:0;[^}]*font-size:var\(--timeline-detail-size\);/s);
   assert.match(styles, /\.agentThoughtContent[^}]*font-size:var\(--timeline-body-size\);[^}]*line-height:var\(--timeline-body-leading\);/s);
   assert.match(styles, /\.commandSummary code[^}]*font-size:var\(--timeline-code-size\);/s);
   assert.match(styles, /\.fileCopy strong[^}]*font-size:var\(--timeline-code-size\);/s);
@@ -525,12 +559,12 @@ test("Agent 上下文、切换和运行控制只按真实 capability 启用", as
   assert.match(view, /workspace-switch\/describe/);
   assert.match(view, /nextAgentId === routedAgentId/);
   assert.doesNotMatch(view, /nextAgentId === agentId\) return/);
-  assert.match(view, /仅补发它尚未收到的内容/);
   assert.match(view, /agentOperationAvailable\(selectedAgent, "append"\)/);
   assert.match(view, /agentOperationAvailable\(selectedAgent, "interrupt"\)/);
   assert.match(view, /directRemoteTaskId: activeTask\.id/);
   assert.doesNotMatch(view, /waitForOpenCodeQueueWindow|queueOpenCode|queueWhileRunning/);
-  assert.match(view, /!\["completed", "failed", "cancelled", "interrupted"\]\.includes\(task\.status\)/);
+  assert.match(view, /mergeTaskSnapshots/);
+  assert.match(view, /isActiveTask/);
   assert.doesNotMatch(view, /\/api\/tasks\/\$\{activeTask\.id\}\/append/);
   assert.doesNotMatch(view, /\/api\/tasks\/\$\{activeTask\.id\}\/resume/);
   assert.match(services, /class RemoteTaskLifecycle/);
@@ -543,7 +577,8 @@ test("Agent 上下文、切换和运行控制只按真实 capability 启用", as
 test("Agent 中断后新消息新建 Task，运行中追加才直通并复用原生会话", async () => {
   const [view, viewStyles, services, timeline] = await Promise.all([readFile(viewPath, "utf8"), readFile(viewStylePath, "utf8"), readFile(servicesPath, "utf8"), readFile(timelinePath, "utf8")]);
   assert.match(view, /directRemoteTaskId: activeTask\.id/);
-  assert.match(view, /!\["completed", "failed", "cancelled", "interrupted"\]\.includes\(task\.status\)/);
+  assert.match(view, /mergeTaskSnapshots/);
+  assert.match(view, /isActiveTask/);
   assert.match(services, /const skipWebAgentModel = mode === "work" && !taskId && Boolean\(directRemoteTask\)/);
   assert.match(services, /const agentBindingId = createAgentBindingKey\(taskScope, scope\.agentId\)/);
   assert.doesNotMatch(services, /statuses: \[[^\]]*"interrupted"[^\]]*\][\s\S]{0,500}const matching = candidates/);
@@ -563,8 +598,8 @@ test("Agent 中断后新消息新建 Task，运行中追加才直通并复用原
   assert.match(view, /directRemoteAppendTurn \? styles\.directRemoteAppendTurn/);
   assert.match(viewStyles, /\.beforeDirectRemoteAppendTurn > \.assistant\s*\{[^}]*margin-bottom:14px;[^}]*padding-bottom:12px;[^}]*border-bottom:0;/s);
   assert.match(viewStyles, /\.directRemoteAppendTurn > \.user\s*\{[^}]*margin-bottom:14px;/s);
-  assert.match(view, /if \(referencedTaskId && event\.ids\.taskId\) \{[\s\S]+?event\.ids\.sourceMessageId !== message\.id/);
-  assert.match(view, /return !runId \|\| !event\.ids\.runId \|\| event\.ids\.runId === runId/);
+  assert.match(copySource, /if \(taskId && event\.ids\.taskId\)[\s\S]+?event\.ids\.taskId === taskId && event\.ids\.sourceMessageId === sourceId/);
+  assert.match(copySource, /!runId \|\| !event\.ids\.runId \|\| event\.ids\.runId === runId/);
   assert.doesNotMatch(view, /compareTimelinePosition|nextRunStart/);
 });
 
@@ -642,10 +677,17 @@ test("侧栏固定头尾、中部整体滚动，并按需加载八条聊天与�
   const scrollingTitle = shell.slice(shell.indexOf("function ScrollingTitle"), shell.indexOf("export function AppShell"));
   assert.doesNotMatch(conversationSection, /window\.(?:prompt|confirm)/);
   assert.doesNotMatch(projectDeleteSection, /window\.confirm/);
-  assert.match(projectDeleteSection, /idempotencyKey:\s*pending\.idempotencyKey/);
+  assert.match(projectDeleteSection, /conversationPolicy=delete/);
+  assert.match(projectDeleteSection, /pending\.projectOnlyCommandId/);
+  assert.match(projectDeleteSection, /pending\.withConversationsCommandId/);
   assert.match(shell, /<Modal title="删除项目？"/);
-  assert.match(shell, /setProjectPendingDelete\(\{ item: menu\.item, idempotencyKey: commandId\("project-delete"\) \}\)/);
+  assert.match(shell, /仅删除项目/);
+  assert.match(shell, /删除项目及所有对话/);
+  assert.match(shell, /projectOnlyCommandId: commandId\("project-delete"\)/);
+  assert.match(shell, /withConversationsCommandId: commandId\("project-delete-with-conversations"\)/);
   assert.match(styles, /\.deleteDialog\s*\{/);
+  assert.match(styles, /\.projectDeleteOptions\s*\{/);
+  assert.match(styles, /\.projectDeleteOptionDanger\s*\{/);
   assert.doesNotMatch(scrollingTitle, /title=\{title\}/);
   assert.match(styles, /\.titleViewport\s*>\s*span\s*\{[^}]*width:\s*100%;[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/s);
   assert.match(styles, /--sidebar-menu-font-size:\s*13\.5px;/);
@@ -665,17 +707,17 @@ test("侧栏固定头尾、中部整体滚动，并按需加载八条聊天与�
   const fixedArea = shell.slice(shell.indexOf("<nav className={styles.fixedNav}"), shell.indexOf("<div className={styles.navScroll}>"));
   assert.match(fixedArea, /新对话[\s\S]+?searchOpen[\s\S]+?searchBox/);
   assert.doesNotMatch(shell.slice(shell.indexOf("<div className={styles.navScroll}>"), shell.indexOf("<nav className={styles.primaryNav}")), /searchBox/);
-  assert.match(shell, /const displayedProjects = showAllProjects \|\| normalizedQuery \? visibleProjects : visibleProjects\.slice\(0, 4\)/);
+  assert.match(shell, /const displayedProjects = showAllProjects \|\| normalizedQuery \? visibleProjects : visibleProjects\.filter\(\(project, index\) => index < 4 \|\| project\.id === activeProjectId\)/);
   assert.match(shell, /visibleProjects\.length > 4[\s\S]+?showAllProjects \? "收起" : "显示更多"/);
   assert.match(shell, /const INITIAL_CHAT_LIMIT = 8/);
   assert.match(shell, /conversations\.slice\(0, INITIAL_CHAT_LIMIT\)/);
   assert.match(shell, /unassigned: "true", limit: "100", cursor/);
   assert.match(shell, /loadingAllChats \? "正在加载" : showAllChats \? "收起" : "更多"/);
   assert.match(shell, /const INITIAL_PROJECT_CHAT_LIMIT = 4/);
-  assert.match(shell, /const displayed = showAll \? projectConversations : projectConversations\.slice\(0, INITIAL_PROJECT_CHAT_LIMIT\)/);
+  assert.match(shell, /const displayed = showAll \? projectConversations : projectConversations\.filter\(\(item, index\) => index < INITIAL_PROJECT_CHAT_LIMIT \|\| item\.id === activeConversationId\)/);
   assert.match(shell, /if \(!expanded && !projectPage\?\.loaded\) void loadProjectConversations\(project\.id\)/);
   assert.match(shell, /new URLSearchParams\(\{[\s\S]+?projectId,[\s\S]+?INITIAL_PROJECT_CHAT_LIMIT/);
-  assert.match(services, /bootstrapOverview\(\{ limit: 8, projectId: null \}\)/);
+  assert.match(services, /bootstrapOverview\(\{ limit: 8, projectId: null,[^\n]*activeConversationId: conversationId/);
   assert.match(services, /listConversations\(\{ limit: 8, projectId: null \}\)/);
   assert.match(styles, /\.navScroll\s*\{[^}]*flex:\s*1;[^}]*overflow-y:\s*auto;/s);
   assert.match(styles, /\.fixedNav\s*\{[^}]*flex:\s*0 0 auto;[^}]*gap:\s*1px;[^}]*padding:\s*1px 10px 0;/s);
@@ -752,7 +794,7 @@ test("工作台入口恢复到 Agent 配置按钮左侧并复用相同按钮规�
   assert.match(view, /const workbenchAvailable = Boolean\(serverCapabilities/);
   const header = view.slice(view.indexOf("<span className={styles.headerSpacer}"), view.indexOf("</header>"));
   assert.ok(header.indexOf("styles.workbenchButton") < header.indexOf("<AgentControl"));
-  assert.match(header, /styles\.workbenchButton[\s\S]+?setWorkbenchOpen\(true\)[\s\S]+?<SquareTerminal size=\{15\} \/>工作台/);
+  assert.match(header, /styles\.workbenchButton[\s\S]+?window\.innerWidth <= 719 \? !current : true[\s\S]+?<SquareTerminal size=\{15\} \/><span>工作台/);
   assert.match(view, /workbenchOpen && workbenchReady[\s\S]+?<WorkbenchDrawer[\s\S]+?onClose=\{\(\) => setWorkbenchOpen\(false\)\}/);
   const workbenchRule = viewStyles.match(/\.workbenchButton\s*\{[^}]*\}/s)?.[0] || "";
   const agentRule = controlStyles.match(/\.trigger\s*\{[^}]*\}/s)?.[0] || "";
@@ -823,19 +865,20 @@ test("Agent 调用活动区保留完整命令、文件与事件内容，并采�
   assert.match(timeline, /value\.filename \|\| pathFromDiff\(diff\)/);
   assert.match(timeline, /function EventRow/);
   assert.match(timeline, /function AgentThought/);
-  assert.match(timeline, /export function splitRemoteFinalPresentation/);
-  assert.ok(timeline.includes("const match = content.match(/^([\\s\\S]*?\\S)\\n{2,}(#{1,6}[ \\t]+\\S[\\s\\S]*)$/);"));
-  assert.match(timeline, /alreadyStructured[\s\S]+?activity\.length > 500[\s\S]+?activityLines\.length > 3/);
+  assert.match(timeline, /export \{ splitRemoteFinalPresentation \} from/);
+  assert.match(copySource, /export function splitRemoteFinalPresentation/);
+  assert.ok(copySource.includes("const match = content.match(/^([\\s\\S]*?\\S)\\n{2,}(#{1,6}[ \\t]+\\S[\\s\\S]*)$/);"));
+  assert.match(copySource, /structured[\s\S]+?activity\.length > 500[\s\S]+?lines\.length > 3/);
   assert.match(timeline, /function AgentFinalActivity/);
   assert.match(timeline, /finalActivities[\s\S]+?event\.kind === "final"[\s\S]+?splitRemoteFinalPresentation/);
   assert.match(timeline, /finalActivities\.map\(\(content, index\) => <AgentFinalActivity/);
   assert.match(view, /const rawDisplayedContent = !user && timelineMode === "work" && message\.taskId[\s\S]+?splitRemoteFinalPresentation\(message\.content\)\.body[\s\S]+?const displayedContent = user \? rawDisplayedContent : stripArtifactPlaceholderLines/);
-  assert.match(view, /<MarkdownContent content=\{displayedContent\} \/>/);
+  assert.match(view, /<ConversationAnswer content=\{rawDisplayedContent\} events=\{timelineEvents \|\| \[\]\} artifacts=\{artifacts\} artifactHistory=\{artifactHistory\}/);
   assert.match(timeline, /function settledEvents/);
   assert.doesNotMatch(timeline, /未收到仍在运行的持续检查任务|unsupportedFutureFollowupClaim/);
   assert.doesNotMatch(view, /effectivePlanStatus/);
   assert.match(view, /data-status=\{step\.status\}/);
-  assert.match(view, /planStepIcon\(current\.status, 13\)/);
+  assert.match(view, /planStepIcon\(step\.status, 13\)/);
   assert.match(timeline, /function remoteTaskStatus\(events: RealtimeEnvelope\[], taskById:/);
   assert.match(timeline, /if \(!TERMINAL_TASK_STATUSES\.has\(status\)\)[\s\S]+?taskById\[taskId\]\?\.status[\s\S]+?TERMINAL_TASK_STATUSES\.has\(taskStatus\)/);
   assert.match(timeline, /event\.producer === "task-orchestrator" && \(event\.kind === "error" \|\| event\.status === "failed"\)/);
@@ -852,8 +895,8 @@ test("Agent 调用活动区保留完整命令、文件与事件内容，并采�
   assert.match(timeline, /finishedPayload\.delta === true/);
   assert.match(timeline, /if \(event\.kind === "command"\)[\s\S]+?commandId[\s\S]+?callIndexes\.has\(commandKey\)/);
   assert.match(timeline, /file\.delta[\s\S]+?previous\?\.diff/);
-  assert.match(timeline, /<OperationGroup key=\{segment\.id\}/);
-  assert.match(timeline, /<AgentThought key=\{segment\.id\}/);
+  assert.match(timeline, /segment.type === "operations"\) return <OperationGroup/);
+  assert.match(timeline, /event.kind === "message"\) return <AgentThought/);
   assert.match(timeline, /function substantiallySameFinalBody[\s\S]+?shorter\.length \/ longer\.length >= \.86/);
   assert.match(timeline, /function finalSummaryMessageIds/);
   assert.match(timeline, /for \(const event of events\)[\s\S]+?event\.kind === "message" && substantiallySameFinalBody\(normalizedActivityText\(event\), finalText\)[\s\S]+?hidden\.add\(event\.eventId\)/);
@@ -882,8 +925,9 @@ test("Agent 调用活动区保留完整命令、文件与事件内容，并采�
   assert.match(activityRule, /--activity-row-inset:7px;/);
   assert.match(activityRule, /gap:2px;/);
   assert.match(activityRule, /margin:1px 7px 2px 11px;/);
+  assert.match(activityRule, /--activity-content-inset:16px;/);
   assert.match(activityRule, /border-left:1px solid/);
-  assert.match(activityRule, /padding:1px 0 0 16px;/);
+  assert.match(activityRule, /padding:1px 0 0 var\(--activity-content-inset\);/);
   assert.match(styles, /\.activityGroup\s*\{[^}]*border:0;[^}]*border-radius:0;[^}]*background:transparent;/s);
   assert.match(styles, /\.agentEvent\s*\{[^}]*border:0;[^}]*border-radius:0;[^}]*background:transparent;/s);
   assert.match(styles, /\.agentThought\s*\{[^}]*background:transparent;/s);
@@ -917,25 +961,28 @@ test("运行中发送槽位在原生终止与追加发送之间切换，并锁�
     readFile(servicesPath, "utf8"),
   ]);
   assert.match(view, /const hasPendingPrompt = Boolean\(value\.trim\(\)\)/);
-  assert.match(view, /const showStopAction = \(taskRunning \|\| pendingWebRun\) && Boolean\(onInterrupt\) && !hasPendingPrompt/);
+  assert.match(view, /const showStopAction = taskRunning && Boolean\(onInterrupt\) && !hasPendingPrompt/);
+  assert.match(view, /The Web Agent handoff phase has no remote process to interrupt yet/);
   assert.match(view, /showStopAction \? <span[\s\S]+?className=\{`\$\{styles\.send\} \$\{styles\.stop\}`\}[\s\S]+?: <span[\s\S]+?<button className=\{styles\.send\}/);
-  assert.match(view, /aria-label="终止任务"[\s\S]+?<Square size=\{14\} fill="currentColor"/);
+  assert.match(view, /aria-label=\{stopping \|\| activeTask\?\.status === "interrupting" \? "正在终止任务" : "终止任务"\}[\s\S]+?<LoaderCircle[\s\S]+?<Square size=\{14\} fill="currentColor"/);
   assert.doesNotMatch(view, /taskRunning && onInterrupt \?/);
   assert.doesNotMatch(view, /正在中断任务|已发送停止指令|任务已停止/);
   assert.match(view, /data-tooltip=\{busy \? "正在发送" : "发送消息"\}/);
   assert.match(view, /aria-label=\{busy \? "正在发送" : "发送消息"\}/);
   assert.doesNotMatch(view, /直接追加给当前 Agent|"追加消息"/);
-  assert.match(view, /disabled=\{disabled \|\| busy \|\| taskRunning\}/);
+  assert.match(view, /const inputDisabled = Boolean\(disabled \|\| pendingWebRun\)/);
+  assert.match(view, /disabled=\{inputDisabled \|\| busy \|\| taskRunning\}/);
   assert.match(view, /\["queued", "preparing", "delivering_context", "running", "waiting_approval", "waiting_input", "waiting_append", "interrupting"\]/);
   assert.match(view, /event\.kind === "run\.handoff\.dispatched"[\s\S]+?api\.get<TaskSummary>/);
   assert.match(view, /handedOffTaskIdsKey[\s\S]+?Promise\.allSettled/);
   assert.match(view, /settledTaskIdsKey[\s\S]+?"run\.persisted"[\s\S]+?Promise\.allSettled/);
-  assert.match(view, /handedOffTaskIdsKey[\s\S]+?replayCompleteTaskHistory\(taskId\)/);
-  assert.match(view, /settledTaskIdsKey[\s\S]+?replayCompleteTaskHistory\(taskId\)/);
+  assert.match(view, /handedOffTaskIdsKey[\s\S]+?reconcileTaskHistory\(taskId/);
+  assert.match(view, /settledTaskIdsKey[\s\S]+?reconcileTaskHistory\(taskId/);
+  assert.match(view, /reconcileTaskHistory[\s\S]+?replayCompleteTaskHistory\(taskId, \(page\)/);
   assert.match(view, /const liveTaskIdsKey = \[\.\.\.new Set\(\[\.\.\.handedOffTaskIds, activeTaskId\]/);
   assert.match(view, /liveTaskIdsKey\.split\("\\n"\)\.map\(\(taskId\) => realtime\.subscribe\(`task:\$\{taskId\}`/);
   assert.match(view, /const taskReplayCursors = useRef\(new Map<string, number>\(\)\)/);
-  assert.match(view, /\/events\?after=\$\{after\}&limit=500/);
+  assert.match(view, /\/events\?view=summary&after=\$\{after\}&limit=500/);
   assert.match(view, /timer = window\.setTimeout\(\(\) => void poll\(\), 5_000\)/);
   assert.match(view, /\["run\.handoff\.dispatched", "run\.persisted", "run\.suspended", "run\.failed", "run\.superseded"\][\s\S]+?api\.get<TaskSummary>/);
   assert.doesNotMatch(view, /<button className=\{styles\.stop\}[^>]+中断当前任务/);
@@ -986,6 +1033,21 @@ test("新建 Work 环境初始化失败后仍进入已创建对话，防止重�
   assert.match(firstWorkStart, /if \(!conversationOpened\) runtime\.navigate/);
 });
 
+test("Work 首轮交接前失败后可幂等重试虚拟工作区且不会先写入悬空消息", async () => {
+  const view = await readFile(viewPath, "utf8");
+  const descriptor = view.slice(view.indexOf("const responseDescriptor"), view.indexOf("const uploadConversationFiles"));
+  const existingSend = view.slice(view.indexOf("if (activeMode === \"work\" && activeTask?.status === \"running\")"), view.indexOf("const interrupt = async"));
+  const normalSend = existingSend.slice(existingSend.indexOf("// Validate the complete response route"));
+  assert.match(descriptor, /workspace === VIRTUAL_WORKSPACE[\s\S]+?workspacePreparation: \{ kind: "virtual", branchId \}/);
+  assert.match(descriptor, /agentConfigSourceScope: configScope/);
+  assert.doesNotMatch(descriptor, /agentLabel = [^;]*"已选 Agent"/);
+  assert.match(normalSend, /const response = responseDescriptor\(undefined, resources, selection\);[\s\S]+?const sent = await appendConversationMessage/);
+  assert.ok(normalSend.indexOf("const response = responseDescriptor") < normalSend.indexOf("const sent = await appendConversationMessage"));
+  assert.match(view, /latestResponseOrphaned[\s\S]+?responseRecoveryMessageId === latestResponseUserId/);
+  assert.match(view, /orphanRecoveryDelay\(latestResponseCreatedAt\) \+ 50/);
+  assert.match(view, /latestResponseTaskSettled \|\| latestResponseRunSettled \|\| latestResponseOrphaned/);
+});
+
 test("远程连接错误只在当前弹框实际发起连接失败后显示", async () => {
   const [dialog, manager] = await Promise.all([readFile(connectionDialogPath, "utf8"), readFile(serverManagerPath, "utf8")]);
   assert.match(dialog, /connectionAttemptError/);
@@ -1016,7 +1078,7 @@ test("网页上下文区分模型原生 usage 与明确标注的估算值", asyn
   assert.doesNotMatch(services, /function estimatedTokens\(value\) \{\s*return Math\.max\(0, Math\.ceil\(String\(value \|\| ""\)\.length \/ 4\)\);/);
 });
 
-test("Composer 复用流式资源上传、文件集和精确 Skill pins，不回退到 base64", async () => {
+test("Composer 复用流式资源上传，Chat 与 Work 共用文件概览，并保留精确 Skill pins", async () => {
   const [view, resources, services] = await Promise.all([readFile(viewPath, "utf8"), readFile(resourcesPath, "utf8"), readFile(servicesPath, "utf8")]);
   assert.match(view, /uploadResource\(api, file/);
   assert.doesNotMatch(view, /contentBase64|FileReader/);
@@ -1025,11 +1087,12 @@ test("Composer 复用流式资源上传、文件集和精确 Skill pins，不回
   assert.match(view, /scope\.selectedCollectionIds/);
   assert.match(services, /project\?\.collectionIds/);
   assert.match(services, /this\.container\.resources\.catalog/);
-  assert.match(services, /const scopedResourceCatalogPromise = mode === "work"[\s\S]+?this\.container\.resources\.catalog\(\{ scope, limit: 80 \}\)/);
+  assert.match(services, /const scopedResourceCatalogPromise = !skipWebAgentModel && allowWorkResources[\s\S]+?this\.container\.resources\.catalog\(\{ scope, limit: 80 \}\)/);
   assert.match(services, /const workResourceToolsPromise = mode === "work"[\s\S]+?hasSelectedResourceScope \|\| \(Array\.isArray\(catalog\?\.items\) && catalog\.items\.length > 0\)/);
   assert.match(services, /Promise\.all\(\[workMemoryToolsPromise, workSkillToolsPromise, workResourceToolsPromise\]\)/);
   assert.match(services, /includeAllResources: explicitResourceSelection/);
-  assert.match(services, /prompts\.resourceCatalog/);
+  assert.match(services, /const resourceCatalogPromise = !skipWebAgentModel[\s\S]+?prompts\.resourceCatalog/);
+  assert.doesNotMatch(services, /const resourceCatalogPromise = mode === "work"/);
   assert.doesNotMatch(services, /initialToolChoice:\s*forceResourceSearch/);
   assert.match(view, /scope\.skillPins/);
   assert.match(services, /this\.container\.skills\.pinTask/);
@@ -1056,7 +1119,7 @@ test("Work 消息重试、分支与回溯交给后端版本事务", async () => 
   assert.match(services, /\.\.\.preparedVersions\.map\(\(preparedVersion\) => preparedVersion\.versioning\.forkDomain/);
   assert.match(services, /#tryNativeAgentFork/);
   assert.match(services, /operation:\s*"fork"[\s\S]+?lastTurnId/);
-  assert.match(services, /skillPins:\s*clone\(Array\.isArray\(sourceBinding\.native\?\.skillPins\)/);
+  assert.match(services, /skillPins:\s*clone\(boundary\?\.skillSnapshot\?\.skillPins/);
   assert.match(services, /recoveredSkillPins:\s*targetBinding\.native\.skillPins/);
   assert.match(services, /contextHub\.forkBindingCheckpoint/);
   assert.match(services, /inheritedUnits:\s*inheritedConversationUnits/);
@@ -1088,7 +1151,7 @@ test("消息操作按钮使用应用内悬停提示并以历史图标表达回�
   const [view, styles] = await Promise.all([readFile(viewPath, "utf8"), readFile(viewStylePath, "utf8")]);
   assert.match(view, /function MessageAction/);
   assert.match(view, /data-tooltip=\{label\}/);
-  assert.match(view, /label=\{user \? "复制消息" : "复制回复"\}/);
+  assert.match(view, /label=\{copied \? "已复制" : user \? "复制消息" : "复制回复"\}/);
   assert.doesNotMatch(view, /label="编辑消息"/);
   assert.match(view, /label="重新生成"/);
   assert.match(view, /label="重新生成本轮回复"/);

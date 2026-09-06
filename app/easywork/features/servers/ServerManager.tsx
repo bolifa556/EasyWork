@@ -71,7 +71,7 @@ function draftOf(server?: ServerRecord): ServerDraft {
 function Status({ value }: { value: ServerStatus }) {
   const visible = value === "failed" ? "disconnected" : value;
   const labels = { connected: "已连接", connecting: "连接中", disconnected: "未连接" };
-  return <span className={`${styles.status} ${styles[visible]}`}><i />{labels[visible]}</span>;
+  return <span className={`${styles.status} ${styles[visible]}`}><i data-ui-icon="" />{labels[visible]}</span>;
 }
 
 function connectionErrorMessage(reason: unknown) {
@@ -212,13 +212,13 @@ function ConnectDialog({ server, onClose, onChanged }: { server: ServerRecord; o
   </Modal>;
 }
 
-function ShieldFingerprint() { return <span className={styles.fingerprintIcon}><KeyRound size={21} /></span>; }
+function ShieldFingerprint() { return <span data-ui-icon="" className={styles.fingerprintIcon}><KeyRound size={21} /></span>; }
 
 function Detail({ server, onEdit, onConnect, onDisconnect }: { server: ServerRecord; onEdit: () => void; onConnect: () => void; onDisconnect: () => Promise<void> }) {
   const connected = server.connection.status === "connected";
   const conversations = server.conversations ?? server.conversationIds.map((id) => ({ id, title: "未命名对话" }));
   return <div className={styles.detail}>
-    <header className={styles.detailHeading}><div className={styles.serverMark}>{connected ? <Wifi size={23} /> : <ServerOff size={23} />}</div><div><h2>{server.profile.name}</h2><p>{server.profile.username}@{server.profile.host}:{server.profile.port}</p></div><Status value={server.connection.status} /></header>
+    <header className={styles.detailHeading}><div data-ui-icon="" className={styles.serverMark}>{connected ? <Wifi size={23} /> : <ServerOff size={23} />}</div><div><h2>{server.profile.name}</h2><p>{server.profile.username}@{server.profile.host}:{server.profile.port}</p></div><Status value={server.connection.status} /></header>
     <div className={styles.facts}><div><span>认证方式</span><strong>{server.profile.authMethod === "private-key" ? "SSH 私钥" : "密码"}</strong></div><div><span>关联对话</span><strong>{server.conversationIds.length}</strong></div><div><span>最近活动</span><strong>{server.connection.lastActiveAt ? new Date(server.connection.lastActiveAt).toLocaleString("zh-CN") : "—"}</strong></div></div>
     <section className={styles.bindingSection}><div className={styles.subheading}><UsersRound size={17} /><h3>连接对话</h3></div>{conversations.length ? <div className={styles.bindingList}>{conversations.map((conversation) => <div key={conversation.id}><span title={conversation.title}>{conversation.title}</span><i>{connected ? "SSH 可用" : "等待连接"}</i></div>)}</div> : <div className={styles.noBindings}>还没有对话使用这台服务器</div>}</section>
     <footer className={styles.detailActions}><Button onClick={onEdit}>配置</Button>{connected ? <Button variant="danger" icon={<Unplug size={16} />} onClick={() => void onDisconnect()}>断开 SSH</Button> : <Button variant="primary" icon={<Cable size={16} />} onClick={onConnect} disabled={server.connection.status === "connecting"}>连接 SSH</Button>}</footer>
@@ -237,6 +237,8 @@ export default function ServerManager() {
   const [loading, setLoading] = useState(() => !initialCache);
   const [editing, setEditing] = useState<"new" | "selected" | null>(null);
   const [connecting, setConnecting] = useState(false);
+  const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
+  const savedInEditor = useRef(false);
 
   const load = useCallback(async (preferred?: string) => {
     try {
@@ -277,18 +279,18 @@ export default function ServerManager() {
     catch (reason) { notify(reason instanceof Error ? reason.message : "断开失败", "error"); }
   };
 
-  return <div className={styles.page}>
+  return <div className={`${styles.page} ${mobileDetailOpen ? styles.mobileDetailPage : ""}`}>
     <header className={styles.pageHeader}>
-      <div className={styles.titleLine}><span className={styles.titleIcon}><Server size={19} /></span><h1>远程服务器</h1><span>{servers.length}</span></div>
+      <div className={styles.titleLine}>{mobileDetailOpen ? <button className={styles.mobileBack} aria-label="返回服务器列表" onClick={() => { setMobileDetailOpen(false); setEditing(null); }}><ArrowLeft size={17} /></button> : null}<span data-ui-icon="" className={styles.titleIcon}><Server size={19} /></span><h1>远程服务器</h1></div>
     </header>
     {loading ? <div className={styles.centerState}><LoaderCircle className={styles.spin} size={22} />正在读取远程服务器</div> : <div className={styles.manager}>
       <aside className={styles.serverList}>
         <div className={styles.serverItems}>
-          {servers.map((server) => <button key={server.profile.id} className={server.profile.id === selectedId ? styles.selectedServer : ""} onClick={() => { setSelectedId(server.profile.id); setEditing(null); }}><span className={styles.listIcon}><Server size={18} /></span><span><strong>{server.profile.name}</strong><small>{server.profile.host}</small></span><Status value={server.connection.status} /></button>)}
-          <button className={styles.addServer} onClick={() => setEditing("new")}><span className={styles.addServerIcon}><Plus size={17} /></span><strong>新建服务器</strong></button>
+          {servers.map((server) => <button key={server.profile.id} className={server.profile.id === selectedId ? styles.selectedServer : ""} onClick={() => { setSelectedId(server.profile.id); setEditing(null); setMobileDetailOpen(true); }}><span data-ui-icon="" className={styles.listIcon}><Server size={18} /></span><span><strong>{server.profile.name}</strong><small>{server.profile.host}</small></span><Status value={server.connection.status} /></button>)}
+          <button className={styles.addServer} onClick={() => { savedInEditor.current = false; setEditing("new"); setMobileDetailOpen(true); }}><span data-ui-icon="" className={styles.addServerIcon}><Plus size={17} /></span><strong>新建服务器</strong></button>
         </div>
       </aside>
-      <section className={styles.detailPanel}>{editing ? <ServerEditor embedded server={editing === "selected" ? selected ?? undefined : undefined} onClose={() => setEditing(null)} onSaved={async (serverId) => { await load(serverId); await refreshBootstrap(); }} /> : selected ? <Detail server={selected} onEdit={() => setEditing("selected")} onConnect={() => setConnecting(true)} onDisconnect={disconnect} /> : <div className={styles.emptyDetail}><Server size={25} /><strong>选择或新建一台服务器</strong></div>}</section>
+      <section className={styles.detailPanel}>{editing ? <ServerEditor embedded server={editing === "selected" ? selected ?? undefined : undefined} onClose={() => { setEditing(null); if (editing === "new" && !savedInEditor.current) setMobileDetailOpen(false); }} onSaved={async (serverId) => { await load(serverId); await refreshBootstrap(); savedInEditor.current = true; }} /> : selected ? <Detail server={selected} onEdit={() => { savedInEditor.current = false; setEditing("selected"); }} onConnect={() => setConnecting(true)} onDisconnect={disconnect} /> : <div className={styles.emptyDetail}><Server size={25} /><strong>选择或新建一台服务器</strong></div>}</section>
     </div>}
     {connecting && selected ? <ConnectDialog server={selected} onClose={() => setConnecting(false)} onChanged={async () => load(selected.profile.id)} /> : null}
   </div>;

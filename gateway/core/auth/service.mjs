@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { EventEmitter } from "node:events";
 
 import { createActorContext } from "../actor.mjs";
 import { invariant } from "../errors.mjs";
@@ -16,6 +17,8 @@ const DEVICE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const AVATAR_MIME = Object.freeze({ "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" });
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const rootMutationTails = new Map();
+const sessionRevocations = new EventEmitter();
+sessionRevocations.setMaxListeners(0);
 
 function clone(value) {
   return structuredClone(value);
@@ -445,6 +448,9 @@ export class AuthDeviceService {
     sessions.revision += 1;
     sessions.updatedAt = now;
     await this.#writeActorCollections(actorType, actorId, devices, sessions);
+    for (const session of sessions.sessions) if (session.revokedAt) {
+      sessionRevocations.emit(path.resolve(this.dataRoot), { actorId, sessionId: session.sessionId });
+    }
     return { token: created.token, sessionId: created.record.sessionId, device, firstVisit: device.helpSeenAt === null };
   }
 
@@ -624,6 +630,12 @@ export class AuthDeviceService {
     });
   }
 
+  onSessionRevoked(listener) {
+    const key = path.resolve(this.dataRoot);
+    sessionRevocations.on(key, listener);
+    return () => sessionRevocations.off(key, listener);
+  }
+
   async refreshSession(token) {
     return runRootMutation(this.dataRoot, async () => {
       await this.#recoverProfileUpdate();
@@ -645,6 +657,7 @@ export class AuthDeviceService {
       sessions.revision += 1;
       sessions.updatedAt = record.revokedAt;
       await writeJson(paths.sessions, sessions);
+      sessionRevocations.emit(path.resolve(this.dataRoot), { actorId: resolved.payload.actorId, sessionId: resolved.payload.sessionId });
       return { actorId: resolved.payload.actorId, sessionId: resolved.payload.sessionId, revoked: true };
     });
   }

@@ -27,6 +27,23 @@ const prompts = {
   },
 };
 
+test("连续用户 reply edge 不会把启动前已取消的旧提问当作有效追加重新交接", async () => {
+  const history = [
+    { id: "initial", role: "user", content: "原任务" },
+    { id: "append", role: "user", content: "有效追加", replyToMessageId: "initial" },
+    { id: "answer", role: "assistant", content: "已完成", replyToMessageId: "append" },
+    { id: "cancelled", role: "user", content: "可以，按这套配置部署一下，然后你可以从网上下个pdb文件和", replyToMessageId: "answer" },
+    { id: "corrected", role: "user", content: "完整的新提问", replyToMessageId: "cancelled" },
+    { id: "final", role: "assistant", content: "结果", replyToMessageId: "corrected" },
+    { id: "current", role: "user", content: "继续", replyToMessageId: "final" },
+  ];
+  const fragments = await workConversationTranscriptFragments(history, "current", prompts, { tasks: [
+    { sourceMessageId: "initial", status: "interrupted", startedAt: "2026-09-05T00:00:00Z" },
+    { sourceMessageId: "cancelled", status: "interrupted", startedAt: null },
+  ] });
+  assert.deepEqual(fragments.map((item) => item.knowledge.key), ["conversation:initial", "conversation:append", "conversation:answer", "conversation:corrected", "conversation:final"]);
+});
+
 test("网页模型可看见失败请求，但远端重建只采用已结算对话", () => {
   const history = [
     { id: "user-1", role: "user", content: "第一问" },
@@ -56,7 +73,7 @@ test("旧对话没有 reply edge 时仍按相邻 user/assistant 对保留", () =
   assert.deepEqual(settledConversationHistory(history).map((entry) => entry.id), ["legacy-user", "legacy-assistant"]);
 });
 
-test("Work 网页 Agent 只读取用户有效指令链而不重放远端旧结论", () => {
+test("Work 网页 Agent 保留用户提问、正文回答和后续纠正以理解追问", () => {
   const history = [
     { id: "checkpoint", role: "system", content: "对话检查点" },
     { id: "user-1", role: "user", content: "开始检查上传链路" },
@@ -70,10 +87,12 @@ test("Work 网页 Agent 只读取用户有效指令链而不重放远端旧结�
   assert.deepEqual(workConversationState(history, "user-current").map((entry) => entry.id), [
     "checkpoint",
     "user-1",
+    "assistant-1",
     "user-2",
+    "assistant-2",
     "user-failed",
   ]);
-  assert.equal(workConversationState(history, "user-current").some((entry) => entry.content.includes("上传链路把")), false);
+  assert.equal(workConversationState(history, "user-current").some((entry) => entry.content.includes("上传链路把")), true);
 });
 
 test("Work 远端聊天记忆包含全部已完成提问与正文回复，不包含系统、失败请求和当前提问", async () => {
@@ -477,6 +496,7 @@ test("RemoteTaskLifecycle 创建新 Task 前修复当前原生会话最后一轮
     handoffFragments: [
       { knowledge: { key: "memory:project-goal", version: "1", content: "项目目标" } },
       { knowledge: { key: "skill:platform-guide", version: "semantic-v1:1.0.0:hash-a", content: "平台规范正文" } },
+      { toolName: "conversation_reference_read", knowledge: { key: "conversation-reference:source:snapshot:message", version: "snapshot-v1", content: "显式引用正文" } },
     ],
     idempotencyKey: "semantic-watermark-regression",
   });
@@ -489,7 +509,10 @@ test("RemoteTaskLifecycle 创建新 Task 前修复当前原生会话最后一轮
     { key: "conversation:message-user-previous", version: "message-user-previous", content: "user:上一轮问题" },
     { key: "conversation:message-assistant-previous", version: "message-assistant-previous", content: "assistant:上一轮答案" },
   ]);
-  assert.deepEqual(stagedKnowledge, [{ key: "memory:project-goal", version: "1", content: "项目目标" }]);
+  assert.deepEqual(stagedKnowledge, [
+    { key: "memory:project-goal", version: "1", content: "项目目标" },
+    { key: "conversation-reference:source:snapshot:message", version: "snapshot-v1", content: "显式引用正文" },
+  ]);
   assert.deepEqual(registeredTaskInput.observedKnowledge.map((entry) => entry.knowledge.key), ["memory:project-goal", "skill:platform-guide"]);
   assert.equal(deliveryChecks, 1);
 });
@@ -622,7 +645,7 @@ test("RemoteTaskLifecycle 筛选新交接前先确认重启遗留的已投递知
   assert.deepEqual(fragments, []);
 });
 
-test("RemoteTaskLifecycle 依据原生 Skill 视图去重包，不把 SKILL.md 再拼进普通 prompt", async () => {
+test("RemoteTaskLifecycle keeps deployed Skills selectable for native invocation without adding them to ordinary prompt", async () => {
   let nativeSessionId = "native-a";
   const known = { key: "skill:platform-guide", version: "1.0.0:hash-a" };
   const lifecycle = new RemoteTaskLifecycle({
@@ -649,7 +672,7 @@ test("RemoteTaskLifecycle 依据原生 Skill 视图去重包，不把 SKILL.md �
   ];
   const effectiveScope = { ...scope, actorType: "user", actorId: "user-runtime", branchId: "branch-runtime", contextEpoch: 0 };
 
-  assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments })).map((entry) => entry.knowledge.key), ["skill:health-check"]);
+  assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments })).map((entry) => entry.knowledge.key), ["skill:platform-guide", "skill:health-check"]);
   nativeSessionId = "native-b";
   assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments })).map((entry) => entry.knowledge.key), ["skill:platform-guide", "skill:health-check"]);
 });

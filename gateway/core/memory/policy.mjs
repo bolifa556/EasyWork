@@ -131,10 +131,19 @@ function describesWorkProductInventory(candidate) {
       || /(?:^|\n)\s*(?:[-*]|\d+[.)])\s*[^\n]*(?:\/[A-Za-z0-9_.@+-]+|\.[A-Za-z0-9]{1,12})/mu.test(content));
 }
 
-export function durableMemoryCandidate(candidate, { userMessage = "", observedKnowledge = [], mode = "chat" } = {}) {
+export function durableMemoryCandidate(candidate, { userMessage = "", assistantMessage = "", observedKnowledge = [], mode = "chat", checkEvidence = true } = {}) {
   const semanticKey = String(candidate?.semanticKey || "").trim();
   const content = String(candidate?.content || "").trim();
   if (!semanticKey || !content || content.length > 2_000) return false;
+  if (checkEvidence) {
+    const evidence = candidate?.evidence;
+    if (evidence && !String(evidence.role === "user" ? userMessage : assistantMessage).includes(evidence.quote)) return false;
+    const preference = candidate?.kind === "user-preference" || /(?:默认|偏好|长期约定|用户约定|user preference|default delivery)/iu.test(`${semanticKey}\n${content}`);
+    if (preference) {
+      if (evidence && evidence.role !== "user") return false;
+      if (!/(?:请记住|以后|今后|后续|默认|始终|长期|统一|一律|固定|约定|偏好|我喜欢|我希望|always|prefer|from now on|remember)/iu.test(String(evidence?.quote || userMessage))) return false;
+    }
+  }
   if (ABSOLUTE_PATH.test(content)
     || LIVE_MEASUREMENT.test(content)
     || TRANSIENT_RESULT.test(content)
@@ -168,5 +177,5 @@ export function durableMemoryCandidate(candidate, { userMessage = "", observedKn
 }
 
 export function durableStoredMemory(semanticKey, content) {
-  return durableMemoryCandidate({ semanticKey, content, level: "project" });
+  return durableMemoryCandidate({ semanticKey, content, level: "project" }, { checkEvidence: false });
 }

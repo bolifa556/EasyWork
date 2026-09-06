@@ -1,54 +1,174 @@
-# EasyWork
+<p align="center">
+  <img src="assets/readme/hero.svg" width="100%" alt="EasyWork — Chat, knowledge and remote work in one place">
+</p>
 
-EasyWork 是面向个人与算力平台的对话工作台。聊天模式直接调用网页模型；工作模式由部署 EasyWork 的主机统一维护 SSH Worker，并把网页对话、远端服务器、工作区和 CLI Agent 原生会话组合成可持续恢复的任务。
+<p align="center">
+  <img src="https://img.shields.io/badge/version-0.1.0-17786B?style=flat-square" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/platforms-Windows%20%2F%20Linux-17786B?style=flat-square" alt="Windows and Linux">
+  <img src="https://img.shields.io/badge/architecture-x64-17786B?style=flat-square" alt="64-bit x86">
+  <img src="https://img.shields.io/badge/deployment-self--hosted-17786B?style=flat-square" alt="Self-hosted">
+</p>
 
-## 启动
+<p align="center">
+  <a href="README_zh.md"><b>简体中文</b></a> · <b>English</b>
+</p>
+<p align="center">
+  <a href="#features">Features</a> · <a href="#download">Download</a> · <a href="#quick-start">Quick Start</a> · <a href="#faq">FAQ</a>
+</p>
 
-需要 Node.js 22.13 或更高版本。
+## What is EasyWork?
+
+**EasyWork is a conversational workspace that connects AI, your knowledge and remote servers.** Ask questions in Chat mode, or switch to Work mode to let a coding agent complete tasks in a remote workspace. Conversations, files, terminal sessions and results stay together in your browser.
+
+Connect **OpenCode, Claude Code or Codex**, organize reusable material into projects and file collections, and continue your work from another device. EasyWork runs on a host you control; remote work runs on the Linux servers you connect through SSH.
+
+## Features
+
+### 💬 Chat & Work — From questions to action
+
+- **Chat mode** — Ask questions with a model API you configure, using relevant files, skills and memories when needed.
+- **Work mode** — Select a server, agent and workspace, then describe the task in natural language.
+- **Visible progress** — Follow tool activity, commands, responses and generated files in the conversation.
+- **Continuous work** — Closing the browser does not cancel a task while the EasyWork host remains running.
+
+### 🖥️ Remote Workspace — Your server in the browser
+
+- Connect multiple servers with SSH passwords or keys, with interactive verification when required.
+- Browse and preview files, open a terminal and inspect server resources.
+- Use an existing directory or create a temporary workspace managed by EasyWork.
+- Inspect Slurm jobs and submit or cancel jobs on servers that provide Slurm.
+
+### 📚 Files & Memory — Bring the right context
+
+- Organize files into collections and attach them to conversations or projects.
+- Search text, Markdown, PDF and Word documents; image recognition requires an OCR model configuration.
+- Retain useful preferences and project context, with project memory scope controls.
+- Reference another conversation with `@` and search previous conversations.
+
+### 🧩 Agents & Skills — Continue with the tools you prefer
+
+- Switch between OpenCode, Claude Code and Codex, with relevant context passed to the selected session.
+- Install marketplace skills or upload your own, and control where they apply.
+- Branch or rewind conversations with coordinated remote file history, subject to the agent's capabilities and file conflicts.
+
+### 🌐 Self-Hosted — One account, multiple devices
+
+- Access the same deployment from desktop or mobile browsers.
+- Keep account data and encrypted credentials on your EasyWork host.
+- Configure your own model services, or let the administrator provide shared services.
+
+## Download
+
+Only **x86-64 / AMD64** packages are provided. Windows 10 and 11 share one archive.
+
+| Host system | Package | Runtime |
+| --- | --- | --- |
+| Windows 10 / 11, x64 | `easywork-0.1.0-windows-x64.zip` | Bundled Node.js |
+| Ubuntu 22.04+, x64 | `easywork-0.1.0-linux-x64.tar.gz` | Bundled Node.js |
+| CentOS 7.9, x64 | `easywork-0.1.0-linux-centos7-x64.tar.gz` | Bundled glibc 2.17 compatible Node.js |
+
+Release assets belong on the repository's [Releases page](../../releases). Local builds are written to `releases/`, together with `SHA256SUMS.txt`.
+
+The CentOS 7 package uses the Node.js project's [unofficial glibc 2.17 build](https://github.com/nodejs/unofficial-builds#builds). Use that archive on CentOS 7, whose system libraries cannot run the ordinary Linux runtime. This is a compatibility build; CentOS 7 is no longer maintained upstream.
+
+These archives start a web service. Open it in a browser; no desktop application or separate Node.js installation is required. AI services and remote SSH servers must be reachable for the corresponding features.
+
+## Quick Start
+
+### Windows
+
+Extract `easywork-0.1.0-windows-x64.zip` and double-click **`start.cmd`** inside the extracted folder. Keep its window open while using EasyWork.
+
+### Ubuntu
+
+```bash
+tar -xzf easywork-0.1.0-linux-x64.tar.gz
+cd easywork-0.1.0-linux-x64
+./start.sh
+```
+
+### CentOS 7
+
+```bash
+tar -xzf easywork-0.1.0-linux-centos7-x64.tar.gz
+cd easywork-0.1.0-linux-centos7-x64
+./start.sh
+```
+
+Open **[http://127.0.0.1:8001](http://127.0.0.1:8001)** on the host. Other devices can use `http://HOST_IP:8001` when the network and firewall permit access. Press `Ctrl+C` in the launcher terminal to stop the service.
+
+### Your first task
+
+1. **Create an account.** The first registered user becomes the administrator; complete this step before exposing a fresh deployment to other users.
+2. **Configure a model API.** Open your profile → **模型 API** to add an API URL and key, or select a service provided by the administrator.
+3. **Start a chat.** Choose a model and send a message. File indexing requires an embedding service; image recognition also requires an OCR service configured by the administrator.
+4. **Try Work mode.** Connect an SSH server, configure an agent and select a workspace, then describe your task.
+
+The detailed [user guide](help/help.md) follows the current Chinese interface.
+
+### Optional agent installers
+
+The host archives include the installer catalog. To enable EasyWork's **managed agent installation** on remote Linux x64 servers, copy the `agent-app` directory from `easywork-0.1.0-agent-assets-linux-x64.tar.gz` into your EasyWork installation. This optional archive is shared by all three host platforms.
+
+Alternatively, download the pinned installers directly:
+
+```bash
+# Linux host
+./runtime/bin/node scripts/download-agent-app.mjs
+```
 
 ```powershell
-npm install
+# Windows host
+.\runtime\node.exe scripts\download-agent-app.mjs
+```
+
+Downloads are checked against the catalog's SHA-256 hashes. You can also select an agent already installed on your remote server. Each agent has its own system and model requirements; installing the EasyWork host on CentOS 7 does not guarantee that every agent runs on a CentOS 7 remote server.
+
+## Configuration & Data
+
+For release packages, copy `.env.example` to `.env` and edit it before starting. Common settings are the public port (`EASYWORK_WEB_PORT`, default `8001`) and an absolute data directory (`EASYWORK_DATA_ROOT`, default `data/` beside the application).
+
+Back up the **entire data directory**, including its encryption material. When upgrading, stop EasyWork, extract the new package into a separate folder and reuse the same data directory and configuration. Guest data is temporary; use an account for work you want to keep.
+
+For internet access, use an HTTPS reverse proxy with WebSocket support on port `8001`; the internal rendering port does not need to be exposed. Files and credentials are stored on your host, while model requests send the selected context to the configured model provider.
+
+## FAQ
+
+**Does my browser have to stay open?**  
+No. The host continues running tasks after the browser closes. Keep the host process running. After a host restart, reconnect your SSH servers; recovery depends on the task and the agent's available session state.
+
+**Do I need an SSH server for ordinary chat?**  
+No. Chat mode only needs a configured model service. Work mode uses a connected Linux server.
+
+**Will EasyWork change my workspace's Git history?**  
+EasyWork's automatic file history is separate from the workspace's Git repository. An agent can still run Git commands when carrying out your instructions.
+
+**Can I use it completely offline?**  
+The interface runs on your host. Chat, retrieval and agent tasks depend on their configured services; offline operation requires those services and any needed installers to be available locally.
+
+## Development
+
+Use Node.js **22.13+** and install dependencies from the lockfile:
+
+```bash
+npm ci
 npm run build
 npm start
 ```
 
-打开 `http://127.0.0.1:8001`。网页、`/api` 和 `/easywork-ws` 共用这一个对外端口；内部服务不需要单独访问。独立部署时可通过 `NEXT_PUBLIC_EASYWORK_GATEWAY_URL` 指向受保护的 HTTPS/WSS 网关。
+For development, run `npm run gateway` and `npm run dev` in separate terminals. Run the test suite with `npm run test:gateway` and check code with `npm run lint`.
 
-Windows 可使用 `frp\start.cmd` 启动主服务、内部网页渲染器和可选的 FRP 映射。主服务是唯一公开入口；FRP 只映射 `8001 → 8001`，不参与 SSH 认证和远端会话。
-
-开发时可分别运行 `npm run gateway` 与 `npm run dev`；开发服务器同样使用 `8001`，并把 API 与实时连接转发到开发网关。
-
-## 运行模型
-
-- 同一账号的多台设备共享账号配置、对话、文件集、技能和主机维护的 SSH 状态。
-- 每个用户拥有一个 SSH Worker；Worker 可同时连接该用户的多台服务器，同一连接可被多个对话复用。
-- 网页关闭后，主机继续执行已启动任务；服务重启时只恢复能由 Agent 原生会话安全续接的任务，不能证明可恢复的任务会明确失败收口。
-- 一个网页对话可使用多个 Agent；每个 Agent 在每个工作区拥有独立原生会话，切回时只补发缺失上下文。
-- EasyWork 管理的数据位于 `data/users/<id>` 或 `data/guests/<id>`；远端控制数据只位于 `~/.easywork`。
-- Skill 的用户版本保存在 Actor 数据目录，执行前固定版本与哈希，并只部署到远端 `~/.easywork/skills`，不修改 Agent 原生配置。
-- 工作区版本管理使用 `~/.easywork` 下的影子仓库，不读写用户工作区的 `.git`。
-- 文件集、项目文件和对话附件统一经过资源提取、切块与 Embedding；原文件、解析结果和向量索引均按用户隔离。
-
-## 目录
+Build all three release archives with `npm run release` (also requires Python 3.9+ and `tar`). After downloading the agent installers, use `npm run release -- --agents` to include the optional agent archive. Runtime versions and checksums are pinned in `scripts/release-targets.json`.
 
 ```text
-app/easywork/       页面 Shell 与按需加载功能模块
-app/core/           前端合同、网关客户端和能力注册表
-gateway/core/       账户、资源、记忆、SSH、Agent 与任务服务
-prompts/            所有模型提示词、工具定义与上下文组装模板
-doc/                三份唯一机制规范：SSH、网页 Agent、远端版本与 Agent
-data/               用户与访客运行数据（Git 忽略）
-tests/              当前架构的领域、HTTP 与集成测试
-scripts/            当前构建与启动工具
+app/          Browser interface
+gateway/      Application services and remote work
+shared/       Shared utilities
+prompts/      Model prompts and skill definitions
+help/         User guide
+doc/          Mechanism and agent documentation
+scripts/      Build, startup and release tools
+tests/        Automated tests
 ```
 
-机制说明只维护在 [SSH机制](doc/SSH机制.md)、[网页Agent机制](doc/网页Agent机制.md) 和 [远端文件版本与Agent机制](doc/远端文件版本与Agent机制.md) 三份文档中。
-
-## 验证
-
-```powershell
-npm test
-npm run lint
-```
-
-API Key 与 SSH 凭据在磁盘加密保存；公开响应、实时事件和审计记录均不包含明文密钥。首次连接采用主机指纹确认，管理员 SSH 网络策略会在建立连接前校验主机、解析地址和端口。
+For implementation details, see the [SSH](doc/SSH机制.md), [web agent](doc/网页Agent机制.md) and [remote files & agents](doc/远端文件版本与Agent机制.md) documentation. Local data, environments, FRP, synchronization settings, caches and release archives are excluded from Git.

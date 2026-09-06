@@ -8,6 +8,7 @@ import type {
 
 export type ProjectFile = {
   id: string;
+  bindingId: string;
   name: string;
   relativePath: string;
   size: number;
@@ -30,6 +31,8 @@ export type ProjectPageProps = {
   onMemoryModeChange: (mode: ProjectSummary["memoryMode"]) => void | Promise<void>;
   onUploadFiles: (files: File[]) => void | Promise<void>;
   onRetryFile: (fileId: string) => void | Promise<void>;
+  onPreviewFile: (file: ProjectFile) => void;
+  onDeleteFile: (file: ProjectFile) => void | Promise<void>;
   onLinkCollection: (collectionId: string) => void | Promise<void>;
   onUnlinkCollection: (collectionId: string) => void | Promise<void>;
 };

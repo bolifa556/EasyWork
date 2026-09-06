@@ -8,7 +8,7 @@ import test from "node:test";
 import { createActorContext } from "../gateway/core/actor.mjs";
 import { createClaudeCodeAdapter, createCodexAdapter, createOpenCodeAdapter } from "../gateway/core/agents/index.mjs";
 import { coalescedAgentFrames } from "../gateway/core/agent-runtime/index.mjs";
-import { SchedulerSubmissionLedger, SchedulerSubmissionTracker, agentSubmissionReceipts, slurmSubmissionReceipts } from "../gateway/core/scheduler/submissions.mjs";
+import { SchedulerSubmissionLedger, SchedulerSubmissionTracker, agentSchedulerActivity, agentSubmissionReceipts, slurmSubmissionReceipts } from "../gateway/core/scheduler/submissions.mjs";
 
 const SERVER = `ssh_${crypto.createHash("sha256").update("submission-host").digest("base64url")}`;
 const actor = (id = "alice") => createActorContext({ actorType: "user", actorId: id, deviceId: "device", sessionId: "session", roles: [] });
@@ -225,19 +225,73 @@ test("submission tracking pauses on disconnect and resumes from durable receipts
   assert.deepEqual(await ledger.pending(), []);
 });
 
-test("retired, failed-query and foreign-owner jobs remain unknown without endless polling", async (t) => {
+test("retired and foreign jobs stop polling, while transient controller failures remain recoverable", async (t) => {
+  let recovered = false;
   const { ledger, tracker, timers } = await trackingFixture(t, async (id) => {
     if (id === "501") return null;
-    if (id === "502") throw new Error("controller unavailable");
+    if (id === "502") {
+      if (!recovered) throw new Error("controller unavailable");
+      return { id, owner: "alice", state: "completed" };
+    }
     return { id, owner: "bob", state: "completed" };
   });
   await ledger.record(["501", "502", "503"].map((jobId) => ({ jobId, callId: "call" })));
   await tracker.resume();
   for (let index = 0; index < 3; index += 1) await tracker.poll();
-  assert.equal(timers.size, 0);
+  assert.equal(timers.size, 1);
   const history = await ledger.list({ startDate: "2026-09-03", endDate: "2026-09-03" });
   assert.equal(history.length, 3);
   assert.ok(history.every((job) => job.state === "unknown" && job.startedAt === null && job.endedAt === null));
+  recovered = true;
+  await tracker.poll();
+  assert.equal(timers.size, 0);
+  assert.equal((await ledger.list({ startDate: "2026-09-03", endDate: "2026-09-03" })).find((job) => job.id === "502").state, "completed");
+});
+
+test("a new submission replaces the pending timer and state changes notify all clients once", async (t) => {
+  let phase = "running";
+  const notifications = [];
+  const { ledger, tracker, timers } = await trackingFixture(t, async (id) => ({ id, owner: "alice", state: phase }));
+  tracker.onChanged = async (ids) => notifications.push(ids);
+  await ledger.record([{ jobId: "801", callId: "a" }]);
+  await tracker.resume();
+  await tracker.poll();
+  assert.equal([...timers.values()][0].delay, 15_000);
+  await ledger.record([{ jobId: "802", callId: "b" }]);
+  await tracker.resume(["802"]);
+  assert.equal([...timers.values()][0].delay, 0);
+  await tracker.poll();
+  assert.deepEqual(notifications, [["801"], ["802"]]);
+  phase = "completed";
+  await tracker.poll();
+  assert.deepEqual([...notifications.at(-1)].sort(), ["801", "802"]);
+  assert.equal(timers.size, 0);
+});
+
+test("scheduler activity uses executed shell commands, and final empty frames retain accumulated receipts", () => {
+  const make = (command) => ({ event: { kind: "tool_result", phase: "completed", payload: { name: "functions.exec_command", callId: "c", input: { cmd: command }, text: "" } } });
+  assert.equal(agentSchedulerActivity(make("scancel 900")), true);
+  assert.equal(agentSchedulerActivity(make("squeue -u alice")), true);
+  assert.equal(agentSchedulerActivity(make("echo 'scancel 900'")), false);
+  assert.equal(agentSchedulerActivity(make("cat <<EOF\nsbatch job.sh\nEOF")), false);
+  const input = make("sbatch -p cpu job.sh");
+  input.binding = { state: { items: { c: { output: "Submitted batch job 900\n" } } } };
+  assert.equal(agentSubmissionReceipts(input)[0].jobId, "900");
+});
+
+test("a streamed receipt is detected before shell completion but never from a partial JobID", async (t) => {
+  const make = (text, cumulative, phase = "updated") => ({
+    event: { kind: "tool_result", phase, payload: { name: "commandExecution", callId: "stream-submit", text, delta: phase === "updated" } },
+    binding: { state: { items: { "stream-submit": { input: { command: "sbatch -p cpu short.sh; sleep 120" }, output: cumulative } } } },
+  });
+  assert.deepEqual(agentSubmissionReceipts(make("Submitted batch job 12", "Submitted batch job 12")), []);
+  const receipts = agentSubmissionReceipts(make("3\nwaiting", "Submitted batch job 123\nwaiting"));
+  assert.deepEqual(receipts.map((r) => r.jobId), ["123"]);
+  assert.deepEqual(agentSubmissionReceipts(make("\n", "Submitted batch job 123\nwaiting\n")), []);
+  const { ledger } = await trackingFixture(t, async () => null);
+  assert.deepEqual(await ledger.record(receipts, { taskId: "stream-task" }), ["123"]);
+  const finalReceipts = agentSubmissionReceipts(make("Submitted batch job 123\nwaiting\n", "", "completed"));
+  assert.deepEqual(await ledger.record(finalReceipts, { taskId: "stream-task" }), [], "终态帧不能重复登记或重复发布提交通知");
 });
 
 test("submission tracking bounds queries to 20 jobs and 4 concurrent requests per pass", async (t) => {

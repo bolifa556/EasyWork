@@ -165,6 +165,14 @@ export class RealtimeEventJournal {
     }
   }
 
+  async details(topic, eventIds) {
+    invariant(Array.isArray(eventIds) && eventIds.length > 0 && eventIds.length <= 2_000 && eventIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= 200), "REALTIME_EVENT_IDS_INVALID", "事件编号无效", { status: 400 });
+    const selected = new Set(eventIds);
+    const { data } = await this.#repository(topic).read();
+    const events = data.events.filter((event) => selected.has(event.eventId));
+    return { events: structuredClone(events), missingEventIds: eventIds.filter((id) => !events.some((event) => event.eventId === id)) };
+  }
+
   async replay(topic, options = {}) {
     const afterSequence = Number(options.afterSequence ?? 0);
     const limit = Number(options.limit ?? 500);

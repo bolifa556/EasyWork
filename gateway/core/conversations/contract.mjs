@@ -60,6 +60,21 @@ export function assertMessageContent(value) {
   return value;
 }
 
+export function assertConversationReferenceRequests(value) {
+  if (value === undefined || value === null) return [];
+  invariant(Array.isArray(value), "CONVERSATION_REFERENCES_INVALID", "对话引用必须是数组", { status: 400 });
+  const seen = new Set();
+  return value.map((entry, index) => {
+    invariant(entry && typeof entry === "object" && !Array.isArray(entry), "CONVERSATION_REFERENCE_INVALID", `references[${index}] 无效`, { status: 400 });
+    assertInputKeys(entry, ["type", "conversationId"], `references[${index}]`);
+    invariant(entry.type === "conversation", "CONVERSATION_REFERENCE_TYPE_INVALID", "只支持引用 EasyWork 对话", { status: 400 });
+    const conversationId = assertConversationId(entry.conversationId, `references[${index}].conversationId`);
+    invariant(!seen.has(conversationId), "CONVERSATION_REFERENCE_DUPLICATE", "同一对话不能重复引用", { status: 400 });
+    seen.add(conversationId);
+    return Object.freeze({ type: "conversation", conversationId });
+  });
+}
+
 export function assertTitle(value) {
   invariant(typeof value === "string", "CONVERSATION_TITLE_INVALID", "对话名称必须是字符串", { status: 400 });
   const result = value.trim();

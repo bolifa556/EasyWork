@@ -822,6 +822,33 @@ test("Agent 最终回复中的远程文件链接转换为下载产物且不泄�
   assert.equal(final.payload.text.includes("file:///"), false);
 });
 
+test("Agent 最终回复保留 Markdown 段落与列表边界", () => {
+  const text = [
+    "你好！我是 Codex。",
+    "",
+    "**我能做什么**",
+    "",
+    "- 读写代码",
+    "- 运行测试",
+    "",
+    "**我的风格**",
+    "",
+    "- 先验证再回答",
+    "",
+    "随时告诉我下一步。",
+  ].join("\n");
+  const result = consume(createCodexAdapter(), [
+    { method: "turn/started", params: { threadId: "thread-markdown", turn: { id: "turn-markdown" } } },
+    { method: "item/completed", params: { threadId: "thread-markdown", turnId: "turn-markdown", item: {
+      id: "answer-markdown",
+      type: "agentMessage",
+      text,
+    } } },
+    { method: "turn/completed", params: { threadId: "thread-markdown", turn: { id: "turn-markdown", status: "completed" } } },
+  ]);
+  assert.equal(result.events.findLast((event) => event.kind === "final").payload.text, text);
+});
+
 test("Agent 的文件链接列表只生成下载产物，不在正文重复文件名占位行", () => {
   const result = consume(createCodexAdapter(), [
     { method: "turn/started", params: { threadId: "thread-download-list", turn: { id: "turn-download-list" } } },

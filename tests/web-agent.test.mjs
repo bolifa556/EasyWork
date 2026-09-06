@@ -38,7 +38,7 @@ test("Work 在模型入口前遵守用户明确限定的资料来源", () => {
   });
 });
 
-function contextServices(overrides = {}, skillOverrides = {}) {
+function contextServices(overrides = {}, skillOverrides = {}, referenceOverrides = {}) {
   return {
     context: {
       state: async () => ({
@@ -67,6 +67,10 @@ function contextServices(overrides = {}, skillOverrides = {}) {
       read: async () => ({ skills: [] }),
       ...skillOverrides,
     },
+    conversationReferences: {
+      read: async () => ({ conversation: [], nextCursor: null }),
+      ...referenceOverrides,
+    },
   };
 }
 
@@ -82,6 +86,32 @@ function submitVisible(messages, select = (candidateIds) => candidateIds) {
   const candidateIds = select(visibleCandidateIds(messages));
   return { toolCalls: [{ id: `submit_${candidateIds.length}`, name: "handoff_submit", input: { candidateIds } }] };
 }
+
+test("Work 的单次模型请求超时会给出可重试原因而不占满整轮预算", async () => {
+  const events = [];
+  const runtime = new WebAgentRuntime({
+    model: {
+      async complete({ signal }) {
+        await new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      },
+    },
+    tools: await createDefaultWebAgentTools(contextServices(), prompts),
+    prompts,
+    limits: { workModelTimeoutMs: 25, maxWallTimeMs: 2_000 },
+    eventSink: async (event) => events.push(event),
+  });
+
+  await assert.rejects(runtime.run({
+    mode: "work",
+    actor: { actorId: "user_timeout" },
+    scope: { conversationId: "conversation_timeout" },
+    userMessage: "检查相关记忆",
+    runId: "web_model_timeout",
+  }), (error) => error.code === "MODEL_RESPONSE_TIMEOUT" && error.retryable === true && /请重试/.test(error.message));
+  assert.equal(events.at(-1).kind, "run.failed");
+  assert.equal(events.at(-1).payload.code, "MODEL_RESPONSE_TIMEOUT");
+  assert.match(events.at(-1).payload.message, /网页 Agent 模型响应超时/);
+});
 
 test("Work 网页 Agent 只检索上下文并提交 handoff，不接触远程 Task", async () => {
   const events = [];
@@ -190,9 +220,105 @@ test("Work 读取只产生候选，并只交付 handoff_submit 明确选中的�
   assert.doesNotMatch(result.content, /临时颜色/);
 });
 
-test("读取当前对话状态不伪装成查阅资料，真正的历史查询仍可展示", async () => {
+test("Work 临时整理记忆时保留原标题和稳定身份，且不改写已查阅原文", async () => {
+  const events = [];
+  let round = 0;
+  let candidateId = "";
+  const runtime = new WebAgentRuntime({
+    model: { async complete({ messages }) {
+      round += 1;
+      if (round === 1) return { toolCalls: [{ id: "memory", name: "memory_search", input: { query: "旧部署参数" } }] };
+      if (round === 2) {
+        [candidateId] = visibleCandidateIds(messages);
+        return { toolCalls: [{ id: "rewrite", name: "handoff_rewrite_candidate", input: { candidateId, revisedContent: "当前环境应使用新部署参数；旧端口信息已移除。" } }] };
+      }
+      return { toolCalls: [{ id: "submit", name: "handoff_submit", input: { candidateIds: [candidateId] } }] };
+    } },
+    tools: await createDefaultWebAgentTools(contextServices({
+      search: async () => ({ memory: [{ semanticKey: "部署约定", content: "旧部署参数使用 7001 端口。", source: { id: "project:部署约定", version: "9" } }] }),
+    }), prompts),
+    prompts,
+    eventSink: async (event) => events.push(event),
+  });
+
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "按当前环境部署", runId: "rewrite-memory" });
+  assert.equal(result.content, "相关记忆：\n- 当前环境应使用新部署参数；旧端口信息已移除。");
+  assert.equal(result.observedFragments[0].knowledge.content, "旧部署参数使用 7001 端口。");
+  assert.deepEqual(result.handoffFragments[0].knowledge, {
+    key: "memory:project:部署约定",
+    version: "record-v1",
+    content: "当前环境应使用新部署参数；旧端口信息已移除。",
+  });
+  assert.equal(result.handoffFragments[0].rewritten, true);
+  assert.deepEqual(events.find((event) => event.kind === "run.handoff.ready").payload.references, [{
+    kind: "记忆",
+    name: "部署约定",
+    detail: "当前环境应使用新部署参数；旧端口信息已移除。",
+    edited: true,
+  }]);
+});
+
+test("显式 @ 对话只按本轮 reference_id 读取冻结消息，并可临时整理后发送", async () => {
+  const events = [];
+  const catalog = [{ referenceId: "cref_11111111111111111111111111111111", title: "训练参数讨论" }];
+  let round = 0;
+  let candidateId = "";
+  const services = contextServices({}, {}, {
+    read: async ({ referenceId, query }) => {
+      assert.equal(referenceId, catalog[0].referenceId);
+      assert.equal(query, "batch size");
+      return {
+        conversation: [{
+          id: "msg_source_1",
+          role: "assistant",
+          content: "当时建议 batch size 设为 64。",
+          referenceId,
+          referenceTitle: "训练参数讨论",
+          sourceConversationId: "conv_source",
+          sourceSnapshotId: "csnap_frozen",
+        }],
+        nextCursor: "cursor_next",
+      };
+    },
+  });
+  const registry = await createDefaultWebAgentTools(services, prompts, { conversationReferences: catalog });
+  assert.ok(registry.resolve("conversation_reference_read", "chat"));
+  assert.ok(registry.resolve("conversation_reference_read", "work"));
+  assert.throws(() => registry.resolve("conversation_reference_read", "work").validate({ referenceId: "cref_22222222222222222222222222222222" }), /not available/);
+  const runtime = new WebAgentRuntime({
+    model: { async complete({ messages }) {
+      round += 1;
+      if (round === 1) return { toolCalls: [{ id: "read", name: "conversation_reference_read", input: { referenceId: catalog[0].referenceId, query: "batch size" } }] };
+      if (round === 2) {
+        [candidateId] = visibleCandidateIds(messages);
+        assert.match(messages.find((message) => message.name === "conversation_reference_read").content, /cursor_next/);
+        return { toolCalls: [{ id: "rewrite", name: "handoff_rewrite_candidate", input: { candidateId, revisedContent: "该建议来自旧环境；当前训练先从 batch size 32 开始。" } }] };
+      }
+      return { toolCalls: [{ id: "submit", name: "handoff_submit", input: { candidateIds: [candidateId] } }] };
+    } },
+    tools: registry,
+    prompts,
+    eventSink: async (event) => events.push(event),
+  });
+
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "继续调参", runId: "explicit-reference" });
+  assert.deepEqual(result.handoffFragments[0].knowledge, {
+    key: "conversation-reference:conv_source:csnap_frozen:msg_source_1",
+    version: "snapshot-v1",
+    content: "该建议来自旧环境；当前训练先从 batch size 32 开始。",
+  });
+  assert.deepEqual(events.find((event) => event.kind === "run.handoff.ready").payload.references, [{
+    kind: "对话",
+    name: "训练参数讨论",
+    detail: "该建议来自旧环境；当前训练先从 batch size 32 开始。",
+    edited: true,
+  }]);
+});
+
+test("聊天与 Work 都不暴露状态工具，真正的聊天历史查询仍可展示", async () => {
   const tools = await createDefaultWebAgentTools(contextServices(), prompts);
-  assert.equal(tools.resolve("context_get_state", "chat").timelineRead, false);
+  assert.equal(tools.resolve("context_get_state", "chat"), null);
+  assert.equal(tools.resolve("context_get_state", "work"), null);
   assert.equal(tools.resolve("conversation_search", "chat").timelineRead, true);
 });
 
@@ -656,7 +782,7 @@ test("Work handoff discards model-authored execution claims and only forwards se
   assert.equal(result.content, "相关记忆：\n- 用户偏好复用现有部署参数。");
   assert.doesNotMatch(result.content, /memory_version_private|record_private|version_private|priority|kind|source/);
   const read = events.find((event) => event.kind === "run.context.read");
-  assert.deepEqual(read.payload.output, { memory: [{ content: "用户偏好复用现有部署参数。" }] });
+  assert.deepEqual(read.payload.output, { memory: [{ title: "deployment-preference", content: "用户偏好复用现有部署参数。" }] });
   assert.deepEqual(events.find((event) => event.kind === "run.handoff.ready").payload.references, [
     { kind: "记忆", name: "deployment-preference", detail: "用户偏好复用现有部署参数。" },
   ]);
@@ -665,32 +791,35 @@ test("Work handoff discards model-authored execution claims and only forwards se
   assert.equal(events.some((event) => event.kind === "run.output.delta"), false);
 });
 
-test("Work 在供应商忽略 required 时收窄为 handoff_submit 且不暴露终答", async () => {
+test("Work 在供应商先返回正文时保留检索能力且不暴露终答", async () => {
   const events = [];
   const choices = [];
   const runtime = new WebAgentRuntime({
     model: {
-      complete: async ({ toolChoice }) => {
+      complete: async ({ toolChoice, tools, messages }) => {
         choices.push(toolChoice);
-        return toolChoice === "handoff_submit"
-          ? { toolCalls: [{ id: "submit-empty", name: "handoff_submit", input: { candidateIds: [] } }] }
-          : { reasoning: "资料选择已经结束。", content: "**这里是不应出现的网页回答。**", toolCalls: [] };
+        if (choices.length === 1) return { reasoning: "需要确认关联资料。", content: "**这里是不应出现的网页回答。**", toolCalls: [] };
+        assert.ok(tools.some((tool) => tool.name === "resource_read"));
+        if (choices.length === 2) return { toolCalls: [{ id: "read", name: "resource_read", input: { filename: "guide.md" } }] };
+        return submitVisible(messages);
       },
     },
-    tools: await createDefaultWebAgentTools(contextServices(), prompts),
+    tools: await createDefaultWebAgentTools(contextServices({
+      readResource: async () => ({ resources: [{ filename: "guide.md", text: "关联资料中的必要约束" }] }),
+    }), prompts),
     prompts,
     eventSink: async (event) => events.push(event),
   });
 
   const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "执行任务", runId: "web_drop_terminal_answer" });
-  assert.equal(result.reasoning, "资料选择已经结束。");
-  assert.equal(result.content, "");
-  assert.deepEqual(choices, ["required", "handoff_submit"]);
+  assert.equal(result.reasoning, "需要确认关联资料。");
+  assert.match(result.content, /关联资料中的必要约束/);
+  assert.deepEqual(choices, ["required", "required", "required"]);
   assert.equal(events.some((event) => event.kind === "run.reasoning.delta"), true);
-  assert.deepEqual(events.map((event) => event.kind), ["run.started", "run.reasoning.delta", "run.handoff.ready", "run.context.completed"]);
+  assert.deepEqual(events.map((event) => event.kind), ["run.started", "run.reasoning.delta", "run.context.read", "run.handoff.ready", "run.context.completed"]);
 });
 
-test("Work 在供应商继续忽略定向 handoff 时以空选择交付原始请求", async () => {
+test("Work 连续返回过程文本后仍可完成选择，不受两次协议尝试限制", async () => {
   const events = [];
   const choices = [];
   const optionalMemory = {
@@ -713,6 +842,7 @@ test("Work 在供应商继续忽略定向 handoff 时以空选择交付原始请
     model: {
       complete: async ({ toolChoice }) => {
         choices.push(toolChoice);
+        if (choices.length === 3) return { toolCalls: [{ id: "submit", name: "handoff_submit", input: { candidateIds: [] } }] };
         return { reasoning: "不调用工具。", content: "不应成为网页回答。", toolCalls: [] };
       },
     },
@@ -731,13 +861,9 @@ test("Work 在供应商继续忽略定向 handoff 时以空选择交付原始请
     runId: "web_deterministic_empty_selection",
   });
 
-  assert.deepEqual(choices, ["required", "handoff_submit"]);
-  assert.equal(result.reasoning, "不调用工具。不调用工具。");
-  assert.equal(result.content, "");
-  assert.deepEqual(result.handoffFragments.map((entry) => entry.knowledge.key), ["skill:required"]);
-  assert.deepEqual(result.observedFragments.map((entry) => entry.knowledge.key).sort(), ["memory:unrelated", "skill:required"]);
-  assert.deepEqual(events.map((event) => event.kind), ["run.started", "run.reasoning.delta", "run.reasoning.delta", "run.handoff.ready", "run.context.completed"]);
-  assert.deepEqual(events.at(-2).payload.references, [{ kind: "Skill", name: "必需技能" }]);
+  assert.deepEqual(choices, ["required", "required", "required"]);
+  assert.deepEqual(result.handoffFragments.map((fragment) => fragment.knowledge.key), ["skill:required"]);
+  assert.equal(events.some((event) => event.kind === "run.handoff.ready"), true);
 });
 
 test("Work 标记供应商写进 reasoning 的 handoff 协议对象为不可见迭代", async () => {
@@ -784,51 +910,52 @@ test("Work 恢复供应商写进 reasoning 的通用网页工具协议并保持�
   assert.equal(events.filter((event) => event.kind === "run.context.read").length, 2);
 });
 
-test("Work 原子拒绝同批提交与读取，且不会把投机读取展示到前端", async () => {
+test("Work 同批读取与提交时先完成读取，保留工具并重新选择新增候选", async () => {
   const choices = [];
   const events = [];
   let reads = 0;
   const runtime = new WebAgentRuntime({
     model: {
-      complete: async ({ toolChoice }) => {
+      complete: async ({ toolChoice, tools, messages }) => {
         choices.push(toolChoice);
+        assert.ok(tools.some((tool) => tool.name === "resource_read"));
         return choices.length === 1
           ? {
-              reasoning: "无需补充，同时尝试读取。",
+              reasoning: "补齐关联文件后交付。",
               toolCalls: [
                 { id: "submit-mixed", name: "handoff_submit", input: { candidateIds: [] } },
-                { id: "read-mixed", name: "resource_read", input: { filename: "unrelated.json", start: 0 } },
+                { id: "read-mixed", name: "resource_read", input: { filename: "related.json", start: 0 } },
               ],
             }
-          : { toolCalls: [{ id: "submit-final", name: "handoff_submit", input: { candidateIds: [] } }] };
+          : submitVisible(messages);
       },
     },
     tools: await createDefaultWebAgentTools(contextServices({
       readResource: async () => {
         reads += 1;
-        return { resources: [{ filename: "unrelated.json", text: "不应读取" }] };
+        return { resources: [{ filename: "related.json", text: "关联文件的必要约束" }] };
       },
     }), prompts),
     prompts,
     eventSink: async (event) => events.push(event),
   });
 
-  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "只回复 OK", runId: "web_atomic_mixed" });
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "帮我按项目资料处理一下", runId: "web_atomic_mixed" });
 
-  assert.deepEqual(choices, ["required", "handoff_submit"]);
-  assert.equal(reads, 0);
-  assert.equal(result.content, "");
+  assert.deepEqual(choices, ["required", "required"]);
+  assert.equal(reads, 1);
+  assert.match(result.content, /关联文件的必要约束/);
   assert.equal(result.toolCallCount, 3);
-  assert.equal(events.some((event) => event.kind === "run.context.read"), false);
+  assert.equal(events.filter((event) => event.kind === "run.context.read").length, 1);
 });
 
-test("Work 在 handoff 参数畸形时定向重试且不截断任务", async () => {
+test("Work 在 handoff 参数畸形时反馈格式问题并保留检索工具", async () => {
   const choices = [];
   const runtime = new WebAgentRuntime({
     model: {
       complete: async ({ toolChoice }) => {
         choices.push(toolChoice);
-        return toolChoice === "handoff_submit"
+        return choices.length === 2
           ? { toolCalls: [{ id: "submit-ok", name: "handoff_submit", input: { candidateIds: [] } }] }
           : { toolCalls: [{ id: "submit-bad", name: "handoff_submit", input: {}, invalidArguments: true }] };
       },
@@ -839,7 +966,7 @@ test("Work 在 handoff 参数畸形时定向重试且不截断任务", async () 
 
   const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "执行原始请求", runId: "web_retry_malformed_submit" });
 
-  assert.deepEqual(choices, ["required", "handoff_submit"]);
+  assert.deepEqual(choices, ["required", "required"]);
   assert.equal(result.content, "");
   assert.equal(result.iterations, 2);
 });
@@ -866,7 +993,7 @@ test("Chat 把畸形工具参数作为工具错误反馈后继续回答", async 
   assert.match(calls[1].find((message) => message.role === "tool").content, /不是有效 JSON/);
 });
 
-test("Work 在定向 handoff 参数仍畸形时只保留必需补充并继续交付", async () => {
+test("Work 多次畸形提交不会触发固定次数截断，也不会错误交付候选", async () => {
   const choices = [];
   const requiredSkill = {
     toolName: "skill_search",
@@ -880,6 +1007,7 @@ test("Work 在定向 handoff 参数仍畸形时只保留必需补充并继续交
     model: {
       complete: async ({ toolChoice }) => {
         choices.push(toolChoice);
+        if (choices.length === 3) return { toolCalls: [{ id: "valid", name: "handoff_submit", input: { candidateIds: [] } }] };
         return { toolCalls: [{ id: `bad-${choices.length}`, name: "handoff_submit", input: {}, invalidArguments: true }] };
       },
     },
@@ -896,18 +1024,18 @@ test("Work 在定向 handoff 参数仍畸形时只保留必需补充并继续交
     runId: "web_fallback_malformed_submit",
   });
 
-  assert.deepEqual(choices, ["required", "handoff_submit"]);
-  assert.deepEqual(result.handoffFragments.map((entry) => entry.knowledge.key), ["skill:required-malformed"]);
-  assert.equal(result.iterations, 2);
+  assert.deepEqual(choices, ["required", "required", "required"]);
+  assert.deepEqual(result.handoffFragments.map((fragment) => fragment.knowledge.key), ["skill:required-malformed"]);
 });
 
 test("Work 发布网页 Agent 原有 reasoning，但不发布自由文本终答", async () => {
   const events = [];
+  let calls = 0;
   const runtime = new WebAgentRuntime({
     model: {
-      async complete({ onDelta, toolChoice }) {
+      async complete({ onDelta }) {
         await onDelta({ kind: "reasoning", content: "正在判断是否需要背景资料。" });
-        return toolChoice === "handoff_submit"
+        return ++calls === 2
           ? { toolCalls: [{ id: "submit", name: "handoff_submit", input: { candidateIds: [] } }] }
           : { reasoning: "正在判断是否需要背景资料。", content: "这里是不应保留的终局回答。", toolCalls: [] };
       },
@@ -1070,9 +1198,9 @@ test("Work 没有新读取工具时仍可选择已读候选，不能把仅可提
   const runtime = new WebAgentRuntime({
     model: { async complete({ messages, tools, toolChoice }) {
       calls += 1;
-      assert.deepEqual(tools.map((tool) => tool.name), ["handoff_submit"]);
-      assert.equal(toolChoice, "handoff_submit");
-      assert.match(messages[0].content, /从已有候选资料中选择/);
+      assert.deepEqual(tools.map((tool) => tool.name), ["handoff_rewrite_candidate", "handoff_submit"]);
+      assert.equal(toolChoice, "required");
+      assert.match(messages[0].content, /当前上下文已经给出的已读知识可以直接使用/);
       assert.doesNotMatch(messages[0].content, /无需补充资料，调用/);
       return submitVisible(messages);
     } },
@@ -1113,10 +1241,10 @@ test("网页 Agent 按模型原始顺序流式输出，并在查询出现后把�
   ]);
 });
 
-test("Work 只暴露记忆、Skill 与文件三类只读上下文工具", async () => {
+test("Work 暴露只读资料、临时整理与唯一提交工具，Chat 不含状态工具", async () => {
   const registry = await createDefaultWebAgentTools(contextServices(), prompts);
-  const chatTools = ["memory_search", "resource_search", "resource_read", "conversation_search", "skill_list", "skill_search", "context_get_state"].sort();
-  const workTools = ["memory_search", "resource_search", "resource_read", "skill_list", "skill_search", "handoff_submit"].sort();
+  const chatTools = ["memory_search", "resource_search", "resource_read", "conversation_search", "skill_list", "skill_search"].sort();
+  const workTools = ["memory_search", "resource_search", "resource_read", "skill_list", "skill_search", "handoff_rewrite_candidate", "handoff_submit"].sort();
   assert.deepEqual(registry.definitions("chat").map((tool) => tool.name).sort(), chatTools);
   assert.deepEqual(registry.definitions("work").map((tool) => tool.name).sort(), workTools);
   for (const name of workTools) {
@@ -1125,7 +1253,7 @@ test("Work 只暴露记忆、Skill 与文件三类只读上下文工具", async 
   assert.equal(registry.resolve("skill_list", "work").handoff, false);
   assert.equal(registry.resolve("handoff_submit", "work").terminal, true);
   assert.equal(registry.resolve("context_get_state", "work"), null);
-  assert.throws(() => registry.resolve("context_get_state", "chat").validate({}), /fields is required/);
+  assert.equal(registry.resolve("context_get_state", "chat"), null);
   assert.equal(registry.resolve("skill_search", "work").handoff, true);
   assert.deepEqual(registry.definitions("work").find((tool) => tool.name === "skill_search").inputSchema.required, ["name", "query"]);
   assert.throws(() => registry.resolve("skill_search", "work").validate({ query: "服务器状态" }), /name is required/);

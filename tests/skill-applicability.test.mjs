@@ -55,9 +55,10 @@ test("skill applicability matches server identifiers case-insensitively and deny
   );
 });
 
-test("remote download only enters automatic candidates for an explicit file-delivery request", () => {
+test("authorized Skill catalog stays visible for semantic selection across short follow-ups", () => {
   const skill = { skillId: "skill_remote_download", name: "远程文件下载" };
-  assert.equal(isAutomaticSkillRelevantToRequest({ skill, request: "创建 README，然后读取验证安装章节" }), false);
+  assert.equal(isAutomaticSkillRelevantToRequest({ skill, request: "创建 README，然后读取验证安装章节" }), true);
+  assert.equal(isAutomaticSkillRelevantToRequest({ skill, request: "帮我下载" }), true);
   assert.equal(isAutomaticSkillRelevantToRequest({ skill, request: "把生成的报告下载给我" }), true);
   assert.equal(isAutomaticSkillRelevantToRequest({ skill, request: "导出这些结果文件" }), true);
   assert.equal(isAutomaticSkillRelevantToRequest({ skill: { skillId: "other", name: "代码审查" }, request: "创建文件" }), true);
@@ -76,7 +77,7 @@ test("仅允许和禁止按服务器 ID、名称或主机名精确匹配，禁�
   assert.equal(isSkillApplicableToServer({ skill: { applicability: { allowServers: ["  107.USTC.EDU.CN  "] } }, server: SERVER }), true);
 });
 
-test("a Skill declaring explicit-request-only stays out of unrelated Work turns", () => {
+test("description constraints are presented to the model without brittle text pre-filtering", () => {
   const skill = {
     skillId: "easywork-browser-e2e-marker",
     name: "easywork-browser-e2e-marker",
@@ -86,7 +87,7 @@ test("a Skill declaring explicit-request-only stays out of unrelated Work turns"
     skill,
     request: "把 S08 的十对 fixture 口径压缩成一句可验收陈述。",
     mode: "work",
-  }), false);
+  }), true);
   assert.equal(isAutomaticSkillRelevantToRequest({
     skill,
     request: "浏览器验收暗号是什么？",

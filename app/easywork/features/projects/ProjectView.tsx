@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CollectionSummary, ConversationSummary, ProjectSummary, ResourceStatus } from "@/app/core/contracts";
 import { uploadResource } from "@/app/core/gateway/resource-upload";
+import { deleteResourceBindings } from "@/app/core/gateway/resource-delete";
 import { useAppRuntime } from "@/app/easywork/runtime/AppRuntime";
+import { subscribeConversationsChanged } from "@/app/easywork/runtime/cacheEvents";
 import ProjectPage from "./ProjectPage";
 import type { ProjectFile } from "./types";
 
@@ -48,7 +50,7 @@ type ResourceWriteResult = {
   revision: number;
   blob: { size: number };
   version: ResourceVersionRecord;
-  binding: { path: string | null };
+  binding: { id: string; path: string | null };
 };
 
 type ResourceListItem = {
@@ -97,6 +99,7 @@ function conversationSummary(record: ConversationRecord): ConversationSummary {
 function fileFrom(result: ResourceWriteResult): ProjectFile {
   return {
     id: result.version.id,
+    bindingId: result.binding.id,
     name: result.version.filename,
     relativePath: result.binding.path || result.version.filename,
     size: result.blob.size,
@@ -109,6 +112,7 @@ function fileFrom(result: ResourceWriteResult): ProjectFile {
 function fileFromList(item: ResourceListItem): ProjectFile {
   return {
     id: item.version.id,
+    bindingId: item.binding.id,
     name: item.version.filename,
     relativePath: item.binding.path || item.version.filename,
     size: item.size,
@@ -125,7 +129,7 @@ function errorMessage(reason: unknown) {
 export type ProjectViewProps = { projectId: string };
 
 export default function ProjectView({ projectId }: ProjectViewProps) {
-  const { api, bootstrap, navigate, notify, refreshBootstrap } = useAppRuntime();
+  const { api, bootstrap, navigate, notify, refreshBootstrap, openFilePreview, closeFilePreview, filePreviewTabs } = useAppRuntime();
   const [record, setRecord] = useState<ProjectRecord | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [collections, setCollections] = useState<CollectionSummary[]>([]);
@@ -133,8 +137,10 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const resourceRevision = useRef(0);
+  const conversationLoadRevision = useRef(0);
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    const conversationRevision = ++conversationLoadRevision.current;
     setLoading(true);
     try {
       const [projectResult, conversationResult, collectionResult, resourceResult, collectionResourceResult] = await Promise.all([
@@ -150,7 +156,9 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
         resourcesByCollection.set(item.binding.ownerId, [...(resourcesByCollection.get(item.binding.ownerId) ?? []), item]);
       }
       setRecord(projectResult.data);
-      setConversations(conversationResult.data.items.map(conversationSummary));
+      if (!signal?.aborted && conversationRevision === conversationLoadRevision.current) {
+        setConversations(conversationResult.data.items.map(conversationSummary));
+      }
       setCollections(collectionResult.data.map((collection) => collectionSummary(collection, resourcesByCollection.get(collection.id) ?? [])));
       resourceRevision.current = resourceResult.data.revision;
       setFiles(resourceResult.data.items.map(fileFromList));
@@ -168,6 +176,22 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
     }, 0);
     return () => { window.clearTimeout(timer); controller.abort(); };
   }, [load]);
+
+  useEffect(() => {
+    let controller: AbortController | undefined;
+    const unsubscribe = subscribeConversationsChanged(() => {
+      controller?.abort();
+      controller = new AbortController();
+      const signal = controller.signal;
+      const revision = ++conversationLoadRevision.current;
+      void api.get<{ items: ConversationRecord[] }>(`/api/conversations?projectId=${encodeURIComponent(projectId)}&limit=100`, signal)
+        .then((result) => {
+          if (!signal.aborted && revision === conversationLoadRevision.current) setConversations(result.data.items.map(conversationSummary));
+        })
+        .catch(() => undefined);
+    });
+    return () => { controller?.abort(); unsubscribe(); };
+  }, [api, projectId]);
 
   const bootstrapProject = bootstrap?.projects.find((project) => project.id === projectId);
   const effectiveRecord = record && bootstrapProject && bootstrapProject.revision > record.revision
@@ -247,6 +271,24 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
     }
   };
 
+  const deleteFile = async (file: ProjectFile) => {
+    if (busyAction) return;
+    setBusyAction("delete");
+    try {
+      await deleteResourceBindings(api, { type: "project", id: projectId }, [file.bindingId], (bindingId, revision) => {
+        resourceRevision.current = revision;
+        setFiles((current) => current.filter((item) => item.bindingId !== bindingId));
+        filePreviewTabs.filter((tab) => tab.source.kind === "resource" && tab.source.resourceVersionId === file.id).forEach((tab) => closeFilePreview(tab.id));
+      });
+      notify("文件已删除", "success");
+    } catch (reason) {
+      notify(errorMessage(reason), "error");
+      throw reason;
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const retry = async (fileId: string) => {
     setBusyAction(`retry:${fileId}`);
     try {
@@ -279,6 +321,8 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
       onMemoryModeChange={changeMemory}
       onUploadFiles={upload}
       onRetryFile={retry}
+      onPreviewFile={(file) => openFilePreview({ name: file.name, size: file.size, source: { kind: "resource", resourceVersionId: file.id } })}
+      onDeleteFile={deleteFile}
       onLinkCollection={(collectionId) => toggleCollection(collectionId, false)}
       onUnlinkCollection={(collectionId) => toggleCollection(collectionId, true)}
     />

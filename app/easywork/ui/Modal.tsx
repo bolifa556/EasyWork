@@ -11,14 +11,16 @@ type Props = {
   subtitle?: string;
   size?: "compact" | "normal" | "wide";
   panelClassName?: string;
+  backdropClassName?: string;
   bodyClassName?: string;
   headerAction?: ReactNode;
   floating?: boolean;
+  hideCloseButton?: boolean;
   onClose: () => void;
   children: ReactNode;
 };
 
-export function Modal({ title, subtitle, size = "normal", panelClassName = "", bodyClassName = "", headerAction, floating = false, onClose, children }: Props) {
+export function Modal({ title, subtitle, size = "normal", panelClassName = "", backdropClassName = "", bodyClassName = "", headerAction, floating = false, hideCloseButton = false, onClose, children }: Props) {
   const panelRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
@@ -57,11 +59,11 @@ export function Modal({ title, subtitle, size = "normal", panelClassName = "", b
   }, [floating, portalTarget]);
   if (!portalTarget) return null;
   return createPortal(
-    <div className={`${styles.backdrop} ${floating ? styles.floatingBackdrop : ""}`} role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
+    <div className={`${styles.backdrop} ${floating ? styles.floatingBackdrop : ""} ${backdropClassName}`} role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
       <section ref={panelRef} tabIndex={-1} className={`${styles.panel} ${size !== "normal" ? styles[size] : ""} ${floating ? styles.floatingPanel : ""} ${panelClassName}`} role="dialog" aria-modal="true" aria-label={title}>
         <header className={`${styles.header} ${floating ? styles.floatingHeader : ""}`}>
           <div className={styles.heading}><h2>{title}</h2>{subtitle ? <p>{subtitle}</p> : null}</div>
-          <div className={styles.headerActions}>{headerAction}<Button variant="ghost" iconOnly aria-label="关闭" onClick={onClose} icon={<X size={18} />} /></div>
+          {headerAction || !hideCloseButton ? <div className={styles.headerActions}>{headerAction}{!hideCloseButton ? <Button variant="ghost" iconOnly aria-label="关闭" onClick={onClose} icon={<X size={18} />} /> : null}</div> : null}
         </header>
         <div className={`${styles.body} ${bodyClassName}`}>{children}</div>
       </section>

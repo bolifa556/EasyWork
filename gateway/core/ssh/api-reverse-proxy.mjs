@@ -217,11 +217,12 @@ export async function createHostApiRelay({ baseUrl, apiKey, tokenFactory = () =>
       return headers;
     };
     const failUpstream = () => {
-      if (response.writableEnded) return;
+      if (response.writableEnded || response.destroyed) return;
       if (!response.headersSent) response.writeHead(502, { "content-type": "application/json" });
       response.end('{"error":"upstream_unavailable"}');
     };
     const forward = (bodyBytes = null, parsed = null, attempt = 0) => {
+      if (request.aborted || response.destroyed) return;
       const headers = outgoingHeaders(request.headers, upstream, credential);
       if (bodyBytes) {
         delete headers["content-length"];
@@ -235,6 +236,7 @@ export async function createHostApiRelay({ baseUrl, apiKey, tokenFactory = () =>
         path: targetPath,
         headers,
       }, (upstreamResponse) => {
+        if (response.destroyed) { upstreamResponse.destroy(); return; }
         const status = Number(upstreamResponse.statusCode || 502);
         if (bodyBytes && parsed && attempt === 0 && [400, 422].includes(status)) {
           collectBody(upstreamResponse, MAX_ADAPTIVE_ERROR_BYTES).then((errorBytes) => {
@@ -271,6 +273,9 @@ export async function createHostApiRelay({ baseUrl, apiKey, tokenFactory = () =>
       else request.pipe(forwarded);
     };
     request.once("aborted", () => activeForward?.destroy());
+    response.once("close", () => {
+      if (!response.writableEnded) activeForward?.destroy();
+    });
     if (!jsonContentType(request.headers)) {
       forward();
       return;

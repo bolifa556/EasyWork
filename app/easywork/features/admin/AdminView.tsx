@@ -51,6 +51,18 @@ type Provider = {
     chunkOverlap: number;
     batchSize: number;
     hybridEnabled: boolean;
+    memory: {
+      enabled: boolean;
+      vectorWeight: number;
+      lexicalWeight: number;
+      titleWeight: number;
+      minimumScore: number;
+      diversityLambda: number;
+      recallLimit: number;
+      resultLimit: number;
+      tokenBudget: number;
+      pageSize: number;
+    };
   };
   ocr?: {
     model: string;
@@ -142,6 +154,16 @@ type ProviderDraft = {
   chunkOverlap: string;
   batchSize: string;
   hybridEnabled: boolean;
+  memoryEnabled: boolean;
+  memoryVectorWeight: string;
+  memoryLexicalWeight: string;
+  memoryTitleWeight: string;
+  memoryMinimumScore: string;
+  memoryDiversityLambda: string;
+  memoryRecallLimit: string;
+  memoryResultLimit: string;
+  memoryTokenBudget: string;
+  memoryPageSize: string;
   maxOutputTokens: string;
 };
 
@@ -155,7 +177,7 @@ const emptyUsage: UsageSummary = {
 const purposeMeta: Record<Purpose, { title: string; description: string; icon: typeof Globe2 }> = {
   web: { title: "网页对话 API", description: "提供给所有用户的网页模型", icon: Globe2 },
   agent: { title: "Agent API", description: "为 EasyWork 部署的远端 Agent 提供模型", icon: Bot },
-  embedding: { title: "Embedding API", description: "用于文件解析后的向量索引", icon: Database },
+  embedding: { title: "Embedding API", description: "用于文件索引与记忆语义检索", icon: Database },
   ocr: { title: "OCR API", description: "用于图片与扫描 PDF 的文字识别", icon: ScanText },
 };
 
@@ -176,6 +198,16 @@ function draftOf(provider: Provider): ProviderDraft {
     chunkOverlap: String(provider.embedding?.chunkOverlap ?? 600),
     batchSize: String(provider.embedding?.batchSize ?? 32),
     hybridEnabled: provider.embedding?.hybridEnabled !== false,
+    memoryEnabled: provider.embedding?.memory?.enabled !== false,
+    memoryVectorWeight: String(provider.embedding?.memory?.vectorWeight ?? 0.55),
+    memoryLexicalWeight: String(provider.embedding?.memory?.lexicalWeight ?? 0.15),
+    memoryTitleWeight: String(provider.embedding?.memory?.titleWeight ?? 0.3),
+    memoryMinimumScore: String(provider.embedding?.memory?.minimumScore ?? 0.12),
+    memoryDiversityLambda: String(provider.embedding?.memory?.diversityLambda ?? 0.72),
+    memoryRecallLimit: String(provider.embedding?.memory?.recallLimit ?? 48),
+    memoryResultLimit: String(provider.embedding?.memory?.resultLimit ?? 8),
+    memoryTokenBudget: String(provider.embedding?.memory?.tokenBudget ?? 3200),
+    memoryPageSize: String(provider.embedding?.memory?.pageSize ?? 20),
     maxOutputTokens: String(provider.ocr?.maxOutputTokens ?? 4096),
   };
 }
@@ -192,7 +224,7 @@ function UsageChart({ series }: { series: UsageSummary["series"] }) {
   }, [series]);
   return (
     <div className={styles.chart} aria-label="最近请求趋势">
-      {points ? <svg viewBox="0 0 100 42" preserveAspectRatio="none" role="img"><defs><linearGradient id="usage-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="var(--ew-green)" stopOpacity=".24" /><stop offset="1" stopColor="var(--ew-green)" stopOpacity="0" /></linearGradient></defs><polygon points={`0,42 ${points} 100,42`} fill="url(#usage-fill)" /><polyline points={points} fill="none" stroke="var(--ew-green)" strokeWidth="1.7" vectorEffect="non-scaling-stroke" /></svg> : <div className={styles.chartEmpty}>暂无调用记录</div>}
+      {points ? <svg data-ui-icon="" viewBox="0 0 100 42" preserveAspectRatio="none" role="img"><defs><linearGradient id="usage-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="var(--ew-green)" stopOpacity=".24" /><stop offset="1" stopColor="var(--ew-green)" stopOpacity="0" /></linearGradient></defs><polygon points={`0,42 ${points} 100,42`} fill="url(#usage-fill)" /><polyline points={points} fill="none" stroke="var(--ew-green)" strokeWidth="1.7" vectorEffect="non-scaling-stroke" /></svg> : <div className={styles.chartEmpty}>暂无调用记录</div>}
       {series.length ? <div className={styles.chartDates}><span>{series[0].date.slice(5)}</span><span>{series.at(-1)?.date.slice(5)}</span></div> : null}
     </div>
   );
@@ -209,6 +241,7 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
   const [saving, setSaving] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [detecting, setDetecting] = useState(false);
+  const [embeddingTab, setEmbeddingTab] = useState<"files" | "memory">("files");
   const MetaIcon = purposeMeta[provider.purpose].icon;
 
   useEffect(() => () => { if (revealTimer.current) window.clearTimeout(revealTimer.current); }, []);
@@ -263,11 +296,29 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
         chunkOverlap: Number(draft.chunkOverlap),
         batchSize: Number(draft.batchSize),
         hybridEnabled: draft.hybridEnabled,
+        memory: {
+          enabled: draft.memoryEnabled,
+          vectorWeight: Number(draft.memoryVectorWeight),
+          lexicalWeight: Number(draft.memoryLexicalWeight),
+          titleWeight: Number(draft.memoryTitleWeight),
+          minimumScore: Number(draft.memoryMinimumScore),
+          diversityLambda: Number(draft.memoryDiversityLambda),
+          recallLimit: Number(draft.memoryRecallLimit),
+          resultLimit: Number(draft.memoryResultLimit),
+          tokenBudget: Number(draft.memoryTokenBudget),
+          pageSize: Number(draft.memoryPageSize),
+        },
       });
       if (provider.purpose === "ocr") Object.assign(patch, {
         model: draft.model.trim(),
         maxOutputTokens: Number(draft.maxOutputTokens),
       });
+      if (!(provider.purpose === "ocr" && draft.protocol === "mineru")) {
+        await runtime.api.post(`/api/admin/providers/${provider.purpose}/models`, {
+          baseUrl: draft.baseUrl.trim(),
+          ...(keyDirty && draft.apiKey ? { apiKey: draft.apiKey } : {}),
+        });
+      }
       await runtime.api.patch(`/api/admin/providers/${provider.purpose}`, {
         patch,
         ...(keyDirty && draft.apiKey ? { apiKey: draft.apiKey } : {}),
@@ -298,7 +349,7 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
   return (
     <article className={styles.providerCard}>
       <header className={styles.cardHeading}>
-        <span className={`${styles.cardIcon} ${styles[provider.purpose]}`}><MetaIcon size={19} /></span>
+        <span data-ui-icon="" className={`${styles.cardIcon} ${styles[provider.purpose]}`}><MetaIcon size={19} /></span>
         <div><h2>{purposeMeta[provider.purpose].title}</h2><p>{purposeMeta[provider.purpose].description}</p></div>
         <span className={`${styles.status} ${provider.configured ? styles.ready : styles.incomplete}`}>{provider.configured ? <><Check size={13} />可用</> : "未配置"}</span>
       </header>
@@ -311,14 +362,32 @@ function ProviderCard({ provider, revision, onSaved }: { provider: Provider; rev
         <label className={styles.wideField}><span>API URL</span><input inputMode="url" value={draft.baseUrl} placeholder={draft.protocol === "mineru" ? "https://api.llm.ustc.edu.cn" : "https://api.example.com/v1"} onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })} /></label>
         <label className={styles.keyField}><span>API Key</span><span className={styles.keyInput}><input autoComplete="new-password" type={showKey ? "text" : "password"} value={draft.apiKey} placeholder={provider.hasKey ? "" : "输入 API Key"} onChange={(event) => changeApiKey(event.target.value)} />{showStoredKeyMask ? <span className={styles.storedSecretMask} aria-hidden="true">••••••••••••</span> : null}<span className={styles.keyButtons}>{showKey && draft.apiKey ? <button type="button" aria-label="复制 API Key" onClick={() => void copyKey()}><Copy size={16} /></button> : null}<button type="button" aria-label={showKey ? "隐藏 API Key" : "显示 API Key"} disabled={revealingKey} onClick={() => void toggleKey()}>{revealingKey ? <LoaderCircle className={styles.spin} size={16} /> : showKey ? <EyeOff size={17} /> : <Eye size={17} />}</button></span></span></label>
         {["embedding", "ocr"].includes(provider.purpose) ? <label className={styles.modelField}><span>模型</span><span className={styles.modelControl}><input list={`${provider.purpose}-models`} value={draft.model} placeholder="选择或输入模型" readOnly={provider.purpose === "ocr" && draft.protocol === "mineru"} aria-readonly={provider.purpose === "ocr" && draft.protocol === "mineru"} onChange={(event) => setDraft({ ...draft, model: event.target.value })} />{provider.purpose !== "ocr" || draft.protocol !== "mineru" ? <Button type="button" compact onClick={detect} disabled={detecting} icon={detecting ? <LoaderCircle className={styles.spin} size={15} /> : <RefreshCw size={15} />}>检测</Button> : <span className={styles.fixedModel}>固定</span>}</span><datalist id={`${provider.purpose}-models`}>{models.map((model) => <option value={model} key={model} />)}</datalist></label> : null}
-        {provider.purpose === "embedding" ? <>
-          <label><span>分块策略</span><select value={draft.chunkStrategy} onChange={(event) => setDraft({ ...draft, chunkStrategy: event.target.value as ProviderDraft["chunkStrategy"] })}><option value="semantic">语义</option><option value="paragraph">段落</option><option value="fixed">固定长度</option></select></label>
-          <label><span>分块大小</span><input type="number" min="128" max="20000" value={draft.chunkSize} onChange={(event) => setDraft({ ...draft, chunkSize: event.target.value })} /></label>
-          <label><span>重叠字符</span><input type="number" min="0" value={draft.chunkOverlap} onChange={(event) => setDraft({ ...draft, chunkOverlap: event.target.value })} /></label>
-          <label><span>批量大小</span><input type="number" min="1" max="256" value={draft.batchSize} onChange={(event) => setDraft({ ...draft, batchSize: event.target.value })} /></label>
-          <label><span>向量维度</span><input type="number" min="1" placeholder="自动" value={draft.dimensions} onChange={(event) => setDraft({ ...draft, dimensions: event.target.value })} /></label>
-          <label className={styles.toggleLabel}><input type="checkbox" checked={draft.hybridEnabled} onChange={(event) => setDraft({ ...draft, hybridEnabled: event.target.checked })} /><span>混合检索</span></label>
-        </> : null}
+        {provider.purpose === "embedding" ? <section className={styles.embeddingSettings}>
+          <div className={styles.embeddingTabs} role="tablist" aria-label="Embedding 用途配置">
+            <button type="button" role="tab" aria-selected={embeddingTab === "files"} className={embeddingTab === "files" ? styles.active : ""} onClick={() => setEmbeddingTab("files")}>文件</button>
+            <button type="button" role="tab" aria-selected={embeddingTab === "memory"} className={embeddingTab === "memory" ? styles.active : ""} onClick={() => setEmbeddingTab("memory")}>记忆</button>
+          </div>
+          {embeddingTab === "files" ? <div className={styles.embeddingGrid} role="tabpanel">
+            <label><span>分块策略</span><select value={draft.chunkStrategy} onChange={(event) => setDraft({ ...draft, chunkStrategy: event.target.value as ProviderDraft["chunkStrategy"] })}><option value="semantic">语义</option><option value="paragraph">段落</option><option value="fixed">固定长度</option></select></label>
+            <label><span>分块大小</span><input type="number" min="128" max="20000" value={draft.chunkSize} onChange={(event) => setDraft({ ...draft, chunkSize: event.target.value })} /></label>
+            <label><span>重叠字符</span><input type="number" min="0" value={draft.chunkOverlap} onChange={(event) => setDraft({ ...draft, chunkOverlap: event.target.value })} /></label>
+            <label><span>批量大小</span><input type="number" min="1" max="256" value={draft.batchSize} onChange={(event) => setDraft({ ...draft, batchSize: event.target.value })} /></label>
+            <label><span>向量维度</span><input type="number" min="1" placeholder="自动" value={draft.dimensions} onChange={(event) => setDraft({ ...draft, dimensions: event.target.value })} /></label>
+            <label className={styles.toggleLabel}><input type="checkbox" checked={draft.hybridEnabled} onChange={(event) => setDraft({ ...draft, hybridEnabled: event.target.checked })} /><span>混合检索</span></label>
+          </div> : <div className={styles.embeddingGrid} role="tabpanel">
+            <label className={styles.toggleLabel}><input type="checkbox" checked={draft.memoryEnabled} onChange={(event) => setDraft({ ...draft, memoryEnabled: event.target.checked })} /><span>启用向量语义召回</span></label>
+            <span className={styles.memoryHint}>关闭后自动退化为标题与关键词检索；已有向量不会删除。</span>
+            <label><span>向量权重</span><input type="number" min="0" max="1" step="0.05" value={draft.memoryVectorWeight} onChange={(event) => setDraft({ ...draft, memoryVectorWeight: event.target.value })} /></label>
+            <label><span>正文词法权重</span><input type="number" min="0" max="1" step="0.05" value={draft.memoryLexicalWeight} onChange={(event) => setDraft({ ...draft, memoryLexicalWeight: event.target.value })} /></label>
+            <label><span>标题权重</span><input type="number" min="0" max="1" step="0.05" value={draft.memoryTitleWeight} onChange={(event) => setDraft({ ...draft, memoryTitleWeight: event.target.value })} /></label>
+            <label><span>最低相关度</span><input type="number" min="0" max="1" step="0.01" value={draft.memoryMinimumScore} onChange={(event) => setDraft({ ...draft, memoryMinimumScore: event.target.value })} /></label>
+            <label><span>结果多样性</span><input type="number" min="0" max="1" step="0.01" value={draft.memoryDiversityLambda} onChange={(event) => setDraft({ ...draft, memoryDiversityLambda: event.target.value })} /></label>
+            <label><span>候选召回数</span><input type="number" min="8" max="256" value={draft.memoryRecallLimit} onChange={(event) => setDraft({ ...draft, memoryRecallLimit: event.target.value })} /></label>
+            <label><span>单次返回数</span><input type="number" min="1" max="20" value={draft.memoryResultLimit} onChange={(event) => setDraft({ ...draft, memoryResultLimit: event.target.value })} /></label>
+            <label><span>Token 预算</span><input type="number" min="256" max="20000" value={draft.memoryTokenBudget} onChange={(event) => setDraft({ ...draft, memoryTokenBudget: event.target.value })} /></label>
+            <label><span>分页大小</span><input type="number" min="5" max="100" value={draft.memoryPageSize} onChange={(event) => setDraft({ ...draft, memoryPageSize: event.target.value })} /></label>
+          </div>}
+        </section> : null}
         {provider.purpose === "ocr" && draft.protocol !== "mineru" ? <label><span>最大输出 Token</span><input type="number" min="256" max="32768" value={draft.maxOutputTokens} onChange={(event) => setDraft({ ...draft, maxOutputTokens: event.target.value })} /></label> : null}
       </div>
       <footer className={styles.cardFooter}><span>{provider.updatedAt ? `更新于 ${new Date(provider.updatedAt).toLocaleString("zh-CN")}` : ""}</span><Button variant="primary" onClick={save} disabled={saving || !changed || (keyDirty && !draft.apiKey) || !draft.name.trim() || !draft.baseUrl.trim() || (["embedding", "ocr"].includes(provider.purpose) && !draft.model.trim())} icon={saving ? <LoaderCircle className={styles.spin} size={16} /> : <Save size={16} />}>{saving ? "保存中" : "保存"}</Button></footer>
@@ -472,7 +541,7 @@ function UserPanel({ refreshKey, onChanged }: { refreshKey: number; onChanged: (
     <section className={styles.userListCard}>
       <div className={styles.sectionTitle}><div><h2>用户</h2><p>{result ? `共 ${result.total} 位用户` : "按需读取账号与在线状态"}</p></div><UsersRound size={20} /></div>
       <label className={styles.userSearch}><Search size={16} /><input value={query} placeholder="搜索用户名或用户 ID" onChange={(event) => { setQuery(event.target.value); setPage(1); }} /></label>
-      {loading && !result ? <div className={styles.unavailable}><LoaderCircle className={styles.spin} size={22} /><strong>正在读取用户</strong></div> : result?.items.length ? <div className={styles.userRows}>{result.items.map((user) => <button type="button" className={`${styles.userRow} ${selectedId === user.userId ? styles.selectedUser : ""}`} key={user.userId} onClick={() => setSelectedId(user.userId)}><span className={styles.userAvatar}>{user.username.slice(0, 1).toLocaleUpperCase("zh-CN")}</span><span className={styles.userIdentity}><strong>{user.username}{user.admin ? <em>管理员</em> : null}</strong><small>{user.activeSessionCount} 个活跃登录 · {user.liveSshCount} 个 SSH</small></span><time>{user.lastActiveAt ? new Date(user.lastActiveAt).toLocaleDateString("zh-CN") : "—"}</time><ChevronRight size={16} /></button>)}</div> : <div className={styles.unavailable}><Network size={22} /><strong>没有匹配的用户</strong></div>}
+      {loading && !result ? <div className={styles.unavailable}><LoaderCircle className={styles.spin} size={22} /><strong>正在读取用户</strong></div> : result?.items.length ? <div className={styles.userRows}>{result.items.map((user) => <button type="button" className={`${styles.userRow} ${selectedId === user.userId ? styles.selectedUser : ""}`} key={user.userId} onClick={() => setSelectedId(user.userId)}><span data-ui-icon="" className={styles.userAvatar}>{user.username.slice(0, 1).toLocaleUpperCase("zh-CN")}</span><span className={styles.userIdentity}><strong>{user.username}{user.admin ? <em>管理员</em> : null}</strong><small>{user.activeSessionCount} 个活跃登录 · {user.liveSshCount} 个 SSH</small></span><time>{user.lastActiveAt ? new Date(user.lastActiveAt).toLocaleDateString("zh-CN") : "—"}</time><ChevronRight size={16} /></button>)}</div> : <div className={styles.unavailable}><Network size={22} /><strong>没有匹配的用户</strong></div>}
       {result && result.total > result.limit ? <footer className={styles.pager}><Button compact disabled={page <= 1 || loading} onClick={() => setPage((value) => Math.max(1, value - 1))}>上一页</Button><span>{page} / {Math.ceil(result.total / result.limit)}</span><Button compact disabled={!result.hasMore || loading} onClick={() => setPage((value) => value + 1)}>下一页</Button></footer> : null}
     </section>
     <section className={styles.userDetailCard}>

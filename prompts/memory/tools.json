@@ -4,10 +4,51 @@
     "description": "保留跨项目仍适用的稳定用户偏好或事实",
     "inputSchema": {
       "type": "object",
-      "required": ["subject", "content"],
+      "required": [
+        "subject",
+        "content",
+        "kind",
+        "evidence"
+      ],
       "properties": {
-        "subject": { "type": "string", "description": "简短、稳定的事实主题" },
-        "content": { "type": "string", "description": "未来可以直接使用的完整事实" }
+        "subject": {
+          "type": "string",
+          "description": "简短、稳定的事实主题"
+        },
+        "content": {
+          "type": "string",
+          "description": "未来可以直接使用的完整事实"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "user-preference",
+            "observed-fact"
+          ],
+          "description": "用户明确的持续偏好或已确认的稳定事实"
+        },
+        "evidence": {
+          "type": "object",
+          "required": [
+            "role",
+            "quote"
+          ],
+          "properties": {
+            "role": {
+              "type": "string",
+              "enum": [
+                "user",
+                "assistant"
+              ],
+              "description": "证据来自用户还是助手"
+            },
+            "quote": {
+              "type": "string",
+              "description": "对应消息中的简短原文；用户偏好必须引用用户表达持续要求的原话"
+            }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     }
@@ -17,10 +58,51 @@
     "description": "保留同一项目的其他对话仍会需要的稳定事实",
     "inputSchema": {
       "type": "object",
-      "required": ["subject", "content"],
+      "required": [
+        "subject",
+        "content",
+        "kind",
+        "evidence"
+      ],
       "properties": {
-        "subject": { "type": "string", "description": "简短、稳定的事实主题" },
-        "content": { "type": "string", "description": "未来可以直接使用的完整事实" }
+        "subject": {
+          "type": "string",
+          "description": "简短、稳定的事实主题"
+        },
+        "content": {
+          "type": "string",
+          "description": "未来可以直接使用的完整事实"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "user-preference",
+            "observed-fact"
+          ],
+          "description": "用户明确的持续偏好或已确认的稳定事实"
+        },
+        "evidence": {
+          "type": "object",
+          "required": [
+            "role",
+            "quote"
+          ],
+          "properties": {
+            "role": {
+              "type": "string",
+              "enum": [
+                "user",
+                "assistant"
+              ],
+              "description": "证据来自用户还是助手"
+            },
+            "quote": {
+              "type": "string",
+              "description": "对应消息中的简短原文；用户偏好必须引用用户表达持续要求的原话"
+            }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     }
@@ -30,10 +112,51 @@
     "description": "保留当前对话后续仍会需要的决定或事实",
     "inputSchema": {
       "type": "object",
-      "required": ["subject", "content"],
+      "required": [
+        "subject",
+        "content",
+        "kind",
+        "evidence"
+      ],
       "properties": {
-        "subject": { "type": "string", "description": "简短、稳定的事实主题" },
-        "content": { "type": "string", "description": "未来可以直接使用的完整事实" }
+        "subject": {
+          "type": "string",
+          "description": "简短、稳定的事实主题"
+        },
+        "content": {
+          "type": "string",
+          "description": "未来可以直接使用的完整事实"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "user-preference",
+            "observed-fact"
+          ],
+          "description": "用户明确的持续偏好或已确认的稳定事实"
+        },
+        "evidence": {
+          "type": "object",
+          "required": [
+            "role",
+            "quote"
+          ],
+          "properties": {
+            "role": {
+              "type": "string",
+              "enum": [
+                "user",
+                "assistant"
+              ],
+              "description": "证据来自用户还是助手"
+            },
+            "quote": {
+              "type": "string",
+              "description": "对应消息中的简短原文；用户偏好必须引用用户表达持续要求的原话"
+            }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     }

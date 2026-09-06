@@ -83,7 +83,7 @@ function statements(command) {
   return result;
 }
 
-function submissionCommands(command, depth = 0) {
+function submissionCommands(command, depth = 0, executableName = "sbatch") {
   if (depth > 3 || typeof command !== "string" || command.length > 262_144) return [];
   return statements(command).flatMap((tokens) => {
     let index = 0;
@@ -92,9 +92,9 @@ function submissionCommands(command, depth = 0) {
     const args = tokens.slice(index + 1);
     if (["bash", "sh", "zsh"].includes(executable)) {
       const script = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg));
-      return script >= 0 ? submissionCommands(args[script + 1], depth + 1) : [];
+      return script >= 0 ? submissionCommands(args[script + 1], depth + 1, executableName) : [];
     }
-    if (executable !== "sbatch" || args.some((arg) => ["--test-only", "--help", "--usage", "--version", "-V"].includes(arg))) return [];
+    if (executable !== executableName || args.some((arg) => ["--test-only", "--help", "--usage", "--version", "-V"].includes(arg))) return [];
     return [args];
   });
 }
@@ -129,22 +129,45 @@ export function slurmSubmissionReceipts(command, output) {
   });
 }
 
-export function agentSubmissionReceipts({ event, binding }) {
-  if (event?.kind !== "tool_result" || !["completed", "failed"].includes(event.phase)) return [];
+function agentShellInvocation({ event, binding }) {
+  if (event?.kind !== "tool_result" || !["updated", "completed", "failed"].includes(event.phase)) return null;
   const payload = event.payload || {};
-  if (!SHELL_TOOLS.has(String(payload.name || "").toLowerCase())) return [];
+  if (!SHELL_TOOLS.has(String(payload.name || "").toLowerCase().split(".").at(-1))) return null;
   const known = binding?.state?.items?.[payload.callId] || {};
   let input = payload.input || known.input || {};
   if (!input.command && !input.cmd && !known.command) {
     // Claude partial-message input is associated with its content-block id;
     // tool_use_id is the stable link to the execution's terminal result.
     const block = Object.values(binding?.state?.items || {}).find((item) => item.toolId === payload.callId && item.partialJson);
-    try { if (block) input = JSON.parse(block.partialJson); } catch { return []; }
+    try { if (block) input = JSON.parse(block.partialJson); } catch { return null; }
   }
   const command = input.command || input.cmd || known.command;
-  return slurmSubmissionReceipts(command, payload.text).map((receipt) => ({
+  let output = payload.text || payload.output || known.output || known.aggregatedOutput || "";
+  if (event.phase === "updated") {
+    // Only a complete streamed line proves the complete JobID. Reconstruct a
+    // line split across deltas from the adapter's cumulative item, but do not
+    // rescan receipts on every later progress chunk from the same shell call.
+    const cumulative = String(known.output || known.aggregatedOutput || output);
+    const delta = String(payload.text || "");
+    const start = payload.delta === true && cumulative.endsWith(delta)
+      ? cumulative.slice(0, cumulative.length - delta.length).lastIndexOf("\n") + 1 : 0;
+    output = cumulative.slice(start, cumulative.lastIndexOf("\n") + 1);
+  }
+  return { command, output, callId: String(payload.callId) };
+}
+
+export function agentSchedulerActivity(input) {
+  if (!["completed", "failed"].includes(input.event?.phase)) return false;
+  const invocation = agentShellInvocation(input);
+  return Boolean(invocation && ["sbatch", "srun", "scancel", "squeue", "sacct", "scontrol"].some((name) => submissionCommands(invocation.command, 0, name).length));
+}
+
+export function agentSubmissionReceipts(input) {
+  const invocation = agentShellInvocation(input);
+  if (!invocation) return [];
+  return slurmSubmissionReceipts(invocation.command, invocation.output).map((receipt) => ({
     ...receipt,
-    callId: String(payload.callId),
+    callId: invocation.callId,
   }));
 }
 
@@ -170,23 +193,26 @@ export class SchedulerSubmissionLedger {
     for (;;) {
       const current = await this.repository.read();
       const next = structuredClone(current.data);
-      mutator(next);
-      if (JSON.stringify(current.data) === JSON.stringify(next)) return;
-      try { await this.repository.replace(next, { expectedRevision: current.revision, clock: this.clock }); return; }
+      const result = mutator(next);
+      if (JSON.stringify(current.data) === JSON.stringify(next)) return result;
+      try { await this.repository.replace(next, { expectedRevision: current.revision, clock: this.clock }); return result; }
       catch (error) { if (error?.code !== "REVISION_CONFLICT") throw error; }
     }
   }
 
   async record(receipts, { taskId = null, conversationId = null, workspaceId = null, agentId = null, commandId = null } = {}) {
     const submittedAt = new Date(this.clock()).toISOString();
-    await this.#update((data) => {
+    return this.#update((data) => {
+      const created = [];
       for (const receipt of receipts) {
         const jobId = assertJobId(receipt.jobId);
         const id = crypto.createHash("sha256").update(JSON.stringify([taskId, receipt.callId || commandId, jobId])).digest("hex");
         if (data.submissions.some((item) => item.id === id)) continue;
         data.submissions.push({ id, jobId, submittedAt, taskId, conversationId, workspaceId, agentId,
           callId: receipt.callId || null, commandId, name: receipt.name || "EasyWork 提交作业", partition: receipt.partition || "未记录", snapshot: null });
+        created.push(jobId);
       }
+      return created;
     });
   }
 
@@ -228,13 +254,16 @@ export class SchedulerSubmissionLedger {
 // retain controller records for only a few minutes and have no accounting.
 export class SchedulerSubmissionTracker {
   constructor({ ledger, inspectJob, canPoll = async () => true, intervalMs = 15_000,
-    setTimer = setTimeout, clearTimer = clearTimeout }) {
+    setTimer = setTimeout, clearTimer = clearTimeout, onChanged = async () => {} }) {
     this.ledger = ledger;
     this.inspectJob = inspectJob;
     this.canPoll = canPoll;
     this.intervalMs = intervalMs;
     this.setTimer = setTimer;
     this.clearTimer = clearTimer;
+    this.onChanged = onChanged;
+    this.observed = new Map();
+    this.refreshPending = false;
     this.jobs = new Map();
     this.timer = null;
     this.inFlight = null;
@@ -252,7 +281,9 @@ export class SchedulerSubmissionTracker {
         this.jobs.set(jobId, { misses: 0, checked: 0 });
       }
     }
-    this.#schedule(0);
+    if (this.timer !== null) { this.clearTimer(this.timer); this.timer = null; }
+    if (this.inFlight) this.refreshPending = true;
+    else this.#schedule(0);
   }
 
   #schedule(delay) {
@@ -276,7 +307,9 @@ export class SchedulerSubmissionTracker {
     try { return await operation; }
     finally {
       this.inFlight = null;
-      this.#schedule(this.intervalMs);
+      const immediate = this.refreshPending;
+      this.refreshPending = false;
+      this.#schedule(immediate ? 0 : this.intervalMs);
     }
   }
 
@@ -295,7 +328,7 @@ export class SchedulerSubmissionTracker {
       if (this.closed) return;
       state.checked = ++this.sequence;
       let job = null;
-      try { job = await this.inspectJob(jobId); } catch { /* Keep the receipt even when the controller cannot answer. */ }
+      try { job = await this.inspectJob(jobId); } catch { return; /* A transient SSH failure does not retire a receipt. */ }
       if (job?.id === jobId && job.owner === this.ledger.username) {
         state.misses = 0;
         snapshots.push(job);
@@ -309,6 +342,13 @@ export class SchedulerSubmissionTracker {
       await Promise.all(batch.slice(offset, offset + 4).map(inspect));
     }
     await this.ledger.updateJobs(snapshots);
+    const changed = snapshots.filter((job) => {
+      const signature = JSON.stringify([job.state, job.startedAt, job.endedAt, job.locationOrReason]);
+      if (this.observed.get(job.id) === signature) return false;
+      this.observed.set(job.id, signature);
+      return true;
+    }).map((job) => job.id);
+    if (changed.length) await this.onChanged(changed);
     for (const job of snapshots) if (TERMINAL.has(job.state)) this.jobs.delete(job.id);
   }
 

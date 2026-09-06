@@ -6,6 +6,7 @@ import { invariant } from "../errors.mjs";
 import { assertId, assertServerIdentity } from "../entities/common.mjs";
 import { createAgentBindingKey } from "../scope.mjs";
 import { versionDomainId } from "../versioning/contract.mjs";
+import { withVersionScope, bumpVersionScopeEpoch } from "../versioning/publication-gate.mjs";
 import { WORKSPACE_SCHEMA_VERSION, createWorkspaceBindingKey } from "../workspaces/contract.mjs";
 
 const VERSION_SCHEMA_VERSION = 3;
@@ -136,7 +137,11 @@ export class RemoteAgentConversationGarbageCollector {
     const home = await this.executor.home();
     const basePaths = remoteAgentPaths(home, "opencode");
     const protectedWorkspaces = new Set(uniqueStrings(protectedWorkspaceIds));
-    const versions = await this.#reconcileVersionDomains(home, deletedConversationIds);
+    const versionScope = { actorId: this.actor.actorId, serverIdentity: this.serverIdentity };
+    const versions = await withVersionScope(versionScope, async () => {
+      try { return await this.#reconcileVersionDomains(home, deletedConversationIds); }
+      finally { bumpVersionScopeEpoch(versionScope); }
+    });
     const remoteRecords = await this.#scanRemoteBindings(basePaths, deletedConversationIds);
     const candidates = new Map();
     for (const binding of [...bindings, ...remoteRecords.matches]) {
@@ -257,6 +262,10 @@ export class RemoteAgentConversationGarbageCollector {
 
   async #reconcileVersionDomains(home, deletedConversationIds) {
     const versionRoot = `${home}/.easywork/versioning/${this.actor.actorId}/${this.serverIdentity}`;
+    try {
+      const undo = safeJson(await this.executor.readFile(`${versionRoot}/mutation-undo.json`));
+      invariant(!undo?.pending, "AGENT_GC_VERSION_RECOVERY_PENDING", "版本恢复尚未完成，暂缓清理", { status: 409, retryable: true });
+    } catch (error) { if (!missingRemoteFile(error)) throw error; }
     const registryPath = `${versionRoot}/ledgers.json`;
     const pathHeadsPath = `${versionRoot}/path-heads.json`;
     const targetDomainIds = new Set([...deletedConversationIds].map((conversationId) => versionDomainId({
@@ -384,6 +393,7 @@ export class RemoteAgentConversationGarbageCollector {
 
   async #collectUnreferencedVersionObjects(versionRoot, ledgers, pathHeads = null) {
     const liveObjects = new Set();
+    let nativeTaskActive = false;
     const collectSnapshot = (snapshot) => {
       const objectId = String(snapshot?.objectId || "");
       if (/^[a-f0-9]{64}$/.test(objectId)) liveObjects.add(objectId);
@@ -418,10 +428,16 @@ export class RemoteAgentConversationGarbageCollector {
         }
       }
       for (const pending of Object.values(state.pending)) {
+        nativeTaskActive = true;
         invariant(pending?.paths && typeof pending.paths === "object" && !Array.isArray(pending.paths), "AGENT_GC_VERSION_LEDGER_INVALID", "远端版本账本待提交记录无效", { status: 502 });
         for (const record of Object.values(pending.paths)) collectSnapshot(record?.before);
       }
     });
+    // Native pre-tool hooks publish objects on the server before the gateway
+    // imports their operation records. Their Task's durable pending marker
+    // exists throughout that window. Defer sweeping while any such producer
+    // is active; the shared publication gate keeps new Tasks out of this scan.
+    if (nativeTaskActive) return;
     for (const entry of Object.values(pathHeads?.paths || {})) {
       for (const head of Object.values(entry?.domains || {})) collectSnapshot(head?.snapshot);
     }

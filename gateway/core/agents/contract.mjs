@@ -126,6 +126,12 @@ export function createReducerContext(previousState, producer) {
       },
       payload: copyJson(payload || {}),
     };
+    // Keep the original Markdown alongside the readable final text so the UI
+    // can replace captured links at their source position, including on replay.
+    const linked = state.items["easywork:linked-final"];
+    if (kind === "final" && linked?.paths?.length && payload.text === linked.cleaned) {
+      event.payload.artifactMarkdown = String(linked.original);
+    }
     for (const key of ["id", "sessionId", "turnId", "itemId", "requestId"]) {
       if (source[key] != null && source[key] !== "") event.source[key] = String(source[key]);
     }

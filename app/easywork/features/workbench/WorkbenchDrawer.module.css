@@ -250,95 +250,79 @@
 }
 
 @media (max-width: 719px) {
-  .drawer { position:fixed; z-index:80; inset:0; width:100%; height:100dvh; min-height:0; max-height:none; border:0; border-radius:0; }
+  .drawer { position:relative; z-index:28; width:100%; height:var(--mobile-workbench-height,46dvh); min-height:0; max-height:calc(var(--ew-viewport-height,100dvh) - 132px); border:1px solid var(--ew-line); border-bottom:0; border-radius:14px 14px 0 0; backdrop-filter:none; }
+  .drawer:global([data-mobile-resizing]) { contain:layout paint; user-select:none; }
+  .drawer:global([data-mobile-resizing]) .body { pointer-events:none; }
+  .closeButton { display:none; }
+  .body { grid-template-columns:minmax(0,1fr); }
+  .schedulerPane,.schedulerScroll,.sectionToolbar { min-width:0; max-width:100%; }
+  .sectionToolbar .sectionIdentity { min-width:0; flex:1; }
+  .sectionToolbar > .spacer { display:none; }
+  .sectionIdentity > svg { flex-shrink:0; }
+  .sectionToolbar > button { flex-shrink:0; }
   .resizeHandle { display: none; }
-  .header { min-height: calc(54px + env(safe-area-inset-top)); padding: calc(6px + env(safe-area-inset-top)) 8px 6px; }
-  .tab { min-width: 56px; min-height: var(--ew-mobile-touch); justify-content: center; padding: 7px 9px; }
+  .header { position:relative; min-height:42px; padding:5px 8px 3px; touch-action:none; user-select:none; cursor:row-resize; }
+  .header::before { position:absolute; top:3px; left:calc(50% - 16px); width:32px; height:3px; border-radius:2px; background:rgb(90 95 82 / 22%); content:""; }
+  .tab { min-width:52px; min-height:32px; justify-content:center; padding:4px 7px; }
   .tab span { font-size: 0.78rem; }
   .sectionToolbar,
-  .terminalToolbar { min-height: 52px; padding-inline: 9px; }
-  .terminalToolbar > button { min-width: 40px; min-height: 40px; }
-  .metricGrid { grid-template-columns: 1fr; }
+  .terminalToolbar { min-height:40px; gap:5px; padding-inline:8px; }
+  .sectionIdentity { gap:5px; }
+  .sectionIdentity strong { font-size:12px; }
+  .sectionIdentity small { font-size:10px; }
+  .sectionToolbar > button { min-height:30px; padding:4px 6px; font-size:12px; }
+  .terminalToolbar > button { min-width:32px; min-height:32px; }
+  .schedulerScroll { padding: 9px 10px max(16px, env(safe-area-inset-bottom)); }
+  .metricGrid { grid-template-columns: 1fr; gap: 7px; margin-bottom: 12px; }
+  .chartCard { min-height: 116px; border-radius: 11px; }
+  .chartCard > header { min-height: 33px; padding: 6px 9px; }
+  .chartBody { min-height: 81px; grid-template-columns: 84px minmax(0, 1fr); padding: 4px 9px 6px; }
+  .donut { width: 78px; height: 78px; }
+  .usageChartCard { display:grid; min-height:90px; grid-template-columns:minmax(0,1fr) 88px; }
+  .usageChartCard > header { display:grid; min-height:90px; align-content:center; align-items:start; gap:6px; border-bottom:0; }
+  .usageChartCard > header > span { width:100%; }
+  .usageChartCard > header small { width:100%; margin-left:0; font-size:.7rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .usageChartBody { min-height:90px; grid-template-columns:1fr; justify-items:center; padding:6px 8px 6px 2px; }
+  .usageChartBody .donut { width:72px; height:72px; }
   .submitBar { grid-template-columns: 1fr; }
   .submitBar input,
   .submitBar select,
   .submitBar button { min-height: var(--ew-mobile-touch); font-size:var(--ew-mobile-control); }
-  .historyFilter { align-items: stretch; padding: 9px; }
-  .historyPreset { width: 100%; min-height: var(--ew-mobile-touch); }
-  .historyPreset select { min-height: var(--ew-mobile-touch); flex: 1; font-size: var(--ew-mobile-control); }
-  .historyRangeText { align-self: center; padding: 2px 1px 4px 23px; }
+  .historyFilter { align-items:center; gap:5px; padding:6px; }
+  .historyPreset { min-width:0; min-height:32px; gap:4px; font-size:11px; }
+  .historyPreset select { height:32px; min-height:32px; font-size:12px; }
+  .historyRangeText { min-width:0; overflow:hidden; padding:2px; font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
   .historyCustomRange { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 7px; }
   .historyCustomRange label { min-width: 0; flex-direction: column; align-items: stretch; gap: 4px; }
   .historyCustomRange input { width: 100%; min-height: var(--ew-mobile-touch); font-size: var(--ew-mobile-control); }
   .historyCustomRange i { align-self: end; padding-bottom: 14px; }
   .historyCustomRange button { grid-column: 1 / -1; min-height: var(--ew-mobile-touch); }
-  .jobTableViewport { overflow: visible; border: 0; border-radius: 0; background: transparent; }
-  .jobTable { width:100%; min-width:0; }
-  .jobTableHead { display: none; }
-  .jobList { gap: 9px; }
-  .job {
-    grid-template-columns: minmax(0, 1fr) minmax(118px, .72fr);
-    grid-template-areas: "name status" "application resource" "duration duration" "start end";
-    overflow: hidden;
-    border: 1px solid rgba(89, 85, 70, .1);
-    border-radius: 11px;
-    background: rgba(255, 255, 255, .3);
-  }
-  .job:last-child { border-bottom: 1px solid rgba(89, 85, 70, .1); }
-  .jobNameCell { grid-area:name; min-height:64px; padding:10px 11px; }
-  .jobApplication { grid-area: application; }
-  .jobResource { grid-area: resource; }
-  .jobDuration { grid-area: duration; }
-  .jobStart { grid-area: start; }
-  .jobEnd { grid-area: end; }
-  .jobStatusCell { grid-area: status; min-width: 92px; align-items: flex-end; border-top: 0; }
-  .jobCell,
-  .jobStatusCell { padding: 9px 11px; border-left: 0; border-top: 1px solid rgba(82, 79, 66, .065); }
-  .jobStatusCell { border-top: 0; }
-  .jobResource,
-  .jobEnd { border-left: 1px solid rgba(82, 79, 66, .065); }
-  .jobCell::before,
-  .jobStatusCell::before { content: attr(data-label); color: var(--ew-ink-muted); font-size: .68rem; font-weight: 560; }
-  .jobStatusCell::before { display: none; }
-  .jobDate time { white-space: normal; }
-  .historyPagination { min-height: 96px; flex-direction: column; align-items: stretch; justify-content: center; gap: 7px; padding: 10px 0 max(8px, env(safe-area-inset-bottom)); text-align: center; }
+  .jobTableViewport { max-width:100%; overflow:auto; border-radius:9px; touch-action:pan-x pan-y; }
+  .jobTable { width:828px; min-width:828px; }
+  .jobTableHead,.job { grid-template-columns:150px 70px 150px 100px 135px 135px 88px; }
+  .jobTableHead { min-height:29px; font-size:11px; }
+  .jobTableHead > span { padding:0 7px; }
+  .columnResizeHandle { display:none; }
+  .jobNameCell,.jobCell,.jobStatusCell { min-height:37px; gap:4px; overflow:hidden; padding:6px 7px; font-size:11px; }
+  .jobName,.jobResource { min-width:0; overflow:hidden; white-space:nowrap; }
+  .jobName strong,.jobCell > strong,.jobDate time,.jobState,.jobCancel { font-size:11.5px; }
+  .jobName small,.jobCell > small { font-size:10px; }
+  .jobTabs { min-height:34px; }
+  .jobTabs > button { min-height:34px; gap:5px; padding:0 7px; font-size:12px; }
+  .historyPagination { min-height:72px; flex-direction: column; align-items: stretch; justify-content: center; gap: 7px; padding: 10px 0 max(8px, env(safe-area-inset-bottom)); text-align: center; }
   .historyPagination > div { display: grid; grid-template-columns: 1fr auto 1fr; gap: 7px; }
-  .historyPagination button { min-height: var(--ew-mobile-touch); padding-inline: 9px; font-size: var(--ew-mobile-control); }
+  .historyPagination button { min-height:32px; padding-inline:6px; font-size:12px; }
   .terminalToolbar .terminalMeta { display: none; }
-  .terminalSearch { position: absolute; z-index: 4; top: calc(52px + env(safe-area-inset-top)); right: 8px; left: 8px; width: auto; background: rgba(39, 40, 34, .97); box-shadow: 0 8px 24px rgba(20, 20, 17, .24); }
+  .terminalSearch { position: absolute; z-index: 4; top:40px; right: 8px; left: 8px; width: auto; background: rgba(39, 40, 34, .97); box-shadow: 0 8px 24px rgba(20, 20, 17, .24); }
   .terminalSwitcherButton { min-width: 72px; max-width: 118px; }
   .terminalSwitcherMenu { width: min(210px, calc(100vw - 28px)); }
   .terminalSwitcherMenu button { min-height:var(--ew-mobile-touch); }
   .xtermHost { padding: 8px 6px max(8px, env(safe-area-inset-bottom)); }
-  .processTable { min-width:0; gap:8px; overflow:visible; border:0; background:transparent; }
-  .processHead { display:none; }
-  .processRow {
-    grid-template-columns:minmax(0,1fr) auto;
-    grid-template-areas:"pid cpu" "user memory" "command state";
-    gap:5px 12px;
-    min-height:0;
-    padding:10px 11px;
-    border:1px solid rgba(89,85,70,.1);
-    border-radius:10px;
-    background:rgba(255,255,255,.3);
-  }
-  .processRow:last-child { border-bottom:1px solid rgba(89,85,70,.1); }
-  .processRow > :nth-child(1) { grid-area:pid; }
-  .processRow > :nth-child(2) { grid-area:user; }
-  .processRow > :nth-child(3) { grid-area:cpu; text-align:right; }
-  .processRow > :nth-child(4) { grid-area:memory; text-align:right; }
-  .processRow > :nth-child(5) { grid-area:state; text-align:right; }
-  .processRow > :nth-child(6) { grid-area:command; min-width:0; }
-  .processRow > :nth-child(1)::before { content:"PID "; }
-  .processRow > :nth-child(3)::before { content:"CPU "; }
-  .processRow > :nth-child(4)::before { content:"内存 "; }
-  .processRow > :nth-child(5)::before { content:"状态 "; }
-  .processRow > :nth-child(6)::before { content:"命令 "; }
-  .processRow > :nth-child(1)::before,
-  .processRow > :nth-child(3)::before,
-  .processRow > :nth-child(4)::before,
-  .processRow > :nth-child(5)::before,
-  .processRow > :nth-child(6)::before { color:var(--ew-ink-muted); font-family:var(--ew-sans); font-size:10px; font-weight:550; }
+  .processTable { min-width:0; max-width:100%; overflow-x:auto; border-radius:9px; touch-action:pan-x pan-y; }
+  .processHead,.processRow { width:590px; grid-template-columns:56px 72px 60px 68px 48px 230px; gap:6px; padding:0 8px; white-space:nowrap; }
+  .processRow { min-height:32px; }
+  .processRow > * { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -9,6 +9,28 @@ import { ConversationService } from "../gateway/core/conversations/index.mjs";
 
 const CURSOR_SECRET = "conversation-test-secret-0123456789abcdef";
 
+test("forks retain original message ownership, including legacy data and a second-generation fork", async () => withFixture(async (dataRoot) => {
+  const api = service(dataRoot);
+  const created = await startConversation(api, "origins-create", "帮我下载", "work");
+  const answered = await api.sendMessage({ conversationId: created.conversation.id, role: "assistant", content: "文件已准备好", taskId: "task-origin", expectedRevision: 1, commandId: "origins-answer" });
+  const child = await api.forkConversation({ conversationId: created.conversation.id, atMessageId: answered.messageId, expectedRevision: 2, commandId: "origins-child" });
+  const copied = (await api.listMessages({ conversationId: child.conversation.id })).items;
+  assert.deepEqual(copied.map((item) => item.originMessageId), [created.messageId, answered.messageId]);
+  // Read a pre-upgrade immutable message fixture without rewriting production
+  // messages. The storage shim removes only the newly introduced field.
+  const read = api.storage.readMessage.bind(api.storage);
+  api.storage.readMessage = async (conversationId, messageId) => {
+    const value = await read(conversationId, messageId);
+    if (conversationId === child.conversation.id) delete value.originMessageId;
+    return value;
+  };
+  assert.deepEqual((await api.listMessages({ conversationId: child.conversation.id })).items.map((item) => item.originMessageId), [created.messageId, answered.messageId]);
+  const grandchild = await api.forkConversation({ conversationId: child.conversation.id, atMessageId: copied[1].id, expectedRevision: 1, commandId: "origins-grandchild" });
+  assert.deepEqual((await api.listMessages({ conversationId: grandchild.conversation.id })).items.map((item) => item.originMessageId), [created.messageId, answered.messageId]);
+  await api.delete({ conversationId: created.conversation.id, expectedRevision: 2, commandId: "origins-delete-parent" });
+  assert.deepEqual((await api.listMessages({ conversationId: child.conversation.id })).items.map((item) => item.originMessageId), [created.messageId, answered.messageId]);
+}));
+
 function actor(actorId = "alice", actorType = "user") {
   return createActorContext({
     actorType,
@@ -37,6 +59,8 @@ function service(dataRoot, owner = actor(), options = {}) {
     messagePageSize: options.messagePageSize ?? 2,
     beforeIndexCommit: options.beforeIndexCommit,
     clock: options.clock,
+    authorizeProject: options.authorizeProject,
+    projectMemoryMode: options.projectMemoryMode,
   });
 }
 
@@ -253,6 +277,158 @@ test("派生分支创建新的网页对话并保留来源对话不变", async ()
   ]);
   assert.deepEqual((await api.listMessages({ conversationId: created.conversation.id })).items.map((message) => message.content), ["共同问题", "共同回答", "来源后续"]);
   assert.equal((await api.listConversations()).items.length, 2);
+}));
+
+test("全文搜索精确匹配标题与消息，返回分组片段并使用快照游标分页", async () => withFixture(async (dataRoot) => {
+  const api = service(dataRoot);
+  const exact = await startConversation(api, "search-exact", "这是 scnet 连接成功 的验收消息");
+  await api.sendMessage({
+    conversationId: exact.conversation.id,
+    role: "assistant",
+    content: "scnet 连接成功，远端状态正常。",
+    expectedRevision: exact.conversation.revision,
+    commandId: "search-exact-answer",
+  });
+  await startConversation(api, "search-broad", "只有连接成功，不包含服务器名称");
+  const titleOnly = await startConversation(api, "search-title", "这条正文与服务器无关");
+  await api.rename({
+    conversationId: titleOnly.conversation.id,
+    title: "scnet 运维记录",
+    expectedRevision: titleOnly.conversation.revision,
+    commandId: "search-title-rename",
+  });
+
+  const phrase = await api.searchConversations({ query: "scnet 连接成功", limit: 20, messageLimit: 8 });
+  assert.deepEqual(phrase.items.map((entry) => entry.conversationId), [exact.conversation.id]);
+  assert.equal(phrase.items[0].matches.length, 2);
+  assert.equal(phrase.items[0].matches.every((match) => match.excerpt.match.toLocaleLowerCase("zh-CN") === "scnet 连接成功"), true);
+
+  const firstPage = await api.searchConversations({ query: "scnet", limit: 1, messageLimit: 8 });
+  assert.equal(firstPage.items.length, 1);
+  assert.ok(firstPage.nextCursor);
+  const secondPage = await api.searchConversations({ query: "scnet", limit: 1, messageLimit: 8, cursor: firstPage.nextCursor });
+  assert.equal(secondPage.items.length, 1);
+  assert.notEqual(secondPage.items[0].conversationId, firstPage.items[0].conversationId);
+  assert.deepEqual(new Set([firstPage.items[0].conversationId, secondPage.items[0].conversationId]), new Set([
+    exact.conversation.id,
+    titleOnly.conversation.id,
+  ]));
+}));
+
+test("对话 @ 候选覆盖当前账号全部对话，显式选择可跨项目记忆边界", async () => withFixture(async (dataRoot) => {
+  const modes = new Map([
+    ["project-private-a", "project-only"],
+    ["project-private-b", "project-only"],
+    ["project-global", "global"],
+  ]);
+  const api = service(dataRoot, actor(), {
+    authorizeProject: async (projectId) => modes.has(projectId),
+    projectMemoryMode: async (projectId) => modes.get(projectId) || "global",
+  });
+  const create = (commandId, content, projectId = null) => api.sendMessage({
+    mode: "chat", role: "user", content, projectId, expectedRevision: 0, commandId,
+  });
+  const privateSource = await create("ref-private-source", "A 项目源对话", "project-private-a");
+  const privateCurrent = await create("ref-private-current", "A 项目当前对话", "project-private-a");
+  const otherPrivate = await create("ref-private-other", "B 项目对话", "project-private-b");
+  const standalone = await create("ref-standalone", "独立聊天资料");
+  const globalProject = await create("ref-global-project", "全局项目资料", "project-global");
+
+  const privateCandidates = await api.searchReferenceCandidates({ conversationId: privateCurrent.conversation.id, query: "项目", limit: 20 });
+  assert.deepEqual(new Set(privateCandidates.items.map((item) => item.conversationId)), new Set([
+    privateSource.conversation.id,
+    otherPrivate.conversation.id,
+    globalProject.conversation.id,
+  ]));
+  const globalCandidates = await api.searchReferenceCandidates({ conversationId: standalone.conversation.id, query: "资料", limit: 20 });
+  assert.deepEqual(new Set(globalCandidates.items.map((item) => item.conversationId)), new Set([globalProject.conversation.id]));
+
+  const crossPrivateReference = await api.sendMessage({
+    conversationId: privateCurrent.conversation.id,
+    role: "user",
+    content: "引用越界",
+    references: [{ type: "conversation", conversationId: otherPrivate.conversation.id }],
+    expectedRevision: privateCurrent.conversation.revision,
+    commandId: "ref-cross-private",
+  });
+  const crossPrivateMessage = (await api.listMessages({ conversationId: privateCurrent.conversation.id })).items
+    .find((message) => message.id === crossPrivateReference.messageId);
+  assert.equal(crossPrivateMessage.references[0].conversationId, otherPrivate.conversation.id);
+
+  const globalReference = await api.sendMessage({
+    conversationId: standalone.conversation.id,
+    role: "user",
+    content: "引用全局项目",
+    references: [{ type: "conversation", conversationId: globalProject.conversation.id }],
+    expectedRevision: standalone.conversation.revision,
+    commandId: "ref-global-allowed",
+  });
+  const globalMessage = (await api.listMessages({ conversationId: standalone.conversation.id })).items
+    .find((message) => message.id === globalReference.messageId);
+  assert.equal(globalMessage.references[0].conversationId, globalProject.conversation.id);
+  assert.equal(globalMessage.references[0].title, globalProject.conversation.title);
+}));
+
+test("对话 @ 引用冻结发送时快照，读取只能使用当前消息绑定的 opaque reference_id", async () => withFixture(async (dataRoot) => {
+  const api = service(dataRoot);
+  const source = await startConversation(api, "frozen-source", "最初问题");
+  const sourceAnswer = await api.sendMessage({
+    conversationId: source.conversation.id,
+    role: "assistant",
+    content: "冻结快照中的答案",
+    expectedRevision: 1,
+    commandId: "frozen-source-answer",
+  });
+  const renamed = await api.rename({
+    conversationId: source.conversation.id,
+    title: "被冻结的来源名称",
+    expectedRevision: sourceAnswer.conversation.revision,
+    commandId: "frozen-source-title",
+  });
+  const target = await api.sendMessage({
+    mode: "work",
+    role: "user",
+    content: "请参考这个对话",
+    references: [{ type: "conversation", conversationId: source.conversation.id }],
+    expectedRevision: 0,
+    commandId: "frozen-target",
+  });
+  const targetMessage = (await api.listMessages({ conversationId: target.conversation.id })).items[0];
+  const reference = targetMessage.references[0];
+  assert.equal(reference.snapshotId, renamed.conversation.snapshotId);
+  assert.equal(reference.title, "被冻结的来源名称");
+  assert.match(reference.referenceId, /^cref_[a-f0-9]{32}$/);
+
+  await api.sendMessage({
+    conversationId: source.conversation.id,
+    role: "user",
+    content: "引用发送后才新增的内容",
+    expectedRevision: renamed.conversation.revision,
+    commandId: "frozen-source-later",
+  });
+  const firstPage = await api.readConversationReference({
+    conversationId: target.conversation.id,
+    messageId: target.messageId,
+    referenceId: reference.referenceId,
+    limit: 1,
+  });
+  assert.deepEqual(firstPage.items.map((message) => message.content), ["最初问题"]);
+  assert.ok(firstPage.nextCursor);
+  const secondPage = await api.readConversationReference({
+    conversationId: target.conversation.id,
+    messageId: target.messageId,
+    referenceId: reference.referenceId,
+    cursor: firstPage.nextCursor,
+    limit: 1,
+  });
+  assert.deepEqual(secondPage.items.map((message) => message.content), ["冻结快照中的答案"]);
+  assert.equal(secondPage.nextCursor, null);
+  assert.equal([...firstPage.items, ...secondPage.items].some((message) => message.content.includes("新增")), false);
+  await assert.rejects(api.readConversationReference({
+    conversationId: target.conversation.id,
+    messageId: target.messageId,
+    referenceId: "cref_00000000000000000000000000000000",
+  }), (error) => error.code === "CONVERSATION_REFERENCE_NOT_BOUND");
 }));
 
 test("retry 替换同一对话最新回复，rewind 返回清理边界", async () => withFixture(async (dataRoot) => {

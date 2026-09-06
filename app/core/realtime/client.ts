@@ -39,7 +39,10 @@ export class RealtimeClient {
       this.reconnectAttempt = 0;
       const token = this.token();
       if (!token) {
-        socket.close(1008, "missing session");
+        // Browsers only let applications send close codes from 3000-4999.
+        // Using the protocol-reserved 1008 here threw in Chromium exactly
+        // while logout/session rotation was trying to clean up the socket.
+        socket.close(4001, "missing session");
         return;
       }
       socket.send(JSON.stringify({ type: "authenticate", token, requestId: randomRequestId() }));
@@ -112,6 +115,7 @@ export class RealtimeClient {
       requestId: randomRequestId(),
       topics,
       resume,
+      replayView: "summary",
     };
     this.socket.send(JSON.stringify(message));
   }

@@ -31,7 +31,7 @@ function recoveredModelFactory() {
     async complete({ messages, onDelta }) {
       const system = String(messages?.[0]?.content || "");
       if (system.includes("# 可复用记忆提取")) return { content: "", toolCalls: [], usage: {} };
-      if (system.includes("不超过 14 个汉字")) return { content: "恢复回复", toolCalls: [], usage: {} };
+      if (system.includes("只输出标题本身")) return { content: "恢复回复", toolCalls: [], usage: {} };
       await onDelta?.({ kind: "content", content: "重启后完成。" });
       return { content: "重启后完成。", reasoning: "", toolCalls: [], usage: { prompt_tokens: 3, completion_tokens: 2 } };
     },

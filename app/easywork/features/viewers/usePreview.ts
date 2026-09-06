@@ -23,6 +23,7 @@ export function usePreview(previewId: string, kind: "text" | "json" = "text") {
       signal: controller.signal,
       headers: { accept: kind === "json" ? "application/json" : "text/plain" },
     }).then(async (response) => ({ value: await response.text(), truncated: response.headers.get("x-preview-truncated") === "1" })).then(({ value, truncated }) => {
+      if (controller.signal.aborted) return;
       setResult({ key: requestKey, value, error: null, loading: false, truncated });
     }).catch((reason) => {
       if (!controller.signal.aborted) {
@@ -79,6 +80,7 @@ export function usePreviewObjectUrl(previewId: string, descriptor: FileDescripto
       });
       return response.blob();
     })().then((blob) => {
+      if (controller.signal.aborted) return;
       objectUrl = URL.createObjectURL(blob);
       setResult({ key: previewId, value: objectUrl, error: null, loading: false });
     }).catch((reason) => {

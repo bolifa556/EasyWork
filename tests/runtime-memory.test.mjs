@@ -6,7 +6,96 @@ import test from "node:test";
 
 import { ConversationService } from "../gateway/core/conversations/service.mjs";
 import { createEasyWorkRuntime } from "../gateway/core/runtime/runtime.mjs";
-import { ActorServiceContainer, selectRetainedVersionCheckpoint } from "../gateway/core/runtime/services.mjs";
+import {
+  ActorServiceContainer,
+  memoryExtractionObservations,
+  selectRetainedVersionCheckpoint,
+  workCurrentState,
+} from "../gateway/core/runtime/services.mjs";
+
+test("显式 @ 对话引用不作为自动记忆提取证据", () => {
+  const memory = { toolName: "memory_search", knowledge: { key: "memory:1", version: "1", content: "记忆" } };
+  const reference = { toolName: "conversation_reference_read", knowledge: { key: "conversation-reference:1", version: "1", content: "引用" } };
+  assert.deepEqual(memoryExtractionObservations([memory, reference]), [memory]);
+});
+
+test("Work 固定状态只投影选择名称与可用探测结果，不携带连接状态或最终路径", () => {
+  assert.deepEqual(workCurrentState({
+    server: { profile: { name: "211 算力节点", host: "private.example" }, connection: { status: "connected" } },
+    workspace: { canonicalPath: "/home/smr/private/project" },
+    agent: { name: "Codex" },
+    serverCapabilities: { features: { scheduler: { status: "available", type: "slurm" } } },
+  }, {
+    serverLabel: "211 算力节点",
+    workspaceLabel: "选中的项目目录",
+    agentLabel: "Codex",
+  }), {
+    server: { name: "211 算力节点", scheduler: "slurm" },
+    workspace: { name: "选中的项目目录" },
+    agent: { name: "Codex" },
+  });
+  assert.deepEqual(workCurrentState({
+    server: { profile: { host: "private.example" }, connection: { status: "connected" } },
+    workspace: { canonicalPath: "/home/smr/project-a" },
+    agent: { name: "OpenCode" },
+    serverCapabilities: { features: { scheduler: { status: "unavailable", type: "none" } } },
+  }, {
+    serverLabel: "scnet-gpu",
+    workspaceLabel: "project-a",
+    agentLabel: "OpenCode",
+  }), {
+    server: { name: "scnet-gpu" },
+    workspace: { name: "project-a" },
+    agent: { name: "OpenCode" },
+  });
+  assert.deepEqual(workCurrentState({
+    server: { profile: { host: "private.example" }, connection: { status: "connected" } },
+    workspace: { canonicalPath: "/home/smr/project-a" },
+    agent: { name: "OpenCode" },
+  }, {
+    workspaceLabel: "project-a",
+  }), {
+    workspace: { name: "project-a" },
+    agent: { name: "OpenCode" },
+  });
+  assert.deepEqual(workCurrentState({
+    server: { profile: { name: "211 算力节点" } },
+    workspace: { canonicalPath: "/home/smr/research/project-a" },
+    agent: { name: "OpenCode" },
+  }, {
+    workspaceId: "ws_7c8b03076dc9dedc35b564a9",
+    workspacePath: "ws_7c8b03076dc9dedc35b564a9",
+    workspaceLabel: "ws_7c8b03076dc9dedc35b564a9",
+  }), {
+    server: { name: "211 算力节点" },
+    workspace: { name: "project-a" },
+    agent: { name: "OpenCode" },
+  });
+  assert.deepEqual(workCurrentState({
+    server: { profile: { name: "211 算力节点" } },
+    workspace: { kind: "virtual", canonicalPath: "/home/smr/.easywork/workspaces/user/conversation/ws_internal" },
+    agent: { name: "OpenCode" },
+  }, {
+    workspaceId: "ws_internal",
+    workspaceLabel: "ws_internal",
+  }), {
+    server: { name: "211 算力节点" },
+    workspace: { name: "虚拟工作区" },
+    agent: { name: "OpenCode" },
+  });
+  assert.deepEqual(workCurrentState({
+    server: { profile: { name: "211 算力节点" } },
+    workspace: { canonicalPath: "/home/smr/.easywork/workspaces/user/conversation/ws_internal" },
+    agent: { name: "OpenCode" },
+  }, {
+    workspaceId: "ws_internal",
+    workspacePath: "/home/smr/.easywork/workspaces/user/conversation/ws_internal",
+  }), {
+    server: { name: "211 算力节点" },
+    workspace: { name: "虚拟工作区" },
+    agent: { name: "OpenCode" },
+  });
+});
 
 test("分支和回溯跳过净零变更 Task 已移除的临时 Checkpoint", () => {
   const state = {
@@ -635,7 +724,7 @@ test("前一轮网页回复失败后，下一轮不会把未回答请求当成�
     async complete({ messages }) {
       const system = String(messages[0]?.content || "");
       if (system.includes("# 可复用记忆提取")) return { content: "", reasoning: "", toolCalls: [], usage: null };
-      if (system.includes("不超过 14 个汉字")) return { content: "失败请求隔离", reasoning: "", toolCalls: [], usage: null };
+      if (system.includes("只输出标题本身")) return { content: "失败请求隔离", reasoning: "", toolCalls: [], usage: null };
       const serialized = messages.map((entry) => `${entry.role}:${entry.content}`).join("\n");
       modelInputs.push(serialized);
       if (serialized.includes(failedPrompt)) throw new Error("simulated web model failure");

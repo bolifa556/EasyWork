@@ -1,10 +1,11 @@
 "use client";
 
 import { LoaderCircle, ServerCog, SquareTerminal, X } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { ServerCapabilityProfile } from "@/app/core/contracts";
 import { useAppRuntime } from "../../runtime/AppRuntime";
 import { Button } from "../../ui/Button";
+import { bindMobileWorkbench } from "./mobile-workbench";
 import styles from "./WorkbenchDrawer.module.css";
 
 const TerminalPane = lazy(() => import("./TerminalPane"));
@@ -15,6 +16,7 @@ type Props = {
   workspaceId: string;
   workspacePath: string;
   conversationId?: string;
+  branchId?: string;
   height: number;
   onHeightChange: (height: number) => void;
   onClose: () => void;
@@ -33,13 +35,18 @@ function tabIsAvailable(profile: ServerCapabilityProfile | null, candidate: Tab)
   return profile.features.terminal.available;
 }
 
-export default function WorkbenchDrawer({ serverId, workspaceId, workspacePath, conversationId, height, onHeightChange, onClose }: Props) {
+export default function WorkbenchDrawer({ serverId, workspaceId, workspacePath, conversationId, branchId, height, onHeightChange, onClose }: Props) {
   const runtime = useAppRuntime();
   const [tab, setTab] = useState<Tab>("terminal");
   const [resizing, setResizing] = useState(false);
   const [capabilities, setCapabilities] = useState<ServerCapabilityProfile | null>(() => capabilityCache.get(serverId) || null);
   const [capabilityError, setCapabilityError] = useState<string | null>(null);
   const drawerRef = useRef<HTMLElement | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
+  const closeMobile = useEffectEvent(onClose);
+  useLayoutEffect(() => {
+    if (drawerRef.current && headerRef.current) return bindMobileWorkbench(drawerRef.current, headerRef.current, () => closeMobile());
+  }, []);
   const resizeCleanup = useRef<(() => void) | null>(null);
 
   const enabledTabs = useMemo(() => tabDefinitions.filter(([id]) => tabIsAvailable(capabilities, id)), [capabilities]);
@@ -120,18 +127,18 @@ export default function WorkbenchDrawer({ serverId, workspaceId, workspacePath, 
     ? enabledTabs[0]?.[0] || tab
     : tab;
 
-  return <section ref={drawerRef} className={`${styles.drawer} ${resizing ? styles.resizing : ""}`} style={{ "--workbench-height": `${height}px` } as CSSProperties} aria-label="工作台">
+  return <section ref={drawerRef} data-mobile-swipe-ignore="" className={`${styles.drawer} ${resizing ? styles.resizing : ""}`} style={{ "--workbench-height": `${height}px` } as CSSProperties} aria-label="工作台">
     <button className={styles.resizeHandle} type="button" aria-label="调整工作台高度" title="拖动调整工作台高度" onPointerDown={startResize} onKeyDown={resizeWithKeyboard} onDoubleClick={() => { const value = clampHeight(window.innerHeight * .54); onHeightChange(value); localStorage.setItem("easywork.workbench-height", String(Math.round(value))); }} />
-    <header className={styles.header}>
+    <header ref={headerRef} className={styles.header}>
       <div className={styles.tabs} role="tablist" aria-label="工作台功能">{enabledTabs.map(([id, Icon, label]) => <button key={id} role="tab" aria-selected={activeTab === id} className={`${styles.tab} ${activeTab === id ? styles.active : ""}`} onClick={() => setTab(id)}><Icon size={16} /><span>{label}</span></button>)}</div>
       <span className={styles.spacer} />
-      <Button compact iconOnly variant="ghost" aria-label="收起工作台" icon={<X size={17} />} onClick={onClose} />
+      <Button className={styles.closeButton} compact iconOnly variant="ghost" aria-label="收起工作台" icon={<X size={17} />} onClick={onClose} />
     </header>
     <div className={styles.body}>
       {!capabilities || capabilityError || enabledTabs.length === 0 ? <div className={styles.capabilityState}>{capabilityError || (capabilities ? "当前服务器没有可用的工作台能力" : <><LoaderCircle className={styles.spin} size={20} />正在检测服务器能力</>)}</div> : null}
       {capabilities ? <Suspense fallback={<div className={styles.state}><LoaderCircle className={styles.spin} size={21} />正在载入</div>}>
         {activeTab === "terminal" && tabIsAvailable(capabilities, "terminal") ? <TerminalPane key={`${serverId}:${conversationId || "workbench"}:${workspaceId}:${workspacePath}`} serverId={serverId} cacheScope={`${conversationId || "workbench"}:${workspaceId}`} workspacePath={workspacePath} /> : null}
-        {activeTab === "scheduler" && tabIsAvailable(capabilities, "scheduler") ? <SchedulerPane serverId={serverId} capability={capabilities.features.scheduler} /> : null}
+        {activeTab === "scheduler" && tabIsAvailable(capabilities, "scheduler") && conversationId && branchId ? <SchedulerPane serverId={serverId} workspaceId={workspaceId} conversationId={conversationId} branchId={branchId} capability={capabilities.features.scheduler} /> : null}
       </Suspense> : null}
     </div>
   </section>;

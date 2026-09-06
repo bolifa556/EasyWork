@@ -27,6 +27,7 @@ Claude Code 托管制品是按平台下载的 raw binary，不是 tar archive。
 --verbose
 --include-partial-messages
 --permission-prompt-tool stdio
+--disallowedTools CronCreate,CronDelete,CronList
 ```
 
 EasyWork 通过 stdin 连续发送 JSON frame，从 stdout 接收 JSONL。工作区是进程 cwd，环境和 settings 来自当前 binding。预热可以提前启动一个等待输入的进程，但不能发送占位 user frame、创建占位 session 或产生原生回合。
@@ -57,9 +58,11 @@ EasyWork 通过 stdin 连续发送 JSON frame，从 stdout 接收 JSONL。工作
 
 绑定目录中的 `claude/settings.json` 写入 model、effort、默认权限、`autoMemoryEnabled: false` 和 EasyWork `PreToolUse` Hook。进程同时显式传相应 CLI 参数，并设置 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`：EasyWork 的长期记忆由网页层统一提取和隔离，Claude Code 原生 auto memory 不应跨网页项目另建第二套记忆，也不应尝试写入 binding 控制目录。`CLAUDE_CODE_EFFORT_LEVEL` 的原生优先级最高，所以 EasyWork 将当前实际 effort 同步写入环境，避免旧 settings 覆盖本轮适配值。自动压缩窗口由环境变量提供。
 
-服务器级 Skill 包经筛选后链接到当前 binding 的 `skills/`；`<runtime-data>/claude/skills` 再指向这棵 binding-local 视图。Claude Code 使用原生 Skill 发现读取它，普通 prompt 不复制 Skill 正文。即使网页分支共享来源 session 的 transcript，Skill 视图仍按目标 binding 独立。
+Skill 包按用户和内容摘要进入不可变缓存，当前 binding 复制出自己的文件代次；`skills/` 中的指针只指向自有副本。`<runtime-data>/claude/skills` 指向这棵独立视图。本轮选中的技能正文从当前自有副本读取，组合为 `skills/easywork-selected/SKILL.md`，为每个技能保留其资源基准目录，并通过 `$ARGUMENTS` 接收本轮交接正文。包装声明 `disable-model-invocation: true`，由 EasyWork 在 stream-json user frame 中显式调用 `/easywork-selected <本轮交接正文>`，让原生命令展开技能，而不只依赖自动匹配。用户原话仍保留在交接正文中，普通补充 prompt 不另行复制 Skill 正文。即使网页分支共享来源 session 的 transcript，技能仍从分叉 Task 的文件快照复制到目标 binding，之后互不影响。
 
-筛选包括对话模式和 Work 服务器范围。网页 Agent 选择、用户显式附加、Work 强制启用最终共用同一部署及版本收据；后两类不要求网页模型再次读取或批准。已经确认发送给当前 native session 的同版包不会重复投递。
+个人包固定、SSH 上传校验、远端缓存与自有副本的完整目录关系，见[远端文件版本与 Agent 机制](../远端文件版本与Agent机制.md)第 7.1 节；历史技能快照与分支继承见第 9.1 节。生成的 `easywork-selected` 是本轮调用包装，不作为用户技能加入历史快照。
+
+筛选包括对话模式和 Work 服务器范围。网页 Agent 选择、用户显式附加、Work 强制启用最终共用同一部署及版本收据；后两类不要求网页模型再次读取或批准。同版包复用当前 binding 的副本；强制项仅在切换绑定后的首次提问检查并补齐，连续提问不重复交付。用户显式或网页按需选中的项仍执行本轮原生调用。启动指纹覆盖 Skill pin、视图和调用正文；技能变更后不能复用未加载新内容的预热进程。模型 relay 属于 binding，旧进程退出不能关闭替代进程正在使用的 relay。
 
 ## 4. 原生操作映射
 
@@ -87,7 +90,7 @@ EasyWork 通过 stdin 连续发送 JSON frame，从 stdout 接收 JSONL。工作
 
 Claude Code 的 append 通过同一 stream-json stdin 完成：先发原生 control interrupt，让当前采样/工具循环停止在可续接边界，再发用户新 frame。transport 记录 queued turn 数；每个 `result` 都是一个原生回合边界，但只有 queued count 已归零的最后一个 result 才成为整个 EasyWork Task 的 final。这样追问前后的 Agent 调用分段不会一个完成、另一个仍运行。
 
-终止优先使用原生 control interrupt。如果旧用户版本不支持、返回错误或未能结束，则只对当前 binding 已验证的进程句柄升级：先 `SIGINT`，再有界等待 `SIGTERM`，最后才 `SIGKILL`。不会按进程名批量终止，也不会影响另一个网页对话的 Claude 进程。
+终止先发原生 control interrupt，控制失败时对当前受管进程补发 `SIGINT`；随后对同一进程发送 `SIGTERM` 并等待最多 4 秒，仍未退出才升级 `SIGKILL` 并再确认最多 2 秒。信号式兼容路径同样有界确认退出。未确认退出时报可重试错误并保留活动状态，不能提前标记停止。不会按进程名批量终止。原生 Cron 工具被禁用，因为当前网页 Task 的结果流不负责完成后定时通知。
 
 收到控制请求的成功回执只证明命令已接收；Task 终态仍以原生结果/进程退出和文件版本收尾为准。
 

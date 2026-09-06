@@ -8,6 +8,7 @@ import { defaultActorMutationQueue } from "../mutation-queue.mjs";
 import { atomicWriteJson } from "../repository.mjs";
 import { assertExpectedRevision } from "../revision.mjs";
 import { DEFAULT_SKILL_APPLICABILITY, normalizeSkillApplicability } from "./applicability.mjs";
+import { recoverSkillPackageEdit, replaceSkillPackage, removeSkillDirectory, skillStoragePath } from "./package-storage.mjs";
 
 const STORE_SCHEMA_VERSION = 1;
 const PACKAGE_SCHEMA_VERSION = 1;
@@ -138,6 +139,8 @@ function validateStore(store) {
     invariant(typeof item.name === "string" && typeof item.description === "string", "SKILL_CENTER_STORE_INVALID", "市场技能信息无效", { status: 500, expose: false });
     invariant(Number.isSafeInteger(item.revision) && item.revision > 0 && Number.isSafeInteger(item.release) && item.release > 0, "SKILL_CENTER_STORE_INVALID", "市场技能 revision 无效", { status: 500, expose: false });
     normalizeSkillApplicability(item.applicability || DEFAULT_SKILL_APPLICABILITY);
+    invariant(item.deployToAllUsers === undefined || typeof item.deployToAllUsers === "boolean", "SKILL_CENTER_STORE_INVALID", "技能全体部署设置无效", { status: 500 });
+    if (item.deployToAllUsers) assertSegment(item.deploymentId, "market.deploymentId");
     validateFiles(item.files);
     ids.add(item.id);
   }
@@ -172,6 +175,7 @@ function publicMarketItem(entry, installedSkillIds = new Set()) {
     fileCount: entry.files.length,
     installed: installedSkillIds.has(entry.skillId),
     applicability: normalizeSkillApplicability(entry.applicability || DEFAULT_SKILL_APPLICABILITY),
+    deployToAllUsers: entry.deployToAllUsers === true,
   };
 }
 
@@ -194,6 +198,7 @@ export class SkillMarketplaceService {
     this.packagesRoot = path.join(this.root, "packages");
     this.clock = options.clock || (() => new Date());
     this.prompts = options.prompts || null;
+    this.onDeployment = options.onDeployment || null;
     this.queue = options.queue || defaultActorMutationQueue;
     this.idFactory = options.idFactory || ((kind) => `${kind}_${crypto.randomUUID()}`);
     this.maxFiles = Number(options.maxFiles ?? 1000);
@@ -216,6 +221,72 @@ export class SkillMarketplaceService {
     return candidate;
   }
 
+  async #expectedPackageHash(relativeRoot) {
+    const snapshot = await this.#readEnvelope();
+    const hashes = new Set([...snapshot.data.market, ...snapshot.data.submissions]
+      .filter((entry) => `packages/${entry.packageId}` === relativeRoot).map((entry) => entry.packageSha256));
+    invariant(hashes.size <= 1, "SKILL_PACKAGE_REFERENCE_CONFLICT", "技能包引用不一致", { status: 500 });
+    return [...hashes][0] || null;
+  }
+
+  async #locked(operation) {
+    return this.queue.run(GLOBAL_QUEUE_ACTOR, async () => {
+      await recoverSkillPackageEdit(this.root, (relativeRoot) => this.#expectedPackageHash(relativeRoot));
+      return operation();
+    });
+  }
+
+  async #collectPackages(store, dryRun = false) {
+    const referenced = new Set([...store.market, ...store.submissions].map((entry) => entry.packageId));
+    await skillStoragePath(this.root, "packages");
+    const directories = await fs.readdir(this.packagesRoot, { withFileTypes: true }).catch((error) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    const obsolete = directories.filter((entry) => entry.name.startsWith("skill_package_") && !referenced.has(entry.name));
+    for (const entry of obsolete) {
+      await skillStoragePath(this.root, `packages/${entry.name}`);
+      if (!dryRun) await removeSkillDirectory(this.root, `packages/${entry.name}`);
+    }
+    return { removedPackages: obsolete.map((entry) => entry.name), retainedPackages: [...referenced] };
+  }
+
+  async #mutate(operation) {
+    return this.#locked(async () => {
+      const result = await operation();
+      await this.#collectPackages((await this.#readEnvelope()).data);
+      return result;
+    });
+  }
+
+  #syncSubmissionPackages(store, item) {
+    for (const submission of store.submissions) {
+      if (submission.skillId !== item.skillId && submission.id !== item.submissionId) continue;
+      Object.assign(submission, {
+        packageId: item.packageId, packageSha256: item.packageSha256,
+        entrypoint: item.entrypoint, files: clone(item.files), name: item.name, description: item.description,
+      });
+    }
+  }
+
+  async cleanupStorage({ dryRun = true } = {}) {
+    return this.#locked(async () => {
+      const snapshot = await this.#readEnvelope();
+      const draft = clone(snapshot.data);
+      const liveSkills = new Set(draft.market.map((entry) => entry.skillId));
+      const removedSubmissions = draft.submissions.filter((entry) => entry.status === "approved" && !liveSkills.has(entry.skillId));
+      draft.submissions = draft.submissions.filter((entry) => !removedSubmissions.includes(entry));
+      for (const item of draft.market) this.#syncSubmissionPackages(draft, item);
+      for (const item of [...draft.market, ...draft.submissions]) await this.#loadPackage(item, { includeContent: false });
+      const plan = await this.#collectPackages(draft, true);
+      if (!dryRun) {
+        if (JSON.stringify(draft) !== JSON.stringify(snapshot.data)) await this.#update(() => draft);
+        await this.#collectPackages(draft);
+      }
+      return { dryRun, ...plan, removedSubmissions: removedSubmissions.map(({ id, name }) => ({ id, name })) };
+    });
+  }
+
   async #readEnvelope() {
     let envelope;
     try {
@@ -226,6 +297,9 @@ export class SkillMarketplaceService {
       throw error;
     }
     invariant(envelope?.schemaVersion === STORE_SCHEMA_VERSION && Number.isSafeInteger(envelope.revision) && envelope.revision >= 0, "SKILL_CENTER_STORE_CORRUPT", "技能中心索引 envelope 无效", { status: 500, expose: false });
+    invariant(envelope.deletedBuiltinIds === undefined || (Array.isArray(envelope.deletedBuiltinIds)
+      && envelope.deletedBuiltinIds.every((id) => typeof id === "string" && SAFE_SEGMENT_PATTERN.test(id))),
+    "SKILL_CENTER_STORE_CORRUPT", "内置技能删除记录无效", { status: 500, expose: false });
     validateStore(envelope.data);
     return envelope;
   }
@@ -238,6 +312,7 @@ export class SkillMarketplaceService {
       const data = result === undefined ? draft : result;
       validateStore(data);
       const next = {
+        ...current,
         schemaVersion: STORE_SCHEMA_VERSION,
         revision: current.revision + 1,
         updatedAt: this.#now(),
@@ -295,6 +370,8 @@ export class SkillMarketplaceService {
       "技能包索引与文件不一致",
       { status: 500, expose: false },
     );
+    validateFiles(descriptor.files);
+    invariant(JSON.stringify(descriptor.files) === JSON.stringify(entry.files), "SKILL_PACKAGE_CORRUPT", "技能包文件清单与索引不一致", { status: 500, expose: false });
     let remaining = TOTAL_PREVIEW_BYTES;
     const files = [];
     for (const expected of descriptor.files) {
@@ -318,6 +395,9 @@ export class SkillMarketplaceService {
         raw: content,
       });
     }
+    invariant(files.some((file) => file.path === descriptor.entrypoint)
+      && packageDigest(files.map((file) => ({ path: file.path, content: file.raw }))) === entry.packageSha256,
+    "SKILL_PACKAGE_HASH_MISMATCH", "技能包内容哈希校验失败", { status: 500, expose: false });
     return { descriptor, files };
   }
 
@@ -333,16 +413,27 @@ export class SkillMarketplaceService {
   }
 
   async ensureBuiltins() {
+    return this.#mutate(() => this.#ensureBuiltins());
+  }
+
+  async #ensureBuiltins() {
     invariant(this.prompts && typeof this.prompts.builtinSkills === "function", "BUILTIN_SKILL_PROMPTS_REQUIRED", "技能中心缺少内置 Skill Prompt Repository", { status: 500, expose: false });
     for (const definition of await this.prompts.builtinSkills()) {
       const files = normalizeFiles(definition.files, this);
       const digest = packageDigest(files);
-      const packageId = `skill_package_builtin_${digest.slice(0, 16)}`;
       const snapshot = await this.#readEnvelope();
+      if (snapshot.deletedBuiltinIds?.includes(definition.id)) continue;
       const current = snapshot.data.market.find((entry) => entry.id === definition.id);
-      if (current?.packageSha256 === digest) continue;
-      const descriptor = await this.#writePackage(packageId, files);
-      await this.#update((store) => {
+      if (current?.builtinSourceSha256 === digest) continue;
+      if (current?.packageSha256 === digest) {
+        await this.#update((store) => { store.market.find((entry) => entry.id === definition.id).builtinSourceSha256 = digest; });
+        continue;
+      }
+      const shared = current && [...snapshot.data.market, ...snapshot.data.submissions]
+        .some((entry) => entry.packageId === current.packageId && entry.skillId !== current.skillId);
+      const packageId = shared ? this.#newId("skill_package") : current?.packageId || `skill_package_builtin_${digest.slice(0, 16)}`;
+      const descriptor = { schemaVersion: PACKAGE_SCHEMA_VERSION, packageId, sha256: digest, files: fileDescriptors(files), entrypoint: preferredEntrypoint(files) };
+      const commit = () => this.#update((store) => {
         const index = store.market.findIndex((entry) => entry.id === definition.id);
         const previous = index >= 0 ? store.market[index] : null;
         if (previous?.packageSha256 === descriptor.sha256) return;
@@ -352,11 +443,14 @@ export class SkillMarketplaceService {
           skillId: definition.skillId,
           packageId: descriptor.packageId,
           packageSha256: descriptor.sha256,
+          builtinSourceSha256: digest,
           entrypoint: descriptor.entrypoint,
           files: descriptor.files,
           name: definition.name,
           description: definition.description,
           applicability: normalizeSkillApplicability(previous?.applicability || DEFAULT_SKILL_APPLICABILITY),
+          deployToAllUsers: previous?.deployToAllUsers === true,
+          deploymentId: previous?.deploymentId || null,
           createdAt: previous?.createdAt || now,
           updatedAt: now,
           revision: previous ? previous.revision + 1 : 1,
@@ -364,11 +458,19 @@ export class SkillMarketplaceService {
         };
         if (index >= 0) store.market[index] = next;
         else store.market.push(next);
+        this.#syncSubmissionPackages(store, next);
       });
+      if (current && !shared) await replaceSkillPackage({ root: this.root, relativeRoot: `packages/${packageId}`, descriptor, files,
+        readExpectedHash: (relativeRoot) => this.#expectedPackageHash(relativeRoot), commit });
+      else { await this.#writePackage(packageId, files); await commit(); }
     }
   }
 
   async getMarket(id, { installedSkillIds = [] } = {}) {
+    return this.#locked(() => this.#getMarket(id, { installedSkillIds }));
+  }
+
+  async #getMarket(id, { installedSkillIds = [] } = {}) {
     const snapshot = await this.#readEnvelope();
     const item = snapshot.data.market.find((entry) => entry.id === assertSegment(String(id || ""), "marketId"));
     invariant(item, "MARKET_SKILL_NOT_FOUND", "市场技能不存在", { status: 404 });
@@ -382,12 +484,20 @@ export class SkillMarketplaceService {
   }
 
   async submit(actor, input) {
+    return this.#mutate(() => this.#submit(actor, input));
+  }
+
+  async #submit(actor, input) {
     requireAuthenticatedActor(actor);
     const name = normalizedText(String(input?.name ?? ""), "技能名称", 256, { required: true });
     const description = normalizedText(String(input?.description ?? ""), "技能简介", 8192);
     const files = normalizeFiles(input?.files, this);
     const command = String(input?.commandId || "").trim();
     invariant(command.length > 0 && command.length <= 512, "IDEMPOTENCY_KEY_REQUIRED", "上传技能需要 Idempotency-Key", { status: 428 });
+    const snapshot = await this.#readEnvelope();
+    const prior = snapshot.data.submissions.find((entry) => entry.uploaderId === actor.actorId && (entry.commandId === command
+      || (entry.status !== "rejected" && entry.name === name && entry.description === description && entry.packageSha256 === packageDigest(files))));
+    if (prior) return { item: publicSubmission(prior), revision: snapshot.revision, duplicate: true };
     const packageId = this.#newId("skill_package");
     const descriptor = await this.#writePackage(packageId, files);
     try {
@@ -449,6 +559,10 @@ export class SkillMarketplaceService {
   }
 
   async getSubmission(actor, id) {
+    return this.#locked(() => this.#getSubmission(actor, id));
+  }
+
+  async #getSubmission(actor, id) {
     requireAuthenticatedActor(actor);
     const snapshot = await this.#readEnvelope();
     const item = snapshot.data.submissions.find((entry) => entry.id === assertSegment(String(id || ""), "submissionId"));
@@ -514,12 +628,20 @@ export class SkillMarketplaceService {
   }
 
   async updateMarket(actor, id, input) {
+    const result = await this.#mutate(() => this.#updateMarket(actor, id, input));
+    // Copy into user libraries after releasing the market write lock.
+    if (result.item.deployToAllUsers && this.onDeployment) result.deployment = await this.onDeployment(result.item.id);
+    return result;
+  }
+
+  async #updateMarket(actor, id, input) {
     requireAuthenticatedActor(actor);
     requireRole(actor, "admin");
     const marketId = assertSegment(String(id || ""), "marketId");
     const name = input?.name === undefined ? null : normalizedText(String(input.name ?? ""), "技能名称", 256, { required: true });
     const description = input?.description === undefined ? null : normalizedText(String(input.description ?? ""), "技能简介", 8192);
     const requestedApplicability = input?.applicability === undefined ? null : normalizeSkillApplicability(input.applicability);
+    invariant(input?.deployToAllUsers === undefined || typeof input.deployToAllUsers === "boolean", "SKILL_DEPLOYMENT_INVALID", "部署给全体用户必须是布尔值", { status: 400 });
     invariant(input?.files === undefined || input?.fileUpdates === undefined, "SKILL_FILE_UPDATE_CONFLICT", "不能同时替换技能包并更新单个文件", { status: 400 });
     let replacementFiles = input?.files === undefined ? null : normalizeFiles(input.files, this);
     if (input?.fileUpdates !== undefined) {
@@ -540,9 +662,14 @@ export class SkillMarketplaceService {
       }, 0);
       invariant(totalBytes <= this.maxPackageBytes, "SKILL_PACKAGE_TOO_LARGE", "技能包超过大小限制", { status: 413, details: { maxPackageBytes: this.maxPackageBytes } });
     }
-    const packageId = replacementFiles ? this.#newId("skill_package") : null;
-    const descriptor = replacementFiles ? await this.#writePackage(packageId, replacementFiles) : null;
-    try {
+    const snapshot = await this.#readEnvelope();
+    const source = snapshot.data.market.find((entry) => entry.id === marketId);
+    invariant(source, "MARKET_SKILL_NOT_FOUND", "市场技能不存在", { status: 404 });
+    assertExpectedRevision(source.revision, input?.expectedRevision);
+    const shared = [...snapshot.data.market, ...snapshot.data.submissions].some((entry) => entry.packageId === source.packageId && entry.skillId !== source.skillId);
+    const packageId = shared && replacementFiles ? this.#newId("skill_package") : source.packageId;
+    const descriptor = replacementFiles ? { schemaVersion: PACKAGE_SCHEMA_VERSION, packageId, sha256: packageDigest(replacementFiles), files: fileDescriptors(replacementFiles), entrypoint: preferredEntrypoint(replacementFiles) } : null;
+    const commit = async () => {
       let updated;
       const result = await this.#update((store) => {
         const index = store.market.findIndex((entry) => entry.id === marketId);
@@ -560,42 +687,62 @@ export class SkillMarketplaceService {
           name: name ?? current.name,
           description: description ?? current.description,
           applicability: requestedApplicability || normalizeSkillApplicability(current.applicability || DEFAULT_SKILL_APPLICABILITY),
+          deployToAllUsers: input?.deployToAllUsers ?? (current.deployToAllUsers === true),
+          deploymentId: input?.deployToAllUsers === true && !current.deployToAllUsers ? this.#newId("skill_deployment") : current.deploymentId || null,
           updatedAt: this.#now(),
           revision: current.revision + 1,
           release: current.release + 1,
         };
         store.market[index] = updated;
+        this.#syncSubmissionPackages(store, updated);
       });
       return { item: publicMarketItem(updated), revision: result.revision };
-    } catch (error) {
-      if (packageId) await fs.rm(this.#packageRoot(packageId), { recursive: true, force: true }).catch(() => undefined);
-      throw error;
-    }
+    };
+    if (!descriptor) return commit();
+    if (shared) { await this.#writePackage(packageId, replacementFiles); return commit(); }
+    return replaceSkillPackage({ root: this.root, relativeRoot: `packages/${packageId}`, descriptor, files: replacementFiles,
+      readExpectedHash: (relativeRoot) => this.#expectedPackageHash(relativeRoot), commit });
   }
 
   async deleteMarket(actor, id, input) {
+    return this.#mutate(() => this.#deleteMarket(actor, id, input));
+  }
+
+  async #deleteMarket(actor, id, input) {
     requireAuthenticatedActor(actor);
     requireRole(actor, "admin");
     let removed;
-    const result = await this.#update((store) => {
+    const result = await this.#update((store, envelope) => {
       const index = store.market.findIndex((entry) => entry.id === assertSegment(String(id || ""), "marketId"));
       invariant(index >= 0, "MARKET_SKILL_NOT_FOUND", "市场技能不存在", { status: 404 });
       removed = store.market[index];
       assertExpectedRevision(removed.revision, input?.expectedRevision);
       store.market.splice(index, 1);
+      store.submissions = store.submissions.filter((entry) => entry.skillId !== removed.skillId && entry.id !== removed.submissionId);
+      if (removed.builtinSourceSha256) envelope.deletedBuiltinIds = [...new Set([...(envelope.deletedBuiltinIds || []), removed.id])];
     });
     return { id: removed.id, skillId: removed.skillId, revision: result.revision };
   }
 
-  async install(actor, skillService, id) {
+  async listDeployments() {
+    const snapshot = await this.#readEnvelope();
+    return snapshot.data.market.filter((item) => item.deployToAllUsers)
+      .map(({ id, deploymentId }) => ({ id, deploymentId }));
+  }
+
+  async install(actor, skillService, id, { deploymentId } = {}) {
     requireAuthenticatedActor(actor);
     invariant(typeof skillService?.installPackage === "function", "SKILL_INSTALL_SERVICE_INVALID", "用户技能服务不可用", { status: 500, expose: false });
-    const snapshot = await this.#readEnvelope();
-    const item = snapshot.data.market.find((entry) => entry.id === assertSegment(String(id || ""), "marketId"));
-    invariant(item, "MARKET_SKILL_NOT_FOUND", "市场技能不存在", { status: 404 });
-    const loaded = await this.#loadPackage(item, { includeContent: false });
+    const { item, loaded } = await this.#locked(async () => {
+      const snapshot = await this.#readEnvelope();
+      const item = snapshot.data.market.find((entry) => entry.id === assertSegment(String(id || ""), "marketId"));
+      if (deploymentId && (!item?.deployToAllUsers || item.deploymentId !== deploymentId)) return { item: null, loaded: null };
+      invariant(item, "MARKET_SKILL_NOT_FOUND", "市场技能不存在", { status: 404 });
+      return { item, loaded: await this.#loadPackage(item, { includeContent: false }) };
+    });
+    if (!item) return { skipped: true, duplicate: true };
     const version = `market-${item.release}-${item.packageSha256.slice(0, 12)}`;
-    const installed = await skillService.installPackage({
+    const input = {
       skillId: item.skillId,
       version,
       manifest: {
@@ -606,7 +753,10 @@ export class SkillMarketplaceService {
       },
       files: loaded.files.map((file) => ({ path: file.path, content: file.raw })),
       applicability: normalizeSkillApplicability(item.applicability || DEFAULT_SKILL_APPLICABILITY),
-    });
+    };
+    const installed = deploymentId
+      ? await skillService.installMarketDeployment(input, { marketSkillId: item.id, deploymentId })
+      : await skillService.installPackage(input, { ifAbsent: true });
     return {
       marketSkillId: item.id,
       skillId: item.skillId,

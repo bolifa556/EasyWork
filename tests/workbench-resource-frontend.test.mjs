@@ -18,7 +18,7 @@ test("workspace downloads use an EasyWork-issued streaming link and extensionles
   assert.match(sidebar, /files\/download/);
   assert.match(sidebar, /document\.createElement\("a"\)/);
   assert.doesNotMatch(sidebar, /response\.blob\(|URL\.createObjectURL/);
-  assert.match(sidebar, /return !extension \|\| PREVIEW_EXTENSIONS\.has\(extension\)/);
+  assert.match(sidebar, /return canPreviewFile\(entry\)/);
   assert.match(sidebar, /contextEntry && contextEntry\.kind !== "directory"[\s\S]+?打开预览/);
   assert.match(sidebar, /<Download size=\{15\} \/>下载…/);
   assert.doesNotMatch(conversation, /RemoteFileDialog|setRemoteFilesOpen|>文件<\/button>/);
@@ -53,7 +53,7 @@ test("collection deletion supplies the backend idempotency key", async () => {
   assert.match(source, /api\.delete\(`\/api\/collections\/\$\{encodeURIComponent\(id\)\}`,[\s\S]+?idempotencyKey: commandId\("collection-delete"\)/);
 });
 
-test("scheduler resources keep polling while job lists load on entry and mutations", async () => {
+test("scheduler job lists refresh on native notifications, entry, tab selection and mutations", async () => {
   const [source, styles] = await Promise.all([readFile(schedulerPath, "utf8"), readFile(drawerStylePath, "utf8")]);
   assert.match(source, /function Donut\(/);
   assert.match(source, /<BreakdownChart label="节点"/);
@@ -65,7 +65,10 @@ test("scheduler resources keep polling while job lists load on entry and mutatio
   assert.doesNotMatch(source, /ACTIVE_JOB_REFRESH_MS|setInterval\(\(\) => void loadCurrentJobs/);
   assert.match(source, /loadHistory\(initialHistoryRange, controller\.signal\)/);
   assert.match(source, /Promise\.all\(\[loadCurrentJobs\(\), loadHistory\(historyRange\)\]\)/);
-  assert.match(source, /const chooseJobTab = \(tab: "current" \| "history"\) => \{\s*setJobTab\(tab\);\s*if \(tab === "history"\) void loadHistory\(historyRange\);\s*else void loadCurrentJobs\(\);/);
+  assert.match(source, /runtime\.realtime\?\.subscribe\(`scheduler:[\s\S]+?event\.kind === "jobs.changed"[\s\S]+?refreshJobs/);
+  const chooseTabSource = source.slice(source.indexOf("const chooseJobTab"), source.indexOf("const chooseHistoryPreset"));
+  assert.match(chooseTabSource, /loadCurrentJobs\(/);
+  assert.match(chooseTabSource, /loadHistory\(/);
   assert.match(source, /onClick=\{\(\) => chooseJobTab\("history"\)\}/);
   assert.match(source, /onClick=\{\(\) => chooseJobTab\("current"\)\}/);
   assert.match(source, /window\.setInterval\(\(\) => void loadResources\(controller\.signal\), RESOURCE_REFRESH_MS\)/);
@@ -81,6 +84,7 @@ test("scheduler resources keep polling while job lists load on entry and mutatio
   assert.match(source, /aria-label="历史作业分页"/);
   assert.doesNotMatch(source, /进入算力时读取|作业变化后更新/);
   assert.doesNotMatch(source, /jobTab === "current" \? <time>/);
+  assert.doesNotMatch(source, /<small>提交<\/small>/);
   assert.match(styles, /\.jobName\s*\{[^}]*align-items:baseline;[^}]*white-space:nowrap;/s);
   assert.match(styles, /\.jobCell,[\s\S]+?\.jobStatusCell\s*\{[^}]*align-items:center;[^}]*white-space:nowrap;/s);
   assert.match(styles, /\.jobState\s*\{[^}]*padding:0;[^}]*background:transparent;/s);

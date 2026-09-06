@@ -9,6 +9,28 @@ import { actorDataRoot } from "../gateway/core/paths.mjs";
 import { SkillMarketplaceService, SkillService } from "../gateway/core/skills/index.mjs";
 import { normalizeSkillApplicability } from "../gateway/core/skills/applicability.mjs";
 
+test("installed personal Skill content is independent of market edits, retries and deletion", async () => fixture(async (dataRoot) => {
+  const owner = actor("copy-owner"), newcomer = actor("copy-newcomer"), admin = actor("copy-admin", ["admin"]);
+  const market = new SkillMarketplaceService({ dataRoot, idFactory: ids() });
+  const skills = new SkillService({ dataRoot, actor: owner, authorizeTask: async () => true });
+  const nextSkills = new SkillService({ dataRoot, actor: newcomer, authorizeTask: async () => true });
+  const submitted = await market.submit(admin, upload({ commandId: "copy-create" }));
+  const published = await market.review(admin, submitted.item.id, { decision: "approve", expectedRevision: submitted.item.revision });
+  await market.install(owner, skills, published.market.id);
+  const before = await skills.getInstalledDetail(published.market.skillId);
+  const catalogBefore = await skills.inspect();
+  const changed = await market.updateMarket(admin, published.market.id, {
+    name: "市场的新名称", description: "市场的新说明", fileUpdates: [{ path: "SKILL.md", content: "# 市场新内容\n\n请使用新版规则。\n" }], expectedRevision: published.market.revision,
+  });
+  assert.deepEqual(await skills.getInstalledDetail(published.market.skillId), before);
+  assert.equal((await market.install(owner, skills, published.market.id)).duplicate, true);
+  assert.deepEqual(await skills.inspect(), catalogBefore);
+  await market.install(newcomer, nextSkills, published.market.id);
+  assert.match((await nextSkills.getInstalledDetail(published.market.skillId)).files.find((file) => file.path === "SKILL.md").content, /市场新内容/);
+  await market.deleteMarket(admin, published.market.id, { expectedRevision: changed.item.revision });
+  assert.deepEqual(await skills.getInstalledDetail(published.market.skillId), before);
+}));
+
 function actor(actorId, roles = []) {
   return createActorContext({ actorType: "user", actorId, deviceId: `device_${actorId}`, sessionId: `session_${actorId}`, roles });
 }

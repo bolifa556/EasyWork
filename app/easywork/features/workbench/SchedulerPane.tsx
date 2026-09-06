@@ -68,7 +68,7 @@ function Donut({ segments, value, caption, label }: {
   const total = segments.reduce((sum, segment) => sum + Math.max(0, segment.value), 0);
   let offset = 0;
   return <div className={styles.donut} role="img" aria-label={label}>
-    <svg viewBox="0 0 100 100" aria-hidden="true">
+    <svg data-ui-icon="" viewBox="0 0 100 100" aria-hidden="true">
       <circle className={styles.donutTrack} cx="50" cy="50" r="42" />
       {total > 0 ? segments.map((segment, index) => {
         const length = (Math.max(0, segment.value) / total) * DONUT_CIRCUMFERENCE;
@@ -93,7 +93,7 @@ function Donut({ segments, value, caption, label }: {
 
 function Legend({ items }: { items: Array<{ label: string; value: number; color: string }> }) {
   return <div className={styles.chartLegend}>{items.map((item) => <span key={item.label}>
-    <i style={{ backgroundColor: item.color }} />
+    <i data-ui-icon="" style={{ backgroundColor: item.color }} />
     <small>{item.label}</small>
     <strong>{item.value}</strong>
   </span>)}</div>;
@@ -307,7 +307,7 @@ function JobList({ jobs, capability, history = false, busy, columnWidths, onColu
           <span className={`${styles.jobCell} ${styles.jobApplication}`} role="cell" data-label="应用"><strong>{jobApplication(job)}</strong></span>
           <span className={`${styles.jobCell} ${styles.jobResource}`} role="cell" data-label="队列 / 资源"><strong>{job.partition || "未指定"}</strong><small>{job.nodes ?? 0} 节点 · {job.cpuCores ?? 0} 核</small></span>
           <span className={`${styles.jobCell} ${styles.jobDuration}`} role="cell" data-label="运行时长"><strong>{job.elapsed || "—"}</strong>{job.timeLeft ? <small>剩余 {job.timeLeft}</small> : null}</span>
-          <span className={`${styles.jobCell} ${styles.jobDate} ${styles.jobStart}`} role="cell" data-label="开始时间"><time>{formatJobDateTime(job.startedAt || job.submittedAt)}</time>{!job.startedAt && job.submittedAt ? <small>提交</small> : null}</span>
+          <span className={`${styles.jobCell} ${styles.jobDate} ${styles.jobStart}`} role="cell" data-label="开始时间"><time>{formatJobDateTime(job.startedAt || job.submittedAt)}</time></span>
           <span className={`${styles.jobCell} ${styles.jobDate} ${styles.jobEnd}`} role="cell" data-label="结束时间"><time>{formatJobDateTime(job.endedAt || job.expectedEndAt)}</time>{job.expectedEndAt && !job.endedAt ? <small>预计</small> : null}</span>
           <span className={styles.jobStatusCell} role="cell" data-label="作业状态">
             <span className={`${styles.jobState} ${styles[`job_${job.state}`] || ""}`}>{jobLabels[job.state]}</span>
@@ -319,7 +319,15 @@ function JobList({ jobs, capability, history = false, busy, columnWidths, onColu
   </div>;
 }
 
-function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capability: ServerCapabilityProfile["features"]["scheduler"] }) {
+type SchedulerPaneProps = {
+  serverId: string;
+  workspaceId: string;
+  conversationId: string;
+  branchId: string;
+  capability: ServerCapabilityProfile["features"]["scheduler"];
+};
+
+function ClusterSchedulerPane({ serverId, workspaceId, conversationId, branchId, capability }: SchedulerPaneProps) {
   const runtime = useAppRuntime();
   const cached = schedulerDashboardCache.get(serverId);
   const [initialHistoryRange] = useState<HistoryRange>(() => recentHistoryRange(30));
@@ -345,6 +353,8 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
   const [partition, setPartition] = useState("");
   const [scriptPath, setScriptPath] = useState("");
   const historyRequestRef = useRef(0);
+  const currentRequestRef = useRef(0);
+  const [jobsError, setJobsError] = useState<string | null>(null);
 
   const changeColumnWidths = (widths: number[] | null) => {
     setColumnWidths(widths);
@@ -356,41 +366,13 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
 
   const remember = useCallback((patch: Partial<SchedulerDashboard>) => {
     const current = schedulerDashboardCache.get(serverId);
-    if (current) schedulerDashboardCache.set(serverId, { ...current, ...patch });
+    schedulerDashboardCache.set(serverId, { scheduler: "slurm", summary: null, partitions: [], jobs: [], history: [], sampledAt: "", ...current, ...patch });
   }, [serverId]);
 
   const applyPartitions = useCallback((next: SchedulerPartition[]) => {
     setPartitions(next);
     if (next.length) setPartition((current) => current || next.find((item) => item.isDefault)?.id || next[0].id);
   }, []);
-
-  const loadDashboard = useCallback(async (signal?: AbortSignal, refresh = true) => {
-    if (!schedulerDashboardCache.has(serverId)) setLoading(true);
-    try {
-      const [resources, current] = await Promise.all([
-        runtime.api.get<SchedulerResourceSnapshot>(`/api/servers/${encodeURIComponent(serverId)}/scheduler/resource-dashboard${refresh ? "?refresh=1" : ""}`, signal),
-        runtime.api.get<SchedulerJob[]>(`/api/servers/${encodeURIComponent(serverId)}/scheduler/jobs`, signal),
-      ]);
-      const previous = schedulerDashboardCache.get(serverId);
-      const dashboard: SchedulerDashboard = {
-        scheduler: resources.data.scheduler,
-        summary: resources.data.summary,
-        partitions: resources.data.partitions,
-        sampledAt: resources.data.sampledAt,
-        jobs: current.data || [],
-        history: previous?.history || [],
-      };
-      schedulerDashboardCache.set(serverId, dashboard);
-      setSummary(resources.data.summary || null);
-      applyPartitions(resources.data.partitions || []);
-      setJobs(current.data || []);
-      setError(null);
-    } catch (reason) {
-      if (!signal?.aborted) setError(reason instanceof Error ? reason.message : "无法读取算力信息");
-    } finally {
-      if (!signal?.aborted) setLoading(false);
-    }
-  }, [applyPartitions, runtime.api, serverId]);
 
   const loadResources = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -404,14 +386,13 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
     }
   }, [applyPartitions, remember, runtime.api, serverId]);
 
-  const loadHistory = useCallback(async (range: HistoryRange, signal?: AbortSignal) => {
+  const loadHistory = useCallback(async (range: HistoryRange, signal?: AbortSignal, quiet = false) => {
     if (!capability.jobHistory) {
       setHistoryLoading(false);
       return;
     }
     const requestId = ++historyRequestRef.current;
-    setHistoryPage(1);
-    setHistoryLoading(true);
+    if (!quiet) { setHistoryPage(1); setHistoryLoading(true); }
     try {
       const query = new URLSearchParams({ startDate: range.startDate, endDate: range.endDate, utcOffsetMinutes: String(-new Date().getTimezoneOffset()) });
       const result = await runtime.api.get<SchedulerJob[]>(`/api/servers/${encodeURIComponent(serverId)}/scheduler/jobs/history?${query}`, signal);
@@ -429,16 +410,49 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
   }, [capability.jobHistory, remember, runtime.api, serverId]);
 
   const loadCurrentJobs = useCallback(async (signal?: AbortSignal) => {
+    const requestId = ++currentRequestRef.current;
     try {
       const result = await runtime.api.get<SchedulerJob[]>(`/api/servers/${encodeURIComponent(serverId)}/scheduler/jobs`, signal);
+      if (signal?.aborted || requestId !== currentRequestRef.current) return;
       const nextJobs = result.data || [];
       setJobs(nextJobs);
       remember({ jobs: nextJobs });
-      setError(null);
+      setJobsError(null);
     } catch (reason) {
-      if (!signal?.aborted) setError(reason instanceof Error ? reason.message : "当前作业更新失败");
+      if (!signal?.aborted && requestId === currentRequestRef.current) setJobsError(reason instanceof Error ? reason.message : "当前作业更新失败");
     }
   }, [remember, runtime.api, serverId]);
+
+  const loadDashboard = useCallback(async (signal?: AbortSignal, _refresh = true) => {
+    if (!schedulerDashboardCache.has(serverId)) setLoading(true);
+    // A failed resource probe must not discard a successful job query.
+    await Promise.allSettled([loadResources(signal), loadCurrentJobs(signal)]);
+    if (!signal?.aborted) setLoading(false);
+  }, [loadResources, loadCurrentJobs, serverId]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = false, dirty = false;
+    const refreshJobs = async () => {
+      if (active) { dirty = true; return; }
+      active = true;
+      do {
+        dirty = false;
+        await Promise.allSettled([loadCurrentJobs(controller.signal), loadHistory(historyRange, controller.signal, true)]);
+      } while (dirty && !controller.signal.aborted);
+      active = false;
+    };
+    const unsubscribe = runtime.realtime?.subscribe(`scheduler:${serverId}`, (event) => {
+      if (event.kind === "jobs.changed") void refreshJobs();
+    });
+    const unsubscribeState = runtime.realtime?.onState((state) => { if (state === "open") void refreshJobs(); });
+    // Reconnect/focus and polling repair missed notifications and changes made
+    // outside EasyWork; native submissions trigger the same refresh immediately.
+    const onFocus = () => { void refreshJobs(); };
+    window.addEventListener("focus", onFocus);
+    const interval = window.setInterval(onFocus, RESOURCE_REFRESH_MS);
+    return () => { controller.abort(); unsubscribe?.(); unsubscribeState?.(); window.clearInterval(interval); window.removeEventListener("focus", onFocus); };
+  }, [historyRange, loadCurrentJobs, loadHistory, runtime.realtime, serverId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -468,8 +482,11 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
     setBusy("submit");
     try {
       const result = await runtime.api.post<{ jobId: string }>(`/api/servers/${encodeURIComponent(serverId)}/scheduler/jobs`, {
+        workspaceId,
+        conversationId,
+        branchId,
         partition,
-        scriptPath: scriptPath.trim(),
+        scriptPath,
         args: [],
       }, { idempotencyKey: commandId("scheduler-submit") });
       runtime.notify(`作业 ${result.data.jobId} 已提交`, "success");
@@ -494,8 +511,8 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
 
   const chooseJobTab = (tab: "current" | "history") => {
     setJobTab(tab);
-    if (tab === "history") void loadHistory(historyRange);
-    else void loadCurrentJobs();
+    if (tab === "current") void loadCurrentJobs();
+    else void loadHistory(historyRange, undefined, true);
   };
 
   const chooseHistoryPreset = (value: HistoryPreset) => {
@@ -538,6 +555,7 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
   if (error && !hasCachedData) return <div className={styles.state}><ServerCog size={22} /><strong>调度器暂时不可用</strong><span>{error}</span><Button compact onClick={() => void loadDashboard()}>重试</Button></div>;
 
   return <div className={styles.schedulerPane}>
+    {jobsError ? <p role="alert">{jobsError}</p> : null}
     <header className={styles.sectionToolbar}>
       <div className={styles.sectionIdentity}><ServerCog size={18} /><span><strong>{capability.type === "slurm" ? "Slurm" : "远端作业"}</strong><small>{summary?.scope.label || `${partitions.length} 个可用队列`}</small></span></div>
       <span className={styles.spacer} />
@@ -547,7 +565,7 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
     </header>
     {showSubmit ? <div className={styles.submitBar}>
       <select aria-label="分区" value={partition} onChange={(event) => setPartition(event.target.value)}>{partitions.map((item) => <option key={item.id} value={item.id}>{item.name}{item.isDefault ? "（默认）" : ""}</option>)}</select>
-      <input aria-label="脚本路径" value={scriptPath} placeholder="远端脚本绝对路径" onChange={(event) => setScriptPath(event.target.value)} />
+      <input aria-label="脚本路径" value={scriptPath} placeholder="远端脚本路径（相对路径以当前工作区为准）" onChange={(event) => setScriptPath(event.target.value)} />
       <Button compact variant="primary" disabled={!partition || !scriptPath.trim() || Boolean(busy)} icon={busy === "submit" ? <LoaderCircle className={styles.spin} size={14} /> : <Play size={14} />} onClick={() => void submit()}>提交</Button>
     </div> : null}
     <div className={styles.schedulerScroll}>
@@ -604,6 +622,6 @@ function ClusterSchedulerPane({ serverId, capability }: { serverId: string; capa
   </div>;
 }
 
-export default function SchedulerPane(props: { serverId: string; capability: ServerCapabilityProfile["features"]["scheduler"] }) {
+export default function SchedulerPane(props: SchedulerPaneProps) {
   return props.capability.type === "none" ? <SystemMonitorPane serverId={props.serverId} /> : <ClusterSchedulerPane {...props} />;
 }

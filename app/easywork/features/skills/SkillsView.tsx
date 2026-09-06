@@ -20,6 +20,7 @@ import {
   Trash2,
   Upload,
   UploadCloud,
+  Users,
   X,
   XCircle,
 } from "lucide-react";
@@ -35,6 +36,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { commandId } from "@/app/core/gateway/client";
+import { extractSkillFrontmatter } from "@/shared/skill-frontmatter.mjs";
 import { useAppRuntime } from "../../runtime/AppRuntime";
 import { Button } from "../../ui/Button";
 import { Modal } from "../../ui/Modal";
@@ -60,6 +62,7 @@ type SkillSummary = {
   installed?: boolean;
   createdAt?: string;
   applicability: SkillApplicability;
+  deployToAllUsers?: boolean;
 };
 
 type UploadSummary = SkillSummary & {
@@ -205,7 +208,7 @@ async function packageFilesFromEntry(entry: DirectoryEntry, prefix = ""): Promis
 async function packageFilesFromTransfer(transfer: DataTransfer) {
   const entries = [...transfer.items]
     .filter((item) => item.kind === "file")
-    .map((item) => (item as DataTransferItem & { webkitGetAsEntry?: () => DirectoryEntry | null }).webkitGetAsEntry?.() ?? null)
+    .map((item): DirectoryEntry | null => (item as DataTransferItem & { webkitGetAsEntry?: () => DirectoryEntry | null }).webkitGetAsEntry?.() ?? null)
     .filter((entry): entry is DirectoryEntry => entry !== null);
   if (entries.length) {
     const groups = await Promise.all(entries.map(async (entry) => {
@@ -235,12 +238,11 @@ function statusCopy(status: ReviewStatus) {
   return "待审核";
 }
 
-function SkillsHeader({ count }: { count: number | null }) {
+function SkillsHeader() {
   return <header className={styles.pageHeader}>
     <div className={styles.titleLine}>
-      <span className={styles.titleIcon}><Sparkles size={19} /></span>
+      <span data-ui-icon="" className={styles.titleIcon}><Sparkles size={19} /></span>
       <h1>技能</h1>
-      {count !== null ? <span>{count}</span> : null}
     </div>
   </header>;
 }
@@ -265,7 +267,7 @@ function EmptyState({ tab, authenticated }: { tab: SkillTab; authenticated: bool
       ? authenticated
         ? ["还没有上传记录", "上传技能后，可以在这里查看审核状态。"]
         : ["登录后管理上传", "注册或登录账号后即可上传技能。"]
-      : ["还没有安装技能", "从市场安装后，网页 Agent 才能按需读取它。"];
+      : ["还没有安装技能", "从市场安装或上传自己的技能后，网页 Agent 就能按需读取它。"];
   const Icon = tab === "market" ? Store : tab === "uploads" ? UploadCloud : PackageCheck;
   return <section className={styles.emptyState}><Icon size={28} /><strong>{copy[0]}</strong><span>{copy[1]}</span></section>;
 }
@@ -286,14 +288,14 @@ function SkillCards({ items, source, authenticated, admin, busy, onOpen, onInsta
     const installing = source === "market" && busy === item.id && !item.installed;
     return <article className={styles.skillCard} key={item.id}>
     <button className={styles.skillOpen} onClick={() => onOpen(item)}>
-      <span className={`${styles.skillIcon} ${source === "market" ? styles.marketIcon : ""}`}>{source === "market" ? <Store size={19} /> : <Sparkles size={19} />}</span>
+      <span data-ui-icon="" className={`${styles.skillIcon} ${source === "market" ? styles.marketIcon : ""}`}>{source === "market" ? <Store size={19} /> : <Sparkles size={19} />}</span>
       <span className={styles.skillCopy}><span className={styles.skillNameLine}><strong>{item.name}</strong><span className={styles.skillScope}><SlidersHorizontal size={11} />{applicabilityLabel(item.applicability)}</span></span><small>{item.description || "暂无简介"}</small></span>
     </button>
     <div className={styles.skillActions}>
       {source === "market" ? <>
-        <Button compact className={`${styles.skillAction} ${styles.installAction}`} disabled={!authenticated || item.installed || busy !== null} aria-busy={installing} icon={installing ? <LoaderCircle className={styles.spin} size={14} /> : item.installed ? <Check size={14} /> : <Plus size={14} />} onClick={() => onInstall(item)}>{installing ? "安装中" : item.installed ? "已安装" : authenticated ? "安装" : "登录后安装"}</Button>
+        <Button compact className={`${styles.skillAction} ${styles.installAction}`} disabled={!authenticated || Boolean(item.installed) || busy !== null} aria-busy={installing} icon={installing ? <LoaderCircle className={styles.spin} size={14} /> : item.installed ? <Check size={14} /> : <Plus size={14} />} onClick={() => onInstall(item)}>{installing ? "安装中" : item.installed ? "已安装" : authenticated ? "安装" : "登录后安装"}</Button>
         {admin ? <><Button compact className={styles.skillAction} disabled={busy !== null} icon={<Pencil size={14} />} onClick={() => onEdit(item)}>编辑</Button><Button compact className={`${styles.skillAction} ${styles.deleteAction}`} disabled={busy !== null} icon={<Trash2 size={14} />} onClick={() => onDelete(item)}>删除</Button></> : null}
-      </> : <Button compact className={`${styles.skillAction} ${styles.uninstallAction}`} disabled={busy !== null} icon={<PackageMinus size={14} />} onClick={() => onUninstall(item)}>卸载</Button>}
+      </> : <>{authenticated ? <Button compact className={styles.skillAction} disabled={busy !== null} icon={<Pencil size={14} />} onClick={() => onEdit(item)}>编辑</Button> : null}<Button compact className={`${styles.skillAction} ${styles.uninstallAction}`} disabled={busy !== null} icon={<PackageMinus size={14} />} onClick={() => onUninstall(item)}>卸载</Button></>}
     </div>
   </article>})}</div>;
 }
@@ -333,8 +335,9 @@ function AdminUploadTable({ items, busy, onOpen, onReview }: {
   </section>;
 }
 
-function UploadPanel({ onUploaded, authenticated }: { onUploaded: () => Promise<void>; authenticated: boolean }) {
+function UploadPanel({ onUploaded, authenticated, destination = "review" }: { onUploaded: () => Promise<void>; authenticated: boolean; destination?: "installed" | "review" }) {
   const runtime = useAppRuntime();
+  const personal = destination === "installed";
   const fileInput = useRef<HTMLInputElement>(null);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -349,7 +352,7 @@ function UploadPanel({ onUploaded, authenticated }: { onUploaded: () => Promise<
       return;
     }
     const merged = [...new Map([...files, ...loaded].map((file) => [file.path, file])).values()];
-    const metadata = readSkillMetadata(merged);
+    const metadata: { name?: string; description?: string } = readSkillMetadata(merged);
     setFiles(merged);
     if (metadata.name) setName(metadata.name);
     if (metadata.description) setDescription(metadata.description);
@@ -357,14 +360,17 @@ function UploadPanel({ onUploaded, authenticated }: { onUploaded: () => Promise<
 
   const receive = async (event: ChangeEvent<HTMLInputElement>) => {
     const input = event.currentTarget;
+    if (!authenticated || busy || reading) { input.value = ""; return; }
     const selected = [...(input.files ?? [])];
-    const loaded = await Promise.all(selected.map(async (file) => ({ path: relativeFilePath(file), content: await file.text() })));
-    acceptFiles(loaded);
-    input.value = "";
+    if (!selected.length) return;
+    setReading(true);
+    try { acceptFiles(await Promise.all(selected.map(async (file) => ({ path: relativeFilePath(file), content: await file.text() })))); }
+    catch (reason) { runtime.notify(errorMessage(reason), "error"); }
+    finally { input.value = ""; setReading(false); }
   };
 
   const receiveTransfer = async (transfer: DataTransfer) => {
-    if (!authenticated || reading) return;
+    if (!authenticated || reading || busy) return;
     setReading(true);
     try { acceptFiles(await packageFilesFromTransfer(transfer)); }
     catch (reason) { runtime.notify(errorMessage(reason), "error"); }
@@ -384,14 +390,15 @@ function UploadPanel({ onUploaded, authenticated }: { onUploaded: () => Promise<
   };
 
   const submit = async () => {
+    if (busy || reading || !name.trim() || !files.length) return;
     if (!authenticated) {
       runtime.notify("请先登录后再上传技能", "error");
       return;
     }
     setBusy(true);
     try {
-      await runtime.api.post("/api/skill-center/uploads", { name: name.trim(), description: description.trim(), files }, { idempotencyKey: commandId("skill-submit") });
-      runtime.notify("技能已提交审核", "success");
+      await runtime.api.post(personal ? "/api/skill-center/installed" : "/api/skill-center/uploads", { name: name.trim(), description: description.trim(), files }, { idempotencyKey: commandId(personal ? "skill-upload" : "skill-submit") });
+      runtime.notify(personal ? "技能已加入我的技能库" : "技能已提交审核", "success");
       setName("");
       setDescription("");
       setFiles([]);
@@ -404,7 +411,7 @@ function UploadPanel({ onUploaded, authenticated }: { onUploaded: () => Promise<
   };
 
   return <section className={styles.uploadPanel} onPaste={pasteFiles}>
-    <div className={styles.uploadIntro}><span className={styles.uploadIcon}><UploadCloud size={21} /></span><span><strong>上传技能</strong><small>拖入技能文件夹或多个文件，也可以按 Ctrl+V 粘贴文件。</small></span></div>
+    <div className={styles.uploadIntro}><span data-ui-icon="" className={styles.uploadIcon}><UploadCloud size={21} /></span><span><strong>{personal ? "上传到我的技能库" : "上传技能"}</strong><small>拖入技能文件夹或多个文件，也可以按 Ctrl+V 粘贴文件。</small></span></div>
     <div
       className={`${styles.dropZone} ${dragging ? styles.dropZoneActive : ""} ${!authenticated ? styles.dropZoneDisabled : ""}`}
       role="group"
@@ -415,33 +422,35 @@ function UploadPanel({ onUploaded, authenticated }: { onUploaded: () => Promise<
       onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
       onDrop={dropFiles}
     >
-      <span className={styles.dropIcon}>{reading ? <LoaderCircle className={styles.spin} size={20} /> : <UploadCloud size={20} />}</span>
+      <span data-ui-icon="" className={styles.dropIcon}>{reading ? <LoaderCircle className={styles.spin} size={20} /> : <UploadCloud size={20} />}</span>
       <span className={styles.dropCopy}><strong>{reading ? "正在读取文件" : files.length ? `已选择 ${files.length} 个文件` : "拖放技能文件到这里"}</strong><small>{files.length ? `${files.slice(0, 4).map((file) => file.path).join(" · ")}${files.length > 4 ? " …" : ""}` : "支持文件夹、多个文件和 Ctrl+V 粘贴"}</small></span>
       <span className={styles.dropActions}>
-        {files.length ? <Button type="button" compact variant="ghost" disabled={reading} onClick={() => setFiles([])}>清空</Button> : null}
-        <Button type="button" compact disabled={!authenticated || reading} onClick={() => fileInput.current?.click()}>选择文件</Button>
+        {files.length ? <Button type="button" compact variant="ghost" disabled={reading || busy} onClick={() => setFiles([])}>清空</Button> : null}
+        <Button type="button" compact disabled={!authenticated || reading || busy} onClick={() => fileInput.current?.click()}>选择文件</Button>
       </span>
       <input ref={fileInput} className={styles.hiddenInput} type="file" multiple onChange={(event) => void receive(event)} />
     </div>
     <div className={styles.uploadFields}>
-      <label><span>技能名称</span><input value={name} disabled={!authenticated} placeholder="输入技能名称" onChange={(event) => setName(event.target.value)} /></label>
-      <label className={styles.descriptionField}><span>简介</span><textarea value={description} disabled={!authenticated} placeholder="简要说明这个技能能做什么" onChange={(event) => setDescription(event.target.value)} /></label>
+      <label><span>技能名称</span><input value={name} disabled={!authenticated || busy} placeholder="输入技能名称" onChange={(event) => setName(event.target.value)} /></label>
+      <label className={styles.descriptionField}><span>简介</span><textarea value={description} disabled={!authenticated || busy} placeholder="简要说明这个技能能做什么" onChange={(event) => setDescription(event.target.value)} /></label>
     </div>
     <div className={styles.uploadFooter}>
       {!authenticated ? <span>当前为访客，请登录后上传。</span> : null}
-      <Button variant="primary" disabled={!authenticated || !name.trim() || files.length === 0 || busy || reading} icon={busy ? <LoaderCircle className={styles.spin} size={16} /> : <Upload size={16} />} onClick={() => void submit()}>{busy ? "提交中" : "提交审核"}</Button>
+      <Button variant="primary" disabled={!authenticated || !name.trim() || files.length === 0 || busy || reading} icon={busy ? <LoaderCircle className={styles.spin} size={16} /> : <Upload size={16} />} onClick={() => void submit()}>{busy ? "提交中" : personal ? "上传到我的技能库" : "提交审核"}</Button>
     </div>
   </section>;
 }
 
-function EditMarketForm({ item, busy, onCancel, onSave }: {
+function EditSkillForm({ item, busy, allowDeployment, onCancel, onSave }: {
   item: SkillDetail;
   busy: boolean;
+  allowDeployment: boolean;
   onCancel: () => void;
-  onSave: (name: string, description: string, fileUpdates: PackageFile[]) => void;
+  onSave: (name: string, description: string, fileUpdates: PackageFile[], deployToAllUsers?: boolean) => void;
 }) {
   const [name, setName] = useState(item.name);
   const [description, setDescription] = useState(item.description);
+  const [deployToAllUsers, setDeployToAllUsers] = useState(item.deployToAllUsers === true);
   const editableFiles = item.files.filter((file) => /\.md$/i.test(file.path) && !file.binary && !file.truncated && file.content !== null);
   const [activePath, setActivePath] = useState(editableFiles.find((file) => file.path === item.primaryFile)?.path ?? editableFiles[0]?.path ?? null);
   const [contents, setContents] = useState<Record<string, string>>(() => Object.fromEntries(editableFiles.map((file) => [file.path, file.content ?? ""])));
@@ -449,22 +458,29 @@ function EditMarketForm({ item, busy, onCancel, onSave }: {
   const fileUpdates = editableFiles.flatMap((file) => contents[file.path] === file.content ? [] : [{ path: file.path, content: contents[file.path] ?? "" }]);
   const changed = name.trim() !== item.name
     || description.trim() !== item.description
-    || fileUpdates.length > 0;
+    || fileUpdates.length > 0
+    || (allowDeployment && deployToAllUsers !== (item.deployToAllUsers === true));
   return <section className={styles.editForm}>
-    <label><span>技能名称</span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
-    <label><span>简介</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+    <label><span>技能名称</span><input value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
+    <label><span>简介</span><textarea value={description} disabled={busy} onChange={(event) => setDescription(event.target.value)} /></label>
+    {allowDeployment ? <div className={styles.deploymentField}>
+      <span className={styles.deploymentIcon}><Users size={19} /></span>
+      <span className={styles.deploymentCopy}><strong>部署给全体用户</strong><small>为尚未安装的现有用户补装，并为新注册用户自动安装。已安装用户保留自己的内容。</small></span>
+      <button type="button" role="switch" aria-label="部署给全体用户" aria-checked={deployToAllUsers} disabled={busy} className={styles.deploymentSwitch} onClick={() => setDeployToAllUsers((value) => !value)}><span /></button>
+    </div> : null}
     <div className={styles.markdownEdit}>
       <div className={styles.markdownEditHeader}><span>技能内容</span>{editableFiles.length > 1 ? <nav aria-label="选择要编辑的技能文件">{editableFiles.map((file) => <button key={file.path} className={file.path === activeFile?.path ? styles.activeEditFile : ""} onClick={() => setActivePath(file.path)}>{file.path}</button>)}</nav> : activeFile ? <small>{activeFile.path}</small> : null}</div>
-      {activeFile ? <textarea className={styles.markdownTextarea} aria-label={`${activeFile.path} 技能内容`} spellCheck={false} value={contents[activeFile.path] ?? ""} onChange={(event) => setContents((current) => ({ ...current, [activeFile.path]: event.target.value }))} /> : <div className={styles.noEditableMarkdown}>该技能没有可直接编辑的内容。</div>}
+      {activeFile ? <textarea className={styles.markdownTextarea} aria-label={`${activeFile.path} 技能内容`} spellCheck={false} disabled={busy} value={contents[activeFile.path] ?? ""} onChange={(event) => setContents((current) => ({ ...current, [activeFile.path]: event.target.value }))} /> : <div className={styles.noEditableMarkdown}>该技能没有可直接编辑的内容。</div>}
     </div>
-    <footer><Button disabled={busy} onClick={onCancel}>取消</Button><Button variant="primary" disabled={!name.trim() || !changed || busy} onClick={() => onSave(name.trim(), description.trim(), fileUpdates)}>{busy ? "保存中" : "保存"}</Button></footer>
+    <footer><Button disabled={busy} onClick={onCancel}>取消</Button><Button variant="primary" disabled={!name.trim() || !changed || busy} onClick={() => onSave(name.trim(), description.trim(), fileUpdates, allowDeployment ? deployToAllUsers : undefined)}>{busy ? "保存中" : "保存"}</Button></footer>
   </section>;
 }
 
-function DetailPage({ source, id, admin, startEditing, onBack, onChanged, onEditFinished }: {
+function DetailPage({ source, id, admin, authenticated, startEditing, onBack, onChanged, onEditFinished }: {
   source: DetailSource;
   id: string;
   admin: boolean;
+  authenticated: boolean;
   startEditing: boolean;
   onBack: () => void;
   onChanged: () => Promise<void>;
@@ -476,7 +492,8 @@ function DetailPage({ source, id, admin, startEditing, onBack, onChanged, onEdit
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [loadedEndpoint, setLoadedEndpoint] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [editing, setEditing] = useState(source === "market" && admin && startEditing);
+  const canEdit = authenticated && (source === "installed" || (source === "market" && admin));
+  const [editing, setEditing] = useState(canEdit && startEditing);
   const [scopeOpen, setScopeOpen] = useState(false);
 
   const endpoint = source === "market"
@@ -517,12 +534,12 @@ function DetailPage({ source, id, admin, startEditing, onBack, onChanged, onEdit
     finally { setBusy(null); }
   };
 
-  const saveMarketSkill = async (name: string, description: string, fileUpdates: PackageFile[]) => {
-    if (!detail || source !== "market" || !admin || busy !== null) return;
+  const saveSkill = async (name: string, description: string, fileUpdates: PackageFile[], deployToAllUsers?: boolean) => {
+    if (!detail || !canEdit || busy !== null) return;
     setBusy("save");
     try {
-      await runtime.api.patch(`/api/skill-center/market/${encodeURIComponent(detail.id)}`, { name, description, ...(fileUpdates.length ? { fileUpdates } : {}) }, { expectedRevision: detail.revision ?? 0 });
-      runtime.notify(fileUpdates.length ? "技能信息和内容已更新" : "市场信息已更新", "success");
+      const result = await runtime.api.patch<{ deployment?: { failed: number } }>(endpoint, { name, description, ...(fileUpdates.length ? { fileUpdates } : {}), ...(source === "market" && admin && deployToAllUsers !== undefined ? { deployToAllUsers } : {}) }, { expectedRevision: detail.revision ?? 0 });
+      runtime.notify(result.data.deployment?.failed ? `技能已保存，${result.data.deployment.failed} 位用户暂未完成安装。` : fileUpdates.length ? "技能信息和内容已更新" : "技能信息已更新", result.data.deployment?.failed ? "neutral" : "success");
       setEditing(false);
       onEditFinished();
       await Promise.all([load(), onChanged()]);
@@ -559,27 +576,28 @@ function DetailPage({ source, id, admin, startEditing, onBack, onChanged, onEdit
 
   return <div className={styles.detailPage}>
     <header className={styles.detailHeader}>
-      <Button variant="ghost" iconOnly aria-label="返回技能列表" icon={<ArrowLeft size={19} />} onClick={onBack} />
-      <div className={styles.detailTitle}><span className={styles.detailIcon}><Sparkles size={19} /></span><span><h1>{detail.name}</h1><small>{detail.description || "暂无简介"}</small></span></div>
+      <div className={styles.detailTitle}><span data-ui-icon="" className={styles.detailIcon}><Sparkles size={19} /></span><span><h1>{detail.name}</h1><small>{detail.description || "暂无简介"}</small></span></div>
       <div className={styles.detailActions}>
+        <Button aria-label="返回技能列表" disabled={busy !== null} icon={<ArrowLeft size={14} />} onClick={onBack}>返回</Button>
+        {canEdit && !editing ? <Button disabled={busy !== null} icon={<Pencil size={14} />} onClick={() => setEditing(true)}>编辑</Button> : null}
         {source === "upload" && admin && detail.status === "pending" ? <><Button variant="primary" disabled={busy !== null} icon={<Check size={15} />} onClick={() => void review("approve")}>通过</Button><Button variant="danger" disabled={busy !== null} icon={<X size={15} />} onClick={() => void review("reject")}>拒绝</Button></> : null}
       </div>
     </header>
 
     <div className={styles.detailMeta}>{source === "upload" && detail.status ? <StatusBadge status={detail.status} /> : null}{canEditScope ? <button type="button" className={styles.scopeButton} disabled={busy !== null} onClick={() => setScopeOpen(true)}><SlidersHorizontal size={14} />{applicabilityLabel(displayedApplicability)}</button> : <span><SlidersHorizontal size={14} />{applicabilityLabel(displayedApplicability)}</span>}{source === "upload" ? <><span>上传时间 {formatDate(detail.submittedAt)}</span>{detail.reviewedAt ? <span>审核时间 {formatDate(detail.reviewedAt)}</span> : null}</> : null}</div>
-    {source === "market" && admin && editing ? <EditMarketForm key={detail.id} item={detail} busy={busy !== null} onCancel={() => { setEditing(false); onEditFinished(); }} onSave={(name, description, fileUpdates) => void saveMarketSkill(name, description, fileUpdates)} /> : null}
+    {canEdit && editing ? <EditSkillForm key={detail.id} item={detail} busy={busy !== null} allowDeployment={source === "market" && admin} onCancel={() => { setEditing(false); onEditFinished(); }} onSave={(name, description, fileUpdates, deployToAllUsers) => void saveSkill(name, description, fileUpdates, deployToAllUsers)} /> : null}
 
-    {source === "market" && admin && editing ? null : <div className={styles.detailLayout}>
-      {detail.files.length > 1 ? <aside className={styles.fileList} aria-label="技能文件">
-        <div className={styles.fileListTitle}><span>文件</span><small>{detail.files.length}</small></div>
-        {detail.files.map((file) => <button key={file.path} className={selected?.path === file.path ? styles.activeFile : ""} onClick={() => setSelectedPath(file.path)}>
-          <FileText size={15} /><span>{file.path}</span><small>{formatSize(file.size)}</small>
-        </button>)}
-      </aside> : null}
+    {canEdit && editing ? null : <div className={styles.detailLayout}>
+      {detail.files.length > 1 ? <section className={styles.fileList} aria-label="技能文件">
+        <div className={styles.fileListHeader}><span>名称</span><span>大小</span></div>
+        <div className={styles.fileListBody}>{detail.files.map((file) => <button type="button" key={file.path} className={`${styles.fileRow} ${selected?.path === file.path ? styles.activeFile : ""}`} aria-pressed={selected?.path === file.path} title={`预览 ${file.path}`} onClick={() => setSelectedPath(file.path)}>
+          <span className={styles.fileName}><FileText size={18} /><strong>{file.path}</strong></span><span className={styles.fileSize}>{formatSize(file.size)}</span>
+        </button>)}</div>
+      </section> : null}
       <article className={styles.document}>
         <div className={styles.documentHeading}><span>{selected?.path || detail.entrypoint}</span>{selected?.truncated ? <small>仅显示部分内容</small> : null}</div>
         {selected?.binary ? <div className={styles.binaryState}>二进制文件无法直接预览</div> : selected?.content !== null && selected?.content !== undefined
-          ? /\.md$/i.test(selected.path) ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{selected.content}</ReactMarkdown> : <pre><code>{selected.content}</code></pre>
+          ? /\.(?:md|mdx)$/i.test(selected.path) ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{extractSkillFrontmatter(selected.content)?.body ?? selected.content}</ReactMarkdown> : <pre><code>{selected.content}</code></pre>
           : <div className={styles.binaryState}>此文件没有可预览内容</div>}
       </article>
     </div>}
@@ -604,7 +622,7 @@ export default function SkillsView() {
   const [query, setQuery] = useState("");
   const [busyReview, setBusyReview] = useState<string | null>(null);
   const [busyMarket, setBusyMarket] = useState<string | null>(null);
-  const [editingMarket, setEditingMarket] = useState<SkillSummary | null>(null);
+  const [editingSkill, setEditingSkill] = useState<{ source: DetailSource; id: string } | null>(null);
   const [pendingAction, setPendingAction] = useState<{ kind: "delete" | "uninstall"; item: SkillSummary } | null>(null);
   const [showUploader, setShowUploader] = useState(false);
   const listKeyFor = useCallback((tab: SkillTab) => `${authenticated ? "user" : "guest"}:${admin ? "admin" : "member"}:${tab}${tab === "uploads" ? `:${reviewTab}` : ""}`, [admin, authenticated, reviewTab]);
@@ -654,16 +672,18 @@ export default function SkillsView() {
 
   const navigateTab = (tab: SkillTab) => {
     setQuery("");
-    setEditingMarket(null);
+    setEditingSkill(null);
+    setShowUploader(false);
     runtime.navigate({ kind: "skills", tab, ...(tab === "uploads" && admin ? { reviewTab } : {}) });
   };
   const openDetail = (source: DetailSource, item: SkillSummary) => runtime.navigate({ kind: "skills", tab: tabForSource(source), detailSource: source, detailId: source === "installed" ? item.skillId : item.id, ...(source === "upload" && admin ? { reviewTab } : {}) });
-  const editMarketSkill = (item: SkillSummary) => {
-    setEditingMarket(item);
-    openDetail("market", item);
+  const editSkill = (item: SkillSummary) => {
+    const source = activeTab === "market" ? "market" : "installed";
+    setEditingSkill({ source, id: source === "installed" ? item.skillId : item.id });
+    openDetail(source, item);
   };
   const back = () => {
-    setEditingMarket(null);
+    setEditingSkill(null);
     runtime.navigate({ kind: "skills", tab: activeTab, ...(activeTab === "uploads" && admin ? { reviewTab } : {}) });
   };
   const changeReviewTab = (tab: ReviewTab) => runtime.navigate({ kind: "skills", tab: "uploads", reviewTab: tab });
@@ -702,7 +722,7 @@ export default function SkillsView() {
     try {
       await runtime.api.delete(`/api/skill-center/market/${encodeURIComponent(item.id)}`, { expectedRevision: item.revision ?? 0 });
       runtime.notify("市场技能已删除", "success");
-      if (editingMarket?.id === item.id) setEditingMarket(null);
+      if (editingSkill?.source === "market" && editingSkill.id === item.id) setEditingSkill(null);
       setPendingAction(null);
       setMarket((current) => current.filter((entry) => entry.id !== item.id));
     } catch (reason) { runtime.notify(errorMessage(reason), "error"); }
@@ -730,29 +750,28 @@ export default function SkillsView() {
     finally { setBusyMarket(null); }
   };
 
-  if (view.detailId && view.detailSource) return <DetailPage key={`${view.detailSource}:${view.detailId}`} source={view.detailSource} id={view.detailId} admin={admin} startEditing={editingMarket?.id === view.detailId} onBack={back} onChanged={async () => {
+  if (view.detailId && view.detailSource) return <DetailPage key={`${view.detailSource}:${view.detailId}`} source={view.detailSource} id={view.detailId} admin={admin} authenticated={authenticated} startEditing={editingSkill?.source === view.detailSource && editingSkill.id === view.detailId} onBack={back} onChanged={async () => {
     if (view.detailSource === "upload") invalidateTab("market");
     await loadTab(activeTab);
-  }} onEditFinished={() => setEditingMarket(null)} />;
+  }} onEditFinished={() => setEditingSkill(null)} />;
 
+  const uploadOpen = authenticated && showUploader && (activeTab === "installed" || (activeTab === "uploads" && admin));
   const list = activeTab === "market" ? market : installed;
   const needle = query.trim().toLocaleLowerCase("zh-CN");
   const filtered = list.filter((item) => !needle || `${item.name}\n${item.description}`.toLocaleLowerCase("zh-CN").includes(needle));
-  const count = activeTab === "uploads" ? uploads.length : list.length;
-
   return <div className={styles.page}>
-    <SkillsHeader count={loadedListKeys.has(activeListKey) ? count : null} />
+    <SkillsHeader />
     <div className={styles.toolbar}>
       <PrimaryTabs active={activeTab} onChange={navigateTab} />
       {activeTab !== "uploads"
-        ? <SearchField value={query} onChange={setQuery} placeholder={activeTab === "market" ? "搜索市场技能" : "搜索已安装技能"} />
-        : admin ? <Button compact icon={showUploader ? <X size={15} /> : <Upload size={15} />} onClick={() => setShowUploader((visible) => !visible)}>{showUploader ? "收起上传" : "上传技能"}</Button> : null}
+        ? <div className={styles.toolbarActions}><SearchField value={query} onChange={setQuery} placeholder={activeTab === "market" ? "搜索市场技能" : "搜索已安装技能"} />{activeTab === "installed" ? <Button compact disabled={!authenticated} icon={showUploader ? <X size={15} /> : <Upload size={15} />} onClick={() => setShowUploader((visible) => !visible)}>{showUploader ? "收起上传" : "上传技能"}</Button> : null}</div>
+        : admin ? <div className={styles.toolbarActions}><Button compact icon={showUploader ? <X size={15} /> : <Upload size={15} />} onClick={() => setShowUploader((visible) => !visible)}>{showUploader ? "收起上传" : "上传技能"}</Button></div> : null}
     </div>
 
-    {activeTab === "uploads" && admin && showUploader ? <UploadPanel authenticated={authenticated} onUploaded={async () => { await loadTab("uploads"); setShowUploader(false); }} /> : null}
-    {activeTab === "uploads" && admin ? <nav className={styles.reviewTabs} aria-label="审核分类"><button className={reviewTab === "pending" ? styles.activeReview : ""} onClick={() => changeReviewTab("pending")}>待审核</button><button className={reviewTab === "reviewed" ? styles.activeReview : ""} onClick={() => changeReviewTab("reviewed")}>已审核</button></nav> : null}
+    {uploadOpen ? <UploadPanel destination={activeTab === "installed" ? "installed" : "review"} authenticated={authenticated} onUploaded={async () => { setQuery(""); await loadTab(activeTab); setShowUploader(false); }} /> : null}
+    {activeTab === "uploads" && admin && !uploadOpen ? <nav className={styles.reviewTabs} aria-label="审核分类"><button className={reviewTab === "pending" ? styles.activeReview : ""} onClick={() => changeReviewTab("pending")}>待审核</button><button className={reviewTab === "reviewed" ? styles.activeReview : ""} onClick={() => changeReviewTab("reviewed")}>已审核</button></nav> : null}
     {activeTab === "uploads" && !admin ? <UploadPanel authenticated={authenticated} onUploaded={() => loadTab("uploads")} /> : null}
-    {!loadedListKeys.has(activeListKey) ? <div className={styles.centerState}><LoaderCircle className={styles.spin} size={22} />正在读取列表</div>
+    {uploadOpen ? null : !loadedListKeys.has(activeListKey) ? <div className={styles.centerState}><LoaderCircle className={styles.spin} size={22} />正在读取列表</div>
       : activeTab === "uploads"
         ? uploads.length
           ? admin
@@ -760,11 +779,11 @@ export default function SkillsView() {
             : <UserUploadTable items={uploads} onOpen={(item) => openDetail("upload", item)} />
           : <EmptyState tab="uploads" authenticated={authenticated} />
         : filtered.length
-          ? <SkillCards items={filtered} source={activeTab === "market" ? "market" : "installed"} authenticated={authenticated} admin={admin} busy={busyMarket} onOpen={(item) => openDetail(activeTab === "market" ? "market" : "installed", item)} onInstall={(item) => void installMarketSkill(item)} onEdit={editMarketSkill} onDelete={(item) => setPendingAction({ kind: "delete", item })} onUninstall={(item) => setPendingAction({ kind: "uninstall", item })} />
+          ? <SkillCards items={filtered} source={activeTab === "market" ? "market" : "installed"} authenticated={authenticated} admin={admin} busy={busyMarket} onOpen={(item) => openDetail(activeTab === "market" ? "market" : "installed", item)} onInstall={(item) => void installMarketSkill(item)} onEdit={editSkill} onDelete={(item) => setPendingAction({ kind: "delete", item })} onUninstall={(item) => setPendingAction({ kind: "uninstall", item })} />
           : query ? <section className={styles.emptyState}><Search size={27} /><strong>没有匹配的技能</strong><span>换个关键词试试。</span></section> : <EmptyState tab={activeTab} authenticated={authenticated} />}
     {pendingAction ? <Modal size="compact" title={pendingAction.kind === "delete" ? "删除市场技能" : "卸载技能"} onClose={() => setPendingAction(null)}>
       <div className={styles.confirmDialog}>
-        <span className={styles.confirmIcon}><AlertTriangle size={22} /></span>
+        <span data-ui-icon="" className={styles.confirmIcon}><AlertTriangle size={22} /></span>
         <div className={styles.confirmCopy}>
           <strong>{pendingAction.kind === "delete" ? `确定删除“${pendingAction.item.name}”？` : `确定卸载“${pendingAction.item.name}”？`}</strong>
           <p>{pendingAction.kind === "delete" ? "它将从技能市场中移除，用户已经安装的副本不会受到影响。" : "卸载后，网页 Agent 将立即无法检索或选择该技能；历史任务记录不受影响。"}</p>

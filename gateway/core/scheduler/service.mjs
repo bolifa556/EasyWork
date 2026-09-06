@@ -76,13 +76,15 @@ function validateStore(data, actorId, serverIdentity) {
   if (Object.keys(data).length !== 4 || !["actorId", "serverIdentity", "profile", "commands"].every((key) => Object.hasOwn(data, key))) return false;
   const ids = new Set();
   return data.commands.every((command) => command && typeof command === "object" && !Array.isArray(command)
-    && Object.keys(command).length === 5
+    && Object.keys(command).every((key) => ["commandId", "operation", "fingerprint", "result", "completedAt", "status", "startedAt"].includes(key))
     && ["commandId", "operation", "fingerprint", "result", "completedAt"].every((key) => Object.hasOwn(command, key))
     && typeof command.commandId === "string" && !ids.has(command.commandId) && ids.add(command.commandId)
     && typeof command.operation === "string" && command.operation.startsWith("scheduler.")
     && /^[a-f0-9]{64}$/.test(command.fingerprint)
     && command.result && typeof command.result === "object" && !Array.isArray(command.result)
-    && Number.isFinite(Date.parse(command.completedAt)));
+    && (["pending", "unknown"].includes(command.status)
+      ? command.completedAt === null && Number.isFinite(Date.parse(command.startedAt))
+      : (!command.status || command.status === "completed") && Number.isFinite(Date.parse(command.completedAt))));
 }
 
 function fingerprint(operation, input) {
@@ -106,7 +108,9 @@ export class SchedulerService {
     this.clock = options.clock;
     this.submissions = options.submissionLedger || new SchedulerSubmissionLedger(options);
     this.onSubmitted = options.onSubmitted || null;
+    this.onCancelled = options.onCancelled || null;
     this.submissionStatusCache = new Map();
+    this.jobsRevision = 0;
     this.capabilityTtlMs = options.capabilityTtlMs ?? 10 * 60 * 1000;
     this.dashboardCache = null;
     this.dashboardPending = null;
@@ -189,15 +193,22 @@ export class SchedulerService {
     const profile = await this.getCapabilities();
     if (!profile.commands.scontrol) return null;
     const plan = this.adapter.inspectJob({ jobId: assertJobId(jobId) });
-    const output = await this.#execute(plan.descriptor);
+    const output = await this.#execute(plan.descriptor, { allowFailure: true });
+    if (output.code !== 0 && /(?:invalid job id|invalid job identifier|job.*not found)/i.test(`${output.stderr}\n${output.stdout}`)) return null;
+    if (output.code !== 0) throw schedulerCommandFailure(plan.descriptor, output);
     const detail = plan.parse(output.stdout);
     if (detail.owner !== this.username) return null;
-    const { jobId: id, stdoutPath: _stdout, stderrPath: _stderr, ...fields } = detail;
+    const fields = { ...detail };
+    const id = fields.jobId;
+    delete fields.jobId;
+    delete fields.stdoutPath;
+    delete fields.stderrPath;
     return { ...fields, id, scheduler: this.adapter.type };
   }
 
   async jobHistory(input = {}) {
     const profile = await this.#requireFeature("jobHistory");
+    const jobsRevision = this.jobsRevision;
     const sampledAt = now(this.clock);
     const utcOffsetMinutes = Number(input.utcOffsetMinutes ?? 0);
     invariant(Number.isInteger(utcOffsetMinutes) && Math.abs(utcOffsetMinutes) <= 14 * 60, "SCHEDULER_HISTORY_RANGE_INVALID", "历史作业时区无效", { status: 400 });
@@ -265,7 +276,7 @@ export class SchedulerService {
             inspected.push(job);
           }
         } catch { /* The controller may already have retired this job. */ }
-        this.submissionStatusCache.set(receipt.id, { at: sampledAt.valueOf(), job });
+        if (jobsRevision === this.jobsRevision) this.submissionStatusCache.set(receipt.id, { at: sampledAt.valueOf(), job });
       };
       for (let offset = 0; offset < Math.min(pending.length, 20); offset += 4) {
         await Promise.all(pending.slice(offset, Math.min(offset + 4, 20)).map(inspect));
@@ -329,15 +340,25 @@ export class SchedulerService {
     };
   }
 
+  invalidateJobs(jobIds = []) {
+    this.jobsRevision += 1;
+    this.dashboardCache = null;
+    this.dashboardPending = null;
+    if (jobIds.length) for (const id of jobIds) this.submissionStatusCache.delete(id);
+    else this.submissionStatusCache.clear();
+  }
+
   async dashboard({ refresh = false } = {}) {
     await this.#authorize("read");
     if (!refresh && this.dashboardCache) return clone(this.dashboardCache);
     if (this.dashboardPending) return clone(await this.dashboardPending);
-    this.dashboardPending = this.#readDashboard({ refresh }).then((snapshot) => {
-      this.dashboardCache = snapshot;
+    const jobsRevision = this.jobsRevision;
+    const pending = this.#readDashboard({ refresh }).then((snapshot) => {
+      if (jobsRevision === this.jobsRevision) this.dashboardCache = snapshot;
       return snapshot;
-    }).finally(() => { this.dashboardPending = null; });
-    return clone(await this.dashboardPending);
+    }).finally(() => { if (this.dashboardPending === pending) this.dashboardPending = null; });
+    this.dashboardPending = pending;
+    return clone(await pending);
   }
 
   async #readDashboard({ refresh = false } = {}) {
@@ -398,13 +419,19 @@ export class SchedulerService {
     const partition = assertPartitionName(input?.partition);
     const allowed = new Set((await this.accessiblePartitions()).map((entry) => entry.id));
     invariant(allowed.has(partition), "SCHEDULER_SCOPE_VIOLATION", "不能向当前 SSH 用户不可访问的分区提交作业", { status: 403 });
-    const commandInput = { partition, scriptPath: String(input?.scriptPath || ""), args: clone(input?.args || []) };
+    const commandInput = {
+      partition,
+      scriptPath: String(input?.scriptPath || ""),
+      args: clone(input?.args || []),
+      ...(input?.cwd ? { cwd: String(input.cwd) } : {}),
+    };
     const result = await this.#mutation("scheduler.submit", commandId, commandInput, async () => {
       const plan = this.adapter.submit(commandInput);
       const output = await this.#execute(plan.descriptor);
       return plan.parse(output.stdout);
     });
     await this.submissions.record([{ jobId: result.jobId, partition, name: path.posix.basename(commandInput.scriptPath) }], { commandId });
+    this.invalidateJobs([result.jobId]);
     if (this.onSubmitted) void Promise.resolve().then(() => this.onSubmitted([result.jobId])).catch(() => undefined);
     return result;
   }
@@ -413,7 +440,7 @@ export class SchedulerService {
     await this.#requireFeature("cancelJob", "write");
     const commandId = assertCommandId(input?.commandId);
     const jobId = assertJobId(input?.jobId);
-    return this.#mutation("scheduler.cancel-job", commandId, { jobId }, async () => {
+    const result = await this.#mutation("scheduler.cancel-job", commandId, { jobId }, async () => {
       const inspectPlan = this.adapter.inspectJob({ jobId });
       const inspected = await this.#execute(inspectPlan.descriptor);
       const job = inspectPlan.parse(inspected.stdout);
@@ -422,6 +449,9 @@ export class SchedulerService {
       const output = await this.#execute(plan.descriptor);
       return plan.parse(output.stdout);
     });
+    this.invalidateJobs([jobId]);
+    if (this.onCancelled) void Promise.resolve().then(() => this.onCancelled([jobId])).catch(() => undefined);
+    return result;
   }
 
   async #authorize(action) {
@@ -453,12 +483,17 @@ export class SchedulerService {
       const previous = current.data.commands.find((entry) => entry.commandId === commandId);
       if (previous) {
         invariant(previous.operation === operation && previous.fingerprint === hash, "COMMAND_ID_REUSED", "commandId 已用于其他 Scheduler 操作", { status: 409 });
+        invariant(!previous.status || previous.status === "completed", "SCHEDULER_RESULT_UNKNOWN", "这次操作已发出但结果尚未确认，请在作业列表核对；系统不会重复提交", { status: 409, retryable: false, details: { commandId, operation } });
         return { ...clone(previous.result), idempotentReplay: true };
       }
+      const admitted = await this.repository.update((data) => {
+        data.commands.push({ commandId, operation, fingerprint: hash, status: "pending", startedAt: now(this.clock).toISOString(), result: {}, completedAt: null });
+      }, { expectedRevision: current.revision, clock: () => now(this.clock) });
       const result = await execute();
       await this.repository.update((data) => {
-        data.commands.push({ commandId, operation, fingerprint: hash, result: clone(result), completedAt: now(this.clock).toISOString() });
-      }, { expectedRevision: current.revision, clock: () => now(this.clock) });
+        const command = data.commands.find((entry) => entry.commandId === commandId);
+        Object.assign(command, { status: "completed", result: clone(result), completedAt: now(this.clock).toISOString() });
+      }, { expectedRevision: admitted.revision, clock: () => now(this.clock) });
       return { ...clone(result), idempotentReplay: false };
     });
   }

@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
-import { cp, mkdir, readdir, rm, stat } from "node:fs/promises";
+import { cp, mkdir, readdir, rm } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createGatewayServer } from "../gateway/core/server.mjs";
+import { archiveClientAssets, builtAssetHandler } from "./static-assets.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const node = process.execPath;
@@ -17,6 +17,7 @@ const buildRoot = path.resolve(
   process.env.EASYWORK_BUILD_ROOT || path.join(root, ".cache", "runtime-build", "dist"),
 );
 const dataRoot = path.resolve(process.env.EASYWORK_DATA_ROOT || path.join(root, "data"));
+const archivedClientRoot = path.join(path.dirname(buildRoot), "shared-client");
 const allowedOrigins = String(process.env.EASYWORK_ALLOWED_ORIGINS || "")
   .split(",")
   .map((entry) => entry.trim())
@@ -30,22 +31,6 @@ const secrets = ["SESSION_SECRET", "MASTER_SECRET", "CURSOR_SECRET", "ARTIFACT_S
       artifactSecret: process.env.EASYWORK_ARTIFACT_SECRET,
     }
   : undefined;
-
-const contentTypes = new Map([
-  [".css", "text/css; charset=utf-8"],
-  [".gif", "image/gif"],
-  [".ico", "image/x-icon"],
-  [".jpeg", "image/jpeg"],
-  [".jpg", "image/jpeg"],
-  [".js", "text/javascript; charset=utf-8"],
-  [".json", "application/json; charset=utf-8"],
-  [".map", "application/json; charset=utf-8"],
-  [".png", "image/png"],
-  [".svg", "image/svg+xml"],
-  [".webp", "image/webp"],
-  [".woff", "font/woff"],
-  [".woff2", "font/woff2"],
-]);
 
 function assertPort(value, name) {
   if (!Number.isInteger(value) || value < 1 || value > 65535) {
@@ -61,6 +46,7 @@ if (publicPort === internalPort) {
 
 async function publishBuildSnapshot() {
   const sourceRoot = path.join(root, "dist");
+  await archiveClientAssets(path.join(sourceRoot, "client"), archivedClientRoot);
   if (buildRoot === sourceRoot) return sourceRoot;
 
   const parent = path.dirname(buildRoot);
@@ -70,15 +56,18 @@ async function publishBuildSnapshot() {
   await Promise.all(previousEntries.map(async (entry) => {
     if (!entry.isDirectory()) return;
     if (!/^dist(?:-\d+-\d+|\.(?:staging|previous)-\d+)$/.test(entry.name)) return;
+    await archiveClientAssets(path.join(parent, entry.name, "client"), archivedClientRoot);
     await rm(path.join(parent, entry.name), { recursive: true, force: true }).catch(() => undefined);
   }));
   await rm(snapshotRoot, { recursive: true, force: true });
-  await cp(sourceRoot, snapshotRoot, { recursive: true, force: true });
+  await cp(sourceRoot, snapshotRoot, { recursive: true, force: true, preserveTimestamps: true });
   return snapshotRoot;
 }
 
 const publishedBuildRoot = await publishBuildSnapshot();
 const clientRoot = path.join(publishedBuildRoot, "client");
+const serveBuiltAsset = builtAssetHandler(clientRoot);
+const serveArchivedAsset = builtAssetHandler(archivedClientRoot);
 
 // Vinext remains an isolated renderer. The current process owns the only
 // public listener and the complete EasyWork business runtime. It reads a
@@ -137,32 +126,6 @@ function proxyFrontend(request, response) {
   request.pipe(upstream);
 }
 
-async function serveBuiltAsset(request, response) {
-  if (request.method !== "GET" && request.method !== "HEAD") return false;
-  const pathname = decodeURIComponent(new URL(request.url || "/", "http://easywork.local").pathname);
-  const absolutePath = path.resolve(clientRoot, `.${pathname}`);
-  const clientPrefix = `${clientRoot}${path.sep}`;
-  if (absolutePath !== clientRoot && !absolutePath.startsWith(clientPrefix)) return false;
-  let info;
-  try {
-    info = await stat(absolutePath);
-  } catch {
-    return false;
-  }
-  if (!info.isFile()) return false;
-  const extension = path.extname(absolutePath).toLowerCase();
-  response.writeHead(200, {
-    "content-type": contentTypes.get(extension) || "application/octet-stream",
-    "content-length": info.size,
-    "cache-control": pathname.startsWith("/assets/")
-      ? "public, max-age=31536000, immutable"
-      : "no-cache, max-age=0, must-revalidate",
-  });
-  if (request.method === "HEAD") response.end();
-  else createReadStream(absolutePath).pipe(response);
-  return true;
-}
-
 function waitForFrontend({ attempts = 120, intervalMs = 125 } = {}) {
   return new Promise((resolve, reject) => {
     let remaining = attempts;
@@ -206,6 +169,12 @@ try {
     allowedOrigins,
     fallbackRequestHandler: async (request, response) => {
       if (await serveBuiltAsset(request, response)) return;
+      if (String(request.url || "").startsWith("/assets/")) {
+        if (await serveArchivedAsset(request, response)) return;
+        response.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+        response.end("Asset not found");
+        return;
+      }
       proxyFrontend(request, response);
     },
   });

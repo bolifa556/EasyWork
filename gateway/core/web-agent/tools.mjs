@@ -63,10 +63,15 @@ function withinTextBudget(entries, textOf, limit = MAX_PRESENTED_CHARACTERS, tru
 }
 
 function semanticMemory(entries, formatting) {
-  const contents = deduplicateMemoryContents(uniqueStrings((Array.isArray(entries) ? entries : []).map((entry) => (
+  const values = Array.isArray(entries) ? entries : [];
+  const contents = deduplicateMemoryContents(uniqueStrings(values.map((entry) => (
     typeof entry === "string" ? entry : entry?.content?.value ?? entry?.content ?? entry?.text ?? ""
   ))));
-  return withinTextBudget(contents, (content) => content, MAX_PRESENTED_CHARACTERS, formatting.truncationSuffix).map(({ text: content }) => ({ content }));
+  return withinTextBudget(contents, (content) => content, MAX_PRESENTED_CHARACTERS, formatting.truncationSuffix).map(({ entry: originalContent, text: content }) => {
+    const source = values.find((entry) => nonEmptyText(typeof entry === "string" ? entry : entry?.content?.value ?? entry?.content ?? entry?.text) === originalContent);
+    const title = nonEmptyText(source?.title ?? source?.semanticKey);
+    return { ...(title ? { title } : {}), content };
+  });
 }
 
 function semanticResources(entries, formatting) {
@@ -159,7 +164,7 @@ function semanticSkillSummaries(entries) {
     if ((!name && !description) || seen.has(key)) return [];
     seen.add(key);
     return [{ ...(name ? { name } : {}), ...(description ? { description } : {}) }];
-  }).slice(0, 50);
+  });
 }
 
 function semanticSearchResult(source, output, limit, formatting) {
@@ -197,8 +202,9 @@ function semanticState(output, requestedFields = [...STATE_FIELDS]) {
       ...(scheduler ? { scheduler } : {}),
     };
   }
+  const workspaceName = nonEmptyText(output?.workspace?.name ?? output?.workspace?.displayName);
   const workspacePath = nonEmptyText(output?.workspace?.path ?? output?.workspace?.canonicalPath);
-  if (fields.has("workspace") && workspacePath) state.workspace = { path: workspacePath };
+  if (fields.has("workspace") && (workspaceName || workspacePath)) state.workspace = workspaceName ? { name: workspaceName } : { path: workspacePath };
   const agentName = nonEmptyText(output?.agent?.displayName ?? output?.agent?.name);
   if (fields.has("agent") && agentName) state.agent = { name: agentName };
   return state;
@@ -253,7 +259,7 @@ async function renderSemanticContext(output, prompts, options = {}) {
     if (value && scheduler) value = templates.serverWithScheduler.replace("{{VALUE}}", value).replace("{{SCHEDULER}}", scheduler);
     if (value) stateLines.push(templates.stateItem.server.replace("{{VALUE}}", value));
   }
-  if (output?.workspace?.path) stateLines.push(templates.stateItem.workspace.replace("{{VALUE}}", indented(output.workspace.path, templates)));
+  if (output?.workspace?.name || output?.workspace?.path) stateLines.push(templates.stateItem.workspace.replace("{{VALUE}}", indented(output.workspace.name || output.workspace.path, templates)));
   if (output?.agent?.name) stateLines.push(templates.stateItem.agent.replace("{{VALUE}}", indented(output.agent.name, templates)));
   if (stateLines.length) sections.push(templates.stateSection.replace("{{ITEMS}}", stateLines.join(templates.itemSeparator)));
   const limit = Number.isFinite(options.maxCharacters) && options.maxCharacters > 0
@@ -269,8 +275,10 @@ function knowledgeForSearchResult(source, entry, presented) {
       : entry?.content?.value ?? entry?.content ?? entry?.text)
       || nonEmptyText(presented?.memory?.[0]?.content);
     const sourceId = nonEmptyText(entry?.source?.id ?? entry?.recordId ?? entry?.semanticKey ?? entry?.id) || `content:${semanticDigest(content)}`;
-    const sourceVersion = nonEmptyText(entry?.source?.version ?? entry?.version?.id ?? entry?.version) || semanticDigest(content);
-    return { key: `memory:${sourceId}`, version: sourceVersion, content };
+    // A memory is considered cited by its stable scope + original-title record
+    // identity. Updating the body must not make the same titled memory reappear
+    // in the same native Agent conversation.
+    return { key: `memory:${sourceId}`, version: "record-v1", content };
   }
   if (source === "resources") {
     const item = presented?.resources?.[0] || {};
@@ -314,9 +322,9 @@ function knowledgeForSearchResult(source, entry, presented) {
     ].filter(Boolean).join("\n");
     const skillId = nonEmptyText(entry?.skillId ?? entry?.id ?? item.name) || `content:${semanticDigest(content)}`;
     const sourceVersion = [nonEmptyText(entry?.version), nonEmptyText(entry?.sha256)].filter(Boolean).join(":") || semanticDigest(content);
-    // semantic-v1 marks the point at which selected Skill instructions became
-    // part of the ContextHub delivery itself.  Older receipts only proved the
-    // package was deployed, so they must not suppress this first real handoff.
+    // This identity pins the source package even when the Web Agent selects
+    // cached knowledge. Native Skill invocation is separate from deployment;
+    // neither a read nor a package pin proves model compliance.
     return { key: `skill:${skillId}`, version: `semantic-v1:${sourceVersion}`, content };
   }
   const content = nonEmptyText(JSON.stringify(presented || {}));
@@ -331,6 +339,22 @@ export async function conversationKnowledgeUnit(entry, prompts) {
   const messageId = nonEmptyText(entry?.id);
   const identity = messageId || `content:${semanticDigest(content)}`;
   return { key: `conversation:${identity}`, version: identity, content };
+}
+
+async function conversationReferenceKnowledgeUnit(entry, prompts) {
+  const rawContent = nonEmptyText(typeof entry === "string" ? entry : entry?.content ?? entry?.text);
+  if (!rawContent) return null;
+  const role = entry?.role === "assistant" ? "assistant" : entry?.role === "user" ? "user" : "system";
+  const content = await prompts.conversationMessage(role, rawContent);
+  const sourceConversationId = nonEmptyText(entry?.sourceConversationId);
+  const sourceSnapshotId = nonEmptyText(entry?.sourceSnapshotId);
+  const messageId = nonEmptyText(entry?.id);
+  if (!sourceConversationId || !sourceSnapshotId || !messageId) return null;
+  return {
+    key: `conversation-reference:${sourceConversationId}:${sourceSnapshotId}:${messageId}`,
+    version: "snapshot-v1",
+    content,
+  };
 }
 
 function pruneObservedSearchResults(source, output, observedFragments, formatting) {
@@ -359,7 +383,7 @@ function pruneObservedSearchResults(source, output, observedFragments, formattin
 
 function handoffReference(source, entry, presented) {
   if (source === "memory") {
-    return { kind: "记忆", name: nonEmptyText(entry?.semanticKey) || "相关记忆" };
+    return { kind: "记忆", name: nonEmptyText(entry?.title ?? entry?.semanticKey) || "相关记忆" };
   }
   if (source === "resources") {
     const item = presented?.resources?.[0] || {};
@@ -368,6 +392,9 @@ function handoffReference(source, entry, presented) {
   if (source === "skills") {
     const item = presented?.skills?.[0] || {};
     return { kind: "Skill", name: nonEmptyText(item.name ?? entry?.name ?? entry?.displayName) || "已选 Skill" };
+  }
+  if (source === "conversation") {
+    return { kind: "对话", name: nonEmptyText(entry?.referenceTitle) || "引用对话" };
   }
   return null;
 }
@@ -380,7 +407,9 @@ async function semanticHandoffItems(source, output, formatting, prompts, toolNam
     const rendered = await renderSemanticContext(presented, prompts);
     if (!rendered) continue;
     const knowledge = source === "conversation"
-      ? await conversationKnowledgeUnit(entry, prompts)
+      ? toolName === "conversation_reference_read"
+        ? await conversationReferenceKnowledgeUnit(entry, prompts)
+        : await conversationKnowledgeUnit(entry, prompts)
       : knowledgeForSearchResult(source, entry, presented);
     if (!knowledge) continue;
     items.push({
@@ -389,7 +418,7 @@ async function semanticHandoffItems(source, output, formatting, prompts, toolNam
       presented,
       knowledge,
       reference: handoffReference(source, entry, presented),
-      priority: source === "skills" ? 100 : source === "resources" ? 90 : 80,
+      priority: source === "skills" || toolName === "conversation_reference_read" ? 100 : source === "resources" ? 90 : 80,
     });
   }
   return items;
@@ -431,6 +460,7 @@ export class WebAgentToolRegistry {
       handoffItems: typeof definition.handoffItems === "function"
         ? definition.handoffItems
         : async ({ presented, rendered }) => rendered ? [{ toolName: name, rendered, presented }] : [],
+      modelSuffix: typeof definition.modelSuffix === "function" ? definition.modelSuffix : async () => "",
       modelMessages: typeof definition.modelMessages === "function" ? definition.modelMessages : async () => [],
     });
     this.#tools.set(name, normalized);
@@ -455,6 +485,7 @@ export async function createDefaultWebAgentTools(services, prompts, {
   workMemoryTools = true,
   workResourceTools = true,
   workSkillTools = true,
+  conversationReferences = [],
 } = {}) {
   if (!prompts || typeof prompts.webTools !== "function") throw new TypeError("Web Agent prompt repository is required");
   const [promptConfig, formatting] = await Promise.all([prompts.webTools(), prompts.webToolPresentation()]);
@@ -527,6 +558,12 @@ export async function createDefaultWebAgentTools(services, prompts, {
       return [content, ...continuations].filter(Boolean).join(formatting.sectionSeparator);
     },
     handoffItems: ({ output }) => semanticHandoffItems("resources", output, formatting, prompts, "resource_read"),
+    modelSuffix: async ({ output }) => (await Promise.all((output?.resources || [])
+      .filter((entry) => entry?.nextOffset !== null && entry?.nextOffset !== undefined)
+      .map((entry) => prompts.webToolResult("resourceContinuation", {
+        FILENAME: entry.filename || "文件",
+        NEXT_OFFSET: entry.nextOffset,
+      })))).filter(Boolean).join(formatting.sectionSeparator),
     modelMessages: async ({ output }) => Promise.all((output?.modelImages || []).map(async (image) => ({
       role: "user",
       content: [
@@ -535,6 +572,48 @@ export async function createDefaultWebAgentTools(services, prompts, {
       ],
     }))),
   });
+  const referenceIds = new Set((Array.isArray(conversationReferences) ? conversationReferences : [])
+    .map((entry) => nonEmptyText(entry?.referenceId))
+    .filter(Boolean));
+  if (referenceIds.size) {
+    registry.register({
+      name: "conversation_reference_read",
+      description: promptConfig.tools.conversation_reference_read.description,
+      modes: ["chat", "work"],
+      timelineRead: true,
+      inputSchema: promptConfig.tools.conversation_reference_read.inputSchema,
+      validate: (input) => {
+        const referenceId = nonEmptyText(input?.referenceId);
+        if (!referenceIds.has(referenceId)) throw new TypeError("referenceId is not available in this turn");
+        const query = nonEmptyText(input?.query);
+        const roles = uniqueStrings(Array.isArray(input?.roles) ? input.roles : [])
+          .filter((role) => ["system", "user", "assistant", "tool"].includes(role));
+        const cursor = nonEmptyText(input?.cursor);
+        return {
+          referenceId,
+          ...(query ? { query } : {}),
+          ...(roles.length ? { roles } : {}),
+          ...(cursor ? { cursor } : {}),
+        };
+      },
+      execute: ({ input, actor, scope, signal }) => services.conversationReferences.read({ actor, scope, ...input, signal }),
+      present: ({ output }) => ({
+        ...semanticSearchResult("conversation", output, 20, formatting),
+        ...(output?.nextCursor ? { nextCursor: output.nextCursor } : {}),
+      }),
+      render: async (presented) => {
+        const content = await renderSemanticContext(presented, prompts);
+        const continuation = presented?.nextCursor
+          ? await prompts.webToolResult("conversationReferenceContinuation", { NEXT_CURSOR: presented.nextCursor })
+          : "";
+        return [content, continuation].filter(Boolean).join(formatting.sectionSeparator);
+      },
+      handoffItems: ({ output }) => semanticHandoffItems("conversation", output, formatting, prompts, "conversation_reference_read"),
+      modelSuffix: ({ output }) => output?.nextCursor
+        ? prompts.webToolResult("conversationReferenceContinuation", { NEXT_CURSOR: output.nextCursor })
+        : "",
+    });
+  }
   registry.register({
     name: "skill_search",
     description: promptConfig.tools.skill_search.description,
@@ -563,23 +642,27 @@ export async function createDefaultWebAgentTools(services, prompts, {
     validate: () => ({}),
     execute: ({ actor, signal }) => services.skills.list({ actor, signal }),
     present: ({ output }) => ({ skills: semanticSkillSummaries(output?.skills ?? output?.items ?? output) }),
-    render: (presented) => renderSemanticContext(presented, prompts),
+    // This is the discovery directory, not selected source text. Silently
+    // clipping it makes skills near the end impossible for the model to find.
+    render: (presented) => renderSemanticContext(presented, prompts, { maxCharacters: Number.MAX_SAFE_INTEGER }),
   });
   registry.register({
-    name: "context_get_state",
-    description: promptConfig.tools.context_get_state.description,
-    modes: ["chat"],
+    name: "handoff_rewrite_candidate",
+    description: promptConfig.tools.handoff_rewrite_candidate.description,
+    modes: ["work"],
     handoff: false,
-    timelineRead: false,
-    inputSchema: promptConfig.tools.context_get_state.inputSchema,
+    inputSchema: promptConfig.tools.handoff_rewrite_candidate.inputSchema,
     validate: (input) => {
-      const fields = uniqueStrings(Array.isArray(input?.fields) ? input.fields : []).filter((field) => STATE_FIELDS.has(field));
-      if (!fields.length) throw new TypeError("fields is required");
-      return { fields };
+      const candidateId = nonEmptyText(input?.candidateId);
+      const revisedContent = nonEmptyText(input?.revisedContent);
+      if (!candidateId) throw new TypeError("candidateId is required");
+      if (!revisedContent) throw new TypeError("revisedContent is required");
+      if (revisedContent.length > MAX_HANDOFF_CHARACTERS) throw new TypeError("revisedContent is too large");
+      return { candidateId, revisedContent };
     },
-    execute: ({ actor, scope, input, signal }) => services.context.state({ actor, scope, fields: input.fields, signal }),
-    present: ({ input, output }) => semanticState(output, input.fields),
-    render: (presented) => renderSemanticContext(presented, prompts),
+    execute: async ({ input }) => input,
+    present: ({ output }) => ({ candidateId: output?.candidateId || "" }),
+    render: async () => "",
   });
   registry.register({
     name: "handoff_submit",
@@ -590,7 +673,7 @@ export async function createDefaultWebAgentTools(services, prompts, {
     inputSchema: promptConfig.tools.handoff_submit.inputSchema,
     validate: (input) => {
       if (!Array.isArray(input?.candidateIds)) throw new TypeError("candidateIds is required");
-      return { candidateIds: uniqueStrings(input.candidateIds).slice(0, 128) };
+      return { candidateIds: uniqueStrings(input.candidateIds) };
     },
     execute: async ({ input }) => ({ candidateIds: input.candidateIds }),
     present: ({ output }) => ({ candidateIds: [...(output?.candidateIds || [])] }),

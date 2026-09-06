@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import { Button } from "@/app/easywork/ui/Button";
+import { FileDeleteButton } from "@/app/easywork/ui/FileDeleteButton";
 import type { CollectionSummary, ResourceStatus } from "@/app/core/contracts";
 import type { ProjectFile, ProjectPageProps } from "./types";
 import styles from "./ProjectPage.module.css";
@@ -76,7 +77,7 @@ function ConversationTab({
         <div className={styles.conversationList}>
           {conversations.map((conversation) => (
             <button key={conversation.id} className={styles.conversationRow} onClick={() => onOpen(conversation.id)}>
-              <span className={`${styles.modeIcon} ${conversation.mode === "work" ? styles.workMode : styles.chatMode}`}>
+              <span data-ui-icon="" className={`${styles.modeIcon} ${conversation.mode === "work" ? styles.workMode : styles.chatMode}`}>
                 {conversation.mode === "work" ? <TerminalSquare size={17} /> : <MessageSquare size={17} />}
               </span>
               <span className={styles.conversationText}>
@@ -95,11 +96,13 @@ function ConversationTab({
   );
 }
 
-function FilesTab({ files, busyAction, onUpload, onRetry }: {
+function FilesTab({ files, busyAction, onUpload, onRetry, onDelete, onPreview }: {
   files: ProjectFile[];
   busyAction: string | null;
   onUpload: (files: File[]) => void;
   onRetry: (fileId: string) => void;
+  onDelete: ProjectPageProps["onDeleteFile"];
+  onPreview: ProjectPageProps["onPreviewFile"];
 }) {
   const [query, setQuery] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
@@ -121,8 +124,8 @@ function FilesTab({ files, busyAction, onUpload, onRetry }: {
       <div className={styles.fileToolbar}>
         <label className={styles.searchField}><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目文件" /></label>
         <div className={styles.sectionActions}>
-          <Button icon={<Upload size={16} />} disabled={busyAction === "upload"} onClick={() => fileInput.current?.click()}>上传文件</Button>
-          <Button icon={<FolderUp size={16} />} disabled={busyAction === "upload"} onClick={() => folderInput.current?.click()}>上传文件夹</Button>
+          <Button icon={busyAction === "upload" ? <LoaderCircle className={styles.spin} size={16} /> : <Upload size={16} />} disabled={Boolean(busyAction)} onClick={() => fileInput.current?.click()}>上传文件</Button>
+          <Button icon={busyAction === "upload" ? <LoaderCircle className={styles.spin} size={16} /> : <FolderUp size={16} />} disabled={Boolean(busyAction)} onClick={() => folderInput.current?.click()}>上传文件夹</Button>
           <input className={styles.hiddenInput} ref={fileInput} type="file" multiple onChange={receive} />
           <input
             className={styles.hiddenInput}
@@ -133,18 +136,24 @@ function FilesTab({ files, busyAction, onUpload, onRetry }: {
           />
         </div>
       </div>
+      {busyAction === "upload" ? <div className={styles.mobileUploadStatus} role="status" aria-live="polite"><span><LoaderCircle className={styles.spin} size={16} /><strong>正在上传项目文件</strong></span><small>完成后文件会自动加入项目资料</small><i data-ui-icon="" aria-hidden="true"><b /></i></div> : null}
       {visible.length ? (
         <div className={styles.projectFiles}>
-          <div className={styles.fileHeader}><span>名称</span><span>更新时间</span><span>大小</span><span>索引状态</span></div>
+          <div className={styles.fileHeader}><span>名称</span><span>更新时间</span><span>大小</span><span>索引状态</span><span className={styles.actionHeader}>操作</span></div>
           {visible.map((file) => (
-            <div key={file.id} className={`${styles.projectFileRow} ${file.status === "error" ? styles.fileError : ""}`}>
-              <span className={styles.projectFileName}><FileText size={17} /><span><strong>{file.name}</strong>{file.relativePath && file.relativePath !== file.name ? <small>{file.relativePath}</small> : null}</span></span>
+            <div key={file.bindingId} className={`${styles.projectFileRow} ${file.status === "error" ? styles.fileError : ""}`}>
+              <button type="button" className={styles.projectFileName} onClick={() => onPreview(file)}><FileText size={17} /><span><strong>{file.name}</strong>{file.relativePath && file.relativePath !== file.name ? <small>{file.relativePath}</small> : null}</span></button>
               <time className={styles.projectFileTime}>{formatDate(file.updatedAt)}</time>
               <span className={styles.projectFileSize}>{formatSize(file.size)}</span>
               <span className={styles.fileStatusCell}>
                 <ResourceStatusLabel status={file.status} />
-                {["error", "readable"].includes(file.status) ? <Button compact variant="ghost" icon={<RotateCcw size={14} />} disabled={busyAction === `retry:${file.id}`} onClick={() => onRetry(file.id)}>{file.status === "readable" ? "向量化" : "重试"}</Button> : null}
+                {["error", "readable"].includes(file.status) ? <Button compact variant="ghost" icon={<RotateCcw size={14} />} disabled={Boolean(busyAction)} onClick={() => onRetry(file.id)}>{file.status === "readable" ? "向量化" : "重试"}</Button> : null}
               </span>
+              <FileDeleteButton
+                path={file.relativePath}
+                disabled={Boolean(busyAction)}
+                onDelete={() => onDelete(file)}
+              />
               {file.status === "error" && file.error ? <span className={styles.fileErrorReason}>{file.error}</span> : null}
             </div>
           ))}
@@ -237,6 +246,8 @@ export default function ProjectPage({
   onMemoryModeChange,
   onUploadFiles,
   onRetryFile,
+  onPreviewFile,
+  onDeleteFile,
   onLinkCollection,
   onUnlinkCollection,
 }: ProjectPageProps) {
@@ -251,7 +262,7 @@ export default function ProjectPage({
     <div className={styles.page}>
       <header className={styles.projectHeader}>
         <div className={styles.projectIdentity}>
-          <span className={styles.projectMark}><Folder size={24} /></span>
+          <span data-ui-icon="" className={styles.projectMark}><Folder size={24} /></span>
           <div><h1>{project.name}</h1><span>{project.conversationCount} 个对话</span></div>
         </div>
         <div className={styles.memoryControl} aria-label="项目记忆范围">
@@ -283,7 +294,7 @@ export default function ProjectPage({
       ) : (
         <div key={tab} className={styles.tabContent}>
           {tab === "conversations" ? <ConversationTab conversations={conversations} onOpen={onOpenConversation} onCreate={onCreateConversation} /> : null}
-          {tab === "files" ? <FilesTab files={files} busyAction={busyAction} onUpload={onUploadFiles} onRetry={onRetryFile} /> : null}
+          {tab === "files" ? <FilesTab files={files} busyAction={busyAction} onUpload={onUploadFiles} onRetry={onRetryFile} onDelete={onDeleteFile} onPreview={onPreviewFile} /> : null}
           {tab === "collections" ? <CollectionsTab collections={collections} linkedIds={linkedCollectionIds} busyAction={busyAction} onLink={onLinkCollection} onUnlink={onUnlinkCollection} /> : null}
         </div>
       )}

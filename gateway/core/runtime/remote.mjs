@@ -346,16 +346,8 @@ class WorkerBoundAgentExecutor {
     this.worker.withSession(this.serverId, async (session) => {
       const sftp = await session.sftp();
       try {
-        await new Promise((resolve, reject) => {
-          const stream = sftp.createReadStream(remotePath, options);
-          const fail = (error) => { output.destroy(error); reject(error); };
-          stream.once("error", fail);
-          stream.once("end", resolve);
-          output.once("close", () => {
-            if (!output.writableEnded) stream.destroy();
-          });
-          stream.pipe(output);
-        });
+        if (output.destroyed) return;
+        await pipeline(sftp.createReadStream(remotePath, options), output);
       } finally {
         sftp.end?.();
       }
@@ -646,7 +638,7 @@ class SshRemoteFiles {
       ? this.#inside(target.root, await new SshRemoteControl(this.executor).canonicalize(target.canonical))
       : target.canonical;
     const attributes = canonicalPath === target.canonical ? target.attributes : await this.#lstat(canonicalPath);
-    invariant(!attributes?.isDirectory?.() && !attributes?.isSymbolicLink?.(), "REMOTE_FILE_NOT_REGULAR", "下载目标必须是普通文件", { status: 409 });
+    invariant(attributes?.isFile?.() === true && !attributes?.isSymbolicLink?.(), "REMOTE_FILE_NOT_REGULAR", "下载目标必须是普通文件", { status: 409 });
     const size = Number(attributes?.size);
     invariant(Number.isSafeInteger(size) && size >= 0 && size <= this.limits.maxDownloadBytes, "REMOTE_FILE_TOO_LARGE", "远端文件超过下载上限", { status: size > this.limits.maxDownloadBytes ? 413 : 502, details: { maxBytes: this.limits.maxDownloadBytes } });
     const digest = await this.executor.exec(`sha256sum -- ${shellQuote(canonicalPath)} | cut -d' ' -f1`, { maxOutputBytes: 1024 });
@@ -688,8 +680,8 @@ class SshRemoteFiles {
       },
     });
     const source = this.executor.openReadStream(descriptor.canonicalPath, { start, end: endExclusive - 1 });
-    source.once("error", (error) => verifier.destroy(error));
-    return source.pipe(verifier);
+    void pipeline(source, verifier).catch((error) => verifier.destroy(error));
+    return verifier;
   }
 
   async mkdir(input) {
@@ -785,7 +777,10 @@ class SshSchedulerExecutor {
     // login profile. ssh2 exec channels are non-login shells, so invoking the
     // command directly can report `sinfo`/`squeue` as missing even though the
     // same user can run them in an interactive terminal.
-    const command = `bash -lc ${shellQuote(schedulerCommand)}`;
+    const commandBody = descriptor.cwd
+      ? `cd -- ${shellQuote(descriptor.cwd)} && ${schedulerCommand}`
+      : schedulerCommand;
+    const command = `bash -lc ${shellQuote(commandBody)}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), descriptor.timeoutMs);
     try {
@@ -800,9 +795,19 @@ class SshSchedulerExecutor {
   }
 
   async readRange(descriptor) {
-    const bytes = await this.executor.readFile(descriptor.path);
-    const selected = bytes.subarray(descriptor.offset, descriptor.offset + descriptor.maxBytes);
-    return { bytes: selected, nextOffset: descriptor.offset + selected.length, eof: descriptor.offset + selected.length >= bytes.length };
+    invariant(Number.isSafeInteger(descriptor.offset) && descriptor.offset >= 0 && Number.isSafeInteger(descriptor.maxBytes) && descriptor.maxBytes > 0, "SCHEDULER_LOG_RANGE_INVALID", "日志读取范围无效", { status: 400 });
+    // One lookahead byte determines EOF without transferring the whole log.
+    const stream = this.executor.openReadStream(descriptor.path, { start: descriptor.offset, end: descriptor.offset + descriptor.maxBytes });
+    const chunks = [];
+    let length = 0;
+    for await (const chunk of stream) {
+      const bytes = Buffer.from(chunk);
+      length += bytes.length;
+      invariant(length <= descriptor.maxBytes + 1, "SCHEDULER_LOG_RANGE_OVERFLOW", "远端日志返回超出请求范围", { status: 502 });
+      chunks.push(bytes);
+    }
+    const bytes = Buffer.concat(chunks).subarray(0, descriptor.maxBytes);
+    return { bytes, nextOffset: descriptor.offset + bytes.length, eof: length <= descriptor.maxBytes };
   }
 }
 
@@ -840,21 +845,51 @@ class SshRemoteArtifactSource {
   }
 
   async openReadStream(input) {
+    let target = input.canonicalPath;
+    let snapshot = null;
+    if (input.expectedSha256) {
+      await this.verifyAvailable(input);
+      const actorKey = crypto.createHash("sha256").update(String(input.actor?.actorId || this.container.actor.actorId)).digest("hex");
+      const root = `${await this.executor.home()}/.easywork/downloads/${actorKey}`;
+      snapshot = `${root}/${crypto.randomUUID()}`;
+      try {
+        const copied = await this.executor.exec(`umask 077; mkdir -p -- ${shellQuote(root)} && cp --reflink=auto -- ${shellQuote(target)} ${shellQuote(snapshot)} && chmod 0400 -- ${shellQuote(snapshot)} && stat -c '%s' -- ${shellQuote(snapshot)} && sha256sum -- ${shellQuote(snapshot)} | cut -d' ' -f1`, { maxOutputBytes: 2048 });
+        const [size, digest] = String(copied.stdout || "").trim().split(/\r?\n/);
+        invariant(copied.code === 0 && Number(size) === input.expectedSize && digest === input.expectedSha256, "ARTIFACT_REMOTE_CHANGED", "远端文件已发生变化，请重新生成下载链接", { status: 409 });
+        target = snapshot;
+      } catch (error) {
+        await this.executor.exec(`rm -f -- ${shellQuote(snapshot)}`, { maxOutputBytes: 1024 }).catch(() => undefined);
+        throw error;
+      }
+    }
     const output = new PassThrough();
+    if (snapshot) output.once("close", () => {
+      void this.executor.exec(`rm -f -- ${shellQuote(snapshot)}`, { maxOutputBytes: 1024 }).catch(() => undefined);
+    });
     if (input.range.endExclusive <= input.range.start) {
       output.end();
       return output;
     }
-    this.executor.worker.withSession(this.executor.serverId, async (session) => {
-      const sftp = await session.sftp();
-      const stream = sftp.createReadStream(input.canonicalPath, {
-        start: input.range.start,
-        end: input.range.endExclusive - 1,
-      });
-      stream.once("error", (error) => output.destroy(error));
-      stream.once("close", () => sftp.end?.());
-      stream.pipe(output);
-    }).catch((error) => output.destroy(error));
+    let source;
+    try {
+      source = this.executor.openReadStream(target, { start: input.range.start, end: input.range.endExclusive - 1 });
+    } catch (error) {
+      output.destroy();
+      if (snapshot) await this.executor.exec(`rm -f -- ${shellQuote(snapshot)}`, { maxOutputBytes: 1024 }).catch(() => undefined);
+      throw error;
+    }
+    const expectedBytes = input.range.endExclusive - input.range.start;
+    const hash = input.expectedSha256 && input.range.start === 0 && input.range.endExclusive === input.expectedSize ? crypto.createHash("sha256") : null;
+    let received = 0;
+    const verifier = new Transform({
+      transform(chunk, _encoding, callback) { received += chunk.length; hash?.update(chunk); callback(null, chunk); },
+      flush(callback) {
+        if (received !== expectedBytes || (hash && hash.digest("hex") !== input.expectedSha256)) {
+          callback(Object.assign(new Error("下载内容校验失败，请重新生成下载链接"), { code: "ARTIFACT_REMOTE_CHANGED", status: 409 }));
+        } else callback();
+      },
+    });
+    void pipeline(source, verifier, output).catch((error) => output.destroy(error));
     return output;
   }
 
@@ -865,13 +900,16 @@ class SshRemoteArtifactSource {
       `if [ ! -e ${shellQuote(target)} ]; then exit 44; fi`,
       `if [ ! -f ${shellQuote(target)} ] || [ ! -r ${shellQuote(target)} ]; then exit 45; fi`,
       `stat -c '%s' -- ${shellQuote(target)}`,
+      `sha256sum -- ${shellQuote(target)} | cut -d' ' -f1`,
     ].join("; ");
     const result = await this.executor.exec(command, { maxOutputBytes: 1024 });
     invariant(result.code !== 44, "ARTIFACT_REMOTE_DELETED", "文件已被删除", { status: 410 });
     invariant(result.code === 0, "ARTIFACT_REMOTE_UNREADABLE", "远端文件当前不可读取", { status: 409 });
-    const actualSize = Number(String(result.stdout || "").trim());
+    const [size, digest] = String(result.stdout || "").trim().split(/\r?\n/);
+    const actualSize = Number(size);
     invariant(Number.isSafeInteger(actualSize) && actualSize >= 0, "ARTIFACT_REMOTE_INSPECTION_INVALID", "无法读取远端文件状态", { status: 502 });
     invariant(actualSize === Number(input.expectedSize), "ARTIFACT_REMOTE_CHANGED", "远端文件已发生变化，请重新生成下载链接", { status: 409 });
+    invariant(/^[a-f0-9]{64}$/.test(String(input.expectedSha256 || "")) && digest === input.expectedSha256, "ARTIFACT_REMOTE_CHANGED", "远端文件内容已发生变化，请重新生成下载链接", { status: 409 });
     return { available: true, size: actualSize };
   }
 }
@@ -891,6 +929,11 @@ export class RoutingAgentTransport {
     const apiRoute = await this.resolveApiRoute({ request, serverId, providerId: route.providerId, modelId: route.modelId });
     invariant(apiRoute && typeof apiRoute === "object", "AGENT_API_ROUTE_RESOLUTION_FAILED", "无法解析 Agent 模型 API", { status: 500, expose: false });
     return transport.execute({ ...request, apiRoute });
+  }
+
+  async captureSkillSnapshot(request) {
+    const transport = await this.resolveTransport(request.task.route.serverId);
+    return transport.captureSkillSnapshot?.(request) || null;
   }
 
   async prepare(request) {

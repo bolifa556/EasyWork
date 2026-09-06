@@ -54,6 +54,7 @@ export class CatalogConsistencyService {
     this.projects = options.projects;
     this.collections = options.collections;
     this.conversations = options.conversations;
+    this.deleteConversation = options.deleteConversation || ((input) => this.conversations.delete(input));
     this.resources = options.resources;
     this.artifacts = options.artifacts;
     this.memories = options.memories;
@@ -159,17 +160,32 @@ export class CatalogConsistencyService {
     const operation = started.operation;
     try {
       invariant(!project.deletedAt || started.resumed, "PROJECT_ALREADY_DELETED", "项目已被删除", { status: 409 });
-      const moved = await this.#step(operation, "move-conversations", async (plan) => {
+      const conversationPolicy = input.conversationPolicy === "delete" ? "delete" : "move-out";
+      const handledConversations = await this.#step(operation, conversationPolicy === "delete" ? "delete-conversations" : "move-conversations", async (plan) => {
         for (const planned of plan.conversations) {
-          const current = await this.conversations.getConversation(planned.id);
-          if (current.summary.projectId === null) continue;
+          let current;
+          try {
+            current = await this.conversations.getConversation(planned.id);
+          } catch (error) {
+            if (conversationPolicy === "delete" && error?.code === "CONVERSATION_NOT_FOUND") continue;
+            throw error;
+          }
+          if (conversationPolicy === "move-out" && current.summary.projectId === null) continue;
           invariant(current.summary.projectId === input.projectId, "PROJECT_DELETE_CONVERSATION_MOVED", "项目删除期间对话被移至其他项目", { status: 409 });
-          await this.conversations.moveToProject({
-            conversationId: planned.id,
-            projectId: null,
-            expectedRevision: current.summary.revision,
-            commandId: `${input.commandId}:move:${planned.id}`,
-          });
+          if (conversationPolicy === "delete") {
+            await this.deleteConversation({
+              conversationId: planned.id,
+              expectedRevision: current.summary.revision,
+              commandId: `${input.commandId}:delete:${planned.id}`,
+            });
+          } else {
+            await this.conversations.moveToProject({
+              conversationId: planned.id,
+              projectId: null,
+              expectedRevision: current.summary.revision,
+              commandId: `${input.commandId}:move:${planned.id}`,
+            });
+          }
         }
         return { conversationIds: plan.conversations.map((entry) => entry.id) };
       }, async () => ({ conversations: (await allProjectConversations(this.conversations, input.projectId)).map((entry) => ({ id: entry.id })) }));
@@ -186,8 +202,9 @@ export class CatalogConsistencyService {
       return this.#complete(operation, {
         project: deletedProject,
         cleanup: { ownerType: "project", ownerId: input.projectId, ...cleanup, memory: memoryCleanup },
-        conversationPolicy: "move-out",
-        movedConversationIds: moved?.conversationIds || [],
+        conversationPolicy,
+        movedConversationIds: conversationPolicy === "move-out" ? handledConversations?.conversationIds || [] : [],
+        deletedConversationIds: conversationPolicy === "delete" ? handledConversations?.conversationIds || [] : [],
         detachedArtifactIds: detachedArtifacts?.detachedArtifactIds || [],
         commandId: input.commandId,
       });

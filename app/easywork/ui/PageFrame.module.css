@@ -12,8 +12,8 @@
 .empty { display: grid; min-height: 280px; place-content: center; justify-items: center; gap: 9px; color: var(--ew-ink-muted); text-align: center; }
 .empty strong { color: var(--ew-ink-soft); font-size: .98rem; }
 @media (max-width: 719px) {
-  .page { padding: max(68px, calc(env(safe-area-inset-top) + 60px)) 13px max(32px, env(safe-area-inset-bottom)); }
-  .header { min-height: 44px; gap: 10px; margin-bottom: 18px; padding-inline: 3px; }
+  .page { padding: max(8px, env(safe-area-inset-top)) 13px max(32px, env(safe-area-inset-bottom)); }
+  .header { min-height: 44px; gap: 10px; margin-bottom: 18px; padding:0 3px 0 57px; }
   .title { font-size: var(--ew-mobile-title); }
   .toolbar { gap: 9px; }
   .search { min-height: var(--ew-mobile-touch); }

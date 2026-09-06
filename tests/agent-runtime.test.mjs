@@ -27,6 +27,30 @@ import {
 
 const temporaryDirectories = [];
 
+it("native process replacement and late exit cannot close the binding's active API relay", async () => {
+  for (const adapter of [createClaudeCodeAdapter(), createCodexAdapter()]) {
+    const executor = new FakeExecutor();
+    const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+    const request = requestFor(adapter, "start", { prompt: "prepare", cwd: "/work/demo" }, {
+      task: { id: "task-relay", route: { agentId: adapter.id } },
+      apiRoute: { baseUrl: "https://api.internal/v1", apiKey: "fixture", model: "model-agent-1", remoteReachable: false },
+    });
+    await transport.prepare(request);
+    const old = executor.processes[0];
+    // Force a runtime replacement, as happens when selected Skills change.
+    for (const entry of transport.active.values()) entry.runtimeFingerprint = "previous-skills";
+    const result = await transport.execute(request);
+    assert.equal(executor.processes.length, 2);
+    old.close();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(executor.proxyClosed, 0);
+    assert.equal(executor.proxyRequests.length, 1);
+    assert.ok(result.runId);
+    await transport.close();
+    assert.equal(executor.proxyClosed, 1);
+  }
+});
+
 afterEach(async () => {
   while (temporaryDirectories.length) await rm(temporaryDirectories.pop(), { recursive: true, force: true });
 });
@@ -60,7 +84,8 @@ async function artifactFixture({ hashOverride = null, archive = "raw", archiveBi
 }
 
 class FakeProcess {
-  constructor(id, { codexHook = null } = {}) {
+  constructor(id, { codexHook = null, skillCatalog = null } = {}) {
+    this.skillCatalog = skillCatalog;
     this.processId = id;
     this.closed = false;
     this.queue = new AsyncQueue();
@@ -90,6 +115,8 @@ class FakeProcess {
 
   async requestJsonRpc(method, params) {
     this.rpc.push({ method, params: structuredClone(params) });
+    if (method === "skills/extraRoots/set") { this.skillRoots = params.extraRoots; return {}; }
+    if (method === "skills/list") return { data: [{ cwd: params.cwds[0], skills: await this.skillCatalog(this.skillRoots) }] };
     if (method === "turn/steer" && this.rejectCodexSteerOnce) {
       this.rejectCodexSteerOnce = false;
       throw Object.assign(new Error("no active turn to steer"), { code: "AGENT_RPC_FAILED" });
@@ -123,7 +150,10 @@ class FakeProcess {
     this.rpc.push({ response: true, id, result: structuredClone(result) });
   }
 
-  async signal(value) { this.signals.push(value); }
+  async signal(value) {
+    this.signals.push(value);
+    if (["SIGTERM", "SIGKILL"].includes(value) && this.writes.at(-1)?.request?.subtype === "interrupt") this.close();
+  }
 
   wait() { return this.exitPromise; }
 
@@ -137,6 +167,7 @@ class FakeProcess {
 class FakeExecutor {
   constructor() {
     this.files = new Map();
+    this.links = new Map();
     this.commands = [];
     this.uploads = [];
     this.writes = [];
@@ -157,6 +188,12 @@ class FakeExecutor {
 
   async exec(command) {
     this.commands.push(command);
+    const copied = /cp -a --reflink=auto -- '([^']+)\/\.' '([^']+)'/.exec(command);
+    if (copied) for (const [file, bytes] of [...this.files]) if (file.startsWith(`${copied[1]}/`)) this.files.set(`${copied[2]}${file.slice(copied[1].length)}`, Buffer.from(bytes));
+    const linked = /ln -s -- '([^']+)' '([^']+)'/.exec(command);
+    if (linked) this.links.set(linked[2], linked[1]);
+    const moved = /mv -Tf -- '([^']+)' '([^']+)'/.exec(command);
+    if (moved && this.links.has(moved[1])) { this.links.set(moved[2], this.links.get(moved[1])); this.links.delete(moved[1]); }
     if (command.includes("leafUuid")) return {
       code: 0,
       stdout: this.claudeBoundaryOutputs.length ? this.claudeBoundaryOutputs.shift() : this.claudeBoundaryOutput,
@@ -179,6 +216,11 @@ class FakeExecutor {
   }
 
   async readFile(remotePath) {
+    for (let depth = 0; depth < 8; depth += 1) {
+      const link = [...this.links].find(([prefix]) => remotePath === prefix || remotePath.startsWith(`${prefix}/`));
+      if (!link) break;
+      remotePath = `${link[1]}${remotePath.slice(link[0].length)}`;
+    }
     if (!this.files.has(remotePath)) throw Object.assign(new Error("No such file"), { code: "ENOENT" });
     return this.files.get(remotePath);
   }
@@ -200,7 +242,14 @@ class FakeExecutor {
       enabled: true,
       isManaged: false,
     } : null;
-    const process = new FakeProcess(`process-${this.processes.length + 1}`, { codexHook });
+    const process = new FakeProcess(`process-${this.processes.length + 1}`, { codexHook, skillCatalog: async (roots) => {
+      const results = [];
+      for (const root of roots || []) for (const [view] of this.links) if (view.startsWith(`${root}/`)) {
+        const body = (await this.readFile(`${view}/SKILL.md`)).toString();
+        results.push({ name: /^name: (.+)$/m.exec(body)?.[1], path: `${view}/SKILL.md` });
+      }
+      return results;
+    } });
     this.processes.push(process);
     return process;
   }
@@ -297,12 +346,7 @@ function requestFor(adapter, operation, input, patch = {}) {
     binding: currentBinding,
     task: { id: "task-1" },
     workspace: { path: "/work/demo" },
-    skills: [{
-      skillId: "review",
-      version: "1.0.0",
-      sha256: "a".repeat(64),
-      remotePath: "/home/tester/.easywork/skills/review/1.0.0",
-    }],
+    skills: [],
     ...patch,
   };
 }
@@ -904,6 +948,29 @@ describe("SSH process protocol", () => {
     assert.equal(stream.destroyed, true);
   });
 
+  it("bounds the complete loopback HTTP request including a stalled SSH forward", async () => {
+    let lateStreamDestroyed = false;
+    const executor = new SshAgentExecutor({
+      session: {
+        exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+        sftp: async () => ({}),
+        forwardOut: async () => new Promise((resolve) => setTimeout(() => resolve({
+          destroy() { lateStreamDestroyed = true; },
+          end() {},
+        }), 320)),
+      },
+    });
+
+    await assert.rejects(executor.requestHttp({
+      host: "127.0.0.1",
+      port: 4096,
+      path: "/api/health",
+      timeoutMs: 250,
+    }), (error) => error.code === "AGENT_HTTP_REQUEST_TIMEOUT" && error.details.timeoutMs === 250);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(lateStreamDestroyed, true);
+  });
+
   it("detaches an HTTP Agent service before opening forwarding channels", async () => {
     const commands = [];
     const executor = new SshAgentExecutor({
@@ -1069,48 +1136,79 @@ describe("managed and user Agent deployment", () => {
 });
 
 describe("three-Agent executable runtime transport", () => {
-  it("rebuilds previously pinned native Skills when a missing session is replaced", async () => {
+  it("probes the Codex app-server initialization protocol before Agent selection", async () => {
     const executor = new FakeExecutor();
+    const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+
+    const readiness = await transport.checkReadiness("codex", { configScope: "conversation-1" });
+
+    assert.equal(readiness.ready, true);
+    assert.equal(readiness.protocol, "codex-app-server-jsonrpc");
+    assert.deepEqual(executor.spawns[0].args, ["app-server"]);
+    assert.equal(executor.spawns[0].env.CODEX_HOME, "/home/tester/.easywork/runtime/readiness/codex");
+    assert.deepEqual(executor.processes[0].rpc.map((entry) => entry.method), ["initialize", "initialized"]);
+    assert.deepEqual(executor.processes[0].signals, ["SIGTERM"]);
+  });
+
+  it("rejects Codex selection when the installed app-server cannot initialize", async () => {
+    const executor = new FakeExecutor();
+    executor.spawn = async function spawn(specification) {
+      this.spawns.push(structuredClone(specification));
+      const process = new FakeProcess("process-readiness-failure");
+      process.requestJsonRpc = async () => {
+        throw Object.assign(new Error("process exited before initialize"), { code: "AGENT_PROCESS_EXITED" });
+      };
+      this.processes.push(process);
+      return process;
+    };
+    const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+
+    await assert.rejects(
+      transport.checkReadiness("codex", { configScope: "conversation-1" }),
+      (error) => error.code === "AGENT_CODEX_PROTOCOL_UNAVAILABLE"
+        && error.message.includes("app-server 初始化协议")
+        && error.details.reason === "AGENT_PROCESS_EXITED",
+    );
+    assert.deepEqual(executor.processes[0].signals, ["SIGTERM"]);
+  });
+
+  it("recovers discoverable Skills and sends only this turn's selection through Codex native inputs", async () => {
+    const executor = new FakeExecutor();
+    const refs = new Map();
+    for (const [skillId, version, character] of [["cluster-guide", "2.0.0", "b"], ["review", "1.0.0", "a"]]) {
+      const remotePath = "/home/tester/.easywork/skills/packages/actor/" + character.repeat(64);
+      const sha256 = character.repeat(64);
+      const content = Buffer.from("---\nname: " + skillId + "\ndescription: fixture\n---\n\nApply " + skillId + " rules.\n");
+      const entrypoint = skillId === "review" ? "review-guide.md" : "SKILL.md";
+      executor.files.set(remotePath + "/" + entrypoint, content);
+      executor.files.set(remotePath + "/package.json", Buffer.from(JSON.stringify({ sha256, manifest: { name: skillId, description: "fixture", entrypoint }, files: [{ path: entrypoint }] })));
+      refs.set(skillId, { skillId, version, sha256, remotePath });
+    }
     const adapter = createCodexAdapter();
-    const transport = new AgentRuntimeTransport({
-      executor,
-      deploymentService: deploymentResolver(),
+    const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver(),
+      skillDeployment: { async ensurePins(pins) { return pins.map((pin) => refs.get(pin.skillId)); } },
       configurationService: { async runtimeValues() { return { approvalPolicy: "never", sandboxMode: "workspace-write" }; } },
     });
     const result = await transport.execute(requestFor(adapter, "start", { prompt: "continue", cwd: "/work/demo" }, {
-      recoveredSkillPins: [{ skillId: "cluster-guide", version: "2.0.0", sha256: "b".repeat(64) }],
+      recoveredSkillPins: [{ skillId: "cluster-guide", version: "2.0.0", sha256: "b".repeat(64) }], skills: [refs.get("review")],
     }));
-    assert.deepEqual(
-      result.bindingPatch.native.skillPins.map((pin) => pin.skillId).sort(),
-      ["cluster-guide", "review"],
-    );
-    const linkCommands = executor.commands.filter((command) => command.includes("ln -sfn"));
-    const runtimePaths = remoteAgentPaths("/home/tester", "codex", "binding:conversation-1:workspace-1");
-    const prepareCommand = executor.commands.find((command) => command.includes(runtimePaths.runtimeHome));
-    assert.match(prepareCommand, new RegExp(`${runtimePaths.runtimeHome.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/\\.ssh`));
-    assert.match(prepareCommand, /chmod 0700 .*\/home\/\.ssh/);
-    assert.equal(linkCommands.some((command) => command.includes("/.easywork/skills/cluster-guide/2.0.0") && command.includes("/skills/cluster-guide")), true);
-    assert.equal(linkCommands.some((command) => command.includes("/.easywork/skills/review/1.0.0") && command.includes("/skills/review")), true);
-    const packageLinkCommands = linkCommands.filter((command) => command.includes("cluster-guide/2.0.0") || command.includes("review/1.0.0"));
-    assert.equal(packageLinkCommands.every((command) => command.includes("[ -d ")), true, "Skill view 只链接已经物化的包目录");
+    assert.deepEqual(result.bindingPatch.native.skillPins.map((pin) => pin.skillId).sort(), ["cluster-guide", "review"]);
+    const paths = remoteAgentPaths("/home/tester", "codex", "binding:conversation-1:workspace-1");
+    const manifest = JSON.parse((await executor.readFile(paths.runtimeState + "/skill-view.json")).toString());
+    assert.equal(manifest.skills.length, 2);
+    for (const skill of manifest.skills) {
+      assert.ok(skill.ownedRoot.startsWith(paths.runtimeRoot + "/skill-generations/"));
+      assert.equal(executor.links.get(paths.skillsRoot + "/" + skill.skillId), skill.ownedRoot);
+      assert.ok((await executor.readFile(skill.remotePath + "/SKILL.md")).length > 0);
+    }
+    const roots = executor.processes[0].rpc.find((entry) => entry.method === "skills/extraRoots/set");
+    assert.deepEqual(roots.params.extraRoots, [paths.skillsRoot]);
     const turnInput = executor.processes[0].rpc.find((entry) => entry.method === "turn/start").params.input;
-    assert.deepEqual(turnInput[0], { type: "text", text: "continue" });
-    assert.deepEqual(
-      turnInput.slice(1).map((item) => ({ ...item })).sort((left, right) => left.name.localeCompare(right.name)),
-      [
-        {
-          type: "skill",
-          name: "cluster-guide",
-          path: `${remoteAgentPaths("/home/tester", "codex", "binding:conversation-1:workspace-1").skillsRoot}/cluster-guide/SKILL.md`,
-        },
-        {
-          type: "skill",
-          name: "review",
-          path: `${remoteAgentPaths("/home/tester", "codex", "binding:conversation-1:workspace-1").skillsRoot}/review/SKILL.md`,
-        },
-      ],
-    );
-    assert.equal(turnInput[0].text.includes("cluster-guide"), false, "Skill 正文或说明不应复制进普通用户提示词");
+    assert.deepEqual(turnInput, [{ type: "text", text: "continue" }, { type: "skill", name: "review", path: paths.skillsRoot + "/review/SKILL.md" }]);
+    const review = manifest.skills.find((skill) => skill.skillId === "review");
+    executor.files.set(review.ownedRoot + "/SKILL.md", Buffer.from("changed in conversation"));
+    assert.match((await executor.readFile(refs.get("review").remotePath + "/review-guide.md")).toString(), /Apply review rules/);
+    assert.equal(executor.files.has(refs.get("review").remotePath + "/SKILL.md"), false);
     await transport.close();
   });
 
@@ -1993,6 +2091,7 @@ describe("three-Agent executable runtime transport", () => {
     assert.deepEqual(process.rpc.map((entry) => entry.method), [
       "initialize",
       "initialized",
+      "skills/extraRoots/set",
       "hooks/list",
       "config/batchWrite",
       "hooks/list",
@@ -2031,6 +2130,7 @@ describe("three-Agent executable runtime transport", () => {
     assert.deepEqual(restartedExecutor.processes[0].rpc.map((entry) => entry.method), [
       "initialize",
       "initialized",
+      "skills/extraRoots/set",
       "hooks/list",
       "config/batchWrite",
       "hooks/list",
@@ -2171,6 +2271,7 @@ describe("three-Agent executable runtime transport", () => {
     assert.deepEqual(executor.processes[0].rpc.map((entry) => entry.method), [
       "initialize",
       "initialized",
+      "skills/extraRoots/set",
       "hooks/list",
       "config/batchWrite",
       "hooks/list",
@@ -2296,6 +2397,7 @@ describe("three-Agent executable runtime transport", () => {
     assert.deepEqual(executor.processes[1].rpc.map((entry) => entry.method), [
       "initialize",
       "initialized",
+      "skills/extraRoots/set",
       "hooks/list",
       "config/batchWrite",
       "hooks/list",

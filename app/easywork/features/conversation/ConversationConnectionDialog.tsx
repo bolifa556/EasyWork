@@ -322,7 +322,7 @@ export function ConversationConnectionDialog({
       {showSidebar ? <aside className={styles.serverSidebar}>
         <div className={styles.serverHeading}><span>服务器</span><button type="button" aria-label="添加服务器" onClick={startNewProfile}><Plus size={15} /></button></div>
         <div className={styles.serverList}>{servers.map((server) => <button type="button" className={server.profile.id === selectedId ? styles.activeServer : ""} key={server.profile.id} onClick={() => chooseServer(server)}>
-          <i className={`${styles.serverDot} ${server.connection.status === "connected" ? styles.dotConnected : server.connection.status === "connecting" ? styles.dotConnecting : ""}`} />
+          <i data-ui-icon="" className={`${styles.serverDot} ${server.connection.status === "connected" ? styles.dotConnected : server.connection.status === "connecting" ? styles.dotConnecting : ""}`} />
           <span><strong>{server.profile.name || server.profile.host}</strong><small>{server.profile.username ? `${server.profile.username}@` : ""}{server.profile.host}</small></span>
         </button>)}</div>
         {!servers.length ? <span className={styles.serverEmpty}>还没有保存的服务器</span> : null}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ensureBlankLineBeforeTables, protectShellVariablesFromInlineMath } from "../app/easywork/features/conversation/markdown-normalization.mjs";
+import { ensureBlankLineBeforeTables, ensureSectionBlockBoundaries, protectShellVariablesFromInlineMath } from "../app/easywork/features/conversation/markdown-normalization.mjs";
 
 test("shell environment variables cannot consume later prose as inline math", () => {
   const source = "Run srun echo $SLURM_ARRAY_TASK_ID, then inspect $SLURM_JOB_ID and ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.";
@@ -45,4 +45,49 @@ test("table normalization is idempotent and ignores fenced examples", () => {
   assert.equal(ensureBlankLineBeforeTables(separated), separated);
   const fenced = "说明\n```md\n| A | B |\n| --- | --- |\n```";
   assert.equal(ensureBlankLineBeforeTables(fenced), fenced);
+});
+
+test("standalone section labels do not become lazy continuations of Agent lists", () => {
+  const source = [
+    "你好！我是 Codex。",
+    "**我能做什么**",
+    "- 读写代码",
+    "- 做多步任务",
+    "**我的风格**",
+    "- 改动克制精准",
+    "- 先验证再回答",
+    "当前工作目录为空。",
+  ].join("\n");
+  const expected = [
+    "你好！我是 Codex。",
+    "",
+    "**我能做什么**",
+    "",
+    "- 读写代码",
+    "- 做多步任务",
+    "",
+    "**我的风格**",
+    "",
+    "- 改动克制精准",
+    "- 先验证再回答",
+    "",
+    "当前工作目录为空。",
+  ].join("\n");
+  assert.equal(ensureSectionBlockBoundaries(source), expected);
+  assert.equal(ensureSectionBlockBoundaries(expected), expected);
+});
+
+test("section boundary repair leaves fenced and indented Markdown untouched", () => {
+  const source = [
+    "```md",
+    "**示例标题**",
+    "- 示例列表",
+    "```",
+    "",
+    "**说明**",
+    "",
+    "- 第一项",
+    "  延续说明",
+  ].join("\n");
+  assert.equal(ensureSectionBlockBoundaries(source), source);
 });

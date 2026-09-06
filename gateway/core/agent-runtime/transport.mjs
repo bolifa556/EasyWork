@@ -21,11 +21,27 @@ import {
   versionHookPaths,
 } from "./version-pretool.mjs";
 import { AsyncQueue } from "./ssh-executor.mjs";
+import { normalizeNativeSkillFiles, parseNativeSkill } from "../skills/native-package.mjs";
+import { captureSkillSnapshot, restoreSkillSnapshot, readSkillView, selectedSkillCommand } from "./skill-views.mjs";
 
 const DEFAULT_OPENCODE_OUTPUT_LIMIT = 32_768;
 const PREPARED_RUNTIME_TTL_MS = 15 * 60_000;
 const SERVICE_HEALTH_TTL_MS = 60_000;
+const READINESS_RPC_TIMEOUT_MS = 8_000;
+const OPENCODE_READY_TIMEOUT_MS = 30_000;
+const OPENCODE_READY_REQUEST_TIMEOUT_MS = 3_000;
 const OPENCODE_NATIVE_STORE_CLONE_REVISION = 4;
+async function confirmProcessExit(process, timeoutMs) {
+  if (process.closed) return true;
+  invariant(typeof process.wait === "function", "AGENT_INTERRUPT_UNCONFIRMED", "无法确认远端进程是否已停止", { status: 502, retryable: true });
+  let timer;
+  try {
+    return await Promise.race([
+      process.wait().then(() => true),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
 const OPENCODE_NATIVE_STORE_CLONE_SHELL = `#!/bin/sh
 set -eu
 
@@ -349,6 +365,20 @@ async function* framesWithRequiredPersistence(frames, persistenceOutcome, agentV
     if (streamError) throw streamError;
     if (persistenceError) throw persistenceError;
   }
+}
+
+async function* withNativeSubmission(frames, submission) {
+  if (!submission) { yield* frames; return; }
+  const failure = submission.then(() => new Promise(() => {}), (error) => { throw error; });
+  failure.catch(() => undefined);
+  const iterator = frames[Symbol.asyncIterator]();
+  try {
+    while (true) {
+      const next = await Promise.race([iterator.next(), failure]);
+      if (next.done) { await submission; return; }
+      yield next.value;
+    }
+  } finally { await iterator.return?.(); }
 }
 
 function effortAdjustmentProtocolFrame(agentId, detail, agentVersion = "unknown") {
@@ -1240,7 +1270,7 @@ function commandHelpHasFlag(help, flag) {
   return new RegExp(`(?:^|[\\s,])${escaped}(?=[\\s,=]|$)`, "m").test(String(help || ""));
 }
 
-function isolatedRuntimeFingerprint(agentId, configuration, route, installation = null, agentProfile = null) {
+function isolatedRuntimeFingerprint(agentId, configuration, route, installation = null, agentProfile = null, skillPins = []) {
   // This identifier is part of the current generated configuration contract.
   // Change it whenever that exact configuration shape changes.
   const configurationContract = `2026-08-26.3:${VERSION_HOOK_REVISION}`;
@@ -1256,6 +1286,7 @@ function isolatedRuntimeFingerprint(agentId, configuration, route, installation 
       binaryPath: installation.binaryPath,
     } : null,
     agentProfile,
+    skillPins: [...skillPins].map(({ skillId, version, sha256, viewHash }) => ({ skillId, version, sha256, viewHash })).sort((a, b) => a.skillId.localeCompare(b.skillId)),
     configuration,
     route: route ? {
       baseUrl: route.baseUrl,
@@ -1403,6 +1434,66 @@ export class AgentRuntimeTransport {
     this.claudeEffortFallbacks = new Map();
   }
 
+  async checkReadiness(agentId, { source = null, configScope = "default" } = {}) {
+    runtimeAgentDefinition(agentId);
+    const installation = await this.deploymentService.resolveRuntime(agentId, { source });
+    if (agentId !== "codex") {
+      return Object.freeze({ ready: true, agentId, version: installation.version, protocol: null });
+    }
+
+    const [home, configuration] = await Promise.all([
+      this.executor.home(),
+      this.configurationService
+        ? this.configurationService.runtimeValues(agentId, { configScope })
+        : Promise.resolve({}),
+    ]);
+    const probeHome = `${remoteAgentPaths(home, agentId).easyworkRoot}/runtime/readiness/codex`;
+    const prepared = await this.executor.exec(`mkdir -p -- ${shellQuote(probeHome)}`, { maxOutputBytes: 16 * 1024 });
+    invariant(prepared.code === 0, "AGENT_READINESS_PREPARE_FAILED", "无法准备 Codex 就绪检查目录", {
+      status: 502,
+      retryable: true,
+      details: { agentId, exitCode: prepared.code },
+    });
+    let process = null;
+    try {
+      process = await this.executor.spawn({
+        executable: installation.binaryPath,
+        args: ["app-server", ...codexRuntimeConfigArguments(configuration, null, null)],
+        cwd: home,
+        env: { HOME: home, CODEX_HOME: probeHome },
+      });
+      await process.requestJsonRpc("initialize", {
+        clientInfo: { name: "easywork-readiness", title: "EasyWork", version: "2" },
+        capabilities: { experimentalApi: true },
+      }, READINESS_RPC_TIMEOUT_MS);
+      invariant(typeof process.notifyJsonRpc === "function", "AGENT_CODEX_INITIALIZE_UNSUPPORTED", "Codex process 不支持 initialized notification", {
+        status: 409,
+      });
+      process.notifyJsonRpc("initialized");
+      return Object.freeze({
+        ready: true,
+        agentId,
+        version: installation.version,
+        protocol: "codex-app-server-jsonrpc",
+      });
+    } catch (error) {
+      throw new ApiError("AGENT_CODEX_PROTOCOL_UNAVAILABLE", `Codex ${String(installation.version || "unknown")} 没有提供 EasyWork 所需的 app-server 初始化协议`, {
+        status: 409,
+        retryable: Boolean(error?.retryable),
+        details: {
+          actualVersion: String(installation.version || "unknown"),
+          protocol: "codex-app-server-jsonrpc",
+          reason: String(error?.code || error?.message || "initialize_failed"),
+        },
+        cause: error,
+      });
+    } finally {
+      if (process && !process.closed && typeof process.signal === "function") {
+        await process.signal("SIGTERM").catch(() => undefined);
+      }
+    }
+  }
+
   async execute(request) {
     invariant(request && request.descriptor && request.binding, "AGENT_TRANSPORT_REQUEST_INVALID", "Agent transport 请求不完整", { status: 400 });
     const agentId = String(request.adapterId || "");
@@ -1529,13 +1620,11 @@ export class AgentRuntimeTransport {
         XDG_DATA_HOME: nativeStorePaths.runtimeData,
       });
     }
-    const recoveredSkillRefs = (Array.isArray(request.recoveredSkillPins) ? request.recoveredSkillPins : []).map((pin) => {
-      const skillId = assertRuntimeIdentifier(pin?.skillId, "recoveredSkillPins[].skillId");
-      const version = assertRuntimeIdentifier(pin?.version, "recoveredSkillPins[].version");
-      const sha256 = String(pin?.sha256 || "").toLowerCase();
-      invariant(/^[a-f0-9]{64}$/.test(sha256), "AGENT_RECOVERED_SKILL_PIN_INVALID", "恢复的 Agent Skill pin 无效", { status: 409 });
-      return { skillId, version, sha256, remotePath: `${paths.skillCacheRoot}/${skillId}/${version}` };
-    });
+    await restoreSkillSnapshot(this.executor, paths, request.binding.native?.skillSnapshot);
+    const currentView = await readSkillView(this.executor, paths);
+    const inheritedPins = [...new Map([...(request.binding.native?.skillPins || []), ...(request.recoveredSkillPins || [])].map((pin) => [pin.skillId, pin])).values()];
+    const missingPins = inheritedPins.filter((pin) => !currentView.skills.some((item) => item.skillId === pin.skillId && item.sha256 === pin.sha256));
+    const recoveredSkillRefs = missingPins.length ? await this.skillDeployment.ensurePins(missingPins) : [];
     // Only a verified native-session replacement supplies recovered pins.  It
     // rebuilds the old session's discoverable capabilities without copying a
     // Skill body into the user prompt.
@@ -1544,9 +1633,14 @@ export class AgentRuntimeTransport {
       ? await this.#deploySkills(request.skills, paths)
       : await this.#bindSkillView(request.skills || [], paths);
     const skills = assertEasyWorkSkillPaths(
-      [...new Map([...recoveredSkills, ...deployedSkills].map((entry) => [entry.skillId, entry])).values()],
+      deployedSkills,
       paths.skillsRoot,
     );
+    const skillPins = [...new Map([...currentView.skills, ...recoveredSkills, ...skills].map((skill) => [skill.skillId, skill])).values()];
+    const nativeSkillCommand = ["claude-code", "opencode"].includes(agentId) && ["start", "resume"].includes(request.operation)
+      ? await selectedSkillCommand(this.executor, paths, skills) : null;
+    runtimeFingerprint = isolatedRuntimeFingerprint(agentId, configuration, runtimeApiRoute, installation, agentProfile, skillPins);
+    if (nativeSkillCommand) runtimeFingerprint = crypto.createHash("sha256").update(runtimeFingerprint).update(nativeSkillCommand.sha256).digest("hex");
     const context = {
       request,
       agentId,
@@ -1557,6 +1651,7 @@ export class AgentRuntimeTransport {
       paths,
       nativeStorePaths,
       skills,
+      nativeSkillCommand,
       environment,
       configuration,
       agentProfile,
@@ -1683,11 +1778,13 @@ export class AgentRuntimeTransport {
     }
     const knownSkills = new Map((Array.isArray(request.binding?.native?.skillPins) ? request.binding.native.skillPins : [])
       .map((entry) => [String(entry.skillId), entry]));
-    for (const skill of skills) {
+    for (const skill of skillPins) {
       knownSkills.set(String(skill.skillId), {
         skillId: String(skill.skillId),
         version: String(skill.version),
         sha256: String(skill.sha256),
+        ...(skill.viewHash ? { viewHash: skill.viewHash } : {}),
+        ...(skill.nativeName ? { nativeName: skill.nativeName } : {}),
       });
     }
     return {
@@ -1697,6 +1794,9 @@ export class AgentRuntimeTransport {
         native: {
           ...(result.bindingPatch?.native || {}),
           skillPins: [...knownSkills.values()],
+          ...(["start", "resume"].includes(request.operation) ? {
+            skillSnapshotRequiredFrom: request.binding.native?.skillSnapshotRequiredFrom || request.task.createdAt,
+          } : {}),
         },
       },
     };
@@ -1750,6 +1850,13 @@ export class AgentRuntimeTransport {
     this.pendingPreparations.set(pendingKey, run);
     try { return await run; }
     finally { if (this.pendingPreparations.get(pendingKey) === run) this.pendingPreparations.delete(pendingKey); }
+  }
+
+  async captureSkillSnapshot({ task, binding }) {
+    if (!binding?.native?.runtimeRoot) return null;
+    const paths = remoteAgentPaths(await this.executor.home(), binding.adapterId, binding.agentBindingId);
+    const manifest = await readSkillView(this.executor, paths);
+    return captureSkillSnapshot(this.executor, paths, task.id, manifest.skills.map(({ skillId, version, sha256, nativeName, viewHash }) => ({ skillId, version, sha256, nativeName, viewHash })));
   }
 
   async #prepare(request) {
@@ -1814,7 +1921,7 @@ export class AgentRuntimeTransport {
       installation,
       discoveredAgentProfile,
     );
-    const runtimeFingerprint = isolatedRuntimeFingerprint(agentId, configuration, runtimeApiRoute, installation, agentProfile);
+    const runtimeFingerprint = isolatedRuntimeFingerprint(agentId, configuration, runtimeApiRoute, installation, agentProfile, request.binding.native?.skillPins || []);
     const sessionId = request.binding.native?.sessionId || request.binding.state?.sessionId || null;
     const descriptor = {
       transport: agentId === "claude-code" ? "process-jsonl" : agentId === "codex" ? "json-rpc" : "http",
@@ -1851,9 +1958,10 @@ export class AgentRuntimeTransport {
     // case, but never start a native process without the exact API route that
     // its first real turn will use.  Otherwise the later turn can inherit a
     // process whose generated config names an API key that was never exported.
-    if (runtimeApiRoute && agentId === "opencode") entry = await this.#openCodeService(context);
-    else if (runtimeApiRoute && agentId === "codex") entry = await this.#codexProcess(context);
-    else if (runtimeApiRoute && !request.binding.native?.pendingFork) {
+    const warmNativeProcess = runtimeApiRoute && !request.task.skillPins?.length;
+    if (warmNativeProcess && agentId === "opencode") entry = await this.#openCodeService(context);
+    else if (warmNativeProcess && agentId === "codex") entry = await this.#codexProcess(context);
+    else if (warmNativeProcess && !request.binding.native?.pendingFork) {
       entry = await this.#claudeProcess(context);
       entry.prepared = true;
     }
@@ -1963,18 +2071,37 @@ export class AgentRuntimeTransport {
   async #bindSkillView(refs, paths) {
     const cached = assertEasyWorkSkillPaths(refs, paths.skillCacheRoot);
     if (!cached.length) return [];
-    const quote = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;
     const unique = [...new Map(cached.map((entry) => [entry.skillId, entry])).values()];
-    const commands = unique.map((entry) => {
+    const manifestPath = `${paths.runtimeState}/skill-view.json`;
+    let manifest = { schemaVersion: 1, skills: [] };
+    try { manifest = JSON.parse((await this.executor.readFile(manifestPath)).toString("utf8")); }
+    catch (error) { if (!["ENOENT", "NO_SUCH_FILE", 2].includes(error?.code)) throw error; }
+    const results = [];
+    for (const entry of unique) {
+      const previous = manifest.skills.find((skill) => skill.skillId === entry.skillId && skill.sha256 === entry.sha256);
+      if (previous) { results.push({ ...previous, remotePath: `${paths.skillsRoot}/${entry.skillId}` }); continue; }
+      const descriptor = JSON.parse((await this.executor.readFile(`${entry.remotePath}/package.json`)).toString("utf8"));
+      invariant(descriptor.sha256 === entry.sha256 && Array.isArray(descriptor.files), "AGENT_SKILL_PACKAGE_INVALID", "当前技能包缺少固定内容清单", { status: 409 });
+      const files = await Promise.all(descriptor.files.map(async (file) => ({ path: file.path, content: await this.executor.readFile(`${entry.remotePath}/${file.path}`) })));
+      const normalized = normalizeNativeSkillFiles({ skillId: entry.skillId, ...descriptor.manifest, files });
+      const document = normalized.find((file) => file.path === "SKILL.md");
+      const { metadata } = parseNativeSkill(document.content);
+      invariant(!manifest.skills.some((skill) => skill.skillId !== entry.skillId && skill.nativeName === metadata.name), "AGENT_SKILL_NAME_CONFLICT", "当前对话的技能原生名称冲突", { status: 409 });
+      const viewHash = crypto.createHash("sha256").update(entry.sha256).update(document.content).digest("hex");
+      const ownedRoot = `${paths.runtimeRoot}/skill-generations/${crypto.randomUUID()}/${entry.skillId}`;
+      const copied = await this.executor.exec(`mkdir -p -- ${shellQuote(ownedRoot)} && cp -a --reflink=auto -- ${shellQuote(`${entry.remotePath}/.`)} ${shellQuote(ownedRoot)}`, { maxOutputBytes: 2048 });
+      invariant(copied.code === 0, "AGENT_SKILL_VIEW_FAILED", "无法复制当前对话的技能文件", { status: 502 });
+      await this.executor.writeAtomic(`${ownedRoot}/SKILL.md`, document.content, { mode: 0o600 });
       const viewPath = `${paths.skillsRoot}/${entry.skillId}`;
-      return `[ -d ${quote(entry.remotePath)} ] || exit 74; [ ! -e ${quote(viewPath)} ] || [ -L ${quote(viewPath)} ] || exit 73; ln -sfn -- ${quote(entry.remotePath)} ${quote(viewPath)}`;
-    });
-    const linked = await this.executor.exec(`mkdir -p -- ${quote(paths.skillsRoot)}; ${commands.join("; ")}`);
-    invariant(linked.code === 0, "AGENT_SKILL_VIEW_FAILED", "无法建立当前 Agent 对话的 Skill 视图", { status: 502 });
-    return unique.map((entry) => ({
-      ...entry,
-      remotePath: `${paths.skillsRoot}/${entry.skillId}`,
-    }));
+      const temporaryLink = `${paths.skillsRoot}/.link-${crypto.randomUUID()}`;
+      const linked = await this.executor.exec(`ln -s -- ${shellQuote(ownedRoot)} ${shellQuote(temporaryLink)} && mv -Tf -- ${shellQuote(temporaryLink)} ${shellQuote(viewPath)}`, { maxOutputBytes: 2048 });
+      invariant(linked.code === 0, "AGENT_SKILL_VIEW_FAILED", "无法切换当前对话的技能代次", { status: 502 });
+      const record = { ...entry, nativeName: metadata.name, viewHash, ownedRoot, remotePath: viewPath };
+      manifest.skills = [...manifest.skills.filter((skill) => skill.skillId !== entry.skillId), record];
+      await this.executor.writeAtomic(manifestPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
+      results.push(record);
+    }
+    return results;
   }
 
   async #prepareRuntime(paths, agentId, nativeStorePaths = paths) {
@@ -2521,16 +2648,17 @@ export class AgentRuntimeTransport {
     );
   }
 
-  async #assertOpenCodeHealth(port, actualVersion = "unknown") {
+  async #assertOpenCodeHealth(port, actualVersion = "unknown", timeoutMs = null) {
+    const timeout = timeoutMs ? { timeoutMs } : {};
     let currentError = null;
     try {
-      const current = await this.executor.requestHttp({ host: "127.0.0.1", port, method: "GET", path: "/api/health" });
+      const current = await this.executor.requestHttp({ host: "127.0.0.1", port, method: "GET", path: "/api/health", ...timeout });
       if (current?.healthy === true || current?.data?.healthy === true) return { commonHealth: true };
     } catch (error) {
       currentError = error;
     }
     try {
-      const legacy = await this.executor.requestHttp({ host: "127.0.0.1", port, method: "GET", path: "/global/health" });
+      const legacy = await this.executor.requestHttp({ host: "127.0.0.1", port, method: "GET", path: "/global/health", ...timeout });
       if (legacy?.healthy === true || legacy?.data?.healthy === true) return { commonHealth: false };
     } catch (error) {
       if (!currentError) currentError = error;
@@ -2544,7 +2672,8 @@ export class AgentRuntimeTransport {
     });
   }
 
-  async #assertOpenCodeReady(port, context) {
+  async #assertOpenCodeReady(port, context, timeoutMs = null) {
+    const timeout = timeoutMs ? { timeoutMs } : {};
     const selectedModel = String(context.runtimeApiRoute?.model || context.configuration.model || "").trim();
     const actualVersion = String(context.installation?.version || "unknown");
     const existingSessionId = String(context.request.binding?.native?.sessionId || context.request.binding?.state?.sessionId || "").trim();
@@ -2558,10 +2687,10 @@ export class AgentRuntimeTransport {
     let v2CatalogSeen = false;
     let v2ModelCount = null;
     let v2Ready = false;
-    const { commonHealth } = await this.#assertOpenCodeHealth(port, actualVersion);
+    const { commonHealth } = await this.#assertOpenCodeHealth(port, actualVersion, timeoutMs);
     if (commonHealth && targetProtocol !== "v1") {
       try {
-        const catalog = await this.executor.requestHttp({ host: "127.0.0.1", port, method: "GET", path: "/api/model" });
+        const catalog = await this.executor.requestHttp({ host: "127.0.0.1", port, method: "GET", path: "/api/model", ...timeout });
         if (catalog && typeof catalog === "object" && !Array.isArray(catalog) && Array.isArray(catalog.data)) {
           v2CatalogSeen = true;
           const models = catalog.data;
@@ -2581,7 +2710,7 @@ export class AgentRuntimeTransport {
     let v1Ready = false;
     if (targetProtocol !== "v2") {
       try {
-        const catalog = await this.executor.requestHttp({ host: "127.0.0.1", port, method: "GET", path: "/provider" });
+        const catalog = await this.executor.requestHttp({ host: "127.0.0.1", port, method: "GET", path: "/provider", ...timeout });
         const value = catalog?.data && typeof catalog.data === "object" ? catalog.data : catalog;
         const providers = Array.isArray(value?.all) ? value.all : Array.isArray(value?.providers) ? value.providers : null;
         if (providers) {
@@ -2629,12 +2758,17 @@ export class AgentRuntimeTransport {
   async #waitForOpenCode(port, context) {
     let lastError = null;
     const selectedModel = String(context.runtimeApiRoute?.model || context.configuration.model || "").trim();
+    const deadline = Date.now() + OPENCODE_READY_TIMEOUT_MS;
     for (let attempt = 0; attempt < this.httpReadyAttempts; attempt += 1) {
       try {
-        return await this.#assertOpenCodeReady(port, context);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        return await this.#assertOpenCodeReady(port, context, Math.max(250, Math.min(OPENCODE_READY_REQUEST_TIMEOUT_MS, remaining)));
       } catch (error) {
         lastError = error;
-        await sleep(this.httpReadyDelayMs);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await sleep(Math.min(this.httpReadyDelayMs, remaining));
       }
     }
     const actualVersion = String(context.installation?.version || "unknown");
@@ -2750,7 +2884,6 @@ export class AgentRuntimeTransport {
     this.active.set(key, entry);
     if (!process.detached) process.wait?.().finally(() => {
       if (this.active.get(key)?.process === process) this.active.delete(key);
-      void this.#releaseProxy(context.bindingId);
     }).catch(() => {});
     try {
       entry.protocol = await this.#waitForOpenCode(port, context);
@@ -2845,6 +2978,17 @@ export class AgentRuntimeTransport {
         const permission = /^\/api\/session\/([^/]+)\/permission\/([^/]+)\/reply$/.exec(resolved.path);
         const question = /^\/api\/session\/([^/]+)\/question\/([^/]+)\/reply$/.exec(resolved.path);
         if (prompt) {
+          if (context.nativeSkillCommand) {
+            const catalog = await this.executor.requestHttp({ host: "127.0.0.1", port: entry.servicePort, method: "GET", path: `/command${query}` });
+            const commands = Array.isArray(catalog) ? catalog : catalog?.data || [];
+            invariant(commands.some((item) => item.name === context.nativeSkillCommand.name), "AGENT_SKILL_NOT_DISCOVERED", "OpenCode 未发现本轮原生技能命令", { status: 409 });
+            context.pendingSubmission = this.executor.requestHttp({ host: "127.0.0.1", port: entry.servicePort, method: "POST", path: `/session/${prompt[1]}/command${query}`, body: {
+              command: context.nativeSkillCommand.name, arguments: String(resolved.body?.prompt?.text || ""),
+              ...(model ? { model: `easywork/${model}` } : {}), ...(variant ? { variant } : {}),
+            }, waitForTurn: true, timeoutMs: 12 * 60 * 60 * 1000 });
+            context.pendingSubmission.catch(() => undefined);
+            return null;
+          }
           legacy = {
             ...resolved,
             path: `/session/${prompt[1]}/prompt_async${query}`,
@@ -3154,7 +3298,7 @@ export class AgentRuntimeTransport {
         },
       },
       ...(lines ? {
-        frames: framesWithRequiredPersistence(coalescedAgentFrames(governedOpenCodeFrames({
+        frames: withNativeSubmission(framesWithRequiredPersistence(coalescedAgentFrames(governedOpenCodeFrames({
           frames: prefixedFrames(
             entry.protocol === "v1"
               ? resilientOpenCodeV1Frames({
@@ -3185,7 +3329,7 @@ export class AgentRuntimeTransport {
           paths: context.paths,
           workspacePath: context.request.workspace?.path || context.paths.runtimeHome,
           taskId: context.request.task?.id,
-        }), "opencode"), runtimePersistence, context.installation.version),
+        }), "opencode"), runtimePersistence, context.installation.version), context.pendingSubmission),
       } : {}),
     };
   }
@@ -3233,6 +3377,7 @@ export class AgentRuntimeTransport {
           expose: false,
         });
         process.notifyJsonRpc("initialized");
+        await process.requestJsonRpc("skills/extraRoots/set", { extraRoots: [context.paths.skillsRoot] });
       } catch (error) {
         if (typeof process.signal === "function") await process.signal("SIGTERM").catch(() => undefined);
         const agentVersion = String(context.installation.version || "unknown");
@@ -3271,7 +3416,6 @@ export class AgentRuntimeTransport {
       process.wait?.().finally(() => {
         if (this.active.get(key)?.process === process) {
           this.active.delete(key);
-          void this.#releaseProxy(context.bindingId);
         }
       }).catch(() => {});
       return started;
@@ -3454,15 +3598,20 @@ export class AgentRuntimeTransport {
         params = codexTurnRequestParams(params, context);
       }
       if (call.method === "turn/start" && context.skills.length) {
+        const catalog = await entry.process.requestJsonRpc("skills/list", { cwds: [context.request.workspace?.path || context.paths.runtimeHome], forceReload: true });
+        const discovered = (catalog?.data || []).flatMap((group) => group.skills || []);
         const existingInput = Array.isArray(params.input) ? params.input : [];
         const existingSkillPaths = new Set(existingInput
           .filter((item) => item?.type === "skill")
           .map((item) => String(item.path || "")));
         const skillInput = [...new Map(context.skills.map((skill) => {
-          const skillPath = `${skill.remotePath}/SKILL.md`;
+          const expectedPath = `${skill.remotePath}/SKILL.md`;
+          const found = discovered.find((item) => item.path === expectedPath || (item.name === skill.nativeName && String(item.path || "").startsWith(`${context.paths.runtimeRoot}/`)));
+          invariant(found, "AGENT_SKILL_NOT_DISCOVERED", `Codex 未发现所选技能 ${skill.nativeName || skill.skillId}`, { status: 409, retryable: true });
+          const skillPath = found.path;
           return [skillPath, {
             type: "skill",
-            name: String(skill.skillId),
+            name: String(found.name),
             path: skillPath,
           }];
         })).values()].filter((item) => !existingSkillPaths.has(item.path));
@@ -3748,6 +3897,7 @@ export class AgentRuntimeTransport {
       });
     }
     if (!requestedArgs.includes("--settings")) requestedArgs.push("--settings", `${context.paths.runtimeData}/claude/settings.json`);
+    requestedArgs.push("--disallowedTools", "CronCreate,CronDelete,CronList");
     if (context.configuration.model) requestedArgs.push("--model", context.configuration.model);
     if (effectiveEffort) requestedArgs.push("--effort", effectiveEffort);
     if (context.configuration.permissionMode) requestedArgs.push("--permission-mode", context.configuration.permissionMode);
@@ -3783,7 +3933,11 @@ export class AgentRuntimeTransport {
     this.active.set(key, entry);
     process.wait?.().finally(() => {
       if (this.active.get(key)?.process === process) this.active.delete(key);
-      void this.#releaseProxy(context.bindingId);
+      // The SSH relay belongs to the binding, not this one native process.
+      // A Skill/configuration change can replace a warmed process after its
+      // successor's environment already references the same relay. Closing it
+      // here would disconnect that successor (including on a late exit).
+      // releaseBinding(), route replacement and close() own relay cleanup.
     }).catch(() => {});
     return entry;
   }
@@ -3812,7 +3966,16 @@ export class AgentRuntimeTransport {
       context = { ...context, request: { ...context.request, descriptor: resumed } };
       entry = null;
     }
-    const effectiveDescriptor = context.request.descriptor;
+    const effectiveDescriptor = structuredClone(context.request.descriptor);
+    if (context.nativeSkillCommand && ["start", "resume"].includes(operation)) {
+      for (const frame of effectiveDescriptor.stdin || []) {
+        if (frame.type === "user" && typeof frame.message?.content === "string") frame.message.content = `/${context.nativeSkillCommand.name} ${frame.message.content}`;
+        else if (frame.type === "user" && Array.isArray(frame.message?.content)) {
+          const text = frame.message.content.find((part) => part.type === "text");
+          if (text) text.text = `/${context.nativeSkillCommand.name} ${text.text}`;
+        }
+      }
+    }
     if (effectiveDescriptor.transport === "process-jsonl") {
       entry = await this.#claudeProcess(context);
       const sessionBeforeTurn = context.request.binding.native?.sessionId || context.request.binding.state?.sessionId || null;
@@ -3951,7 +4114,11 @@ export class AgentRuntimeTransport {
           // protocol had a chance to stop its active tool tree.
           if (!entry.process.closed) await entry.process.signal("SIGINT");
         }
-        if (!entry.process.closed) await entry.process.signal("SIGTERM").catch(() => undefined);
+        if (!entry.process.closed) await entry.process.signal("SIGTERM");
+        if (!await confirmProcessExit(entry.process, 4_000)) {
+          await entry.process.signal("SIGKILL");
+          invariant(await confirmProcessExit(entry.process, 2_000), "AGENT_INTERRUPT_TIMEOUT", "Claude Code 中断后仍未退出，可重试停止", { status: 504, retryable: true });
+        }
         if (this.active.get(key)?.process === entry.process) this.active.delete(key);
       } else {
         for (const frame of effectiveDescriptor.frames || []) writeClaudeFrame(entry, frame);

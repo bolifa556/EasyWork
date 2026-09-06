@@ -58,11 +58,14 @@ export class SshTerminalManager {
     this.broker = broker;
     this.clock = clock;
     this.sessions = new Map();
+    this.pendingCreates = 0;
+    this.closeGeneration = 0;
   }
 
   async create(input = {}) {
     const value = exactObject(input, ["term", "rows", "cols", "cwd", "scopeKey", "commandId"], "创建终端");
-    invariant(this.sessions.size < MAX_SESSIONS, "TERMINAL_SESSION_LIMIT", "当前服务器终端会话数已达上限", { status: 429, details: { limit: MAX_SESSIONS } });
+    const openCount = [...this.sessions.values()].filter((state) => state.status === "open").length;
+    invariant(openCount + this.pendingCreates < MAX_SESSIONS, "TERMINAL_SESSION_LIMIT", "当前服务器终端会话数已达上限", { status: 429, details: { limit: MAX_SESSIONS } });
     const cwd = workingDirectory(value.cwd);
     const scopeKey = terminalScopeKey(value.scopeKey);
     const descriptor = {
@@ -71,10 +74,21 @@ export class SshTerminalManager {
       cols: dimension(value.cols, 80, "cols"),
       ...(cwd ? { cwd } : {}),
     };
-    const handle = await this.worker.withSession(this.serverId, async (session) => {
-      invariant(typeof session.openPty === "function", "REMOTE_TERMINAL_UNAVAILABLE", "SSH transport 不支持受控 PTY", { status: 409 });
-      return session.openPty(descriptor);
-    });
+    const generation = this.closeGeneration;
+    this.pendingCreates += 1;
+    let handle;
+    try {
+      handle = await this.worker.withSession(this.serverId, async (session) => {
+        invariant(typeof session.openPty === "function", "REMOTE_TERMINAL_UNAVAILABLE", "SSH transport 不支持受控 PTY", { status: 409 });
+        return session.openPty(descriptor);
+      });
+      if (generation !== this.closeGeneration) {
+        await handle.close();
+        invariant(false, "TERMINAL_SESSION_CLOSED", "终端创建已取消", { status: 409 });
+      }
+    } finally {
+      this.pendingCreates -= 1;
+    }
     const sessionId = `term_${crypto.randomBytes(16).toString("hex")}`;
     const topic = `terminal:${sessionId}`;
     const now = new Date(this.clock()).toISOString();
@@ -91,6 +105,9 @@ export class SshTerminalManager {
       publishChain: Promise.resolve(),
       closeResult: null,
       outputBuffer: Buffer.alloc(0),
+      pendingOutput: [],
+      pendingOutputBytes: 0,
+      outputTimer: null,
     };
     this.sessions.set(sessionId, state);
     handle.onData(({ stream, bytes }) => this.#publishOutput(state, stream, bytes));
@@ -174,6 +191,7 @@ export class SshTerminalManager {
   }
 
   async closeAll() {
+    this.closeGeneration += 1;
     await Promise.allSettled([...this.sessions.keys()].map((sessionId) => this.close(sessionId)));
   }
 
@@ -214,14 +232,44 @@ export class SshTerminalManager {
   }
 
   #publishOutput(state, stream, bytes) {
+    if (state.status !== "open") return;
     const value = Buffer.from(bytes);
     state.outputBuffer = Buffer.concat([state.outputBuffer, value]);
     if (state.outputBuffer.length > MAX_SCROLLBACK_BYTES) state.outputBuffer = state.outputBuffer.subarray(state.outputBuffer.length - MAX_SCROLLBACK_BYTES);
-    for (let offset = 0; offset < value.length; offset += MAX_EVENT_BYTES) {
-      const chunk = value.subarray(offset, Math.min(value.length, offset + MAX_EVENT_BYTES));
+    const source = stream === "stderr" ? "stderr" : "stdout";
+    // Interactive shells may echo one byte per SSH frame. Persist bounded
+    // bursts instead of one full journal rewrite per character; otherwise
+    // closing the terminal can wait minutes for thousands of queued writes.
+    for (let offset = 0; offset < value.length;) {
+      let pending = state.pendingOutput.at(-1);
+      if (!pending || pending.stream !== source || pending.size === MAX_EVENT_BYTES) {
+        pending = { stream: source, chunks: [], size: 0 };
+        state.pendingOutput.push(pending);
+      }
+      const chunk = value.subarray(offset, offset + Math.min(MAX_EVENT_BYTES - pending.size, value.length - offset));
+      pending.chunks.push(chunk);
+      pending.size += chunk.length;
+      state.pendingOutputBytes += chunk.length;
+      offset += chunk.length;
+      if (state.pendingOutputBytes >= MAX_EVENT_BYTES) this.#flushOutput(state);
+    }
+    if (state.pendingOutput.length && !state.outputTimer) {
+      state.outputTimer = setTimeout(() => this.#flushOutput(state), 16);
+      state.outputTimer.unref?.();
+    }
+  }
+
+  #flushOutput(state) {
+    clearTimeout(state.outputTimer);
+    state.outputTimer = null;
+    const pending = state.pendingOutput;
+    state.pendingOutput = [];
+    state.pendingOutputBytes = 0;
+    for (const batch of pending) {
+      const chunk = Buffer.concat(batch.chunks, batch.size);
       this.#publish(state, "terminal.output", "updated", {
         sessionId: state.sessionId,
-        stream: stream === "stderr" ? "stderr" : "stdout",
+        stream: batch.stream,
         dataBase64: chunk.toString("base64"),
         byteLength: chunk.length,
       });
@@ -230,6 +278,7 @@ export class SshTerminalManager {
 
   async #remoteClosed(state, error, result) {
     if (state.status === "closed") return;
+    this.#flushOutput(state);
     state.status = "closed";
     state.attached = false;
     state.updatedAt = new Date(this.clock()).toISOString();
@@ -239,6 +288,8 @@ export class SshTerminalManager {
       error: error ? { code: String(error.code || "SSH_PTY_FAILED"), message: String(error.message || "PTY 已异常关闭").slice(0, 2_000) } : null,
     };
     await this.#publish(state, "terminal.closed", error ? "failed" : "completed", { sessionId: state.sessionId, ...state.closeResult });
+    const closed = [...this.sessions.values()].filter((entry) => entry.status === "closed");
+    for (const entry of closed.slice(0, Math.max(0, closed.length - MAX_SESSIONS))) this.sessions.delete(entry.sessionId);
   }
 
   #publish(state, kind, status, payload) {

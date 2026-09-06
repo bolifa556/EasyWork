@@ -48,6 +48,20 @@ test("catalog HTTP deletion performs the canonical cascade and Artifact save-as-
   assert.equal(replay.response.status, 200);
   assert.deepEqual(replay.payload.data, deleted.payload.data);
 
+  const cascadeProject = await json(baseUrl, "/api/projects", { token, method: "POST", body: { name: "Delete conversations" } });
+  const cascadeConversation = await json(baseUrl, "/api/conversations", {
+    token, method: "POST", headers: { "idempotency-key": "catalog-api-cascade-conversation" },
+    body: { mode: "chat", projectId: cascadeProject.payload.data.id, content: "delete me", expectedRevision: 0 },
+  });
+  const cascadeConversationId = cascadeConversation.payload.data.conversation.id;
+  const cascadeDeleted = await json(baseUrl, `/api/projects/${cascadeProject.payload.data.id}?conversationPolicy=delete`, {
+    token, method: "DELETE", headers: { "if-match": '"0"', "idempotency-key": "catalog-api-delete-project-and-conversations" },
+  });
+  assert.equal(cascadeDeleted.response.status, 200);
+  assert.equal(cascadeDeleted.payload.data.conversationPolicy, "delete");
+  assert.deepEqual(cascadeDeleted.payload.data.deletedConversationIds, [cascadeConversationId]);
+  assert.equal((await json(baseUrl, `/api/conversations/${cascadeConversationId}`, { token })).response.status, 404);
+
   const liveProject = await json(baseUrl, "/api/projects", { token, method: "POST", body: { name: "Artifact target" } });
   const session = await gateway.runtime.auth.resolveSession(token);
   const services = await gateway.runtime.servicesForActor(session.actor);

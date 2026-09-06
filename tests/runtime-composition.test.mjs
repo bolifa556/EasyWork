@@ -29,7 +29,7 @@ function fakeModelFactory() {
           usage: { prompt_tokens: 8, completion_tokens: 4 },
         };
       }
-      if (system.includes("不超过 14 个汉字")) {
+      if (system.includes("只输出标题本身")) {
         return { content: "组合运行时验证", reasoning: "", toolCalls: [], usage: { prompt_tokens: 4, completion_tokens: 2 } };
       }
       await onDelta?.({ kind: "reasoning", content: "核对上下文。" });
@@ -48,7 +48,7 @@ function titleFailureModelFactory() {
   return {
     async complete({ messages, onDelta }) {
       const system = String(messages?.[0]?.content || "");
-      if (system.includes("不超过 14 个汉字")) throw Object.assign(new Error("title unavailable"), { code: "MODEL_UNAVAILABLE", status: 502 });
+      if (system.includes("只输出标题本身")) throw Object.assign(new Error("title unavailable"), { code: "MODEL_UNAVAILABLE", status: 502 });
       if (system.includes("# 可复用记忆提取")) return { content: "", reasoning: "", toolCalls: [], usage: {} };
       await onDelta?.({ kind: "content", content: "主回复正常完成。" });
       return { content: "主回复正常完成。", reasoning: "", toolCalls: [], usage: {} };
@@ -156,6 +156,16 @@ test("组合 Gateway 完成注册、严格 bootstrap、项目、流式对话并�
   assert.equal(replayedConversation.response.status, 200);
   assert.ok(replayedConversation.payload.data.events.some((event) => event.kind === "run.reasoning.delta"));
   assert.ok(replayedConversation.payload.data.events.some((event) => event.kind === "run.persisted"));
+  const summaryReplay = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/events?view=summary`, { token });
+  const reasoningHeading = summaryReplay.payload.data.events.find((event) => event.kind === "run.reasoning.delta");
+  assert.equal(reasoningHeading.payload.content, "");
+  const details = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/events/details`, { token, method: "POST", body: { eventIds: [reasoningHeading.eventId] } });
+  assert.equal(details.response.status, 200);
+  assert.equal(details.payload.data.events[0].payload.content, "核对上下文。");
+  const getDetails = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/events/details?ids=${encodeURIComponent(reasoningHeading.eventId)}`, { token });
+  assert.deepEqual(getDetails.payload.data, details.payload.data);
+  const anonymousDetails = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/events/details`, { method: "POST", body: { eventIds: [reasoningHeading.eventId] } });
+  assert.equal(anonymousDetails.response.status, 401);
   const conversationTasks = await requestJson(active.baseUrl, `/api/tasks?conversationId=${conversationId}&limit=1000`, { token });
   assert.deepEqual(conversationTasks.payload.data, []);
   const titled = await requestJson(active.baseUrl, `/api/conversations/${conversationId}`, { token });
@@ -183,6 +193,7 @@ test("组合 Gateway 完成注册、严格 bootstrap、项目、流式对话并�
   });
   const compactConversationId = compactConversation.payload.data.conversation.id;
   await services.interactions.waitFor(compactConversation.payload.data.response.runId);
+  await services.taskRuntime.waitForIdle();
   for (let index = 2; index <= 3; index += 1) {
     const current = await requestJson(active.baseUrl, `/api/conversations/${compactConversationId}`, { token });
     const appended = await requestJson(active.baseUrl, `/api/conversations/${compactConversationId}/messages`, {
@@ -351,4 +362,150 @@ test("首轮标题生成失败不影响主回复并保留首问截断标题", as
   assert.equal(context.payload.data.usage.source, "estimated");
   assert.ok(context.payload.data.usage.usedTokens >= firstQuestion.length);
   assert.ok(context.payload.data.usage.parts.every((part) => part.source === "estimated"));
+  const audit = await services.audit.list();
+  const failure = audit.items.find((event) => event.action === "conversation.title.generate");
+  assert.equal(failure.status, "failure");
+  assert.equal(failure.target.conversationId, created.payload.data.conversation.id);
+  assert.equal(failure.requestId, created.payload.data.response.runId);
+  assert.equal(failure.metadata.code, "MODEL_UNAVAILABLE");
+});
+
+async function titleRuntime(t, completeTitle) {
+  const { dataRoot, helpFile } = await temporaryRuntimeRoot(t);
+  const active = await startGateway({ dataRoot, helpFile, webModelFactory: () => ({
+    complete: (input) => String(input.messages?.[0]?.content || "").includes("只输出标题本身")
+      ? completeTitle(input)
+      : fakeModelFactory().complete(input),
+  }) });
+  t.after(() => active.gateway.close());
+  const registered = await requestJson(active.baseUrl, "/api/auth/register", {
+    method: "POST", body: { username: "title-test-user", password: "runtime-password", deviceId: "title-test-device" },
+  });
+  const token = registered.payload.data.token;
+  const session = await active.gateway.runtime.auth.resolveSession(token);
+  const services = await active.gateway.runtime.servicesForActor(session.actor);
+  return { ...active, token, services, actor: session.actor, create: async (content) => {
+    const result = await requestJson(active.baseUrl, "/api/conversations", { token, method: "POST", headers: { "idempotency-key": "title-test-create" }, body: {
+      mode: "chat", content, expectedRevision: 0,
+      response: { providerId: "platform-web", modelId: "fake-model", scope: {} },
+    } });
+    assert.equal(result.response.status, 200);
+    return result.payload.data;
+  } };
+}
+
+test("标题思考不受 64 token 截断，英文标题保留完整单词，列表按账号实时接收", async (t) => {
+  let titleCalls = 0;
+  let titleLimits;
+  const generated = "Relaxed Weekend Reading Group Names";
+  const active = await titleRuntime(t, async ({ limits }) => {
+    titleCalls += 1;
+    titleLimits = limits;
+    return { content: generated, reasoning: "Reasoning about the title. ".repeat(100), toolCalls: [], usage: { completion_tokens: 650 } };
+  });
+  const socket = new WebSocket(active.wsUrl);
+  t.after(() => socket.close());
+  await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+  const authentication = waitForMessage(socket, (message) => message.type === "authenticated");
+  socket.send(JSON.stringify({ type: "authenticate", token: active.token }));
+  await authentication;
+  const topic = `conversations:${active.actor.actorId}`;
+  const subscription = waitForMessage(socket, (message) => message.type === "subscribed");
+  socket.send(JSON.stringify({ type: "subscribe", topics: [topic] }));
+  assert.deepEqual((await subscription).topics, [topic]);
+  const metadata = waitForMessage(socket, (message) => message.type === "event" && message.event.kind === "conversation.title.updated");
+  const created = await active.create("帮我给周末的读书小组想三个名字，轻松一点。");
+  await active.services.interactions.waitFor(created.response.runId);
+  await active.services.taskRuntime.waitForIdle();
+  const event = (await metadata).event;
+  const detail = await active.services.baseConversations.getConversation(created.conversation.id);
+  assert.equal(titleLimits.maxOutputTokens, null);
+  assert.equal(detail.summary.title, generated);
+  assert.equal(event.topic, topic);
+  assert.equal(event.ids.conversationId, created.conversation.id);
+  assert.equal(event.payload.title, generated);
+  assert.equal(event.payload.conversationRevision, detail.summary.revision);
+  const list = await active.services.baseConversations.listConversations({ limit: 100 });
+  assert.equal(list.items[0].title, generated);
+
+  const next = await requestJson(active.baseUrl, `/api/conversations/${created.conversation.id}/messages`, {
+    token: active.token, method: "POST", headers: { "if-match": `"${detail.summary.revision}"`, "idempotency-key": "title-test-next-message" },
+    body: { content: "再轻松一点呢", response: { providerId: "platform-web", modelId: "fake-model", scope: {} } },
+  });
+  assert.equal(next.response.status, 200);
+  await active.services.interactions.waitFor(next.payload.data.response.runId);
+  await active.services.taskRuntime.waitForIdle();
+  assert.equal(titleCalls, 1);
+  const forbidden = waitForMessage(socket, (message) => message.type === "error");
+  socket.send(JSON.stringify({ type: "subscribe", topics: ["conversations:usr_someone_else"] }));
+  assert.equal((await forbidden).error.code, "REALTIME_TOPIC_FORBIDDEN");
+});
+
+test("标题请求未结束也可完成主回复，并发修订仅重试保存不重新调用模型", { timeout: 15_000 }, async (t) => {
+  const gate = Promise.withResolvers();
+  const started = Promise.withResolvers();
+  let titleCalls = 0;
+  const active = await titleRuntime(t, async () => {
+    titleCalls += 1;
+    started.resolve();
+    await gate.promise;
+    return { content: "轻松读书小组命名", toolCalls: [], usage: {} };
+  });
+  try {
+    const created = await active.create("读书小组叫什么好呢");
+    await started.promise;
+    await active.services.interactions.waitFor(created.response.runId);
+    assert.equal((await active.services.interactions.status(created.response.runId)).status, "completed");
+    const originalRename = active.services.baseConversations.rename.bind(active.services.baseConversations);
+    let renameCalls = 0;
+    active.services.baseConversations.rename = async (input) => {
+      renameCalls += 1;
+      if (renameCalls === 1) await active.services.baseConversations.setPinned({
+        conversationId: input.conversationId, expectedRevision: input.expectedRevision, pinned: true, commandId: "title-pin-race",
+      });
+      return originalRename(input);
+    };
+    gate.resolve();
+    await active.services.taskRuntime.waitForIdle();
+    const detail = await active.services.baseConversations.getConversation(created.conversation.id);
+    assert.equal(detail.summary.title, "轻松读书小组命名");
+    assert.equal(detail.summary.pinned, true);
+    assert.equal(renameCalls, 2);
+    assert.equal(titleCalls, 1);
+  } finally { gate.resolve(); }
+});
+
+test("标题生成期间的手动重命名优先，后台结果不会覆盖", async (t) => {
+  const gate = Promise.withResolvers();
+  const started = Promise.withResolvers();
+  const active = await titleRuntime(t, async () => {
+    started.resolve();
+    await gate.promise;
+    return { content: "模型生成的标题", toolCalls: [], usage: {} };
+  });
+  try {
+    const created = await active.create("给读书小组起个名");
+    await started.promise;
+    await active.services.interactions.waitFor(created.response.runId);
+    const current = await active.services.baseConversations.getConversation(created.conversation.id);
+    await active.services.baseConversations.rename({
+      conversationId: created.conversation.id, title: "我自己取的标题", expectedRevision: current.summary.revision, commandId: "title-manual-rename",
+    });
+    gate.resolve();
+    await active.services.taskRuntime.waitForIdle();
+    assert.equal((await active.services.baseConversations.getConversation(created.conversation.id)).summary.title, "我自己取的标题");
+    const events = await active.services.broker.replay(`conversations:${active.actor.actorId}`);
+    assert.equal(events.events.length, 0);
+  } finally { gate.resolve(); }
+});
+
+test("仅返回思考而没有标题正文时记录可诊断的失败", async (t) => {
+  const active = await titleRuntime(t, async () => ({ content: "\n\n", reasoning: "Thinking only", toolCalls: [], usage: {} }));
+  const created = await active.create("周末读什么书好");
+  await active.services.interactions.waitFor(created.response.runId);
+  await active.services.taskRuntime.waitForIdle();
+  const detail = await active.services.baseConversations.getConversation(created.conversation.id);
+  assert.equal(detail.summary.title, "周末读什么书好");
+  const audit = await active.services.audit.list();
+  assert.equal(audit.items.find((event) => event.action === "conversation.title.generate").metadata.code, "CONVERSATION_TITLE_GENERATION_EMPTY");
 });

@@ -194,6 +194,8 @@ export function AgentControl({
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
+  const [selectingAgentId, setSelectingAgentId] = useState<string | null>(null);
+  const [selectionError, setSelectionError] = useState<{ agentId: string; message: string } | null>(null);
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
   const [anchor, setAnchor] = useState<MenuAnchor | null>(null);
   const [page, setPage] = useState<MenuPage>("root");
@@ -511,23 +513,39 @@ export function AgentControl({
     : page === "config"
       ? initialConfigLoading || initialConfigFailed ? 174 : 18 + 43 + (configAgent ? 108 : 0) + nativeFields.length * 52 + (configAgent?.status === "ready" ? (context.status === "unavailable" ? 139 : 112) + (configMutationError ? 42 : 0) : 0) + (configAgent?.managed && configAgent.status === "ready" ? 38 : 0)
       : modelMenuHeight;
-  const menuHeight = typeof window === "undefined"
+  const viewportGap = 14;
+  const anchoredOnMobile = triggerVariant === "toolbar" && typeof window !== "undefined" && window.innerWidth <= 719;
+  const roomBelow = anchor && typeof window !== "undefined" ? window.innerHeight - anchor.bottom - viewportGap : 0;
+  const menuHeight = anchoredOnMobile && anchor
+    ? Math.min(calculatedMenuHeight, Math.max(0, roomBelow - 8))
+    : typeof window === "undefined"
     ? calculatedMenuHeight
     : Math.min(calculatedMenuHeight, Math.max(220, window.innerHeight - 28));
   const pageStyle = { "--agent-menu-height": `${menuHeight}px` } as CSSProperties;
   const desiredMenuWidth = page === "config" ? 400 : 360;
   const menuWidth = typeof window === "undefined" ? desiredMenuWidth : Math.min(desiredMenuWidth, window.innerWidth - 28);
-  const viewportGap = 14;
   const menuLeft = anchor && typeof window !== "undefined"
     ? Math.max(viewportGap, Math.min(anchor.right - menuWidth, window.innerWidth - menuWidth - viewportGap))
     : viewportGap;
-  const roomBelow = anchor && typeof window !== "undefined" ? window.innerHeight - anchor.bottom - viewportGap : 0;
   const menuTop = anchor
-    ? roomBelow >= menuHeight + 8 ? anchor.bottom + 8 : Math.max(viewportGap, anchor.top - menuHeight - 8)
+    ? anchoredOnMobile || roomBelow >= menuHeight + 8 ? anchor.bottom + 8 : Math.max(viewportGap, anchor.top - menuHeight - 8)
     : viewportGap;
   const portalStyle = { top: menuTop, left: menuLeft, width: menuWidth } as CSSProperties;
+  const selectAgent = async (agent: AgentSummary) => {
+    if (selectingAgentId || disabled || agent.agentId === selectedAgentId) return;
+    setSelectingAgentId(agent.agentId);
+    setSelectionError(null);
+    try {
+      await onSelect(agent.agentId);
+      setOpen(false);
+    } catch (reason) {
+      setSelectionError({ agentId: agent.agentId, message: errorText(reason, "Agent 检查失败") });
+    } finally {
+      setSelectingAgentId(null);
+    }
+  };
   return <div className={styles.root} ref={root}>
-    <button ref={trigger} className={`${styles.trigger} ${triggerVariant === "setup" ? styles.setupTrigger : ""} ${setupConfigured ? styles.setupReady : ""} ${installingAgent ? styles.setupInstalling : ""}`} disabled={disabled} aria-expanded={open} onClick={() => {
+    <button ref={trigger} className={`${styles.trigger} ${triggerVariant === "setup" ? styles.setupTrigger : ""} ${setupConfigured ? styles.setupReady : ""} ${installingAgent ? styles.setupInstalling : ""}`} disabled={disabled} aria-label={triggerVariant === "toolbar" ? `Agent 配置${selected ? `：${selected.displayName}` : ""}` : undefined} title={triggerVariant === "toolbar" ? "Agent 配置" : undefined} aria-expanded={open} onClick={() => {
       if (open) { setOpen(false); setPage("root"); return; }
       setOpen(true);
       if (initialPage === "config" && selected) void openConfig(selected);
@@ -537,7 +555,7 @@ export function AgentControl({
       {triggerVariant === "toolbar" ? loading ? <LoaderCircle className={styles.spin} size={15} /> : selected?.status === "ready" ? <AgentContextRing value={context.status === "ready" ? context.usage.ratio ?? 0 : 0} readable={context.status === "ready" && context.usage.ratio !== null} /> : null : null}
       {triggerVariant === "toolbar" ? <ChevronDown size={13} /> : null}
     </button>
-    {open && portalTarget && anchor ? createPortal(<div className={styles.portal} style={portalStyle}><div className={`${styles.menu} ${styles[page]}`} style={pageStyle}>
+    {open && portalTarget && anchor ? createPortal(<div className={`${styles.portal} ${triggerVariant === "toolbar" ? styles.anchoredPortal : ""}`} style={portalStyle}><div className={`${styles.menu} ${styles[page]}`} style={pageStyle}>
       <div className={styles.track}>
         <section className={`${styles.menuPanel} ${styles.rootPanel}`}>
           <div className={styles.rootList}>
@@ -546,14 +564,15 @@ export function AgentControl({
             const ready = agent.installed && agent.status === "ready";
             const installing = installingAgentId === agent.agentId;
             return <div className={`${styles.rootRow} ${ready && agent.agentId === selectedAgentId ? styles.rootActive : ""}`} key={agent.agentId}>
-              <button className={styles.rootSelect} disabled={!ready || disabled} onClick={() => void onSelect(agent.agentId).then(() => setOpen(false), (reason) => runtime.notify(reason instanceof Error ? reason.message : "Agent 切换失败", "error"))}>
-                <span className={styles.rootIcon}>{agent.agentId === "opencode" ? <Code2 size={16} /> : <Bot size={16} />}</span>
+              <button className={styles.rootSelect} disabled={!ready || disabled || Boolean(selectingAgentId)} onClick={() => void selectAgent(agent)}>
+                <span data-ui-icon="" className={styles.rootIcon}>{agent.agentId === "opencode" ? <Code2 size={16} /> : <Bot size={16} />}</span>
                 <span className={styles.rootIdentity}><strong><span>{agent.displayName}</span>{agent.installed && agent.model ? <em>{agent.model}</em> : agent.installed && !agent.configured ? <em>需要配置api</em> : null}</strong><small>{agent.installed ? "EasyWork已部署" : "未部署"}</small></span>
-                {ready && agent.agentId === selectedAgentId ? <Check size={14} /> : null}
+                {selectingAgentId === agent.agentId ? <LoaderCircle className={styles.spin} size={14} /> : ready && agent.agentId === selectedAgentId ? <Check size={14} /> : null}
               </button>
               {!ready && agent.capabilities.install === "available" && onInstall ? <button className={`${styles.inlineAction} ${installing ? styles.installing : ""}`} aria-label={installing ? `正在安装 ${agent.displayName}` : `安装 ${agent.displayName}`} disabled={Boolean(installingAgentId)} onClick={() => void onInstall(agent.agentId)}>{installing ? <LoaderCircle className={styles.spin} size={13} /> : <><Download size={13} /><span>安装</span></>}</button> : ready ? <span className={styles.rowActions}>{agent.managed ? <button aria-label={`检测 ${agent.displayName} 更新`} title="更新" disabled={deploymentBusy === agent.agentId || updateChecking} onClick={() => void checkUpdate(agent)}><RefreshCw className={deploymentBusy === agent.agentId || updateChecking && updateAgent?.agentId === agent.agentId ? styles.spin : ""} size={14} /></button> : null}<button aria-label={`配置 ${agent.displayName}`} onClick={() => void openConfig(agent)}><ChevronRight size={15} /></button></span> : null}
             </div>;
             })}
+            {selectionError ? <div className={styles.selectionError} role="alert"><X size={14} /><span><strong>无法选择 {agents.find((agent) => agent.agentId === selectionError.agentId)?.displayName || "Agent"}</strong><small>{selectionError.message}</small></span></div> : null}
             {onManualAdd ? <button className={styles.rootManual} onClick={() => { setOpen(false); onManualAdd(); }}><Plus size={14} />手动添加</button> : null}
           </div>
         </section>
@@ -565,7 +584,7 @@ export function AgentControl({
           {configAgent && ["opencode", "codex", "claude-code"].includes(configAgent.agentId) ? <button className={styles.option} disabled={Boolean(resolvedConfig && !resolvedConfig.writable)} onClick={() => void openModels()}><Bot size={16} /><span className={styles.optionCopy}><span>选择模型</span><small title={resolvedConfig?.values.model || ""}>{resolvedConfig?.values.model || "尚未选择"}</small></span><ChevronRight size={15} /></button> : null}
           {nativeFields.map((field) => <label className={styles.nativeSetting} key={field.key}><span>{field.label}</span>{field.type === "enum" ? <span className={styles.selectControl}><select disabled={!resolvedConfig?.writable || configBusy} value={resolvedConfig?.values[field.key] || field.options?.[0]?.value || ""} onChange={(event) => void changeField(field.key, event.target.value)}>{field.options?.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select><ChevronDown aria-hidden="true" size={14} /></span> : <input disabled={!resolvedConfig?.writable || configBusy} value={resolvedConfig?.values[field.key] || ""} onChange={(event) => setConfig((current) => current ? { ...current, values: { ...current.values, [field.key]: event.target.value } } : current)} onBlur={(event) => void changeField(field.key, event.target.value)} />}</label>)}
           {configAgent?.status === "ready" ? <div className={styles.contextControls}>
-            <div className={styles.usageRow}><i><b style={{ width: `${context.status === "ready" && context.usage.ratio !== null ? context.usage.ratio * 100 : 0}%` }} /></i><strong>{context.status === "ready" ? `${formatTokens(context.usage.used)} / ${context.usage.limit === null ? "上限未知" : formatTokens(context.usage.limit)}` : context.status === "loading" ? "正在读取实时用量" : "暂时没有实时用量"}</strong></div>
+            <div className={styles.usageRow}><i data-ui-icon=""><b style={{ width: `${context.status === "ready" && context.usage.ratio !== null ? context.usage.ratio * 100 : 0}%` }} /></i><strong>{context.status === "ready" ? `${formatTokens(context.usage.used)} / ${context.usage.limit === null ? "上限未知" : formatTokens(context.usage.limit)}` : context.status === "loading" ? "正在读取实时用量" : "暂时没有实时用量"}</strong></div>
             {context.status === "unavailable" ? <p className={styles.contextReason}>{context.reason}</p> : null}
             <div className={styles.contextActions}><span className={styles.contextLimitGroup}><small>{contextLimitField?.label || "上下文容量"}</small><span className={styles.limitControl}><input type="text" inputMode="numeric" disabled={!contextLimitField || !resolvedConfig?.writable || configBusy} value={contextLimitDraft} aria-label={contextLimitField?.label || "上下文容量"} placeholder={contextLimitField ? "输入 Token 数" : "原生配置自行管理"} onChange={(event) => { setContextLimitDraft(event.target.value); setConfigMutationError(null); }} /><button type="button" aria-label={`保存${contextLimitField?.label || "上下文容量"}`} disabled={!resolvedConfig?.writable || configBusy || !contextLimitChanged} onClick={() => void changeField("contextLimit", contextLimitDraft)}>{configSaving ? <LoaderCircle className={styles.spin} size={13} /> : <Save size={13} />}</button></span></span><button disabled={!contextBindingId || !operationAvailable(configAgent, "compact") || compacting} onClick={() => void compact()}>{compacting ? <LoaderCircle className={styles.spin} size={13} /> : <Database size={13} />}压缩</button></div>
             {configMutationError ? <p className={styles.operationError} role="alert">{configMutationError}</p> : null}

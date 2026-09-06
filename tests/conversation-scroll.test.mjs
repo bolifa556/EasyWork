@@ -6,13 +6,13 @@ function fixture(t, saved) {
   const original = Object.fromEntries(["ResizeObserver", "requestAnimationFrame", "cancelAnimationFrame"].map((name) => [name, globalThis[name]]));
   const frames = new Map();
   let frameId = 0;
-  let observer;
+  const observers = [];
   globalThis.requestAnimationFrame = (callback) => { frames.set(++frameId, callback); return frameId; };
   globalThis.cancelAnimationFrame = (id) => frames.delete(id);
   globalThis.ResizeObserver = class {
     targets = [];
     disconnected = false;
-    constructor(callback) { this.callback = callback; observer = this; }
+    constructor(callback) { this.callback = callback; observers.push(this); }
     observe(target) { this.targets.push(target); }
     disconnect() { this.disconnected = true; }
   };
@@ -23,9 +23,10 @@ function fixture(t, saved) {
     addEventListener(type, callback) { listeners.set(type, callback); },
     removeEventListener(type) { listeners.delete(type); },
   };
-  const content = {};
+  const content = { style: { minHeight: "" }, contains: (node) => node?.disclosure === true };
   const positions = [];
   const cleanup = followConversationScroll(viewport, content, saved, (position) => positions.push(position));
+  const observer = observers.at(-1);
   t.after(() => { cleanup(); Object.assign(globalThis, original); });
   return {
     viewport, content, observer, frames, listeners, positions, cleanup,
@@ -141,6 +142,30 @@ test("上次停在底部的对话重新进入后继续跟随新增内容", (t) =
   assert.equal(f.viewport.scrollTop, 1100);
 });
 
+test("手动展开固定栏目位置，延迟详情增高也不会把栏目推走", (t) => {
+  const f = fixture(t);
+  const heading = { disclosure: true };
+  f.emit("click", { target: { closest: () => heading } });
+  assert.equal(f.content.style.minHeight, "1000px");
+  f.viewport.scrollHeight = 1800;
+  f.resize();
+  f.flush();
+  assert.equal(f.viewport.scrollTop, 600);
+  assert.equal(f.positions.at(-1).following, false);
+  f.viewport.scrollHeight = 2100;
+  f.resize();
+  f.flush();
+  assert.equal(f.viewport.scrollTop, 600);
+  f.emit("wheel", { deltaY: 200 });
+  assert.equal(f.content.style.minHeight, "");
+  f.viewport.scrollTop = 1700;
+  f.emit("scroll");
+  f.viewport.scrollHeight = 2400;
+  f.resize();
+  f.flush();
+  assert.equal(f.viewport.scrollTop, 2000);
+});
+
 test("离开对话时取消帧、尺寸监听和滚动事件", (t) => {
   const f = fixture(t);
   f.resize();
@@ -148,4 +173,33 @@ test("离开对话时取消帧、尺寸监听和滚动事件", (t) => {
   assert.equal(f.frames.size, 0);
   assert.equal(f.observer.disconnected, true);
   assert.equal(f.listeners.size, 0);
+});
+
+for (const gesture of ["wheel", "touch-or-scrollbar"]) test(`${gesture} 在底部只向上移动 12px 也能暂停跟随，向下返回才恢复`, (t) => {
+  const f = fixture(t);
+  if (gesture === "wheel") f.emit("wheel", { deltaY: -12 });
+  f.viewport.scrollTop = 588;
+  f.emit("scroll");
+  assert.equal(f.positions.at(-1).following, false);
+  f.viewport.scrollHeight = 1020;
+  f.resize(); f.flush();
+  assert.equal(f.viewport.scrollTop, 588);
+  f.emit("scroll");
+  assert.equal(f.positions.at(-1).following, false, "布局事件不重新开启跟随");
+  f.viewport.scrollTop = 600;
+  f.emit("scroll");
+  f.viewport.scrollHeight = 1120;
+  f.resize(); f.flush();
+  assert.equal(f.viewport.scrollTop, 720);
+});
+
+test("自动收纳使浏览器收缩滚动范围时仍然跟随下一段输出", (t) => {
+  const f = fixture(t);
+  f.viewport.scrollHeight = 700;
+  f.viewport.scrollTop = 300;
+  f.resize(); f.emit("scroll"); f.flush();
+  assert.equal(f.positions.at(-1).following, true);
+  f.viewport.scrollHeight = 1200;
+  f.resize(); f.flush();
+  assert.equal(f.viewport.scrollTop, 800);
 });

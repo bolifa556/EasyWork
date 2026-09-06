@@ -123,7 +123,7 @@ function filtersFrom(input) {
 function summaryMatches(summary, filters) {
   return (
     (filters.taskId === null || summary.taskId === filters.taskId)
-    && (filters.conversationId === null || summary.conversationId === filters.conversationId)
+    && (filters.conversationId === null || summary.conversationId === filters.conversationId || filters.inheritedTaskIds?.includes(summary.taskId))
     && (filters.projectId === null || summary.projectId === filters.projectId)
     && (filters.workspaceId === null || summary.workspaceId === filters.workspaceId)
     && filters.lifecycle.includes(summary.lifecycle)
@@ -170,6 +170,7 @@ export class ArtifactService {
     this.maxInlineBytes = Number(options.maxInlineBytes ?? 1024 * 1024);
     this.defaultRetentionMs = Number(options.defaultRetentionMs ?? DEFAULT_RETENTION_MS);
     this.maxListLimit = Number(options.maxListLimit ?? 100);
+    this.conversationTaskIds = options.conversationTaskIds || null;
     invariant(Number.isSafeInteger(this.maxInlineBytes) && this.maxInlineBytes > 0, "ARTIFACT_INLINE_LIMIT_INVALID", "Artifact 内联大小限制无效", { status: 500, expose: false });
     invariant(Number.isSafeInteger(this.defaultRetentionMs) && this.defaultRetentionMs > 0, "ARTIFACT_RETENTION_INVALID", "Artifact 保留时间无效", { status: 500, expose: false });
     invariant(Number.isSafeInteger(this.maxListLimit) && this.maxListLimit >= 1 && this.maxListLimit <= 1000, "ARTIFACT_LIST_LIMIT_INVALID", "Artifact 列表上限无效", { status: 500, expose: false });
@@ -435,11 +436,18 @@ export class ArtifactService {
     return clone(redactSensitive(publicArtifactDetail(record)));
   }
 
+  async getSourceServerIdentity(input) {
+    assertAllowedKeys(input, ["artifactId"], "getSourceServerIdentity");
+    const record = await this.#readRecord(input.artifactId);
+    return versionFor(record, record.activeVersionId).locator.serverIdentity;
+  }
+
   async list(input = {}) {
     assertAllowedKeys(input, ["cursor", "limit", "taskId", "conversationId", "projectId", "workspaceId", "lifecycle"], "list");
     const limit = Number(input.limit ?? 20);
     invariant(Number.isSafeInteger(limit) && limit >= 1 && limit <= this.maxListLimit, "ARTIFACT_LIST_LIMIT_INVALID", "Artifact 列表 limit 无效", { status: 400, details: { max: this.maxListLimit } });
     const filters = filtersFrom(input);
+    if (filters.conversationId && this.conversationTaskIds) filters.inheritedTaskIds = [...new Set(await this.conversationTaskIds(filters.conversationId))].sort();
     const root = await this.storage.readIndexRoot();
     let offset = 0;
     if (input.cursor) {
@@ -644,6 +652,8 @@ export class ArtifactService {
           serverIdentity: locator.serverIdentity,
           canonicalPath: locator.remotePath,
           range: normalizedRange,
+          expectedSize: version.size,
+          expectedSha256: version.sha256,
         });
       } catch (error) {
         throw new ApiError("ARTIFACT_REMOTE_STREAM_FAILED", "无法读取远端 Artifact", { status: 502, cause: error });

@@ -9,28 +9,9 @@ const GENERIC_COMPUTE_IDENTIFIERS = new Set([
 ]);
 const SERVER_KINDS = new Set(["all", "compute", "standard"]);
 const SKILL_MODES = new Set(["all", "chat", "work"]);
-const REMOTE_DOWNLOAD_SKILL_IDS = new Set(["skill_remote_download", "remote-download"]);
-const REMOTE_DOWNLOAD_REQUEST_PATTERN = /(?:下载|导出|交付|传给我|发给我|给我(?:一个|一份|这些|该|这个)?(?:文件|压缩包)|提供.{0,12}(?:文件|压缩包|下载)|\bdownload\b|\bexport\b|\bdeliver\b|\battach(?:ment)?\b)/iu;
 const CHAT_ONLY_SKILL_PATTERN = /(?:仅|只)?适用于\s*(?:chat|聊天)(?:\s*模式)?(?:\s*对话)?|(?:chat|聊天)[\s_-]*only/iu;
 const WORK_ONLY_SKILL_PATTERN = /(?:仅|只)?适用于\s*(?:work|工作)(?:\s*模式)?(?:\s*对话)?|(?:work|工作)[\s_-]*only/iu;
-const EXPLICIT_REQUEST_ONLY_PATTERN = /\b(?:use|apply)\s+only\s+when\b[\s\S]{0,80}\bexplicit(?:ly)?\b|\bonly\s+when\s+(?:the\s+)?user\s+explicit(?:ly)?\b|(?:仅当|只有|只在)用户明确(?:询问|要求|请求|提及)/iu;
 export const DEFAULT_SKILL_APPLICABILITY = Object.freeze({ mode: "all", serverKind: "all", allowServers: Object.freeze([]), denyServers: Object.freeze([]), forceEnabled: false });
-
-function explicitRequestPhrases(value) {
-  const text = String(value || "").normalize("NFKC");
-  const phrases = [];
-  for (const match of text.matchAll(/["“”']([^"“”'\r\n]{2,96})["“”']/gu)) phrases.push(match[1]);
-  for (const match of text.matchAll(/\brequests?\s+(?:the\s+)?([^.;\r\n]{3,96})/giu)) phrases.push(match[1]);
-  return [...new Set(phrases.map((entry) => entry.trim()).filter(Boolean))];
-}
-
-function explicitRequestOnlySkillIsNamed(skillText, skillName, request) {
-  if (!EXPLICIT_REQUEST_ONLY_PATTERN.test(skillText)) return true;
-  const normalizedRequest = String(request || "").normalize("NFKC").toLocaleLowerCase("zh-CN");
-  const normalizedName = String(skillName || "").normalize("NFKC").trim().toLocaleLowerCase("zh-CN");
-  if (normalizedName && normalizedRequest.includes(normalizedName)) return true;
-  return explicitRequestPhrases(skillText).some((phrase) => normalizedRequest.includes(phrase.toLocaleLowerCase("zh-CN")));
-}
 
 function serverRules(value, field) {
   invariant(Array.isArray(value) && value.length <= 128, "SKILL_APPLICABILITY_INVALID", `${field} 无效`, { status: 400 });
@@ -156,16 +137,10 @@ export function isAutomaticSkillApplicable({ skill, server = {}, serverName = ""
   return explicitlyNamesServer(skillText, currentServerText);
 }
 
-export function isAutomaticSkillRelevantToRequest({ skill, request = "", mode = "work" } = {}) {
-  const normalizedMode = String(mode || "work").trim().toLocaleLowerCase("en-US");
-  if (!isSkillApplicableToMode({ skill, mode: normalizedMode })) return false;
-  const skillText = [skill?.name, skill?.description].filter(Boolean).join("\n").normalize("NFKC");
-  const skillId = String(skill?.skillId || skill?.id || "").trim().toLocaleLowerCase("en-US");
-  const skillName = String(skill?.name || "").normalize("NFKC").trim();
-  if (!explicitRequestOnlySkillIsNamed(skillText, skillName, request)) return false;
-  const isRemoteDownload = REMOTE_DOWNLOAD_SKILL_IDS.has(skillId) || skillName === "远程文件下载";
-  if (!isRemoteDownload) return true;
-  return REMOTE_DOWNLOAD_REQUEST_PATTERN.test(String(request || "").normalize("NFKC"));
+export function isAutomaticSkillRelevantToRequest({ skill, mode = "work" } = {}) {
+  // Visibility is a scope decision. Semantic selection belongs to the Web
+  // Agent, which can also see the preceding user turns and negations.
+  return isSkillApplicableToMode({ skill, mode: String(mode || "work").trim().toLocaleLowerCase("en-US") });
 }
 
 export function filterEligibleSkillObservations(fragments, eligibleSkillIds = []) {

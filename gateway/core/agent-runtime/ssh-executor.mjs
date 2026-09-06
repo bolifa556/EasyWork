@@ -418,8 +418,9 @@ class SshProcessHandle {
     return promise;
   }
 
-  requestJsonRpc(method, params = {}) {
+  requestJsonRpc(method, params = {}, timeoutMs = JSON_RPC_TIMEOUT_MS) {
     invariant(!this.closed, "AGENT_PROCESS_CLOSED", "Agent 进程已退出", { status: 409 });
+    invariant(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= JSON_RPC_TIMEOUT_MS, "AGENT_RPC_TIMEOUT_INVALID", "Agent RPC 超时时间无效", { status: 500, expose: false });
     this.rpcSequence += 1;
     const id = this.rpcSequence;
     const promise = new Promise((resolve, reject) => {
@@ -428,9 +429,9 @@ class SshProcessHandle {
         reject(new ApiError("AGENT_RPC_TIMEOUT", `Agent RPC ${method} 超时`, {
           status: 504,
           retryable: true,
-          details: { method, timeoutMs: JSON_RPC_TIMEOUT_MS },
+          details: { method, timeoutMs },
         }));
-      }, JSON_RPC_TIMEOUT_MS);
+      }, timeoutMs);
       timer.unref?.();
       this.pendingRpc.set(String(id), { resolve, reject, timer });
     });
@@ -705,7 +706,39 @@ export class SshAgentExecutor {
   async requestHttp(request) {
     const host = request.host || "127.0.0.1";
     invariant(["127.0.0.1", "::1", "localhost"].includes(host), "AGENT_HTTP_HOST_FORBIDDEN", "Agent HTTP 服务必须绑定远端 loopback", { status: 400 });
-    const stream = await this.session.forwardOut({ destinationHost: host, destinationPort: request.port });
+    const requestedTimeout = request.timeoutMs == null ? HTTP_TIMEOUT_MS : Number(request.timeoutMs);
+    const timeoutLimit = request.waitForTurn === true && /^\/session\/[^/]+\/command(?:\?|$)/.test(request.path || "") ? 12 * 60 * 60 * 1000 : HTTP_TIMEOUT_MS;
+    invariant(Number.isSafeInteger(requestedTimeout) && requestedTimeout >= 250 && requestedTimeout <= timeoutLimit, "AGENT_HTTP_TIMEOUT_INVALID", "Agent HTTP 请求超时时间无效", { status: 500, expose: false });
+    const startedAt = Date.now();
+    let openTimedOut = false;
+    let openTimer = null;
+    const opening = Promise.resolve().then(() => this.session.forwardOut({ destinationHost: host, destinationPort: request.port }));
+    const stream = await Promise.race([
+      opening.then((opened) => {
+        if (openTimedOut) {
+          opened?.destroy?.();
+          opened?.end?.();
+          throw new ApiError("AGENT_HTTP_REQUEST_TIMEOUT", "Agent HTTP 请求超时", {
+            status: 504,
+            retryable: true,
+            details: { port: request.port, path: request.path || "/", timeoutMs: requestedTimeout },
+          });
+        }
+        return opened;
+      }),
+      new Promise((_, reject) => {
+        openTimer = setTimeout(() => {
+          openTimedOut = true;
+          reject(new ApiError("AGENT_HTTP_REQUEST_TIMEOUT", "Agent HTTP 请求超时", {
+            status: 504,
+            retryable: true,
+            details: { port: request.port, path: request.path || "/", timeoutMs: requestedTimeout },
+          }));
+        }, requestedTimeout);
+        openTimer.unref?.();
+      }),
+    ]).finally(() => clearTimeout(openTimer));
+    const responseTimeout = Math.max(1, requestedTimeout - (Date.now() - startedAt));
     let responseBuffer = Buffer.alloc(0);
     const response = new Promise((resolve, reject) => {
       let settled = false;
@@ -714,9 +747,9 @@ export class SshAgentExecutor {
         finish(null, new ApiError("AGENT_HTTP_REQUEST_TIMEOUT", "Agent HTTP 请求超时", {
           status: 504,
           retryable: true,
-          details: { port: request.port, path: request.path || "/" },
+          details: { port: request.port, path: request.path || "/", timeoutMs: requestedTimeout },
         }));
-      }, HTTP_TIMEOUT_MS);
+      }, responseTimeout);
       const finish = (value, error = null) => {
         if (settled) return;
         settled = true;

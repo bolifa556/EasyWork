@@ -21,6 +21,7 @@ function memoryRemote() {
     mode: directories.has(candidate) ? 0o040700 : symlinks.has(candidate) ? 0o120777 : 0o100600,
     isDirectory: () => directories.has(candidate),
     isSymbolicLink: () => symlinks.has(candidate),
+    isFile: () => files.has(candidate),
   });
   const children = (directory) => {
     const prefix = directory === "/" ? "/" : `${directory}/`;

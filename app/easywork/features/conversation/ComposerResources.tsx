@@ -121,9 +121,9 @@ export function ComposerResources({ value, disabled, onChange }: {
     {open ? <div className={`${styles.menu} ${styles[direction]} ${styles[`show${page[0].toUpperCase()}${page.slice(1)}`]}`} style={menuStyle}>
       <div className={styles.pages}>
         <div className={styles.page} aria-hidden={page !== "root"}>
-          <button type="button" onClick={() => fileInput.current?.click()}><span className={styles.menuIcon}><Paperclip size={17} /></span><span>上传文件</span></button>
-          <button type="button" onClick={() => void showSkills()}><span className={styles.menuIcon}><Sparkles size={17} /></span><span>选择技能</span><ChevronRight size={16} /></button>
-          <button type="button" onClick={() => void showCollections()}><span className={styles.menuIcon}><Library size={17} /></span><span>选择文件集</span><ChevronRight size={16} /></button>
+          <button type="button" onClick={() => fileInput.current?.click()}><span data-ui-icon="" className={styles.menuIcon}><Paperclip size={17} /></span><span>上传文件</span></button>
+          <button type="button" onClick={() => void showSkills()}><span data-ui-icon="" className={styles.menuIcon}><Sparkles size={17} /></span><span>选择技能</span><ChevronRight size={16} /></button>
+          <button type="button" onClick={() => void showCollections()}><span data-ui-icon="" className={styles.menuIcon}><Library size={17} /></span><span>选择文件集</span><ChevronRight size={16} /></button>
         </div>
         <div className={styles.page} aria-hidden={page !== "skills"}>
           <button type="button" className={styles.pageBack} aria-label="返回" onClick={() => setPage("root")}><ChevronLeft size={16} /><span>返回</span></button>
@@ -131,7 +131,7 @@ export function ComposerResources({ value, disabled, onChange }: {
             const pin = activePin(registry);
             const selected = value.skills.some((item) => item.skillId === registry.skillId);
             return <button type="button" key={registry.skillId} disabled={!pin} className={selected ? styles.selected : ""} onClick={() => toggleSkill(registry)}>
-              <span className={styles.menuIcon}><Sparkles size={16} /></span>
+              <span data-ui-icon="" className={styles.menuIcon}><Sparkles size={16} /></span>
               <span className={styles.optionCopy}><strong>{registry.displayName}</strong>{registry.description ? <small>{registry.description}</small> : null}</span>
               <span className={styles.optionCheck}>{selected ? <Check size={14} /> : null}</span>
             </button>;
@@ -142,7 +142,7 @@ export function ComposerResources({ value, disabled, onChange }: {
           <div className={styles.options}>{loading && page === "collections" ? <p>正在读取…</p> : collections.map((collection) => {
             const selected = value.collections.some((item) => item.id === collection.id);
             return <button type="button" key={collection.id} className={selected ? styles.selected : ""} onClick={() => toggleCollection(collection)}>
-              <span className={styles.menuIcon}><Folder size={16} /></span>
+              <span data-ui-icon="" className={styles.menuIcon}><Folder size={16} /></span>
               <span className={styles.optionCopy}><strong>{collection.name}</strong></span>
               <span className={styles.optionCheck}>{selected ? <Check size={14} /> : null}</span>
             </button>;

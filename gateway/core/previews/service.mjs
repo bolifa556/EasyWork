@@ -403,7 +403,13 @@ export class PreviewService {
     const result = session.source.kind === "host"
       ? await provider.openReadStream({ actor: this.#actor, sourceId: session.source.sourceId, handle: session.privateInspection.handle, range })
       : await provider.openReadStream({ actor: this.#actor, ...session.privateInspection, range });
-    return asReadable(result);
+    const stream = asReadable(result);
+    if (session.released || Date.parse(session.expiresAt) <= Date.parse(nowIso(this.#clock))) {
+      stream.destroy();
+      invariant(false, "PREVIEW_EXPIRED", "Preview 已关闭或过期", { status: 410 });
+    }
+    this.#trackStream(session, stream);
+    return stream;
   }
 
   async #openText(session) {

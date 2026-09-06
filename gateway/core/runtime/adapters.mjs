@@ -53,6 +53,27 @@ export class DynamicEmbeddingAdapter {
 
   async embed(input) { return (await this.#adapter()).embed(input); }
   async search(input) { return (await this.#adapter()).search(input); }
+  async embedTexts(inputs) { return (await this.#adapter()).embedTexts(inputs); }
+
+  async memoryConfiguration() {
+    const provider = await this.platform.publicProvider("embedding");
+    const memory = provider.embedding?.memory || {};
+    return Object.freeze({
+      configured: Boolean(provider.configured),
+      embeddingProfileId: provider.memoryEmbeddingProfileId || null,
+      retrievalProfileId: provider.memoryRetrievalProfileId || null,
+      enabled: memory.enabled !== false,
+      vectorWeight: Number(memory.vectorWeight ?? 0.55),
+      lexicalWeight: Number(memory.lexicalWeight ?? 0.15),
+      titleWeight: Number(memory.titleWeight ?? 0.3),
+      minimumScore: Number(memory.minimumScore ?? 0.12),
+      diversityLambda: Number(memory.diversityLambda ?? 0.72),
+      recallLimit: Number(memory.recallLimit ?? 48),
+      resultLimit: Number(memory.resultLimit ?? 8),
+      tokenBudget: Number(memory.tokenBudget ?? 3200),
+      pageSize: Number(memory.pageSize ?? 20),
+    });
+  }
 }
 
 export class DynamicOcrAdapter {

@@ -8,9 +8,10 @@ const WEB_TOOL_NAMES = Object.freeze([
   "resource_search",
   "resource_read",
   "conversation_search",
+  "conversation_reference_read",
   "skill_search",
   "skill_list",
-  "context_get_state",
+  "handoff_rewrite_candidate",
   "handoff_submit",
 ]);
 const MEMORY_LEVELS = Object.freeze(["user", "project", "conversation"]);
@@ -25,9 +26,8 @@ export function renderPromptTemplate(template, variables = {}) {
   for (const name of expected) {
     invariant(Object.hasOwn(variables, name), "PROMPT_VARIABLE_REQUIRED", `Prompt 缺少变量 ${name}`, { status: 500, expose: false });
   }
-  const rendered = source.replace(/\{\{([A-Z][A-Z0-9_]*)\}\}/g, (_match, name) => promptValue(variables[name]));
-  invariant(!/\{\{[A-Z][A-Z0-9_]*\}\}/.test(rendered), "PROMPT_VARIABLE_UNRESOLVED", "Prompt 存在未解析变量", { status: 500, expose: false });
-  return rendered;
+  // Substituted values are data, even when they contain template syntax.
+  return source.replace(/\{\{([A-Z][A-Z0-9_]*)\}\}/g, (_match, name) => promptValue(variables[name]));
 }
 
 export class PromptRepository {
@@ -125,6 +125,17 @@ export class PromptRepository {
 
   async resourceImageContext(filename) {
     return (await this.#render(["web", "resource-image.md"], { FILENAME: promptValue(filename).replace(/\s+/g, " ").trim().slice(0, 260) })).trim();
+  }
+
+  async conversationReferenceCatalog(entries = []) {
+    const config = await this.#json("web", "conversation-references.json");
+    invariant(["document", "item", "separator"].every((key) => typeof config[key] === "string"), "CONVERSATION_REFERENCE_PROMPT_INVALID", "对话引用 Prompt 不完整", { status: 500, expose: false });
+    const inline = (value, maximum) => promptValue(value).replace(/\s+/g, " ").trim().slice(0, maximum);
+    const items = (Array.isArray(entries) ? entries : []).map((entry) => renderPromptTemplate(config.item, {
+      REFERENCE_ID: inline(entry?.referenceId, 80),
+      TITLE: inline(entry?.title, 240),
+    }));
+    return items.length ? renderPromptTemplate(config.document, { ITEMS: items.join(config.separator) }).trim() : "";
   }
 
   async webTools() {
@@ -286,15 +297,31 @@ export class PromptRepository {
     const request = promptValue(goal).replace(/\r\n/g, "\n").trim();
     const currentUserLine = await this.conversationMessage("user", request);
     const sections = [];
+    const history = [];
     const seen = new Set();
     for (const entry of delivery?.entries || []) {
       if (entry?.content?.format === "json" || entry?.kind === "task" || entry?.source?.type === "task") continue;
       const value = promptValue(entry?.content?.value).trim();
+      if (entry?.source?.type === "conversation") {
+        // Equal text in different historical turns is still distinct history,
+        // including a previous user message identical to the current request.
+        if (value) history.push(value);
+        continue;
+      }
       if (!value || value === request || value === currentUserLine || seen.has(value)) continue;
       seen.add(value);
       sections.push(value);
     }
-    return [...sections, request].filter(Boolean).join(layout.remoteDeliverySeparator);
+    if (!sections.length && !history.length) return request;
+    const [contextText, historyText] = await Promise.all([
+      sections.length ? this.#render(["context", "remote-retrieved.md"], { CONTEXT: sections.join(layout.remoteDeliverySeparator) }) : "",
+      history.length ? this.#render(["context", "remote-history.md"], { HISTORY: history.join(layout.remoteDeliverySeparator) }) : "",
+    ]);
+    return (await this.#render(["context", "remote-delivery.md"], {
+      CONTEXT: contextText.trim(),
+      HISTORY: historyText.trim(),
+      USER_MESSAGE: request,
+    })).trim();
   }
 
 }

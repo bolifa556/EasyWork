@@ -1,0 +1,29 @@
+.trigger {
+  justify-self: end;
+  gap: 6px;
+  min-width: 68px;
+  border-color: rgba(73, 76, 66, 0.09);
+  background: rgba(255, 255, 255, 0.36);
+  color: var(--ew-ink-muted);
+}
+
+.trigger:hover:not(:disabled),
+.trigger:focus-visible {
+  border-color: rgba(173, 68, 61, 0.2);
+  background: var(--ew-red-soft);
+  color: var(--ew-red);
+  transform: none;
+}
+
+.trigger:focus-visible { outline: 2px solid rgba(173, 68, 61, 0.3); outline-offset: 2px; }
+.backdrop.backdrop { align-items: center; padding: 20px; }
+.confirmPanel.confirmPanel { width: min(340px, calc(100vw - 40px)); max-height: calc(100dvh - 40px); border-radius: 18px; }
+.confirmPanel > header { min-height: 0; justify-content: center; padding: 24px 24px 0; border-bottom: 0; text-align: center; }
+.confirmBody.confirmBody { padding: 22px 24px 24px; }
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.spin { animation: spin 900ms linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 900px) {
+  .trigger { grid-column: 2; grid-row: 3; align-self: center; }
+}

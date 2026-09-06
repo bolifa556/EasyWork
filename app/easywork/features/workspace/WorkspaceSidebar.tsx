@@ -1,5 +1,7 @@
 "use client";
 
+import { canPreviewFile } from "@/shared/file-preview.mjs";
+
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -35,6 +37,7 @@ import type { WorkspaceSidebarSession } from "../../runtime/AppRuntime";
 import { useAppRuntime } from "../../runtime/AppRuntime";
 import { Button } from "../../ui/Button";
 import { Modal } from "../../ui/Modal";
+import { useMobileMenuAnchor } from "../../ui/useMobileMenuAnchor";
 import type { RemoteEntry } from "../workbench/types";
 import styles from "./WorkspaceSidebar.module.css";
 import { WORKSPACE_FILES_CHANGED_EVENT, workspaceFilesRevision, type WorkspaceFilesChangedDetail } from "./workspaceFileEvents";
@@ -43,7 +46,7 @@ const WorkspaceVersionView = lazy(() => import("./WorkspaceVersionView"));
 
 type DirectorySnapshot = { path: string; items: RemoteEntry[] };
 type ClipboardEntry = { mode: "cut" | "copy"; entry: RemoteEntry };
-type ContextTarget = { entry: RemoteEntry | null; left: number; top: number };
+type ContextTarget = { entry: RemoteEntry | null; left: number; top: number; anchor: HTMLElement | null };
 type InlineAction = {
   kind: "create-file" | "create-directory" | "rename";
   entry: RemoteEntry | null;
@@ -71,11 +74,6 @@ type UploadConflict = {
 
 const explorerCaches = new Map<string, ExplorerCache>();
 
-const PREVIEW_EXTENSIONS = new Set([
-  "txt", "log", "md", "markdown", "json", "csv", "tsv", "pdf", "png", "jpg", "jpeg", "gif", "webp", "svg",
-  "yaml", "yml", "toml", "ini", "py", "js", "ts", "tsx", "jsx", "css", "html", "sh", "ps1", "r", "cpp", "c",
-  "h", "java", "rs", "go", "sql",
-]);
 
 function joinRelative(parent: string, name: string) {
   return [parent.replace(/\/$/, ""), name.replace(/^\//, "")].filter(Boolean).join("/");
@@ -110,8 +108,7 @@ function absolutePath(root: string, relative: string) {
 
 function canPreview(entry: RemoteEntry) {
   if (entry.kind !== "file" && entry.kind !== "symlink") return false;
-  const extension = entry.name.includes(".") ? entry.name.split(".").at(-1)?.toLocaleLowerCase() || "" : "";
-  return !extension || PREVIEW_EXTENSIONS.has(extension);
+  return canPreviewFile(entry);
 }
 
 function EntryIcon({ entry, open = false }: { entry: RemoteEntry; open?: boolean }) {
@@ -135,6 +132,8 @@ function WorkspaceExplorer({ session, filesRevision }: { session: WorkspaceSideb
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(initialCache?.expanded || [""]));
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(() => new Set(initialCache ? [] : [""]));
   const [context, setContext] = useState<ContextTarget | null>(null);
+  const contextRef = useRef<HTMLDivElement>(null);
+  useMobileMenuAnchor(context?.anchor, contextRef);
   const [clipboard, setClipboard] = useState<ClipboardEntry | null>(null);
   const [action, setAction] = useState<InlineAction | null>(null);
   const [savingAction, setSavingAction] = useState(false);
@@ -384,6 +383,7 @@ function WorkspaceExplorer({ session, filesRevision }: { session: WorkspaceSideb
     const top = event.type === "contextmenu" ? event.clientY : anchor.bottom + 4;
     setContext({
       entry,
+      anchor: event.type !== "contextmenu" && event.currentTarget instanceof HTMLElement ? event.currentTarget : null,
       left: Math.max(8, Math.min(left, window.innerWidth - width - 8)),
       top: Math.max(8, Math.min(top, window.innerHeight - height - 8)),
     });
@@ -521,7 +521,7 @@ function WorkspaceExplorer({ session, filesRevision }: { session: WorkspaceSideb
             title={entry.path}
           >
             <span className={styles.twisty}>{entry.kind === "directory" ? open ? <ChevronDown size={13} /> : <ChevronRight size={13} /> : null}</span>
-            <span className={`${styles.entryIcon} ${entry.kind === "directory" ? styles.folderIcon : ""}`}><EntryIcon entry={entry} open={open} /></span>
+            <span data-ui-icon="" className={`${styles.entryIcon} ${entry.kind === "directory" ? styles.folderIcon : ""}`}><EntryIcon entry={entry} open={open} /></span>
             <span className={styles.entryName}>{entry.name}</span>
           </button>
           <button
@@ -582,7 +582,7 @@ function WorkspaceExplorer({ session, filesRevision }: { session: WorkspaceSideb
         <button title="刷新" aria-label="刷新文件目录" onClick={() => void reloadTree()}><RefreshCw size={14} /></button>
       </div>
     </div>
-    {clipboard ? <div className={styles.clipboardBar}><span>{clipboard.mode === "cut" ? <Scissors size={13} /> : <Copy size={13} />}<b>{clipboard.entry.name}</b></span><button aria-label="清除剪贴板" onClick={() => setClipboard(null)}><X size={13} /></button></div> : null}
+    {clipboard ? <div className={styles.clipboardBar}><span>{clipboard.mode === "cut" ? <Scissors size={13} /> : <Copy size={13} />}<b>{clipboard.entry.name}</b></span><button className={styles.mobileRootPaste} disabled={!canPaste} onClick={() => void pasteInto(null)}><ClipboardPaste size={14} /><span>粘贴到根目录</span></button><button aria-label="清除剪贴板" onClick={() => setClipboard(null)}><X size={13} /></button></div> : null}
     {action ? <form className={styles.inlineAction} onSubmit={(event) => { event.preventDefault(); void submitAction(); }}>
       <span>{action.kind === "create-file" ? <FilePlus2 size={14} /> : action.kind === "create-directory" ? <FolderPlus size={14} /> : <Pencil size={14} />}</span>
       <input ref={inputRef} value={action.value} placeholder={action.kind === "create-file" ? "文件名" : action.kind === "create-directory" ? "文件夹名" : "新名称"} disabled={savingAction} onChange={(event) => setAction((current) => current ? { ...current, value: event.target.value } : current)} onKeyDown={(event) => { if (event.key === "Escape") setAction(null); }} />
@@ -598,37 +598,37 @@ function WorkspaceExplorer({ session, filesRevision }: { session: WorkspaceSideb
     >
       {uploadStatus ? <div className={`${styles.uploadStatus} ${styles[`upload_${uploadStatus.phase}`] || ""}`} role="status" aria-live="polite">
         <div className={styles.uploadStatusLine}>
-          <span className={styles.uploadStatusIcon}>{uploadStatus.phase === "uploading" ? <LoaderCircle className={styles.spin} size={15} /> : uploadStatus.phase === "done" ? <Check size={15} /> : <X size={15} />}</span>
+          <span data-ui-icon="" className={styles.uploadStatusIcon}>{uploadStatus.phase === "uploading" ? <LoaderCircle className={styles.spin} size={15} /> : uploadStatus.phase === "done" ? <Check size={15} /> : <X size={15} />}</span>
           <strong>{uploadStatus.fileName}</strong>
           <b>{uploadStatus.percent}%</b>
         </div>
-        <div className={styles.uploadTrack} aria-hidden="true"><i style={{ width: `${uploadStatus.percent}%` }} /></div>
+        <div data-ui-icon="" className={styles.uploadTrack} aria-hidden="true"><i data-ui-icon="" style={{ width: `${uploadStatus.percent}%` }} /></div>
         <small>{uploadStatus.fileIndex > 0 ? `${uploadStatus.fileIndex}/${uploadStatus.fileCount} · ` : ""}{uploadStatus.detail}</small>
       </div> : null}
       {dropTarget !== null ? <div className={styles.dropHint}><Upload size={16} /><span>松开后上传到</span><strong>{dropTarget ? baseName(dropTarget) : "工作目录根目录"}</strong></div> : null}
       {expanded.has("") ? loadingPaths.has("") && !directories[""] ? <div className={styles.explorerState}><LoaderCircle className={styles.spin} size={17} />正在读取工作目录</div> : directories[""]?.length ? renderEntries("", 0) : <div className={styles.explorerState}><Folder size={18} />当前工作目录为空</div> : null}
     </div>
-    {context && typeof document !== "undefined" ? createPortal(<div className={styles.contextMenu} role="menu" aria-label={contextEntry ? `${contextEntry.name} 操作` : "工作目录操作"} style={{ left: context.left, top: context.top }} onPointerDown={(event) => event.stopPropagation()}>
+    {context && typeof document !== "undefined" ? createPortal(<div ref={contextRef} className={styles.contextMenu} role="menu" aria-label={contextEntry ? `${contextEntry.name} 操作` : "工作目录操作"} style={{ left: context.left, top: context.top }} onPointerDown={(event) => event.stopPropagation()}>
       {contextEntry && contextEntry.kind !== "directory" ? <button disabled={!previewEnabled} onClick={() => previewEnabled && openPreview(contextEntry)}><FileText size={15} />打开预览</button> : contextEntry?.kind === "directory" || !contextEntry ? <>
         <button disabled={!uploadAvailable || uploadStatus?.phase === "uploading"} onClick={() => chooseUploadFiles(contextDirectory?.path || "")}><Upload size={15} />上传文件…</button>
         <button disabled={!session.capabilities.features.remoteFiles.create} onClick={() => begin("create-file", contextDirectory)}><FilePlus2 size={15} />新建文件…</button>
         <button disabled={!session.capabilities.features.remoteFiles.mkdir} onClick={() => begin("create-directory", contextDirectory)}><FolderPlus size={15} />新建文件夹…</button>
       </> : null}
       {contextOperable && contextEntry ? <>
-        <span className={styles.menuSeparator} />
+        <span data-ui-icon="" className={styles.menuSeparator} />
         <button onClick={() => { setClipboard({ mode: "cut", entry: contextEntry }); setContext(null); }}><Scissors size={15} />剪切</button>
         <button onClick={() => { setClipboard({ mode: "copy", entry: contextEntry }); setContext(null); }}><Copy size={15} />复制</button>
       </> : null}
       {!contextEntry || contextEntry.kind === "directory" ? <button disabled={!canPaste} onClick={() => void pasteInto(contextDirectory)}><ClipboardPaste size={15} />粘贴</button> : null}
       {contextEntry && contextEntry.kind !== "directory" ? <>
-        <span className={styles.menuSeparator} />
+        <span data-ui-icon="" className={styles.menuSeparator} />
         <button disabled={!downloadEnabled} onClick={() => downloadEnabled && void download(contextEntry)}><Download size={15} />下载…</button>
       </> : null}
-      <span className={styles.menuSeparator} />
+      <span data-ui-icon="" className={styles.menuSeparator} />
       <button onClick={() => void copyPath(contextEntry)}><Clipboard size={15} />复制路径</button>
       <button onClick={() => void copyPath(contextEntry, true)}><Copy size={15} />复制相对路径</button>
       {contextOperable && contextEntry ? <>
-        <span className={styles.menuSeparator} />
+        <span data-ui-icon="" className={styles.menuSeparator} />
         <button disabled={!session.capabilities.features.remoteFiles.rename} onClick={() => begin("rename", contextEntry)}><Pencil size={15} />重命名…</button>
         <button className={styles.dangerItem} disabled={!session.capabilities.features.remoteFiles.delete} onClick={() => { setPendingDelete(contextEntry); setContext(null); }}><Trash2 size={15} />删除</button>
       </> : null}

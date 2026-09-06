@@ -134,11 +134,13 @@ OpenCode 没有独立上下文用量 RPC；统一 `contextUsage` 从当前 sessi
 
 ## 7. Skill 适配
 
-选中的包先进入服务器级不可变缓存，再在当前 binding 的 `skills/<skill-id>` 下建立符号链接。OpenCode 配置只放行这棵 binding-local Skill 视图。相同服务器上的另一个 OpenCode session 不会因为缓存中存在包而自动看到它。
+选中的包先进入按用户和内容摘要隔离的不可变缓存，再复制到当前 binding 自有的文件代次；`skills/<skill-id>` 只指向这个 binding 自己的副本。OpenCode 配置只放行这棵视图，同一服务器上的其他 session 不会自动看到缓存中的包。分支按所选 Task 的实际文件快照复制技能，父子之后各自持有文件。
 
-网页 Agent 用 Skill 入口判断相关性，OpenCode 从原生 Skill 目录读取内容；普通补充 prompt 不再复制整份 Skill。Context receipt 的 Skill pin 决定同一 session 是否已经确认该版本。
+个人包固定、SSH 上传校验、远端缓存与自有副本的完整目录关系，见[远端文件版本与 Agent 机制](../远端文件版本与Agent机制.md)第 7.1 节；历史技能快照与分支继承见第 9.1 节。`<runtime-config>/opencode/skills` 指向当前 binding 的 `skills`，技能附件通过自有目录保留。
 
-用户显式附加及符合模式、服务器范围的 Work 强制 Skill 由 EasyWork 直接选定，不进入网页模型的检索目录和候选池；最终仍通过上述原生目录部署，按 session 和包版本去重，并显示在网页“发给远端 Agent”的 Skill 引用中。
+网页 Agent 用 Skill 入口判断相关性。当前托管 V1 从本轮所选自有副本读取正文并保留各技能资源基准目录，生成 `skills/easywork-selected/SKILL.md`，用 `$ARGUMENTS` 接收本轮交接正文；此包装不加入历史技能快照。先以 GET `/command?directory=<cwd>` 确认原生命令可发现，再以 POST `/session/:id/command?directory=<cwd>` 传入 `command: "easywork-selected"`、本轮交接正文 `arguments`、model 和 variant，由原生命令展开技能正文。该 HTTP 调用允许持续到原生回合结束，帧流与提交错误一并收敛。已有 V2 会话仍按其固定协议运行，不冒充支持 V1 command。普通补充 prompt 不复制技能正文，pin 只代表部署收据，不代表当前回合已经调用。
+
+用户显式附加及符合模式、服务器范围的 Work 强制 Skill 由 EasyWork 直接选定，不进入网页模型的检索目录和候选池；与网页选中项共用上述原生交付通道。强制项仅在切换远端绑定后的首次提问检查并补齐，后续连续提问复用检查结果；用户显式或网页按需选中的项仍执行本轮原生调用。网页“发给远端 Agent”只显示本轮实际补发或调用的 Skill 引用。
 
 ## 8. 文件写前快照
 
