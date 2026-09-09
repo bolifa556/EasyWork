@@ -17,6 +17,65 @@ const definitions = timeline.statements.filter((node) => ts.isFunctionDeclaratio
 const { classifyConversationOutput } = await importTypeScript(definitions.map((node) => node.getText(timeline)).join("\n"));
 const event = (sequence, kind, payload = {}) => ({ eventId: `event-${sequence}`, sequence, occurredAt: "2026-09-06T00:00:00Z", topic: "conversation:one", producer: "web-agent", ids: { runId: "run-one" }, kind, payload });
 
+test("conversation navigation is idempotent, rejects stale reads and still updates titles, projects and tasks", async () => {
+  const source = ts.createSourceFile("runtime.tsx", await readFile(new URL("../app/easywork/runtime/AppRuntime.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let callback;
+  const visit = (node) => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "updateConversationNavigation") callback = node.initializer.arguments[0].getText(source);
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  const { makeUpdater } = await importTypeScript(`export const makeUpdater = (setBootstrap) => {
+    const window = { location: { pathname: '/c/one', search: '' } };
+    const parseRoute = () => ({ kind: 'conversation', conversationId: 'one' });
+    return (${callback});
+  };`);
+  let snapshot = { runningTasks: [], conversationNavigation: null };
+  let changes = 0;
+  const update = makeUpdater((apply) => { const next = apply(snapshot); if (next !== snapshot) changes++; snapshot = next; });
+  const summary = { id: "one", revision: 1, title: "原标题", projectId: "p1" };
+  update(summary);
+  const first = snapshot;
+  for (let index = 0; index < 30; index++) update({ ...summary });
+  assert.equal(snapshot, first);
+  assert.equal(changes, 1);
+  const projectPage = { projectId: "p1", items: [] };
+  snapshot = { ...snapshot, conversationNavigation: { ...snapshot.conversationNavigation, projectConversations: projectPage } };
+  update({ ...summary, revision: 2, title: "新标题" });
+  const renamed = snapshot;
+  assert.equal(snapshot.conversationNavigation.conversation.title, "新标题");
+  assert.equal(snapshot.conversationNavigation.projectConversations, projectPage);
+  update(summary);
+  assert.equal(snapshot, renamed);
+  update({ ...summary, revision: 3, projectId: "p2" });
+  assert.equal(snapshot.conversationNavigation.projectConversations, null);
+  snapshot = { ...snapshot, runningTasks: [{ id: "task1", conversationId: "one" }] };
+  update({ ...summary, revision: 3, projectId: "p2" });
+  assert.equal(snapshot.conversationNavigation.conversation.runningTaskId, "task1");
+  snapshot = { ...snapshot, runningTasks: [] };
+  update({ ...summary, revision: 3, projectId: "p2" });
+  assert.equal(snapshot.conversationNavigation.conversation.runningTaskId, null);
+});
+
+test("404 recovery reads current runtime without making global UI changes a data effect dependency", async () => {
+  const source = ts.createSourceFile("view.tsx", await readFile(new URL("../app/easywork/features/conversation/ConversationView.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let recovery;
+  let guardedEffects = 0;
+  const visit = (node) => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "recoverMissingConversation") recovery = node.initializer;
+    if (ts.isCallExpression(node) && node.expression.getText(source) === "useEffect" && node.arguments[0]?.getText(source).includes("recoverMissingConversation(")) {
+      guardedEffects++;
+      const dependencies = node.arguments[1].elements.map((element) => element.getText(source));
+      assert.ok(!dependencies.includes("runtime"));
+      assert.ok(!dependencies.includes("recoverMissingConversation"));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  assert.equal(recovery.expression.getText(source), "useEffectEvent");
+  assert.equal(guardedEffects, 5);
+});
+
 test("opening a conversation distinguishes history from live messages and reconnect catch-up", async () => {
   const source = ts.createSourceFile("client.ts", await readFile(new URL("../app/core/realtime/client.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
   const declaration = source.statements.find(ts.isClassDeclaration).getText(source);

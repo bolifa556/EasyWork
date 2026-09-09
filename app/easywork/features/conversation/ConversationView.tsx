@@ -1,6 +1,6 @@
 "use client";
 
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import {
   Brain,
   Check,
@@ -34,6 +34,8 @@ import { commandId } from "@/app/core/gateway/client";
 import { uploadResource } from "@/app/core/gateway/resource-upload";
 import { useAppRuntime, type ConversationPanel } from "../../runtime/AppRuntime";
 import { announceConversationsChanged } from "../../runtime/cacheEvents";
+import { TimelineDetailScope } from "./TimelineDetails";
+import { DisclosureMotion } from "./DisclosureMotion";
 import { Button } from "../../ui/Button";
 import { copyText } from "../../ui/clipboard";
 import { groupConversationTimeline } from "./conversation-copy.mjs";
@@ -875,6 +877,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   const [boundServerId, setBoundServerId] = useState<string | null>(conversationId ? initialRoute.serverId ?? null : null);
   const [conversationConnectionEnabled, setConversationConnectionEnabled] = useState(true);
   const [serverBindingLoading, setServerBindingLoading] = useState(Boolean(conversationId && !initialRoute.serverId));
+  const serverBindingResolved = useRef(Boolean(initialRoute.serverId));
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
   const [serverCapabilities, setServerCapabilities] = useState<ServerCapabilityProfile | null>(initialServerCache?.capabilities ?? null);
   const [capabilityError, setCapabilityError] = useState<string | null>(null);
@@ -934,7 +937,10 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     };
   }), [agentOptions, latestEffortConfiguration]);
 
-  const recoverMissingConversation = useCallback((reason: unknown) => {
+  // Effects may read the latest navigation/preview state when handling a 404,
+  // but that state must never invalidate every conversation read. Depending on
+  // the whole runtime here creates fetch -> navigation -> fetch feedback.
+  const recoverMissingConversation = useEffectEvent((reason: unknown) => {
     if (!conversationId || !(reason instanceof GatewayError) || reason.code !== "CONVERSATION_NOT_FOUND") return false;
     if (missingConversationHandled.current === conversationId) return true;
     missingConversationHandled.current = conversationId;
@@ -948,7 +954,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     runtime.closeWorkspacePreviews(conversationId);
     runtime.navigate({ kind: "home" }, { replace: true });
     return true;
-  }, [actorId, conversationId, runtime]);
+  });
 
   useLayoutEffect(() => {
     tasksRef.current = tasks;
@@ -1295,7 +1301,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       },
     );
     return () => { active = false; };
-  }, [fetchConversation, initialConversationCache, mergeEvents, notify, recoverMissingConversation, retainEventsForMessages]);
+  }, [fetchConversation, initialConversationCache, mergeEvents, notify, retainEventsForMessages]);
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId) return;
     const controller = new AbortController();
@@ -1306,7 +1312,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       },
     );
     return () => controller.abort();
-  }, [conversationId, fetchConversationArtifacts, loadedConversationId, notify, recoverMissingConversation]);
+  }, [conversationId, fetchConversationArtifacts, loadedConversationId, notify]);
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId || activeMode === "chat") return;
     const controller = new AbortController();
@@ -1317,7 +1323,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       })
       .finally(() => { if (!controller.signal.aborted) setEventsHydrated(true); });
     return () => controller.abort();
-  }, [activeMode, api, conversationId, loadedConversationId, mergeEvents, notify, recoverMissingConversation]);
+  }, [activeMode, api, conversationId, loadedConversationId, mergeEvents, notify]);
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId || activeMode !== "work") return;
     const controller = new AbortController();
@@ -1327,7 +1333,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       });
     }, 120);
     return () => { window.clearTimeout(handle); controller.abort(); };
-  }, [activeMode, conversationId, hydrateTaskHistory, loadedConversationId, notify, recoverMissingConversation]);
+  }, [activeMode, conversationId, hydrateTaskHistory, loadedConversationId, notify]);
   useEffect(() => {
     if (!referencedTaskIdsKey || activeMode !== "work") return;
     const controller = new AbortController();
@@ -1591,7 +1597,8 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     let active = true;
     void (async () => {
       await Promise.resolve();
-      if (active && !initialRoute.serverId) setServerBindingLoading(true);
+      if (!active) return;
+      if (!serverBindingResolved.current) setServerBindingLoading(true);
       let binding = (await api.get<ConversationServerBinding>(`/api/conversations/${encodeURIComponent(conversationId)}/server-binding`)).data;
       const pendingServerId = pendingServerBinding(conversationId);
       if (!binding.serverId && pendingServerId && bootstrapServerIdKey.split("\n").includes(pendingServerId)) {
@@ -1609,6 +1616,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         }
       }
       if (!active) return;
+      serverBindingResolved.current = true;
       if (binding.serverId) clearPendingServerBinding(conversationId, binding.serverId);
       setBoundServerId(binding.serverId);
       setConversationConnectionEnabled(binding.connectionEnabled !== false);
@@ -1631,7 +1639,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       if (active) setServerBindingLoading(false);
     });
     return () => { active = false; };
-  }, [activeMode, api, bootstrapServerIdKey, conversationId, initialRoute, loadedConversationId, notify, recoverMissingConversation]);
+  }, [activeMode, api, bootstrapServerIdKey, conversationId, loadedConversationId, notify]);
 
   const syncConversationWorkspaceRoute = useCallback(({
     mode: routeMode,
@@ -2372,7 +2380,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   };
   if (loading) return <LoadingState label="正在载入对话" />;
 
-  return <div className={`${styles.view} ${runtime.rightRailOpen && conversationId ? styles.withRail : ""}`}>
+  return <TimelineDetailScope scope={`${actorId || "loading"}:${conversationId || "draft"}`} events={events}><div className={`${styles.view} ${runtime.rightRailOpen && conversationId ? styles.withRail : ""}`}>
     <section className={styles.stage}>
       <div className={`${styles.stageContent} ${initialPanel ? styles.stageWithPanel : ""}`}>
       {isEmpty ? <div className={styles.modeSwitch} role="group" aria-label="选择对话类型"><button className={`${styles.modeButton} ${mode === "chat" ? styles.selected : ""}`} onClick={() => setMode("chat")}><MessageCircle size={14} />聊天</button><button className={`${styles.modeButton} ${mode === "work" ? styles.selected : ""}`} onClick={() => setMode("work")}><Terminal size={14} />工作</button></div> : <header className={styles.header}>
@@ -2494,12 +2502,12 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
             <button className={styles.record} onClick={() => document.getElementById(`message-${message.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}>{message.content}</button>
             {hasPlan ? <button className={styles.recordExpand} aria-label={expanded ? "收起任务流程" : "展开任务流程"} aria-expanded={expanded} onClick={() => setExpandedRecordId(expanded ? null : message.id)}>{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</button> : null}
           </div>
-          {hasPlan && task && expanded ? <div className={`${styles.recordPlan} ${styles.recordPlanOpen}`}><div><TaskPlanList task={task} /></div></div> : null}
+          {hasPlan && task ? <DisclosureMotion open={expanded} className={styles.recordPlan}><div><div className={styles.recordPlanBody}><TaskPlanList task={task} /></div></div></DisclosureMotion> : null}
         </div>;
       })}</div></section>
     </aside></> : null}
     {conversationId ? <button className={styles.railToggle} aria-label={runtime.rightRailOpen ? "收起对话记录" : "展开对话记录"} onClick={() => runtime.setRightRailOpen(!runtime.rightRailOpen)}>{runtime.rightRailOpen ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}</button> : null}
-  </div>;
+  </div></TimelineDetailScope>;
 }
 
 export default function ConversationView(props: Props) {

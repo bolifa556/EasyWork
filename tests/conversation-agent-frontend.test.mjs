@@ -251,7 +251,7 @@ test("表格自适应列宽且不产生横向滚动条，远端 Skill 逐项展�
   assert.match(timelineStyles, /\.handoffReference\s*\{[^}]*padding:0 38px 0 12px;[^}]*font-size:var\(--timeline-detail-size\);[^}]*white-space:\s*nowrap/s);
   assert.match(timelineStyles, /\.handoffReferenceKind\s*\{[^}]*font-size:var\(--timeline-detail-size\);/s);
   assert.match(timelineStyles, /\.handoffSkillHeading\s*\{[^}]*grid-template-columns:auto minmax\(0,auto\) 14px;[^}]*border-left:3px solid #9dbba4;/s);
-  assert.match(timelineStyles, /\.handoffSkillReferenceOpen \.handoffSkillMotion\s*\{[^}]*grid-template-rows:1fr;/s);
+  assert.match(timeline, /<DisclosureMotion open=\{expandable && open\} className=\{styles\.handoffSkillMotion\}/);
 });
 
 test("思考位于 EasyWork 标题下方，功能栏收纳箭头保持水平居中", async () => {
@@ -301,7 +301,7 @@ test("三种 Agent 的统一计划条与左侧菜单同字号，只有存在计�
   assert.match(viewStyles, /\.record\s*\{[^}]*font-size:var\(--rail-font-size\);/s);
   assert.match(view, /function ComposerTaskPlan/);
   assert.match(view, /<TaskPlanList task=\{task\}/);
-  assert.match(view, /hasPlan && task && expanded \? <div className=\{`\$\{styles\.recordPlan\} \$\{styles\.recordPlanOpen\}`\}/);
+  assert.match(view, /hasPlan && task \? <DisclosureMotion open=\{expanded\} className=\{styles\.recordPlan\}/);
   assert.match(viewStyles, /\.composerPlan\s*\{[^}]*width:66\.666%;[^}]*font-size:var\(--rail-font-size,13\.5px\);/s);
   assert.doesNotMatch(view, /styles\.composerPlanExpanded/);
   assert.match(viewStyles, /\.composerPlanOpen \.composerPlanCurrent\s*\{[^}]*height:calc\(var\(--plan-count\)/s);
@@ -309,7 +309,7 @@ test("三种 Agent 的统一计划条与左侧菜单同字号，只有存在计�
   assert.match(timeline, /event\.kind === "plan" \|\| event\.kind === "plan_state"/);
   assert.match(view, /const hasPlan = Boolean\(task && Array\.isArray\(task\.plan\) && task\.plan\.length > 0\);/);
   assert.match(view, /\{hasPlan \? <button className=\{styles\.recordExpand\}/);
-  assert.match(view, /\{hasPlan && task && expanded \? <div className=\{`\$\{styles\.recordPlan\}/);
+  assert.doesNotMatch(view, /hasPlan && task && expanded \?/);
 });
 
 test("当前工作区保留完整路径，并从路径前端省略以优先显示末尾目录", async () => {
@@ -508,8 +508,11 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(webAgentRuntime, /let submittedCandidateIds = null[\s\S]+?submittedCandidateIds = input\.candidateIds[\s\S]+?return completeWork\(iteration \+ 1, submittedCandidateIds\)/);
   assert.match(webAgentRuntime, /tool\.timelineRead && rendered[\s\S]+?emit\("run\.context\.read"/);
   assert.doesNotMatch(webAgentRuntime, /run\.tool\.(?:started|completed|failed)/);
-  assert.match(styles, /\.reasoningTraceOpen \.reasoningMotion[^}]*grid-template-rows:1fr;/s);
-  assert.match(styles, /\.webThoughtOpen \.webThoughtMotion,[^\{]*\{[^}]*grid-template-rows:\s*1fr;/s);
+  const motionStyles = await readFile(new URL("../app/easywork/features/conversation/DisclosureMotion.module.css", import.meta.url), "utf8");
+  assert.match(motionStyles, /\.motion\s*\{[^}]*grid-template-rows:0fr;[^}]*transition:grid-template-rows/s);
+  assert.match(motionStyles, /\.motion\[data-expanded="true"\]\s*\{[^}]*grid-template-rows:1fr;/s);
+  assert.match(timeline, /<DisclosureMotion open=\{open\} ready=\{detailState\.ready\} className=\{styles\.reasoningMotion\}/);
+  assert.match(timeline, /<DisclosureMotion open=\{hasBody && open\} className=\{styles\.webThoughtMotion\}/);
   assert.match(styles, /\.webThoughtOpen \.webThoughtChevron[^}]*rotate\(90deg\)/s);
   assert.match(styles, /\.reasoningHeading\s*\{[^}]*grid-template-columns:22px minmax\(0,auto\) 14px;/s);
   assert.match(styles, /\.backgroundHeading\s*\{[^}]*align-items:center;/s);

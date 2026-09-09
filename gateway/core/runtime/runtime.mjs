@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import { timelineReplayView } from "../../../shared/timeline-projection.mjs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -659,18 +658,19 @@ export class EasyWorkRuntime {
       return request.services.interactions.status(request.params.runId);
     });
     router.route("GET", "/api/conversations/:id/events", async (request) => {
-      await request.services.conversations.getConversation(request.params.id);
-      return timelineReplayView(await request.services.interactions.events(request.params.id, {
+      await request.services.conversations.assertReadable(request.params.id);
+      return request.services.interactions.events(request.params.id, {
         afterSequence: request.query.after ? Number(request.query.after) : 0,
         limit: request.query.limit ? Number(request.query.limit) : 2_000,
-      }), request.query.view);
+        view: request.query.view,
+      });
     });
     router.route("POST", "/api/conversations/:id/events/details", async (request) => {
-      await request.services.conversations.getConversation(request.params.id);
+      await request.services.conversations.assertReadable(request.params.id);
       return request.services.broker.details(`conversation:${request.params.id}`, strictBody(request.body, ["eventIds"], "读取事件详情").eventIds);
     });
     router.route("GET", "/api/conversations/:id/events/details", async (request) => {
-      await request.services.conversations.getConversation(request.params.id);
+      await request.services.conversations.assertReadable(request.params.id);
       strictQuery(request.query, ["ids"], "读取事件详情");
       return request.services.broker.details(`conversation:${request.params.id}`, String(request.query.ids || "").split(","));
     });
@@ -941,10 +941,11 @@ export class EasyWorkRuntime {
 
     router.route("GET", "/api/tasks/:id/events", async (request) => {
       await request.services.orchestrator.getTask(request.params.id);
-      return timelineReplayView(await request.services.broker.replay(taskTopic(request.params.id), {
+      return request.services.broker.replay(taskTopic(request.params.id), {
         afterSequence: request.query.after ? Number(request.query.after) : 0,
         limit: request.query.limit ? Number(request.query.limit) : 2_000,
-      }), request.query.view);
+        view: request.query.view,
+      });
     });
 
     router.route("POST", "/api/tasks/:id/events/details", async (request) => {

@@ -280,10 +280,9 @@
 .record:hover { color:var(--ew-ink); }
 .recordExpand { display:grid; width:26px; height:26px; place-items:center; padding:0; border:0; border-radius:7px; background:transparent; color:var(--ew-ink-muted); cursor:pointer; }
 .recordExpand:hover { background:rgba(65,64,54,.06); color:var(--ew-ink); }
-.recordPlan { display:grid; grid-template-rows:0fr; opacity:0; transition:grid-template-rows 190ms ease,opacity 150ms ease; }
+.recordPlan { min-width:0; }
 .recordPlan > div { min-height:0; overflow:hidden; }
-.recordPlanOpen { grid-template-rows:1fr; opacity:1; }
-.recordPlanOpen > div { padding:2px 0 10px; }
+.recordPlanBody { padding:2px 0 10px; }
 .recordPlan .taskPlanList { padding:2px 1px 0; }
 .railScrim { display:none; }
 .railClosed { display:none; }

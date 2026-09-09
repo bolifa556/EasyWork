@@ -20,6 +20,23 @@ export class RealtimeBroker {
     return this.journal.replay(topic, options);
   }
 
+  async *replayPages(topic, options = {}) {
+    if (this.journal.replayPages) {
+      yield* this.journal.replayPages(topic, options);
+      return;
+    }
+    // Non-persistent brokers (e.g. external producers) can still page through
+    // the broker contract without a journal snapshot implementation.
+    let afterSequence = options.afterSequence ?? 0;
+    for (;;) {
+      const page = await this.replay(topic, { ...options, afterSequence });
+      yield page;
+      const next = page.nextAfterSequence ?? page.events.at(-1)?.sequence ?? afterSequence;
+      if (!page.hasMore || next <= afterSequence) return;
+      afterSequence = next;
+    }
+  }
+
   details(topic, eventIds) {
     return this.journal.details(topic, eventIds);
   }

@@ -1,7 +1,12 @@
 import crypto from "node:crypto";
+import path from "node:path";
 
 import { assertNoSensitiveFields, invariant } from "./errors.mjs";
-import { AtomicJsonRepository } from "./repository.mjs";
+import { AtomicJsonRepository, clearRepositoryReadCache } from "./repository.mjs";
+import { actorDataRoot } from "./paths.mjs";
+import { summarizeTimelineEvent } from "../../shared/timeline-projection.mjs";
+
+export const JOURNAL_SCHEMA_VERSION = 2;
 
 const TOPIC_PATTERN = /^[a-z][a-z0-9._:-]{0,191}$/;
 
@@ -94,6 +99,40 @@ function markStreamEvent(event) {
   return descriptor ? { ...event, payload: { ...event.payload, realtimeStreamKey: `${descriptor.key}:${event.sequence}` } } : event;
 }
 
+// Used by the explicit offline migration, never as a read-time compatibility path.
+export function compactJournalEvents(events) {
+  const result = [];
+  for (const source of events) {
+    const event = source.payload?.realtimeStreamKey ? source : markStreamEvent(source);
+    const previous = result.at(-1);
+    const compacted = compactStreamEvent(previous, event);
+    if (compacted) {
+      result[result.length - 1] = previous.payload?.realtimeStreamKey === source.payload?.realtimeStreamKey
+        ? event : compacted;
+    } else result.push(event);
+  }
+  return result;
+}
+
+function replayOptions(options) {
+  const afterSequence = Number(options.afterSequence ?? 0);
+  const limit = Number(options.limit ?? 500);
+  invariant(Number.isSafeInteger(afterSequence) && afterSequence >= 0, "REALTIME_CURSOR_INVALID", "afterSequence 无效", { status: 400 });
+  invariant(Number.isSafeInteger(limit) && limit > 0 && limit <= 2_000, "REALTIME_LIMIT_INVALID", "Realtime replay limit 无效", { status: 400 });
+  return { afterSequence, limit, view: options.view };
+}
+
+function firstAfter(events, sequence) {
+  let low = 0;
+  let high = events.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (events[middle].sequence <= sequence) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
 export function createRealtimeEnvelope(input) {
   invariant(!["timestamp", "seq", "type", "taskId", "conversationId"].some((key) => key in (input || {})), "REALTIME_RESERVED_FIELD_FORBIDDEN", "Realtime envelope 包含保留字段", { status: 400 });
   const topic = String(input?.topic || "");
@@ -123,6 +162,9 @@ export class RealtimeEventJournal {
     this.dataRoot = options.dataRoot;
     this.actor = options.actor;
     this.queue = options.queue;
+    this.onRead = options.onRead;
+    this.detailIndexes = new WeakMap();
+    this.summaries = new WeakMap();
     this.maxEventsPerTopic = options.maxEventsPerTopic ?? 10_000;
     invariant(Number.isSafeInteger(this.maxEventsPerTopic) && this.maxEventsPerTopic > 0, "REALTIME_RETENTION_INVALID", "Realtime retention 无效", { status: 500, expose: false });
   }
@@ -133,53 +175,61 @@ export class RealtimeEventJournal {
       dataRoot: this.dataRoot,
       actor: this.actor,
       relativePath: ["runtime", "realtime", topicHash(topic), "journal.json"],
-      schemaVersion: 1,
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
       defaultData: () => ({ topic, firstSequence: 1, lastSequence: 0, events: [] }),
       validate: (data) => data?.topic === topic && Number.isSafeInteger(data.lastSequence) && Array.isArray(data.events),
       queue: this.queue,
+      cacheReads: true,
+      compact: true,
+      onRead: this.onRead,
     });
   }
 
   async append(topic, event) {
     const repository = this.#repository(topic);
-    for (;;) {
-      const current = await repository.read();
-      try {
-        const updated = await repository.update((data) => {
-          const sequence = data.lastSequence + 1;
-          const envelope = markStreamEvent(createRealtimeEnvelope({ ...event, actor: this.actor, topic, sequence }));
-          const compacted = compactStreamEvent(data.events.at(-1), envelope);
-          data.lastSequence = sequence;
-          if (compacted) data.events[data.events.length - 1] = compacted;
-          else data.events.push(envelope);
-          if (data.events.length > this.maxEventsPerTopic) {
-            data.events.splice(0, data.events.length - this.maxEventsPerTopic);
-          }
-          data.firstSequence = data.events[0]?.sequence ?? data.lastSequence + 1;
-          return data;
-        }, { expectedRevision: current.revision });
-        return updated.data.events.at(-1);
-      } catch (error) {
-        if (error?.code !== "REVISION_CONFLICT") throw error;
-      }
-    }
+    return repository.updateCurrent((data) => {
+      const sequence = data.lastSequence + 1;
+      const envelope = markStreamEvent(createRealtimeEnvelope({ ...event, actor: this.actor, topic, sequence }));
+      const compacted = compactStreamEvent(data.events.at(-1), envelope);
+      const events = compacted ? [...data.events.slice(0, -1), compacted] : [...data.events, envelope];
+      if (events.length > this.maxEventsPerTopic) events.splice(0, events.length - this.maxEventsPerTopic);
+      return { ...data, events, lastSequence: sequence, firstSequence: events[0]?.sequence ?? sequence + 1 };
+    }, { project: (updated) => updated.data.events.at(-1) });
   }
 
   async details(topic, eventIds) {
     invariant(Array.isArray(eventIds) && eventIds.length > 0 && eventIds.length <= 2_000 && eventIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= 200), "REALTIME_EVENT_IDS_INVALID", "事件编号无效", { status: 400 });
-    const selected = new Set(eventIds);
-    const { data } = await this.#repository(topic).read();
-    const events = data.events.filter((event) => selected.has(event.eventId));
-    return { events: structuredClone(events), missingEventIds: eventIds.filter((id) => !events.some((event) => event.eventId === id)) };
+    const { data } = await this.#repository(topic).readSnapshot();
+    let index = this.detailIndexes.get(data);
+    if (!index) {
+      index = new Map();
+      data.events.forEach((event, position) => {
+        if (!index.has(event.eventId)) index.set(event.eventId, []);
+        index.get(event.eventId).push(position);
+      });
+      this.detailIndexes.set(data, index);
+    }
+    const positions = [...new Set(eventIds)].flatMap((id) => index.get(id) || []).sort((a, b) => a - b);
+    return structuredClone({ events: positions.map((position) => data.events[position]), missingEventIds: eventIds.filter((id) => !index.has(id)) });
   }
 
   async replay(topic, options = {}) {
-    const afterSequence = Number(options.afterSequence ?? 0);
-    const limit = Number(options.limit ?? 500);
-    invariant(Number.isSafeInteger(afterSequence) && afterSequence >= 0, "REALTIME_CURSOR_INVALID", "afterSequence 无效", { status: 400 });
-    invariant(Number.isSafeInteger(limit) && limit > 0 && limit <= 2_000, "REALTIME_LIMIT_INVALID", "Realtime replay limit 无效", { status: 400 });
-    const envelope = await this.#repository(topic).read();
-    const data = envelope.data;
+    const normalized = replayOptions(options);
+    return this.#page((await this.#repository(topic).readSnapshot()).data, normalized);
+  }
+
+  async *replayPages(topic, options = {}) {
+    const normalized = replayOptions(options);
+    const { data } = await this.#repository(topic).readSnapshot();
+    for (;;) {
+      const page = this.#page(data, normalized);
+      yield page;
+      if (!page.hasMore || page.nextAfterSequence <= normalized.afterSequence) return;
+      normalized.afterSequence = page.nextAfterSequence;
+    }
+  }
+
+  #page(data, { afterSequence, limit, view }) {
     // `after=0` means "start from the earliest retained event". This remains
     // useful after retention or stream compaction creates sequence gaps, while
     // non-zero stale cursors still receive an explicit expiry response.
@@ -187,13 +237,24 @@ export class RealtimeEventJournal {
       status: 410,
       details: { firstAvailableSequence: data.firstSequence },
     });
-    const events = data.events.filter((event) => event.sequence > afterSequence).slice(0, limit);
+    const offset = firstAfter(data.events, afterSequence);
+    const events = data.events.slice(offset, offset + limit);
+    const projected = view === "summary" ? events.map((event) => {
+      if (!this.summaries.has(event)) this.summaries.set(event, summarizeTimelineEvent(event));
+      return this.summaries.get(event);
+    }) : events;
     return {
-      topic,
-      events: structuredClone(events),
+      topic: data.topic,
+      events: structuredClone(projected),
       lastSequence: data.lastSequence,
       nextAfterSequence: events.at(-1)?.sequence ?? afterSequence,
       hasMore: (events.at(-1)?.sequence ?? afterSequence) < data.lastSequence,
     };
+  }
+
+  close() {
+    clearRepositoryReadCache(path.join(actorDataRoot(this.dataRoot, this.actor), "runtime", "realtime"));
+    this.detailIndexes = new WeakMap();
+    this.summaries = new WeakMap();
   }
 }

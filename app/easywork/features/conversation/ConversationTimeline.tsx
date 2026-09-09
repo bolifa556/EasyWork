@@ -10,6 +10,7 @@ import { artifactAnswerMarkdown, artifactDisplayName, conversationArtifactCards,
 import { canPreviewFile, fileTypeLabel } from "@/shared/file-preview.mjs";
 import { groupAgentActivity, timelineDetailIds } from "@/shared/timeline-projection.mjs";
 import { TimelineDetails, TimelineDetailStatus, useTimelineDetails } from "./TimelineDetails";
+import { DisclosureMotion } from "./DisclosureMotion";
 import { markdownFence, markdownLabel, splitRemoteFinalPresentation } from "./conversation-copy.mjs";
 import styles from "./ConversationTimeline.module.css";
 
@@ -311,9 +312,9 @@ function BackgroundResult({ result, index }: { result: { id: string; source: str
     {expandable ? <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
       <small>{sourceLabel(result.source)}</small><span>{title}</span><ChevronRight size={12} />
     </button> : <div className={styles.backgroundResultStatic}><small>{sourceLabel(result.source)}</small><span>{title}</span></div>}
-    {open ? <div className={styles.backgroundResultMotion}><div><div className={styles.backgroundResultDetail}>
+    <DisclosureMotion open={open} ready={state.ready} className={styles.backgroundResultMotion}><div><div className={styles.backgroundResultDetail}>
       <TimelineDetailStatus state={state} />{!state.loading ? <MarkdownContent content={semanticText} compact activity /> : null}
-    </div></div></div> : null}
+    </div></div></DisclosureMotion>
   </div>;
 }
 
@@ -328,7 +329,7 @@ function BackgroundTrace({ reads }: { reads: BackgroundRead[] }) {
       <span data-ui-icon="" className={styles.backgroundGlyph}><BookOpen size={15} /></span>
       <span className={styles.backgroundLabel}>已查阅背景</span><ChevronRight className={styles.backgroundChevron} size={13} />
     </button>
-    {open ? <div className={styles.backgroundMotion}><div>{results.map((result, index) => <BackgroundResult key={result.id} result={result} index={index} />)}</div></div> : null}
+    <DisclosureMotion open={open} className={styles.backgroundMotion}><div>{results.map((result, index) => <BackgroundResult key={result.id} result={result} index={index} />)}</div></DisclosureMotion>
   </div>;
 }
 
@@ -356,10 +357,10 @@ function CurrentStateTrace({ state, detailIds }: { state: Record<string, unknown
       <span className={styles.backgroundLabel}>已查阅当前状态</span>
       <ChevronRight className={styles.backgroundChevron} size={13} />
     </button>
-    {open ? <div className={styles.backgroundMotion}><div>
+    <DisclosureMotion open={open} ready={detailState.ready} className={styles.backgroundMotion}><div>
       <TimelineDetailStatus state={detailState} />
       {values.map((entry) => <div className={styles.backgroundResult} key={entry.key}><div className={styles.backgroundResultStatic}><small>{entry.label}</small><span>{entry.value}</span></div></div>)}
-    </div></div> : null}
+    </div></DisclosureMotion>
   </div>;
 }
 
@@ -552,7 +553,7 @@ function ReasoningTrace({ entry, running, disclosureId }: { entry: ReasoningEntr
       <span className={styles.reasoningLabel}>思考内容</span>
       <ChevronRight className={styles.reasoningChevron} size={13} />
     </button>
-    {open ? <div className={styles.reasoningMotion}><div><div className={styles.reasoningText}><TimelineDetailStatus state={detailState} />{!detailState.loading ? <MarkdownContent content={content} compact activity /> : null}</div></div></div> : null}
+    <DisclosureMotion open={open} ready={detailState.ready} className={styles.reasoningMotion}><div><div className={styles.reasoningText}><TimelineDetailStatus state={detailState} />{!detailState.loading ? <MarkdownContent content={content} compact activity /> : null}</div></div></DisclosureMotion>
   </section>;
 }
 
@@ -570,7 +571,7 @@ function WebThought({ events, handoff = null }: { events: RealtimeEnvelope[]; ha
       <span className={styles.activityHeadingLabel}>{label}</span>
       {hasBody ? <ChevronRight className={styles.webThoughtChevron} size={13} /> : null}
     </button>
-    {hasBody && open ? <div className={styles.webThoughtMotion}><div><div className={styles.webThoughtBody}>
+    <DisclosureMotion open={hasBody && open} className={styles.webThoughtMotion}><div><div className={styles.webThoughtBody}>
       {trace.entries.map((entry) => entry.type === "reasoning"
         ? <ReasoningTrace key={entry.id} entry={entry} running={trace.running} disclosureId={`${disclosureId}:reasoning:${entry.id}`} />
         : entry.type === "background"
@@ -579,7 +580,7 @@ function WebThought({ events, handoff = null }: { events: RealtimeEnvelope[]; ha
             ? <CurrentStateTrace key={entry.id} state={entry.state} detailIds={entry.detailIds} />
             : <p key={entry.id} className={styles.activityText}>{entry.text.trim()}</p>)}
       {handoff ? <WorkHandoff handoff={handoff} /> : null}
-    </div></div></div> : null}
+    </div></div></DisclosureMotion>
     {terminalReason ? <div className={styles.runFailure} role="alert">{terminalReason}</div> : null}
   </section>;
 }
@@ -597,12 +598,12 @@ function WorkHandoff({ handoff }: { handoff: Handoff }) {
     <button type="button" className={styles.handoffHeading} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
       <span data-ui-icon="" className={styles.handoffGlyph}><Send size={15} /></span><span className={styles.handoffLabel}>发给远端 Agent</span><ChevronRight className={styles.handoffChevron} size={13} />
     </button>
-    {open ? <div className={styles.handoffMotion}><div><div className={styles.handoffRail}><div className={styles.handoffBody}>
+    <DisclosureMotion open={open} ready={detailState.ready} className={styles.handoffMotion}><div><div className={styles.handoffRail}><div className={styles.handoffBody}>
       <TimelineDetailStatus state={detailState} />
       {handoff.userMessage ? <p>{handoff.userMessage}</p> : null}
       {handoff.contextBrief ? <p>{handoff.contextBrief}</p> : null}
       {referenceGroups.map((group) => <HandoffReferenceGroup key={group.kind} kind={group.kind} references={group.references} />)}
-    </div></div></div></div> : null}
+    </div></div></div></DisclosureMotion>
   </section>;
 }
 
@@ -614,7 +615,7 @@ function HandoffReferenceGroup({ kind, references }: { kind: string; references:
     <button type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
       <span>{kind}</span><strong>{references.length} 项</strong><ChevronRight size={13} />
     </button>
-    {open ? <div className={styles.handoffReferenceMotion}><div>{references.map((reference) => <HandoffDetailReference key={`${reference.kind}:${reference.name}`} reference={{ ...reference, kind: "" }} />)}</div></div> : null}
+    <DisclosureMotion open={open} className={styles.handoffReferenceMotion}><div>{references.map((reference) => <HandoffDetailReference key={`${reference.kind}:${reference.name}`} reference={{ ...reference, kind: "" }} />)}</div></DisclosureMotion>
   </section>;
 }
 
@@ -627,7 +628,7 @@ function HandoffDetailReference({ reference }: { reference: HandoffReference }) 
     </button> : <div className={styles.handoffReference}>
       <span className={styles.handoffReferenceKind}>{reference.kind}</span><strong>{reference.name}</strong>{reference.edited ? <em className={styles.handoffEdited}>本轮整理</em> : null}
     </div>}
-    {expandable && open ? <div className={styles.handoffSkillMotion}><div><div className={styles.handoffSkillDetail}><MarkdownContent content={reference.detail!} compact activity /></div></div></div> : null}
+    <DisclosureMotion open={expandable && open} className={styles.handoffSkillMotion}><div><div className={styles.handoffSkillDetail}><MarkdownContent content={reference.detail!} compact activity /></div></div></DisclosureMotion>
   </section>;
 }
 
@@ -1094,11 +1095,11 @@ function CommandItem({ event, taskId, taskStatus, onApproval }: { event: Realtim
       <span className={styles.commandStatus}>{event.status === "failed" ? <X size={12} /> : ["cancelled", "interrupted"].includes(String(event.status)) ? <Square size={8} /> : tool.shell ? <Terminal size={12} /> : <Wrench size={12} />}</span>
       <span className={styles.operationKind}>{tool.label}</span><code>{tool.summary}</code><small>{eventStatusLabel(event.status)}</small><ChevronRight className={styles.itemChevron} size={13} />
     </button>
-    {open ? <div className={styles.itemMotion}><div><div className={styles.terminalWrap}>
+    <DisclosureMotion open={open} ready={detailState.ready} className={styles.itemMotion}><div><div className={styles.terminalWrap}>
       <TimelineDetailStatus state={detailState} /><CopyButton content={tool.detail} label={tool.shell ? "复制命令和输出" : "复制工具输入和结果"} />
       {!detailState.loading ? <pre className={styles.remoteTerminal}><code>{tool.detail || (isRunningEvent(event) ? "等待远端结果…" : "Agent 未返回可显示的工具结果。")}</code></pre> : null}
       <EmbeddedApproval event={event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />
-    </div></div></div> : null}
+    </div></div></DisclosureMotion>
   </article>;
 }
 
@@ -1158,9 +1159,9 @@ function OperationGroup({ events, taskId, taskStatus, onApproval }: { events: Re
       <strong>{waiting ? `等待执行 ${entries.length} 个操作` : running ? `正在执行 ${entries.length} 个操作` : cancelled ? `已取消 ${entries.length} 个操作` : `执行了 ${entries.length} 个操作`}</strong>
       <ChevronRight className={styles.groupChevron} size={13} />
     </button>
-    {open ? <div className={styles.groupMotion}><div className={styles.commandList}>{entries.map((entry) => entry.type === "tool"
+    <DisclosureMotion open={open} className={styles.groupMotion}><div><div className={styles.commandList}>{entries.map((entry) => entry.type === "tool"
       ? <CommandItem key={entry.id} event={entry.event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />
-      : <FileItem key={entry.id} file={entry.file} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />)}</div></div> : null}
+      : <FileItem key={entry.id} file={entry.file} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />)}</div></div></DisclosureMotion>
   </section>;
 }
 
@@ -1213,7 +1214,7 @@ function FileItem({ file, taskId, taskStatus, onApproval }: { file: FileEntry; t
   const reading = file.operation === "read";
   return <article className={`${styles.fileItem} ${open ? styles.itemOpen : ""} ${running ? styles.running : ""} ${file.status === "failed" ? styles.error : ""} ${cancelled ? styles.cancelled : ""}`}>
     <button type="button" className={styles.fileSummary} aria-expanded={open} onClick={() => setOpen((value) => !value)}><span className={styles.fileStatus}>{file.status === "failed" ? <X size={12} /> : cancelled ? <Square size={8} /> : <FileText size={13} />}</span><span className={styles.operationKind}>{reading ? "读取文件" : "编辑文件"}</span><span className={styles.fileCopy}><strong>{name}</strong>{file.path ? <small>{file.path}</small> : null}</span><ChevronRight className={styles.itemChevron} size={13} /></button>
-    {open ? <div className={styles.itemMotion}><div><div className={styles.fileDetail}><TimelineDetailStatus state={detailState} />{detailState.loading ? null : file.diff ? <DiffView content={file.diff} /> : file.output ? <><CopyButton content={file.output} label={reading ? "复制文件内容" : "复制文件修改内容"} /><pre className={styles.fileRaw}>{file.output}</pre></> : <p className={styles.fileEmpty}>{reading ? "Agent 未返回可显示的文件内容。" : "Agent 未返回可显示的差异内容。"}</p>}<EmbeddedApproval event={file.event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} /></div></div></div> : null}
+    <DisclosureMotion open={open} ready={detailState.ready} className={styles.itemMotion}><div><div className={styles.fileDetail}><TimelineDetailStatus state={detailState} />{detailState.loading ? null : file.diff ? <DiffView content={file.diff} /> : file.output ? <><CopyButton content={file.output} label={reading ? "复制文件内容" : "复制文件修改内容"} /><pre className={styles.fileRaw}>{file.output}</pre></> : <p className={styles.fileEmpty}>{reading ? "Agent 未返回可显示的文件内容。" : "Agent 未返回可显示的差异内容。"}</p>}<EmbeddedApproval event={file.event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} /></div></div></DisclosureMotion>
   </article>;
 }
 
@@ -1454,7 +1455,7 @@ function EventRow({ event, taskId, taskStatus, onApproval }: { event: RealtimeEn
   };
   return <article className={`${styles.agentEvent} ${styles[`kind_${event.kind}`] || ""} ${open ? styles.itemOpen : ""} ${isRunningEvent(event) ? styles.running : ""} ${event.status === "failed" || event.kind === "error" ? styles.error : ""}`}>
     <button type="button" className={styles.eventSummary} aria-expanded={expandable ? open : undefined} onClick={() => expandable && setOpen((value) => !value)}><span data-ui-icon="" className={styles.eventGlyph}>{eventIcon(event)}</span><span className={styles.eventCopy}><strong>{eventLabel(event)}</strong>{secondary ? <small>{secondary}</small> : null}</span><span className={styles.eventStatus}>{event.kind === "approval_request" && event.status === "waiting" ? "等待操作" : eventStatusLabel(event.status)}</span>{expandable ? <ChevronRight className={styles.itemChevron} size={13} /> : <span />}</button>
-    {expandable && open ? <div className={styles.itemMotion}><div><div className={styles.eventDetail}><TimelineDetailStatus state={detailState} />{text && !detailState.loading ? <div className={styles.eventOutput}><MarkdownContent content={text} compact activity /></div> : null}{approvalPending ? <div className={styles.approvalActions}><button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve")}>{responding === "approve" ? <LoaderCircle className={styles.spin} size={13} /> : null}允许一次</button>{record.allowSession !== false ? <button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve_session")}>{responding === "approve_session" ? <LoaderCircle className={styles.spin} size={13} /> : null}本会话允许</button> : null}<button type="button" className={styles.rejectApproval} disabled={Boolean(responding)} onClick={() => void respond("reject")}>{responding === "reject" ? <LoaderCircle className={styles.spin} size={13} /> : null}拒绝</button></div> : null}{approvalError ? <small className={styles.approvalError}>{approvalError}</small> : null}</div></div></div> : null}
+    <DisclosureMotion open={expandable && open} ready={detailState.ready} className={styles.itemMotion}><div><div className={styles.eventDetail}><TimelineDetailStatus state={detailState} />{text && !detailState.loading ? <div className={styles.eventOutput}><MarkdownContent content={text} compact activity /></div> : null}{approvalPending ? <div className={styles.approvalActions}><button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve")}>{responding === "approve" ? <LoaderCircle className={styles.spin} size={13} /> : null}允许一次</button>{record.allowSession !== false ? <button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve_session")}>{responding === "approve_session" ? <LoaderCircle className={styles.spin} size={13} /> : null}本会话允许</button> : null}<button type="button" className={styles.rejectApproval} disabled={Boolean(responding)} onClick={() => void respond("reject")}>{responding === "reject" ? <LoaderCircle className={styles.spin} size={13} /> : null}拒绝</button></div> : null}{approvalError ? <small className={styles.approvalError}>{approvalError}</small> : null}</div></div></DisclosureMotion>
   </article>;
 }
 
@@ -1690,7 +1691,7 @@ function AgentThinking({ segments, id, running, taskId, status, onApproval, onIn
       <span data-ui-icon="" className={styles.reasoningGlyph}><Brain size={15} /></span>
       <span className={styles.reasoningLabel}>{running ? "Agent思考中" : "Agent已思考"}</span><ChevronRight className={styles.reasoningChevron} size={13} />
     </button>
-    {open ? <div className={styles.agentThinkingMotion}><div className={styles.agentThinkingBody}>{segments.map((segment) => <AgentActivityItem key={segment.id} segment={segment} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</div></div> : null}
+    <DisclosureMotion open={open} className={styles.agentThinkingMotion}><div className={styles.agentThinkingBody}>{segments.map((segment) => <AgentActivityItem key={segment.id} segment={segment} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</div></DisclosureMotion>
   </section>;
 }
 
@@ -1735,12 +1736,12 @@ function AgentCall({ events, status, task, taskId, finalTextHint = "", failure =
       <span className={styles.activityHeadingLabel}>{running ? "Agent调用中" : interrupted ? "Agent调用已停止" : "Agent调用完成"}</span>
       {hasDetails ? <ChevronRight className={styles.agentCallChevron} size={13} /> : null}
     </button>
-    {hasDetails && open ? <div className={styles.agentCallMotion}><div><div className={styles.agentActivity}>
+    <DisclosureMotion open={hasDetails && open} ready={!detailsLoading || disclosureRunning} className={styles.agentCallMotion}><div><div className={styles.agentActivity}>
       {stageDetail ? <div className={styles.agentCallStage}><LoaderCircle className={styles.spin} size={15} /><span>{stageDetail}</span></div> : null}
       <AgentCallContents events={events} status={status} taskId={taskId} finalTextHint={finalTextHint} running={disclosureRunning} onApproval={onApproval} onInput={onInput} />
       {finalActivities.map((content, index) => <AgentFinalActivity key={`final-activity:${index}:${content}`} content={content} />)}
       {detailsLoading ? <p role="status">正在载入活动记录…</p> : null}
-    </div></div></div> : null}
+    </div></div></DisclosureMotion>
   </section>;
 }
 

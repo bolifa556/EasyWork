@@ -6,6 +6,7 @@ import { ApiError, invariant } from "./errors.mjs";
 import { defaultActorMutationQueue } from "./mutation-queue.mjs";
 import { resolveActorPath } from "./paths.mjs";
 import { assertExpectedRevision } from "./revision.mjs";
+import { freezeReadSnapshot, repositoryReadCache } from "./read-cache.mjs";
 
 function clone(value) {
   return structuredClone(value);
@@ -14,9 +15,27 @@ function clone(value) {
 const TRANSIENT_RENAME_ERRORS = new Set(["EPERM", "EACCES", "EBUSY"]);
 const fileMutationTails = new Map();
 
-async function runFileMutation(filePath, operation) {
+function fileKey(filePath) {
   const resolved = path.resolve(filePath);
-  const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+export function clearRepositoryReadCache(directory) {
+  repositoryReadCache.clearPrefix(`${fileKey(directory)}${path.sep}`);
+}
+
+async function fileSignature(filePath) {
+  try {
+    const stat = await fs.stat(filePath, { bigint: true });
+    return { key: `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`, bytes: Number(stat.size) };
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function runFileMutation(filePath, operation) {
+  const key = fileKey(filePath);
   const previous = fileMutationTails.get(key) || Promise.resolve();
   let release;
   const turn = new Promise((resolve) => { release = resolve; });
@@ -79,13 +98,13 @@ async function fsyncDirectory(directory) {
   }
 }
 
-export async function atomicWriteJson(filePath, value) {
+export async function atomicWriteJson(filePath, value, { compact = false } = {}) {
   const directory = path.dirname(filePath);
   await fs.mkdir(directory, { recursive: true });
   const temporaryPath = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
   const handle = await fs.open(temporaryPath, "wx", 0o600);
   try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.writeFile(`${JSON.stringify(value, null, compact ? undefined : 2)}\n`, "utf8");
     await handle.sync();
   } finally {
     await handle.close();
@@ -122,9 +141,23 @@ export class AtomicJsonRepository {
     this.relativePath = (Array.isArray(options.relativePath) ? options.relativePath : [options.relativePath])
       .map((segment) => String(segment));
     this.filePath = resolveActorPath(options.dataRoot, options.actor, options.relativePath);
+    this.cacheReads = options.cacheReads === true;
+    this.compact = options.compact === true;
+    this.onRead = options.onRead;
   }
 
   async #readEnvelope() {
+    let signature;
+    if (this.cacheReads) {
+      signature = await fileSignature(this.filePath);
+      const cached = repositoryReadCache.get(fileKey(this.filePath));
+      if (signature && cached?.signature === signature.key) {
+        this.#validateEnvelope(cached.envelope);
+        this.onRead?.({ cacheHit: true, bytes: signature.bytes });
+        return cached.envelope;
+      }
+      repositoryReadCache.delete(fileKey(this.filePath));
+    }
     let parsed;
     try {
       parsed = JSON.parse(await fs.readFile(this.filePath, "utf8"));
@@ -139,6 +172,13 @@ export class AtomicJsonRepository {
       }
       throw error;
     }
+    this.#validateEnvelope(parsed);
+    this.onRead?.({ cacheHit: false, bytes: signature?.bytes });
+    if (this.cacheReads && signature) this.#cache(parsed, signature);
+    return parsed;
+  }
+
+  #validateEnvelope(parsed) {
     invariant(parsed && typeof parsed === "object" && !Array.isArray(parsed), "REPOSITORY_CORRUPT", "数据文件结构无效", { status: 500, expose: false });
     invariant(parsed.schemaVersion === this.schemaVersion, "SCHEMA_VERSION_MISMATCH", "数据 schema 与当前版本不一致", {
       status: 500,
@@ -147,7 +187,24 @@ export class AtomicJsonRepository {
     });
     invariant(Number.isSafeInteger(parsed.revision) && parsed.revision >= 0, "REPOSITORY_CORRUPT", "数据 revision 无效", { status: 500, expose: false });
     this.#validateData(parsed.data);
-    return parsed;
+  }
+
+  #cache(envelope, signature) {
+    const overhead = Array.isArray(envelope.data?.events) ? envelope.data.events.length * 320 : 0;
+    repositoryReadCache.set(fileKey(this.filePath), {
+      signature: signature.key,
+      envelope: freezeReadSnapshot(envelope),
+    }, signature.bytes * 2 + overhead);
+  }
+
+  async #commit(next) {
+    // A failed Windows in-place replacement must be revalidated on the next read.
+    repositoryReadCache.delete(fileKey(this.filePath));
+    await atomicWriteJson(this.filePath, next, { compact: this.compact });
+    if (this.cacheReads) {
+      const signature = await fileSignature(this.filePath);
+      if (signature) this.#cache(next, signature);
+    }
   }
 
   #validateData(data) {
@@ -164,7 +221,31 @@ export class AtomicJsonRepository {
     // could briefly observe the file between write/truncate operations and
     // report valid persisted data as corrupt JSON. Share the same per-file
     // mutation lane for reads to keep that fallback transactional in-process.
-    return runFileMutation(this.filePath, async () => clone(await this.#readEnvelope()));
+    return this.readProjected((envelope) => envelope);
+  }
+
+  async readProjected(project) {
+    return runFileMutation(this.filePath, async () => clone(project(await this.#readEnvelope())));
+  }
+
+  // Internal readers pin an immutable version while paging; later commits
+  // publish a different snapshot and cannot change an in-progress replay.
+  async readSnapshot() {
+    return runFileMutation(this.filePath, async () => freezeReadSnapshot(await this.#readEnvelope()));
+  }
+
+  async updateCurrent(transform, { project = (envelope) => envelope, clock = () => new Date() } = {}) {
+    invariant(typeof transform === "function", "REPOSITORY_MUTATOR_INVALID", "Repository transform 必须是函数", { status: 500, expose: false });
+    return this.queue.run(this.actor, () => runFileMutation(this.filePath, async () => {
+      const current = freezeReadSnapshot(await this.#readEnvelope());
+      // System appends derive their result inside the transaction. User edits
+      // continue to require expectedRevision through update/replace below.
+      const data = transform(current.data);
+      this.#validateData(data);
+      const next = { schemaVersion: this.schemaVersion, revision: current.revision + 1, updatedAt: clock().toISOString(), data };
+      await this.#commit(next);
+      return clone(project(next));
+    }));
   }
 
   async replace(data, options = {}) {
@@ -179,7 +260,7 @@ export class AtomicJsonRepository {
         updatedAt: (options.clock || (() => new Date()))().toISOString(),
         data: nextData,
       };
-      await atomicWriteJson(this.filePath, next);
+      await this.#commit(next);
       return clone(next);
     }));
   }
@@ -199,7 +280,7 @@ export class AtomicJsonRepository {
         updatedAt: (options.clock || (() => new Date()))().toISOString(),
         data: clone(nextData),
       };
-      await atomicWriteJson(this.filePath, next);
+      await this.#commit(next);
       return clone(next);
     }));
   }

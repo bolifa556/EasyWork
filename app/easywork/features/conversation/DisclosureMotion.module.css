@@ -1,0 +1,14 @@
+.motion {
+  display:grid;
+  min-width:0;
+  min-height:0;
+  overflow:hidden;
+  grid-template-rows:0fr;
+  opacity:0;
+  transition:grid-template-rows 240ms cubic-bezier(.22,1,.36,1), opacity 180ms ease, margin-block 240ms cubic-bezier(.22,1,.36,1);
+}
+.motion > div { min-height:0; overflow:hidden; }
+.motion[data-expanded="true"] { grid-template-rows:1fr; opacity:1; }
+.motion[data-expanded="false"] { margin-block:0; }
+.motion[data-reveal-together="true"] { transition:none; }
+@media (prefers-reduced-motion:reduce) { .motion { transition:none; } }

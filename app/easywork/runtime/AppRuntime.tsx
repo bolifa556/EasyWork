@@ -1,4 +1,5 @@
 "use client";
+import { clearTimelineDetailCache } from "../features/conversation/timeline-detail-cache.mjs";
 
 import {
   createContext,
@@ -229,7 +230,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const [realtime] = useState(() => new RealtimeClient(websocketUrl, sessionSource.read));
 
   const storeSession = useCallback((next: string | null) => {
-    if (sessionSource.read() !== next) closeWorkspacePreviews();
+    if (sessionSource.read() !== next) { closeWorkspacePreviews(); clearTimelineDetailCache(); }
     sessionSource.write(next);
     setToken(next);
     if (next) localStorage.setItem(SESSION_KEY, next);
@@ -282,10 +283,19 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     if (route.kind !== "conversation" || route.conversationId !== conversation.id) return;
     setBootstrap((current) => {
       if (!current) return current;
+      const previous = current.conversationNavigation?.conversation;
+      const runningTaskId = current.runningTasks.find((task) => task.conversationId === conversation.id)?.id ?? null;
+      // Re-reading the same revision does not change navigation. Besides
+      // avoiding needless renders, this prevents consumers from turning a
+      // completed read back into a new global invalidation.
+      if (previous?.id === conversation.id) {
+        if (previous.revision > conversation.revision) return current;
+        if (previous.revision === conversation.revision && previous.runningTaskId === runningTaskId) return current;
+      }
       const page = current.conversationNavigation?.projectConversations;
       return { ...current, conversationNavigation: {
         conversationId: conversation.id,
-        conversation: { ...conversation, runningTaskId: current.runningTasks.find((task) => task.conversationId === conversation.id)?.id ?? null },
+        conversation: { ...conversation, runningTaskId },
         projectConversations: page?.projectId === conversation.projectId ? page : null,
       } };
     });

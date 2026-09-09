@@ -5,6 +5,7 @@ import path from "node:path";
 import { invariant } from "../errors.mjs";
 import { resolveActorPath } from "../paths.mjs";
 import { AtomicJsonRepository } from "../repository.mjs";
+import { ReadCache, freezeReadSnapshot } from "../read-cache.mjs";
 import {
   CONVERSATION_MODES,
   CONVERSATION_SCHEMA_VERSION,
@@ -14,6 +15,9 @@ import {
   clone,
   commandFileName,
 } from "./contract.mjs";
+
+const indexReadCache = new ReadCache({ maxBytes: 32 * 1024 * 1024 });
+const indexReads = new Map();
 
 async function syncDirectory(directory) {
   let handle;
@@ -135,8 +139,30 @@ export class ConversationStorage {
     return this.indexRepository.read();
   }
 
+  async #indexSnapshot(generationId) {
+    if (generationId === null) return { summaries: [], byId: new Map() };
+    const key = this.path("_index", generationId);
+    const cached = indexReadCache.get(key);
+    if (cached) return cached;
+    if (indexReads.has(key)) return indexReads.get(key);
+    const pending = this.#loadIndexGeneration(generationId).then((summaries) => {
+      const snapshot = { summaries: freezeReadSnapshot(summaries), byId: new Map(summaries.map((summary) => [summary.id, summary])) };
+      if (!this.closed && indexReads.get(key) === pending) indexReadCache.set(key, snapshot, Buffer.byteLength(JSON.stringify(summaries)) * 2 + summaries.length * 128);
+      return snapshot;
+    }).finally(() => { if (indexReads.get(key) === pending) indexReads.delete(key); });
+    indexReads.set(key, pending);
+    return pending;
+  }
+
   async readIndexGeneration(generationId) {
-    if (generationId === null) return [];
+    return clone((await this.#indexSnapshot(generationId)).summaries);
+  }
+
+  async readIndexSummary(generationId, conversationId) {
+    return clone((await this.#indexSnapshot(generationId)).byId.get(conversationId));
+  }
+
+  async #loadIndexGeneration(generationId) {
     const manifest = await readJson(this.path("_index", generationId, "manifest.json"));
     invariant(manifest?.schemaVersion === CONVERSATION_SCHEMA_VERSION, "CONVERSATION_INDEX_CORRUPT", "对话摘要索引 schema 无效", { status: 500, expose: false });
     invariant(Number.isSafeInteger(manifest.pageCount) && manifest.pageCount >= 0, "CONVERSATION_INDEX_CORRUPT", "对话摘要索引页数无效", { status: 500, expose: false });
@@ -147,6 +173,8 @@ export class ConversationStorage {
   }
 
   async stageIndexGeneration(generationId, summaries) {
+    indexReadCache.delete(this.path("_index", generationId));
+    indexReads.delete(this.path("_index", generationId));
     const pages = [];
     for (let index = 0; index < summaries.length; index += this.indexPageSize) pages.push(summaries.slice(index, index + this.indexPageSize));
     await Promise.all(pages.map((page, index) => writeJsonAtomic(this.path("_index", generationId, "pages", pageName(index)), page)));
@@ -161,6 +189,11 @@ export class ConversationStorage {
 
   async commitIndexGeneration(generationId, count, expectedIndexRevision, clock) {
     return this.indexRepository.replace({ generationId, count }, { expectedRevision: expectedIndexRevision, clock });
+  }
+
+  close() {
+    this.closed = true;
+    indexReadCache.clearPrefix(this.path("_index"));
   }
 
   async readCommand(commandId) {

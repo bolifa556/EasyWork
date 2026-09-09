@@ -604,9 +604,17 @@ export class ConversationService {
   }
 
   async getConversation(conversationId) {
-    const { summaries } = await this.#readIndex();
-    const { summary, meta } = await this.#loadConversation(summaries, conversationId);
+    const summary = await this.assertReadable(conversationId);
+    const meta = await this.storage.readSnapshot(summary.id, summary.snapshotId);
     return { summary: clone(summary), branches: clone(meta.branches) };
+  }
+
+  async assertReadable(conversationId) {
+    const id = assertConversationId(conversationId);
+    const root = await this.storage.readIndexRoot();
+    const summary = await this.storage.readIndexSummary(root.data.generationId, id);
+    assertVisibleSummary(summary);
+    return summary;
   }
 
   async listMessages(options) {

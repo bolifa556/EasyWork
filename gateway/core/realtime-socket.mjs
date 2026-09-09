@@ -133,8 +133,7 @@ export class RealtimeSocketServer {
             state.subscriptions.set(topic, unsubscribe);
             try {
               let upperBound;
-              for (;;) {
-                const replay = await state.broker.replay(brokerTopic, { afterSequence: cursor });
+              for await (const replay of state.broker.replayPages(brokerTopic, { afterSequence: cursor, view: message.replayView })) {
                 if (state.closed) return;
                 upperBound ??= replay.lastSequence ?? replay.events.at(-1)?.sequence ?? cursor;
                 const before = cursor;

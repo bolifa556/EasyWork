@@ -1,15 +1,32 @@
-// Only rows that are actually expanded request details. Sibling rows opened
-// in the same render share a request, without prefetching their descendants.
-export function createTimelineDetailLoader({ getEvent, isLoaded, request, onLoaded }) {
+// Explicit expansion and current-page prefetch share requests. Background work
+// uses one slot, leaving capacity for the row the user actually opens.
+export function createTimelineDetailLoader({ getEvent, isLoaded, request, onLoaded, concurrency = 4 }) {
   const unavailable = () => Object.assign(new Error("活动详情不可用"), { code: "TIMELINE_DETAIL_UNAVAILABLE" });
+  const aborted = () => Object.assign(new Error("详情加载已取消"), { name: "AbortError" });
   const pending = new Map();
   const queued = new Map();
+  const controller = new AbortController();
   let scheduled = false;
+  let active = 0;
+  let backgroundActive = 0;
 
-  async function read(route, entries) {
+  function routeFor(event) {
+    return event.ids.taskId && !event.topic.startsWith("conversation:")
+      ? `/api/tasks/${encodeURIComponent(event.ids.taskId)}/events/details`
+      : `/api/conversations/${encodeURIComponent(event.ids.conversationId || "")}/events/details`;
+  }
+  function schedule() {
+    if (scheduled || controller.signal.aborted) return;
+    scheduled = true;
+    queueMicrotask(flush);
+  }
+  async function read(route, entries, background) {
+    active += 1;
+    if (background) backgroundActive += 1;
     const ids = entries.map(([id]) => id);
     try {
-      const result = await request(`${route}?${new URLSearchParams({ ids: ids.join(",") })}`);
+      const result = await request(`${route}?${new URLSearchParams({ ids: ids.join(",") })}`, controller.signal);
+      if (controller.signal.aborted) throw aborted();
       const selected = new Set(ids);
       const events = result.events.filter((event) => selected.has(event.eventId));
       if (events.length) onLoaded(events);
@@ -21,50 +38,61 @@ export function createTimelineDetailLoader({ getEvent, isLoaded, request, onLoad
     } catch (error) {
       for (const [, waiter] of entries) waiter.reject(error);
     } finally {
-      for (const [id] of entries) pending.delete(id);
+      for (const [id, waiter] of entries) if (pending.get(id) === waiter) pending.delete(id);
+      active -= 1;
+      if (background) backgroundActive -= 1;
+      schedule();
     }
   }
-
   function flush() {
     scheduled = false;
-    const groups = new Map();
-    for (const [id, waiter] of queued) {
-      const event = getEvent(id);
-      if (!event) {
-        waiter.reject(unavailable());
-        pending.delete(id);
+    if (controller.signal.aborted) return;
+    while (active < concurrency) {
+      const candidates = [...queued].filter(([, waiter]) => !waiter.background || !backgroundActive)
+        .sort((a, b) => Number(a[1].background) - Number(b[1].background));
+      if (!candidates.length) break;
+      const [firstId, first] = candidates[0];
+      const firstEvent = getEvent(firstId);
+      if (!firstEvent) {
+        queued.delete(firstId); pending.delete(firstId); first.reject(unavailable());
         continue;
       }
-      const route = event.ids.taskId && !event.topic.startsWith("conversation:")
-        ? `/api/tasks/${encodeURIComponent(event.ids.taskId)}/events/details`
-        : `/api/conversations/${encodeURIComponent(event.ids.conversationId || "")}/events/details`;
-      if (!groups.has(route)) groups.set(route, []);
-      groups.get(route).push([id, waiter]);
-    }
-    queued.clear();
-    for (const [route, entries] of groups) {
-      // Keep GET URLs bounded; all requested rows are still read.
-      for (let offset = 0; offset < entries.length; offset += 100) void read(route, entries.slice(offset, offset + 100));
+      const route = routeFor(firstEvent);
+      const entries = [];
+      for (const [id, waiter] of candidates) {
+        const event = getEvent(id);
+        if (event && routeFor(event) === route) {
+          entries.push([id, waiter]);
+          queued.delete(id);
+          if (entries.length === 100) break;
+        }
+      }
+      void read(route, entries, first.background);
     }
   }
-
-  return function load(ids) {
+  function load(ids, { background = false } = {}) {
+    if (controller.signal.aborted) return Promise.reject(aborted());
     const waits = [];
     for (const id of new Set(ids)) {
       if (isLoaded(id)) continue;
       let waiter = pending.get(id);
       if (!waiter) {
-        waiter = {};
+        waiter = { background };
         waiter.promise = new Promise((resolve, reject) => Object.assign(waiter, { resolve, reject }));
         pending.set(id, waiter);
         queued.set(id, waiter);
-      }
+      } else if (!background) waiter.background = false;
       waits.push(waiter.promise);
     }
-    if (queued.size && !scheduled) {
-      scheduled = true;
-      queueMicrotask(flush);
-    }
+    if (queued.size) schedule();
     return Promise.all(waits).then(() => undefined);
+  }
+  load.prefetch = (ids) => load(ids, { background: true });
+  load.dispose = () => {
+    controller.abort();
+    for (const waiter of pending.values()) waiter.reject(aborted());
+    queued.clear();
+    pending.clear();
   };
+  return load;
 }

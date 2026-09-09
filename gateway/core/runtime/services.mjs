@@ -1303,6 +1303,7 @@ class ConversationInteractionFacade {
   readConversationReference(input) { return this.base.readConversationReference(input); }
   getConversationSummaries(ids) { return this.base.getConversationSummaries(ids); }
   getConversation(id) { return this.base.getConversation(id); }
+  assertReadable(id) { return this.base.assertReadable(id); }
   listMessages(input) { return this.base.listMessages(input); }
   rename(input) { return this.base.rename(input); }
   setPinned(input) { return this.base.setPinned(input); }
@@ -5061,6 +5062,8 @@ export class ActorServiceContainer {
     await Promise.all([...this.submissionTrackers.values()].map((tracker) => tracker.close()));
     this.submissionTrackers.clear();
     await this.waitForIdle();
+    this.journal.close();
+    this.baseConversations.storage.close();
     await this.previews.closeAll().catch(() => undefined);
     for (const entry of this.remoteBundles.values()) {
       if (typeof entry?.backend?.close === "function") await Promise.resolve(entry.backend.close()).catch(() => undefined);
