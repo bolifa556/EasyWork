@@ -27,7 +27,7 @@ async function loadProjection() {
   const imports = [
     ["parseRemoteArtifactLinks", "../shared/remote-artifact-links.mjs"],
     ["artifactAnswerMarkdown, artifactDisplayName, conversationArtifactCards, referencedArtifactCards", "../app/easywork/features/conversation/artifact-presentation.mjs"],
-    ["groupAgentActivity, timelineDetailIds", "../shared/timeline-projection.mjs"],
+    ["groupAgentActivity, groupBackgroundResults, timelineDetailIds", "../shared/timeline-projection.mjs"],
     ["markdownFence, markdownLabel, splitRemoteFinalPresentation", "../app/easywork/features/conversation/conversation-copy.mjs"],
   ].map(([names, file]) => `import { ${names} } from ${JSON.stringify(new URL(file, import.meta.url).href)};`).join("\n");
   const compiled = ts.transpileModule(imports + declarations + "\nexport { activitySegments, buildWebTrace };", { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022, jsx: ts.JsxEmit.React } }).outputText;

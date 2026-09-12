@@ -79,7 +79,7 @@ export function markdownLabel(value) {
 // Both copy choices use the same question/answer order. Activity is inserted
 // before its answer; uncompleted turns retain the activity available so far.
 /** @param {{ includeActivity?: boolean, activityMarkdown?: (input: any) => string, answerBody?: (value: string) => string, origin?: string }} options */
-export function conversationCopyMarkdown(snapshot, { includeActivity = false, activityMarkdown = (_input) => String(), answerBody = (value) => value, origin = "" } = {}) {
+export function conversationCopyMarkdown(snapshot, { includeActivity = false, activityMarkdown = () => String(), answerBody = (value) => value, origin = "" } = {}) {
   const { detail, messages, events, tasks } = snapshot;
   const groups = groupConversationTimeline(messages, events, tasks);
   const output = [`# ${markdownLabel(detail.summary.title)}`];

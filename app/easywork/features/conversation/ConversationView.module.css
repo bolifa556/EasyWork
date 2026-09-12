@@ -126,8 +126,8 @@
 .composerInput { display:flex; min-width:0; grid-area:input; align-items:center; gap:6px; overflow:hidden; }
 .inlineReferences { display:flex; min-width:0; max-width:52%; flex:0 1 auto; align-items:center; gap:4px; overflow-x:auto; overflow-y:hidden; scrollbar-width:none; }
 .inlineReferences::-webkit-scrollbar { display:none; }
-.referenceInline { display:inline-flex; min-width:0; flex:0 1 auto; align-items:center; }
-.referenceInlineLink { display:inline-flex; min-width:0; max-width:220px; align-items:center; gap:4px; overflow:hidden; padding:3px 1px; border:0; background:transparent; color:#356cad; font:inherit; font-size:15.5px; font-weight:600; line-height:22px; white-space:nowrap; cursor:pointer; }
+.referenceInline { display:inline-flex; min-width:0; flex:0 1 auto; align-items:baseline; vertical-align:baseline; }
+.referenceInlineLink { display:inline-flex; min-width:0; max-width:220px; align-items:center; gap:4px; overflow:hidden; padding:0 1px; border:0; background:transparent; color:#356cad; font:inherit; font-size:inherit; font-weight:600; line-height:inherit; vertical-align:baseline; white-space:nowrap; cursor:pointer; }
 .referenceInlineLink svg { flex:0 0 auto; }
 .referenceInlineLink span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .referenceInlineLink:hover span { text-decoration:underline; }

@@ -196,6 +196,9 @@ test("网页工具只发布语义结果，远端失败原因进入对话时间�
   assert.match(timeline, /\["append", "resume"\]\.includes\(String\(payload\.operation \|\| ""\)\)/);
   assert.match(timeline, /role="alert"/);
   assert.match(timeline, /function BackgroundTrace[\s\S]+?<span className=\{styles\.backgroundLabel\}>已查阅背景<\/span>/);
+  assert.match(timeline, /const displayItems = groupBackgroundResults\(results\)/);
+  assert.match(timeline, /function BackgroundConversation[\s\S]+?<small>对话<\/small><span>\{group\.title\}<\/span>/);
+  assert.doesNotMatch(timeline.match(/function BackgroundConversation[\s\S]+?\n}/)?.[0] || "", /useTimelineDetails|DisclosureMotion|group\.results\.map/);
   assert.match(timeline, /event\.kind !== "run\.context\.read"/);
   assert.match(timeline, /previous\?\.type === "background"\) previous\.reads\.push\(read\)/);
   assert.match(timeline, /entries\.push\(\{ type: "background", id: `background:\$\{read\.id\}`, reads: \[read\] \}\)/);
@@ -484,6 +487,8 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(timeline, /const \[open, toggleOpen\] = useTimelineDisclosure\(disclosureId, trace\.running, hasBody\)/);
   assert.match(timeline, /className=\{styles\.webThoughtHeading\}[\s\S]+?aria-expanded=\{hasBody \? open : undefined\}/);
   assert.match(timeline, /entry\.type === "reasoning"[\s\S]+?<ReasoningTrace key=\{entry\.id\} entry=\{entry\} running=\{trace\.running\}/);
+  assert.match(timeline, /if \(event\.kind === "run\.output\.delta"\)[\s\S]+?replacement[\s\S]+?type: "reasoning"/);
+  assert.doesNotMatch(timeline, /className=\{styles\.activityText\}/);
   assert.match(timeline, /function AgentCall[\s\S]+?useTimelineDisclosure\(disclosureId, disclosureRunning, hasDetails\)/);
   assert.match(timeline, /trace\.running \? "正在思考"/);
   assert.match(timeline, /trace\.aborted \? "思考已停止" : "思考完成"/);
@@ -517,8 +522,8 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(styles, /\.reasoningHeading\s*\{[^}]*grid-template-columns:22px minmax\(0,auto\) 14px;/s);
   assert.match(styles, /\.backgroundHeading\s*\{[^}]*align-items:center;/s);
   assert.match(styles, /\.backgroundChevron\s*\{[^}]*rotate\(0deg\)/s);
-  assert.match(styles, /\.reasoningText,.activityText[^}]*font-size:var\(--timeline-body-size\);[^}]*line-height:var\(--timeline-body-leading\);/s);
-  assert.match(styles, /\.reasoningText\s*\{[^}]*border-left:0;[^}]*padding-left:0;[^}]*font-size:var\(--timeline-detail-size\);/s);
+  assert.match(styles, /\.reasoningText\s*\{[^}]*padding:4px 10px 4px 0;[^}]*font-size:var\(--timeline-detail-size\);[^}]*line-height:var\(--timeline-body-leading\);/s);
+  assert.doesNotMatch(styles, /\.activityText/);
   assert.match(styles, /\.agentThoughtContent[^}]*font-size:var\(--timeline-body-size\);[^}]*line-height:var\(--timeline-body-leading\);/s);
   assert.match(styles, /\.commandSummary code[^}]*font-size:var\(--timeline-code-size\);/s);
   assert.match(styles, /\.fileCopy strong[^}]*font-size:var\(--timeline-code-size\);/s);
@@ -1088,12 +1093,12 @@ test("Composer 复用流式资源上传，Chat 与 Work 共用文件概览，并
   assert.match(resources, /\/api\/collections/);
   assert.match(resources, /\/api\/skills/);
   assert.match(view, /scope\.selectedCollectionIds/);
+  assert.match(view, /scope\.selectedResourceVersions/);
   assert.match(services, /project\?\.collectionIds/);
   assert.match(services, /this\.container\.resources\.catalog/);
-  assert.match(services, /const scopedResourceCatalogPromise = !skipWebAgentModel && allowWorkResources[\s\S]+?this\.container\.resources\.catalog\(\{ scope, limit: 80 \}\)/);
-  assert.match(services, /const workResourceToolsPromise = mode === "work"[\s\S]+?hasSelectedResourceScope \|\| \(Array\.isArray\(catalog\?\.items\) && catalog\.items\.length > 0\)/);
-  assert.match(services, /Promise\.all\(\[workMemoryToolsPromise, workSkillToolsPromise, workResourceToolsPromise\]\)/);
-  assert.match(services, /includeAllResources: explicitResourceSelection/);
+  assert.match(services, /this\.container\.resources\.catalog\(\{[\s\S]+?scope,[\s\S]+?all: true,[\s\S]+?summary: \{ required: true/);
+  assert.match(services, /const workResourceToolsPromise = mode === "work"[\s\S]+?Array\.isArray\(catalog\?\.items\) && catalog\.items\.length > 0/);
+  assert.match(services, /memoryCatalogFragmentsPromise/);
   assert.match(services, /const resourceCatalogPromise = !skipWebAgentModel[\s\S]+?prompts\.resourceCatalog/);
   assert.doesNotMatch(services, /const resourceCatalogPromise = mode === "work"/);
   assert.doesNotMatch(services, /initialToolChoice:\s*forceResourceSearch/);

@@ -22,41 +22,42 @@ function disclosureFixture(saved = []) {
     (identity) => stored.has(identity),
     (identity, open) => open ? stored.add(identity) : stored.delete(identity),
   );
-  return { stored, render(identity, running, expandable = true) {
+  return { stored, async render(identity, running, expandable = true) {
     let result;
     for (let pass = 0; pass < 10; pass += 1) {
       changed = false;
       effects = [];
       result = hook(identity, running, expandable);
       effects.forEach((effect) => effect());
+      await Promise.resolve();
       if (!changed) return result;
     }
     throw new Error("Disclosure state did not settle");
   } };
 }
 
-test("a new thinking phase opens automatically and completion closes even a previously saved open group", () => {
+test("a new thinking phase opens automatically and completion closes even a previously saved open group", async () => {
   const f = disclosureFixture(["group"]);
-  assert.equal(f.render("group", false)[0], true);
-  assert.equal(f.render("group", true)[0], true);
-  assert.equal(f.render("group", true)[0], true);
-  assert.equal(f.render("group", false)[0], false);
+  assert.equal((await f.render("group", false))[0], true);
+  assert.equal((await f.render("group", true))[0], true);
+  assert.equal((await f.render("group", true))[0], true);
+  assert.equal((await f.render("group", false))[0], false);
   assert.equal(f.stored.has("group"), false);
-  assert.equal(f.render("group", false)[0], false);
+  assert.equal((await f.render("group", false))[0], false);
 });
 
-test("manual choices survive new details within a phase and a new phase resumes automatic expansion", () => {
+test("manual choices survive new details within a phase and a new phase resumes automatic expansion", async () => {
   const f = disclosureFixture();
-  assert.equal(f.render("group", true, false)[0], false);
-  const running = f.render("group", true);
+  assert.equal((await f.render("group", true, false))[0], false);
+  const running = await f.render("group", true);
   assert.equal(running[0], true);
   running[1]();
-  assert.equal(f.render("group", true)[0], false);
-  assert.equal(f.render("group", false)[0], false);
-  const completed = f.render("group", false);
+  assert.equal((await f.render("group", true))[0], false);
+  assert.equal((await f.render("group", false))[0], false);
+  const completed = await f.render("group", false);
   completed[1]();
-  assert.equal(f.render("group", false)[0], true);
+  assert.equal((await f.render("group", false))[0], true);
   assert.equal(f.stored.has("group"), true);
-  assert.equal(f.render("next-group", false)[0], false);
-  assert.equal(f.render("next-group", true)[0], true);
+  assert.equal((await f.render("next-group", false))[0], false);
+  assert.equal((await f.render("next-group", true))[0], true);
 });

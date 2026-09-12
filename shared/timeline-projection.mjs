@@ -7,7 +7,7 @@ const pick = (value, keys) => Object.fromEntries(keys.filter((key) => value[key]
 function resultHeading(value) {
   const item = record(value);
   const title = item.title || item.name || item.filename || item.semanticKey || item.path || item.content || item.text || value;
-  return { ...pick(item, ["id", "name", "filename", "title", "semanticKey", "path", "role", "skillId"]),
+  return { ...pick(item, ["id", "name", "filename", "title", "semanticKey", "path", "role", "skillId", "referenceTitle", "sourceConversationId"]),
     timelineTitle: preview(title, 84), timelineHasDetail: Boolean(item.content || item.text || item.summary || item.value || item.description || item.instructions?.length) };
 }
 
@@ -68,6 +68,45 @@ export function summarizeTimelineEvent(event) {
 
 export function timelineReplayView(replay, view) {
   return view === "summary" ? { ...replay, events: replay.events.map(summarizeTimelineEvent) } : replay;
+}
+
+function conversationBackgroundTitle(value) {
+  const item = record(value);
+  return String(item.referenceTitle || item.conversationTitle || item.title || "").trim();
+}
+
+function conversationBackgroundIdentity(value) {
+  const item = record(value);
+  return String(item.sourceConversationId || item.conversationId || item.referenceId || conversationBackgroundTitle(item)).trim();
+}
+
+// Timeline context results preserve source order. Only adjacent excerpts from
+// the same conversation share a disclosure, so intervening sources remain
+// visible exactly where the Web Agent read them.
+export function groupBackgroundResults(results) {
+  const groups = [];
+  for (const [index, result] of (Array.isArray(results) ? results : []).entries()) {
+    if (result?.source !== "conversation") {
+      groups.push({ type: "result", id: String(result?.id || `result:${index}`), index, result });
+      continue;
+    }
+    const title = conversationBackgroundTitle(result.value) || "引用对话";
+    const identity = conversationBackgroundIdentity(result.value);
+    const previous = groups.at(-1);
+    if (identity && previous?.type === "conversation" && previous.identity === identity) {
+      previous.results.push(result);
+      continue;
+    }
+    groups.push({
+      type: "conversation",
+      id: `conversation:${String(result?.id || index)}`,
+      index,
+      identity: identity || `result:${String(result?.id || index)}`,
+      title,
+      results: [result],
+    });
+  }
+  return groups;
 }
 
 // Intermediate assistant messages are native narrative boundaries, independent

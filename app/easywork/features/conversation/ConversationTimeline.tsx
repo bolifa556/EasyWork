@@ -8,7 +8,7 @@ import { MarkdownContent } from "./MarkdownContent";
 import { parseRemoteArtifactLinks } from "@/shared/remote-artifact-links.mjs";
 import { artifactAnswerMarkdown, artifactDisplayName, conversationArtifactCards, referencedArtifactCards } from "./artifact-presentation.mjs";
 import { canPreviewFile, fileTypeLabel } from "@/shared/file-preview.mjs";
-import { groupAgentActivity, timelineDetailIds } from "@/shared/timeline-projection.mjs";
+import { groupAgentActivity, groupBackgroundResults, timelineDetailIds } from "@/shared/timeline-projection.mjs";
 import { TimelineDetails, TimelineDetailStatus, useTimelineDetails } from "./TimelineDetails";
 import { DisclosureMotion } from "./DisclosureMotion";
 import { markdownFence, markdownLabel, splitRemoteFinalPresentation } from "./conversation-copy.mjs";
@@ -16,10 +16,13 @@ import styles from "./ConversationTimeline.module.css";
 
 type OutputSegment = { id: string; runId: string | null; content: string; target: "final" | "activity" | "handoff" | null; committed: boolean; first: RealtimeEnvelope };
 type BackgroundRead = { detailIds: string[]; id: string; name: string; input: Record<string, unknown>; output: unknown };
+type BackgroundResultItem = { detailIds: string[]; id: string; source: string; value: unknown };
+type BackgroundDisplayItem =
+  | { type: "result"; id: string; index: number; result: BackgroundResultItem }
+  | { type: "conversation"; id: string; index: number; identity: string; title: string; results: BackgroundResultItem[] };
 type ReasoningEntry = { detailIds: string[]; type: "reasoning"; id: string; iteration: number; text: string };
 type ThoughtEntry =
   | ReasoningEntry
-  | { type: "activity"; id: string; text: string }
   | { type: "background"; id: string; reads: BackgroundRead[] }
   | { type: "state"; detailIds: string[]; id: string; state: Record<string, unknown> };
 type HandoffReference = { kind: string; name: string; detail?: string; edited?: boolean };
@@ -40,8 +43,8 @@ type AgentQuestion = {
 
 const AGENT_PLAN_TOOLS = new Set(["TodoWrite", "todowrite", "TaskCreate", "TaskUpdate", "update_plan"]);
 const WEB_AGENT_PROTOCOL_TOOLS = new Set([
-  "memory_search", "resource_search", "resource_read", "conversation_search",
-  "skill_search", "skill_list", "handoff_rewrite_candidate", "handoff_submit",
+  "resource_search", "resource_read", "conversation_search", "conversation_reference_search",
+  "skill_search", "handoff_rewrite_candidate", "handoff_submit",
 ]);
 const TOOL_CALL_ENVELOPE_KEYS = new Set([
   "id", "type", "name", "parameters", "arguments", "input", "function", "tool_call_id",
@@ -230,7 +233,7 @@ function resultTitle(source: string, value: unknown, index: number) {
   if (record.timelineTitle) return String(record.timelineTitle);
   const directText = compactText(value, 84);
   if (source === "conversation") {
-    const role = record.role === "user" ? "用户" : record.role === "assistant" ? "回复" : "消息";
+    const role = record.role === "user" ? "提问" : record.role === "assistant" ? "回答" : "消息";
     return compactText(record.content || record.text || record.title, 84) || directText || `${role} ${index + 1}`;
   }
   if (source === "memory") {
@@ -302,7 +305,7 @@ function handoffReferences(output: unknown, skillDetails: ReadonlyMap<string, st
   });
 }
 
-function BackgroundResult({ result, index }: { result: { id: string; source: string; value: unknown; detailIds: string[] }; index: number }) {
+function BackgroundResult({ result, index }: { result: BackgroundResultItem; index: number }) {
   const [open, setOpen] = useState(false);
   const state = useTimelineDetails(result.detailIds, open);
   const semanticText = semanticResultText(result.source, result.value);
@@ -318,18 +321,27 @@ function BackgroundResult({ result, index }: { result: { id: string; source: str
   </div>;
 }
 
+function BackgroundConversation({ group }: { group: Extract<BackgroundDisplayItem, { type: "conversation" }> }) {
+  return <div className={styles.backgroundResult}>
+    <div className={styles.backgroundResultStatic}><small>对话</small><span>{group.title}</span></div>
+  </div>;
+}
+
 function BackgroundTrace({ reads }: { reads: BackgroundRead[] }) {
   const [open, setOpen] = useState(false);
-  const results = reads.flatMap((item) => backgroundItems(item.output).map((result) => ({
+  const results: BackgroundResultItem[] = reads.flatMap((item) => backgroundItems(item.output).map((result) => ({
     ...result, id: `${item.id}:${result.id}`, detailIds: item.detailIds,
   })));
+  const displayItems = groupBackgroundResults(results) as BackgroundDisplayItem[];
   if (!results.length) return null;
   return <div className={`${styles.backgroundTrace} ${open ? styles.backgroundTraceOpen : ""}`}>
     <button className={styles.backgroundHeading} type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
       <span data-ui-icon="" className={styles.backgroundGlyph}><BookOpen size={15} /></span>
       <span className={styles.backgroundLabel}>已查阅背景</span><ChevronRight className={styles.backgroundChevron} size={13} />
     </button>
-    <DisclosureMotion open={open} className={styles.backgroundMotion}><div>{results.map((result, index) => <BackgroundResult key={result.id} result={result} index={index} />)}</div></DisclosureMotion>
+    <DisclosureMotion open={open} className={styles.backgroundMotion}><div>{displayItems.map((item) => item.type === "conversation"
+      ? <BackgroundConversation key={item.id} group={item} />
+      : <BackgroundResult key={item.id} result={item.result} index={item.index} />)}</div></DisclosureMotion>
   </div>;
 }
 
@@ -446,7 +458,13 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
       const replacement = activities.get(segmentId);
       if (replacement && !emittedSegments.has(segmentId)) {
         emittedSegments.add(segmentId);
-        entries.push({ type: "activity", id: replacement.eventId, text: textFrom(replacement.payload) });
+        entries.push({
+          type: "reasoning",
+          detailIds: timelineDetailIds(replacement),
+          id: `reasoning:${replacement.eventId}`,
+          iteration: Number(payload.iteration || 0),
+          text: textFrom(replacement.payload),
+        });
       }
       continue;
     }
@@ -576,9 +594,7 @@ function WebThought({ events, handoff = null }: { events: RealtimeEnvelope[]; ha
         ? <ReasoningTrace key={entry.id} entry={entry} running={trace.running} disclosureId={`${disclosureId}:reasoning:${entry.id}`} />
         : entry.type === "background"
           ? <BackgroundTrace key={entry.id} reads={entry.reads} />
-          : entry.type === "state"
-            ? <CurrentStateTrace key={entry.id} state={entry.state} detailIds={entry.detailIds} />
-            : <p key={entry.id} className={styles.activityText}>{entry.text.trim()}</p>)}
+          : <CurrentStateTrace key={entry.id} state={entry.state} detailIds={entry.detailIds} />)}
       {handoff ? <WorkHandoff handoff={handoff} /> : null}
     </div></div></DisclosureMotion>
     {terminalReason ? <div className={styles.runFailure} role="alert">{terminalReason}</div> : null}
@@ -1633,7 +1649,11 @@ function useTimelineDisclosure(identity: string, running: boolean, expandable: b
   useEffect(() => {
     if (samePhase) return;
     if (justFinished) writeTimelineDisclosure(identity, false);
-    setChoice({ identity, running, expandable, open });
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setChoice({ identity, running, expandable, open });
+    });
+    return () => { cancelled = true; };
   }, [identity, running, expandable, open, samePhase, justFinished]);
   const toggleOpen = () => {
     const next = expandable ? !open : false;
@@ -1901,10 +1921,15 @@ export function conversationTimelineMarkdown({ events, mode = "chat", taskIdHint
         }
       } else if (entry.type === "background") {
         heading("已查阅背景");
-        const results = entry.reads.flatMap((read) => backgroundItems(read.output));
-        results.forEach((result, index) => {
-          heading(`${sourceLabel(result.source)} ${resultTitle(result.source, result.value, index)}`, 5);
-          const content = semanticResultText(result.source, result.value);
+        const results: BackgroundResultItem[] = entry.reads.flatMap((read) => backgroundItems(read.output).map((result) => ({ ...result, detailIds: [] })));
+        const displayItems = groupBackgroundResults(results) as BackgroundDisplayItem[];
+        displayItems.forEach((item) => {
+          if (item.type === "conversation") {
+            output.push(`- 对话：${markdownLabel(item.title)}`);
+            return;
+          }
+          heading(`${sourceLabel(item.result.source)} ${resultTitle(item.result.source, item.result.value, item.index)}`, 5);
+          const content = semanticResultText(item.result.source, item.result.value);
           if (content) output.push(content);
         });
       } else if (entry.text.trim()) output.push(entry.text.trim());

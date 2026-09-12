@@ -47,7 +47,7 @@ test("分支来源使用紧凑系统文案并让预览省略号保持在成对�
 test("Work 固定状态在模型资料前注入并以独立时间线条目展示", async () => {
   const [services, timeline, view] = await Promise.all([readFile(servicesPath, "utf8"), readFile(timelinePath, "utf8"), readFile(viewPath, "utf8")]);
   assert.match(services, /kind: "run\.context\.state"/);
-  assert.match(services, /\[workEnvironment\.rendered, conversationReferenceCatalog, resourceCatalog\]/);
+  assert.match(services, /\[workEnvironment\.rendered, skillCatalog, resourceCatalog, conversationReferenceCatalog\]/);
   assert.match(services, /const selectedServerLabel = String\(routing\.serverLabel/);
   assert.match(services, /const configuredServerName = String\(raw\?\.server\?\.profile\?\.name/);
   assert.match(timeline, /已查阅当前状态/);
@@ -64,7 +64,7 @@ test("记忆与显式对话引用可本轮整理，界面保留原标题并标�
   const [timeline, tools] = await Promise.all([readFile(timelinePath, "utf8"), readFile(toolsPath, "utf8")]);
   assert.match(tools, /handoff_rewrite_candidate/);
   assert.match(tools, /version: "record-v1"/);
-  assert.match(tools, /conversation-reference:\$\{sourceConversationId\}:\$\{sourceSnapshotId\}:\$\{messageId\}/);
+  assert.match(tools, /conversation-reference:\$\{sourceConversationId\}:\$\{sourceSnapshotId\}:\$\{turnId\}/);
   assert.match(timeline, /record\.title \|\| record\.semanticKey/);
   assert.doesNotMatch(timeline, /restoreLegacyMemoryTitles/);
   assert.match(timeline, /本轮整理/);
