@@ -173,6 +173,25 @@ function conversationSearchExcerpt(content, query) {
   };
 }
 
+function conversationReferenceTurns(messages) {
+  const turns = [];
+  const byUserMessageId = new Map();
+  let latestTurn = null;
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message.role === "user") {
+      latestTurn = { id: message.id, messages: [message] };
+      turns.push(latestTurn);
+      byUserMessageId.set(message.id, latestTurn);
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    const turn = (message.replyToMessageId && byUserMessageId.get(message.replyToMessageId)) || latestTurn;
+    if (turn) turn.messages.push(message);
+    else turns.push({ id: message.id, messages: [message] });
+  }
+  return turns;
+}
+
 export class ConversationService {
   constructor(options) {
     invariant(options?.actor?.actorType && options?.actor?.actorId, "ACTOR_CONTEXT_REQUIRED", "ConversationService 需要 ActorContext", { status: 500, expose: false });
@@ -183,6 +202,7 @@ export class ConversationService {
     this.queue = options.queue || defaultActorMutationQueue;
     this.beforeIndexCommit = options.beforeIndexCommit || null;
     this.authorizeProject = options.authorizeProject || null;
+    this.referenceTurnRanker = options.referenceTurnRanker || null;
     this.storage = new ConversationStorage({
       dataRoot: options.dataRoot,
       actor: options.actor,
@@ -469,14 +489,14 @@ export class ConversationService {
     };
   }
 
-  async readConversationReference(options = {}) {
-    assertInputKeys(options, ["conversationId", "messageId", "referenceId", "query", "roles", "cursor", "limit"], "ReadConversationReferenceInput");
+  async searchConversationReference(options = {}) {
+    assertInputKeys(options, ["conversationId", "messageId", "referenceId", "query", "cursor", "limit"], "SearchConversationReferenceInput");
     const conversationId = assertConversationId(options.conversationId);
     const messageId = assertMessageId(options.messageId);
     const referenceId = String(options.referenceId || "");
     invariant(/^cref_[a-f0-9]{32}$/.test(referenceId), "CONVERSATION_REFERENCE_ID_INVALID", "对话引用 ID 无效", { status: 400 });
     const query = normalizedSearchText(options.query).slice(0, 1000);
-    const roles = [...new Set((Array.isArray(options.roles) ? options.roles : []).map(String))].filter((role) => ["user", "assistant", "system", "tool"].includes(role));
+    invariant(query, "CONVERSATION_REFERENCE_QUERY_REQUIRED", "检索引用对话时缺少查询内容", { status: 400 });
     const limit = assertLimit(options.limit, 20);
     const { summaries } = await this.#readIndex();
     const current = assertVisibleSummary(findSummary(summaries, conversationId));
@@ -485,41 +505,77 @@ export class ConversationService {
     invariant(reference, "CONVERSATION_REFERENCE_NOT_BOUND", "该引用不属于当前消息", { status: 404 });
     const target = findSummary(summaries, reference.conversationId);
     await this.#assertReferenceAllowed(current, target);
-    const filterDigest = queryDigest({ conversationId, messageId, referenceId, query, roles });
+    const filterDigest = queryDigest({ conversationId, messageId, referenceId, query });
     let offset = 0;
     if (options.cursor) {
       const cursor = this.cursorCodec.decode(options.cursor);
-      invariant(cursor.actorType === this.actor.actorType && cursor.actorId === this.actor.actorId && cursor.kind === "conversation-reference-read" && cursor.filterDigest === filterDigest, "CURSOR_INVALID", "游标不属于当前对话引用", { status: 400 });
+      invariant(cursor.actorType === this.actor.actorType && cursor.actorId === this.actor.actorId && cursor.kind === "conversation-reference-content-search" && cursor.filterDigest === filterDigest, "CURSOR_INVALID", "游标不属于当前对话引用", { status: 400 });
       offset = cursor.offset;
     }
     const chain = await this.storage.readBranchChain(reference.conversationId, reference.snapshotId, reference.branchId);
     const messages = (await Promise.all(chain.map((id) => this.storage.readMessage(reference.conversationId, id))))
-      .filter((message) => !roles.length || roles.includes(message.role));
-    const selected = query
-      ? messages.map((message) => ({ message, score: referenceSearchScore(query, "", message.content) }))
-        .filter((entry) => entry.score > 0)
-        .sort((left, right) => right.score - left.score || left.message.createdAt.localeCompare(right.message.createdAt))
-        .map((entry) => entry.message)
-      : messages;
+      .filter((message) => ["user", "assistant"].includes(message.role));
+    const turns = conversationReferenceTurns(messages);
+    const recentTurns = turns.slice(-10);
+    const recentIds = new Set(recentTurns.map((turn) => turn.id));
+    const searchableTurns = turns.filter((turn) => !recentIds.has(turn.id));
+    let selected = null;
+    if (this.referenceTurnRanker && searchableTurns.length) {
+      try {
+        const ranked = await this.referenceTurnRanker({
+          query,
+          turns: searchableTurns.map((turn) => ({
+            id: turn.id,
+            content: turn.messages.map((message) => message.content).join("\n"),
+          })),
+        });
+        const byId = new Map(searchableTurns.map((turn) => [turn.id, turn]));
+        const seen = new Set();
+        const ordered = (Array.isArray(ranked) ? ranked : []).flatMap((entry) => {
+          const id = String(entry?.id || "");
+          const turn = byId.get(id);
+          if (!turn || seen.has(id)) return [];
+          seen.add(id);
+          return [turn];
+        });
+        if (ordered.length) selected = ordered;
+      } catch {
+        // Referenced conversations remain searchable by exact text when the
+        // configured embedding provider is unavailable.
+      }
+    }
+    selected ||= searchableTurns.map((turn) => ({
+      turn,
+      score: Math.max(...turn.messages.map((message) => referenceSearchScore(query, "", message.content))),
+    }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score || right.turn.messages[0].createdAt.localeCompare(left.turn.messages[0].createdAt))
+      .map((entry) => entry.turn);
     const page = selected.slice(offset, offset + limit);
-    const items = page.map((message) => ({
+    const projectTurn = (turn, contextKind) => turn.messages.map((message) => ({
       id: message.id,
       role: message.role,
       content: message.content,
       createdAt: message.createdAt,
+      contextKind,
+      referenceTurnId: turn.id,
       referenceId,
       referenceTitle: reference.title,
       sourceConversationId: reference.conversationId,
       sourceSnapshotId: reference.snapshotId,
     }));
-    const nextOffset = offset + items.length;
+    const recentItems = recentTurns.flatMap((turn) => projectTurn(turn, "recent"));
+    const items = page.flatMap((turn) => projectTurn(turn, "matched"));
+    const nextOffset = offset + page.length;
     return {
       reference: clone(reference),
+      recentItems,
       items,
+      memorySourceIds: [...new Set(messages.flatMap((message) => [message.id, message.originMessageId]).filter(Boolean))],
       nextCursor: nextOffset < selected.length ? this.cursorCodec.encode({
         actorType: this.actor.actorType,
         actorId: this.actor.actorId,
-        kind: "conversation-reference-read",
+        kind: "conversation-reference-content-search",
         filterDigest,
         offset: nextOffset,
       }) : null,

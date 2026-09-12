@@ -30,7 +30,7 @@ export const CONTEXT_ENTRY_KINDS = Object.freeze([
 const SCOPE_KEYS = [
   "actorType", "actorId", "userId", "projectId", "conversationId", "workspaceId", "taskId", "serverId", "serverIdentity", "versionDomainId", "memoryMode",
   "branchId", "memorySnapshotSequence", "memorySnapshotVersionIds", "resourceBindingSnapshotId", "selectedCollectionIds",
-  "selectedSkillVersions", "capabilities", "contextEpoch", "memoryBaselineSequence",
+  "selectedResourceVersions", "selectedSkillVersions", "capabilities", "contextEpoch", "memoryBaselineSequence",
 ];
 const SESSION_KEYS = [
   "schemaVersion", "entityType", "revision", "id", "actorId", "consumer", "consumerId", "scope", "budget", "status",
@@ -72,6 +72,7 @@ export function validateEffectiveContextScope(scope) {
   assertUnique(assertArray(scope.memorySnapshotVersionIds, "EffectiveContextScope.memorySnapshotVersionIds", (value, field) => assertId(value, field)), "EffectiveContextScope.memorySnapshotVersionIds");
   assertNullableId(scope.resourceBindingSnapshotId, "EffectiveContextScope.resourceBindingSnapshotId");
   assertUnique(assertArray(scope.selectedCollectionIds, "EffectiveContextScope.selectedCollectionIds", (value, field) => assertId(value, field)), "EffectiveContextScope.selectedCollectionIds");
+  assertUnique(assertArray(scope.selectedResourceVersions || [], "EffectiveContextScope.selectedResourceVersions", (value, field) => assertId(value, field)), "EffectiveContextScope.selectedResourceVersions");
   assertUnique(assertArray(scope.selectedSkillVersions, "EffectiveContextScope.selectedSkillVersions", validateSelectedSkillVersion), "EffectiveContextScope.selectedSkillVersions", (value) => `${value.skillId}@${value.version}`);
   assertUnique(assertArray(scope.capabilities, "EffectiveContextScope.capabilities", (value, field) => assertId(value, field)), "EffectiveContextScope.capabilities");
   assertInteger(scope.contextEpoch, "EffectiveContextScope.contextEpoch", { min: 0 });

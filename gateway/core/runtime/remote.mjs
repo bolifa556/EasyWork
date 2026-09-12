@@ -936,6 +936,14 @@ export class RoutingAgentTransport {
     return transport.captureSkillSnapshot?.(request) || null;
   }
 
+  async stageFiles(request) {
+    const serverId = request?.serverId;
+    invariant(serverId, "AGENT_ROUTE_SERVER_REQUIRED", "Agent 文件投递缺少 serverId", { status: 400 });
+    const transport = await this.resolveTransport(serverId);
+    invariant(typeof transport.stageFiles === "function", "AGENT_FILE_STAGE_UNAVAILABLE", "远端 Agent transport 不支持文件投递", { status: 503 });
+    return transport.stageFiles(request);
+  }
+
   async prepare(request) {
     const serverId = request?.task?.route?.serverId;
     invariant(serverId, "AGENT_ROUTE_SERVER_REQUIRED", "Agent 预备请求缺少 serverId", { status: 400 });

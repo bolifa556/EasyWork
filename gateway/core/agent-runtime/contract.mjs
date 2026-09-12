@@ -135,6 +135,7 @@ export function remoteAgentPaths(home, agentId, bindingId = null) {
       providerConfiguration: `${runtimeRoot}/config/provider.json`,
       providerEnvironment: `${runtimeRoot}/config/provider.env`,
       skillsRoot: `${runtimeRoot}/skills`,
+      filesRoot: `${runtimeRoot}/files`,
     });
   }
   return Object.freeze(result);
@@ -192,6 +193,7 @@ export function runtimeEnvironment(paths, extra = {}) {
     CLAUDE_CONFIG_DIR: `${paths.runtimeData}/claude`,
     OPENCODE_CONFIG_DIR: `${paths.runtimeConfig}/opencode`,
     EASYWORK_SKILLS_DIR: paths.skillsRoot,
+    EASYWORK_FILES_DIR: paths.filesRoot,
     ...Object.fromEntries(Object.entries(extra || {}).map(([key, value]) => [String(key), String(value)])),
   });
 }

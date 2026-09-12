@@ -121,6 +121,7 @@ export async function uploadResource<T = ResourceUploadResult>(
   owner: ResourceOwner,
   expectedRevision: number,
   idempotencyKey?: string,
+  summaryModel?: { providerId: string; modelId: string },
 ) {
   const contentSha256 = await sha256(file);
   const query = new URLSearchParams({
@@ -131,6 +132,10 @@ export async function uploadResource<T = ResourceUploadResult>(
   });
   if (owner.path) query.set("path", owner.path);
   if (owner.createdSequence !== undefined) query.set("createdSequence", String(owner.createdSequence));
+  if (summaryModel?.providerId && summaryModel?.modelId) {
+    query.set("providerId", summaryModel.providerId);
+    query.set("modelId", summaryModel.modelId);
+  }
   return api.upload<T>(`/api/resources/upload?${query}`, file, {
     headers: {
       "content-type": file.type || "application/octet-stream",

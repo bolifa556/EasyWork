@@ -1,16 +1,5 @@
 {
   "tools": {
-    "memory_search": {
-      "description": "查找与当前问题相关的长期记忆",
-      "inputSchema": {
-        "type": "object",
-        "required": ["query"],
-        "properties": {
-          "query": { "type": "string" }
-        },
-        "additionalProperties": false
-      }
-    },
     "resource_search": {
       "description": "使用 Embedding 全面检索当前可用文件中与问题相关的正文；未配置 Embedding 时改用 resource_read 直接读取概览中的文件",
       "inputSchema": {
@@ -43,31 +32,27 @@
           "query": { "type": "string" },
           "roles": {
             "type": "array",
-            "items": { "type": "string", "enum": ["system", "user", "assistant"] }
+            "items": { "type": "string", "enum": ["user", "assistant"] }
           }
         },
         "additionalProperties": false
       }
     },
-    "conversation_reference_read": {
-      "description": "读取用户在当前消息中通过 @ 明确引用的 EasyWork 对话冻结原文；只能使用本轮目录给出的 reference_id，可按查询和角色筛选，并用返回游标继续读取",
+    "conversation_reference_search": {
+      "description": "在用户本轮通过 @ 明确引用的 EasyWork 对话中检索相关历史背景；只能使用本轮目录给出的 reference_id。一次查询会返回该冻结边界内的相关记忆、最近上下文，以及必要的较早完整回合",
       "inputSchema": {
         "type": "object",
-        "required": ["referenceId"],
+        "required": ["referenceId", "query"],
         "properties": {
           "referenceId": { "type": "string" },
           "query": { "type": "string" },
-          "roles": {
-            "type": "array",
-            "items": { "type": "string", "enum": ["system", "user", "assistant", "tool"] }
-          },
           "cursor": { "type": "string" }
         },
         "additionalProperties": false
       }
     },
     "skill_search": {
-      "description": "读取 skill_list 中一个名称完全一致的 Skill 正文；每次调用读取一个候选，存在多个相关候选时分别调用且同名不重复",
+      "description": "读取本轮 Skill 目录中一个名称完全一致的 Skill 正文；每次读取一个候选，存在多个相关候选时分别读取且同名不重复",
       "inputSchema": {
         "type": "object",
         "required": ["name", "query"],
@@ -77,10 +62,6 @@
         },
         "additionalProperties": false
       }
-    },
-    "skill_list": {
-      "description": "查看已安装 Skill 的名称和简介；需要具体说明时再按一个完全一致的名称调用 skill_search",
-      "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
     },
     "handoff_rewrite_candidate": {
       "description": "临时整理一条记忆或明确 @ 引用的对话候选，再由 handoff_submit 发送；candidate_id 与原标题保持不变，整理内容仅本轮有效且不会回写来源",
@@ -95,7 +76,7 @@
       }
     },
     "handoff_submit": {
-      "description": "提交本轮需要交给远端的候选资料。选择当前任务所需的事实或操作规范；工作区中的文件事实可留给远端自行读取，但这一规则不用于排除适用的 Skill。仅使用当前候选 ID；现有候选与必要查询均无相关内容，或无需补充时直接提交空数组。原始请求仍会交给远端，不推测或补写未取得的信息",
+      "description": "提交本轮需要交给远端 Agent 的候选补充。只选择完成用户目标确实需要、且远端自身上下文中未必已有的事实或操作规范。仅使用当前 candidate_id；没有相关内容或无需补充时提交空数组。原始用户请求会原样交付，不推测或补写未取得的信息",
       "inputSchema": {
         "type": "object",
         "required": ["candidateIds"],

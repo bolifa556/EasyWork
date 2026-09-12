@@ -1003,8 +1003,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       if (left.id === right.id) return right.revision - left.revision || right.updatedAt.localeCompare(left.updatedAt);
       return (right.startedAt || right.updatedAt).localeCompare(left.startedAt || left.updatedAt);
     })[0];
-  const activeTask = activeTaskSnapshot?.id === interruptingTaskId
-    ? { ...activeTaskSnapshot, status: "interrupting" as const } : activeTaskSnapshot;
+  const activeTask = useMemo(() => activeTaskSnapshot?.id === interruptingTaskId
+    ? { ...activeTaskSnapshot, status: "interrupting" as const }
+    : activeTaskSnapshot, [activeTaskSnapshot, interruptingTaskId]);
   const interruptFailure = latestInterruptFailure(events);
   const isEmpty = !conversationId;
   const projectContextName = initialProjectId
@@ -1212,7 +1213,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     // wait for every historical event stream to replay.
     const listedTasks = Object.fromEntries(known.map((task) => [task.id, task]));
     setTasks((current) => ({ ...current, ...listedTasks }));
-  }, [api, conversationId]);
+  }, [api, conversationId, setTasks]);
   const referencedTaskIdsKey = [...new Set(messages.map((message) => message.taskId).filter((value): value is string => Boolean(value)))].join("\n");
 
   const fetchConversation = useCallback(async (onFirstPage?: (snapshot: { messages: ConversationMessage[]; detail: ConversationDetail; events: RealtimeEnvelope[] }) => void) => {
@@ -1418,7 +1419,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         void refreshBootstrap().catch(() => undefined);
       }
     });
-  }, [api, conversationId, mergeEvents, notify, realtime, refreshBootstrap, reload]);
+  }, [api, conversationId, mergeEvents, notify, realtime, refreshBootstrap, reload, setTasks]);
   const activeTaskId = activeTask?.id;
   const liveTaskIdsKey = [...new Set([...handedOffTaskIds, activeTaskId].filter((value): value is string => Boolean(value)))]
     .filter((taskId) => !["completed", "failed", "cancelled", "interrupted"].includes(tasks[taskId]?.status || ""))
@@ -1436,7 +1437,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       }
     }));
     return () => { for (const unsubscribe of unsubscribes) unsubscribe(); };
-  }, [api, liveTaskIdsKey, mergeEvents, realtime, refreshBootstrap]);
+  }, [api, liveTaskIdsKey, mergeEvents, realtime, refreshBootstrap, setTasks]);
   useEffect(() => {
     if (!liveTaskIdsKey) return;
     let active = true;
@@ -1480,7 +1481,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       active = false;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [api, liveTaskIdsKey, mergeEvents]);
+  }, [api, liveTaskIdsKey, mergeEvents, setTasks]);
 
   useEffect(() => {
     if (!serverId) return;
@@ -1699,7 +1700,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return () => window.clearTimeout(timer);
   }, [activeMode, boundServerId, conversationConnectionEnabled, conversationId, detail?.summary.activeBranchId, selectedServer?.status, syncConversationWorkspaceRoute, taskRoutedAgentId, taskRoutedWorkspaceId]);
 
-  const responseDescriptor = (scopeOverride?: Record<string, unknown>, resources: ComposerResourceSelection = emptyComposerResources, selection?: WebModelSelection): ResponseDescriptor => {
+  const responseDescriptor = (scopeOverride?: Record<string, unknown>, resources: ComposerResourceSelection = emptyComposerResources, selection?: WebModelSelection, selectedResourceVersions: string[] = []): ResponseDescriptor => {
     const selectedProvider = selection?.providerId ?? (typeof window === "undefined" ? null : localStorage.getItem("easywork.web-provider"));
     const selectedModel = selection?.modelId ?? (typeof window === "undefined" ? null : localStorage.getItem("easywork.web-model"));
     const providerId = runtime.bootstrap?.providers.some((provider) => provider.id === selectedProvider)
@@ -1753,7 +1754,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       if (agentProviderId && agentModelId) scope = { ...scope, agentProviderId, agentModelId };
     }
     if (resources.collections.length) scope.selectedCollectionIds = resources.collections.map((collection) => collection.id);
-    if (resources.files.length) scope.resourceSelectionRequested = true;
+    if (selectedResourceVersions.length) scope.selectedResourceVersions = [...new Set(selectedResourceVersions)];
     if (resources.skills.length) {
       scope.selectedSkillVersions = resources.skills.map(({ skillId, version }) => ({ skillId, version }));
       scope.skillPins = resources.skills.map(({ skillId, version, sha256 }) => ({ skillId, version, sha256 }));
@@ -1761,14 +1762,17 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return { providerId, modelId: selectedModel, scope };
   };
 
-  const uploadConversationFiles = async (targetConversationId: string, files: File[], submissionId: string) => {
-    if (!files.length) return;
+  const uploadConversationFiles = async (targetConversationId: string, files: File[], submissionId: string, selection: WebModelSelection) => {
+    if (!files.length) return [] as string[];
     const inspected = await api.get<{ revision: number }>(`/api/resources?ownerType=conversation&ownerId=${encodeURIComponent(targetConversationId)}&limit=1`);
     let expectedRevision = inspected.data.revision;
+    const uploadedVersionIds: string[] = [];
     for (const [index, file] of files.entries()) {
-      const uploaded = await uploadResource(api, file, { ownerType: "conversation", ownerId: targetConversationId, path: file.name }, expectedRevision, `${submissionId}:resource:${index}`);
+      const uploaded = await uploadResource(api, file, { ownerType: "conversation", ownerId: targetConversationId, path: file.name }, expectedRevision, `${submissionId}:resource:${index}`, selection);
       expectedRevision = uploaded.data.revision;
+      uploadedVersionIds.push(uploaded.data.version.id);
     }
+    return uploadedVersionIds;
   };
 
   const appendConversationMessage = async (content: string, idempotencyKey: string, references: ConversationReferenceSelection[] = []) => {
@@ -1804,10 +1808,10 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         }, { expectedRevision: 0, idempotencyKey: `${submissionId}:conversation` });
         announceConversationsChanged({ conversationId: result.data.conversation.id, kind: "created" });
         try {
-          await uploadConversationFiles(result.data.conversation.id, resources.files, submissionId);
+          const uploadedVersionIds = await uploadConversationFiles(result.data.conversation.id, resources.files, submissionId, selection);
           await api.post(`/api/conversations/${encodeURIComponent(result.data.conversation.id)}/respond`, {
             messageId: result.data.messageId,
-            ...responseDescriptor(undefined, resources, selection),
+            ...responseDescriptor(undefined, resources, selection, uploadedVersionIds),
           }, { idempotencyKey: `${submissionId}:respond` });
         } catch (reason) {
           notify(reason instanceof Error ? reason.message : "消息资源处理失败", "error");
@@ -1844,7 +1848,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         copyAgentConfigurationCache(actorId, serverId, configScope, id, configuredAgentIds);
         let workspacePreparation: { kind: "virtual"; branchId: string } | null = null;
         const bindServer = api.post(`/api/conversations/${encodeURIComponent(id)}/server-binding`, { serverId });
-        const uploadFiles = uploadConversationFiles(id, resources.files, submissionId);
+        const uploadFiles = uploadConversationFiles(id, resources.files, submissionId, selection);
         let registerWorkspace: Promise<{ data: { workspace: WorkspaceSummary } }> | null = null;
         if (workspace === VIRTUAL_WORKSPACE) {
           // The response worker owns deterministic virtual-workspace creation.
@@ -1861,7 +1865,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         // Server binding, resource hashing/upload and a user-workspace probe
         // are independent. Starting them together removes two remote round
         // trips from the first Work turn without weakening either contract.
-        const [, , registered] = await Promise.all([bindServer, uploadFiles, registerWorkspace]);
+        const [, uploadedVersionIds, registered] = await Promise.all([bindServer, uploadFiles, registerWorkspace]);
         if (registered) {
           workspaceId = registered.data.workspace.id;
           resolvedPath = registered.data.workspace.canonicalPath;
@@ -1877,7 +1881,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
               : { workspaceId, ...(resolvedPath ? { workspacePath: resolvedPath } : {}) }),
             agentConfigSourceScope: configScope,
             agentConfigIds: configuredAgentIds,
-          }, resources, selection),
+          }, resources, selection, uploadedVersionIds),
         }, { idempotencyKey: `${submissionId}:respond` });
       } catch (reason) {
         const message = reason instanceof Error ? reason.message : "工作任务启动失败";
@@ -1925,7 +1929,8 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     const response = responseDescriptor(undefined, resources, selection);
     const sent = await appendConversationMessage(content, `${submissionId}:message`, references);
     announceConversationsChanged({ conversationId, kind: "updated" });
-    await uploadConversationFiles(conversationId, resources.files, submissionId);
+    const uploadedVersionIds = await uploadConversationFiles(conversationId, resources.files, submissionId, selection);
+    if (uploadedVersionIds.length) response.scope.selectedResourceVersions = uploadedVersionIds;
     await runtime.api.post(`/api/conversations/${conversationId}/respond`, { messageId: sent.data.messageId, ...response }, { idempotencyKey: `${submissionId}:respond` });
     await reload();
   };

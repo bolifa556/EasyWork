@@ -64,15 +64,6 @@ test("网页模型可看见失败请求，但远端重建只采用已结算对�
   );
 });
 
-test("旧对话没有 reply edge 时仍按相邻 user/assistant 对保留", () => {
-  const history = [
-    { id: "legacy-user", role: "user", content: "旧问题" },
-    { id: "legacy-assistant", role: "assistant", content: "旧回答" },
-    { id: "legacy-failed", role: "user", content: "旧失败请求" },
-  ];
-  assert.deepEqual(settledConversationHistory(history).map((entry) => entry.id), ["legacy-user", "legacy-assistant"]);
-});
-
 test("Work 网页 Agent 保留用户提问、正文回答和后续纠正以理解追问", () => {
   const history = [
     { id: "checkpoint", role: "system", content: "对话检查点" },
@@ -496,7 +487,7 @@ test("RemoteTaskLifecycle 创建新 Task 前修复当前原生会话最后一轮
     handoffFragments: [
       { knowledge: { key: "memory:project-goal", version: "1", content: "项目目标" } },
       { knowledge: { key: "skill:platform-guide", version: "semantic-v1:1.0.0:hash-a", content: "平台规范正文" } },
-      { toolName: "conversation_reference_read", knowledge: { key: "conversation-reference:source:snapshot:message", version: "snapshot-v1", content: "显式引用正文" } },
+      { toolName: "conversation_reference_search", knowledge: { key: "conversation-reference:source:snapshot:message", version: "snapshot-v1", content: "显式引用正文" } },
     ],
     idempotencyKey: "semantic-watermark-regression",
   });
@@ -675,69 +666,4 @@ test("RemoteTaskLifecycle keeps deployed Skills selectable for native invocation
   assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments })).map((entry) => entry.knowledge.key), ["skill:platform-guide", "skill:health-check"]);
   nativeSessionId = "native-b";
   assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments })).map((entry) => entry.knowledge.key), ["skill:platform-guide", "skill:health-check"]);
-});
-
-test("RemoteTaskLifecycle 按原生会话隐藏已完整交付的文件版本并兼容旧 read_0 收据", async () => {
-  let nativeSessionId = "native-a";
-  const knownKeys = new Map([
-    ["native-a", new Set(["resource:csv-fixture:read_0\0version-1"])],
-    ["native-b", new Set()],
-  ]);
-  const knownContent = new Map([
-    ["native-a", new Set(["a,b\n1,2"])],
-    ["native-b", new Set()],
-  ]);
-  const contextHub = {
-    async acknowledgeKnowledge({ units }) {
-      const keys = knownKeys.get(nativeSessionId);
-      const contents = knownContent.get(nativeSessionId);
-      for (const unit of units) {
-        keys.add(`${unit.key}\0${unit.version}`);
-        if (String(unit.content || "").trim()) contents.add(String(unit.content));
-      }
-    },
-    async unacknowledgedKnowledge({ units }) {
-      const keys = knownKeys.get(nativeSessionId);
-      return units.filter((unit) => !keys.has(`${unit.key}\0${unit.version}`));
-    },
-    async unacknowledgedSemanticContent({ values }) {
-      const contents = knownContent.get(nativeSessionId);
-      return values.filter((value) => !contents.has(String(value)));
-    },
-  };
-  const lifecycle = new RemoteTaskLifecycle({
-    taskRuntime: {
-      async loadBinding() { return { activeRunId: null, native: { sessionId: nativeSessionId } }; },
-    },
-    contextHub,
-  }, { runId: null });
-  const effectiveScope = { ...scope, actorType: "user", actorId: "user-runtime", branchId: "branch-runtime", contextEpoch: 0 };
-  const legacyCompleteRead = {
-    toolName: "resource_read",
-    rendered: "文件 csv.csv：a,b\n1,2",
-    presented: { resources: [{ filename: "csv.csv", text: "a,b\n1,2" }] },
-    knowledge: { key: "resource:csv-fixture:read_0", version: "version-1", content: "a,b\n1,2" },
-  };
-  assert.deepEqual(await lifecycle.filterHandoff({ scope: effectiveScope, fragments: [legacyCompleteRead] }), []);
-  assert.equal(knownKeys.get("native-a").has("resource:csv-fixture:file\0version-1"), true);
-
-  const laterSearchChunk = {
-    toolName: "resource_search",
-    rendered: "文件 csv.csv：1,2",
-    presented: { resources: [{ filename: "csv.csv", text: "1,2" }] },
-    knowledge: { key: "resource:csv-fixture:chunk-7", version: "version-1", content: "1,2" },
-  };
-  assert.deepEqual(await lifecycle.filterHandoff({ scope: effectiveScope, fragments: [laterSearchChunk] }), []);
-  const catalog = {
-    revision: 1,
-    items: [
-      { resourceId: "csv-fixture", resourceVersionId: "version-1", filename: "csv.csv" },
-      { resourceId: "new-file", resourceVersionId: "version-2", filename: "new.csv" },
-    ],
-  };
-  assert.deepEqual((await lifecycle.filterResourceCatalog({ scope: effectiveScope, catalog })).items.map((entry) => entry.filename), ["new.csv"]);
-
-  nativeSessionId = "native-b";
-  assert.deepEqual((await lifecycle.filterResourceCatalog({ scope: effectiveScope, catalog })).items.map((entry) => entry.filename), ["csv.csv", "new.csv"]);
-  assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments: [laterSearchChunk] })).map((entry) => entry.knowledge.key), ["resource:csv-fixture:chunk-7"]);
 });

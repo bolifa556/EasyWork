@@ -110,7 +110,6 @@ function serviceOptions(dataRoot, currentActor, clock, overrides = {}) {
     idFactory: idFactory(),
     cursorSecret: TOKEN_SECRET,
     authorizeTask: async ({ task: currentTask }) => currentTask.id !== "task_forbidden",
-    authorizeProject: async ({ projectId }) => projectId !== "project_forbidden",
     ...overrides,
   };
 }
@@ -381,39 +380,6 @@ test("下载 descriptor 仅含 opaque token；host 与 remote 均按 Range 流�
     const other = new ArtifactService(serviceOptions(dataRoot, actor("user", "other_download_actor"), time.clock));
     await assert.rejects(() => other.openDownload({ downloadToken: issued.downloadToken }), (error) => ["CURSOR_INVALID", "ARTIFACT_DOWNLOAD_FORBIDDEN"].includes(error?.code));
     await assert.rejects(() => other.get({ artifactId: captured.artifact.id }), (error) => error?.code === "ARTIFACT_NOT_FOUND");
-  });
-});
-
-test("保存到项目通过流式 source callback 生成 Resource，并固定 Artifact；拒绝越权项目", async () => {
-  await fixture(async (dataRoot) => {
-    const currentActor = actor();
-    const time = clockFixture();
-    const promotions = [];
-    const resourcePromoter = {
-      async promote(input) {
-        const opened = await input.openSource();
-        promotions.push({ projectId: input.projectId, body: await streamText(opened.stream), artifact: input.artifact });
-        return { resourceVersionId: "resource_version_a", bindingId: "resource_binding_a" };
-      },
-    };
-    const service = new ArtifactService(serviceOptions(dataRoot, currentActor, time.clock, { resourcePromoter }));
-    const captured = await service.capture({ task: task(currentActor, time.clock), event: hostEvent(1, { content: "promote me" }) });
-    await assert.rejects(() => service.promoteToProject({ artifactId: captured.artifact.id, projectId: "project_forbidden", expectedRevision: 0, commandId: "promote_forbidden" }), (error) => error?.code === "ARTIFACT_PROJECT_FORBIDDEN");
-    const promoted = await service.promoteToProject({ artifactId: captured.artifact.id, projectId: "project_a", expectedRevision: 0, commandId: "promote_a" });
-    assert.equal(promotions.length, 1);
-    assert.equal(promotions[0].body, "promote me");
-    assert.equal(JSON.stringify(promotions[0].artifact).includes("actorRelativePath"), false);
-    assert.equal(promoted.artifact.projectId, "project_a");
-    assert.equal(promoted.artifact.lifecycle, "pinned");
-    assert.deepEqual(promoted.promotion, {
-      projectId: "project_a",
-      resourceVersionId: "resource_version_a",
-      bindingId: "resource_binding_a",
-      promotedAt: promoted.artifact.promotion.promotedAt,
-    });
-    const duplicate = await service.promoteToProject({ artifactId: captured.artifact.id, projectId: "project_a", expectedRevision: 0, commandId: "promote_a" });
-    assert.equal(duplicate.duplicate, true);
-    assert.equal(promotions.length, 1);
   });
 });
 

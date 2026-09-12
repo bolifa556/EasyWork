@@ -30,6 +30,7 @@ const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const DIRECT_READ_CHARACTERS = 20_000;
 const MODEL_IMAGE_BYTES = 8 * 1024 * 1024;
 const MODEL_IMAGE_MIME = /^image\/(?:png|jpe?g|webp|gif)$/i;
+const RESOURCE_SUMMARY_VERSION = "llm-v1";
 const sharedResourceMutationQueue = new ActorMutationQueue();
 const inlineRepositoryQueue = Object.freeze({
   run: async (_actor, operation) => operation(),
@@ -155,8 +156,8 @@ async function hashFile(filePath) {
   return { size, sha256: hash.digest("hex") };
 }
 
-function deterministicPromotionId(kind, commandId) {
-  return `${kind}_${crypto.createHash("sha256").update(`artifact-promotion:${commandId}:${kind}`).digest("hex").slice(0, 32)}`;
+function deterministicStreamImportId(kind, commandId) {
+  return `${kind}_${crypto.createHash("sha256").update(`stream-import:${commandId}:${kind}`).digest("hex").slice(0, 32)}`;
 }
 
 function processingPath(kind, versionId) {
@@ -184,6 +185,16 @@ async function readJson(filePath, missingCode) {
 function publicFailureMessage(error) {
   const message = typeof error?.message === "string" ? error.message.trim() : "处理失败";
   return message.slice(0, 16384) || "处理失败";
+}
+
+function generatedSummary(value) {
+  const text = String(value || "")
+    .replace(/^```[^\n]*\n?/u, "")
+    .replace(/\n?```$/u, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  invariant(text.length > 0, "RESOURCE_SUMMARY_EMPTY", "文件简介模型没有返回有效内容", { status: 502, retryable: true });
+  return text.slice(0, 600);
 }
 
 function normalizeScope(scope) {
@@ -224,6 +235,7 @@ export class ResourceService {
     this.authorizeOwner = options.authorizeOwner;
     this.extractor = options.extractor;
     this.embedder = options.embedder;
+    this.summaryGenerator = typeof options.summaryGenerator === "function" ? options.summaryGenerator : null;
     this.parserVersion = assertId(String(options.parserVersion || "parser-v1"), "parserVersion");
     this.embeddingProfileId = assertId(String(options.embeddingProfileId || "embedding-default"), "embeddingProfileId");
     this.maxFileBytes = Number(options.maxFileBytes ?? 100 * 1024 * 1024);
@@ -353,7 +365,7 @@ export class ResourceService {
         throw error;
       }
 
-      const processed = await this.#processVersion(version.id);
+      const processed = await this.#processVersion(version.id, input?.summary || null);
       return {
         revision: processed.revision,
         blob: clone(processed.data.blobs.find((entry) => entry.id === version.blobId)),
@@ -364,11 +376,7 @@ export class ResourceService {
     });
   }
 
-  /**
-   * Imports an Artifact without buffering its payload in the JS heap. The
-   * command-derived ids make the cross-store promotion replayable when the
-   * Artifact record commit fails after the Resource commit.
-   */
+  /** Imports a request stream without buffering its payload in the JS heap. */
   async ingestStream(input) {
     return this.#serialize(async () => {
       invariant(typeof input?.openSource === "function", "RESOURCE_STREAM_SOURCE_REQUIRED", "流式资源缺少 source callback", { status: 400 });
@@ -390,9 +398,9 @@ export class ResourceService {
       invariant(Number.isSafeInteger(expectedSize) && expectedSize >= 0 && expectedSize <= this.maxFileBytes, "RESOURCE_FILE_TOO_LARGE", "文件超过允许大小", { status: 413, details: { maxFileBytes: this.maxFileBytes } });
       invariant(/^[a-f0-9]{64}$/.test(expectedSha256), "RESOURCE_STREAM_HASH_REQUIRED", "流式资源必须提供内容 hash", { status: 400 });
 
-      const resourceId = deterministicPromotionId("resource", commandId);
-      const versionId = deterministicPromotionId("resource_version", commandId);
-      const bindingId = deterministicPromotionId("resource_binding", commandId);
+      const resourceId = deterministicStreamImportId("resource", commandId);
+      const versionId = deterministicStreamImportId("resource_version", commandId);
+      const bindingId = deterministicStreamImportId("resource_binding", commandId);
       let snapshot = await this.#repository.read();
       const existingBinding = snapshot.data.bindings.find((entry) => entry.id === bindingId);
       if (existingBinding) {
@@ -406,9 +414,9 @@ export class ResourceService {
           && existingVersion?.resourceId === resourceId
           && existingVersion.filename === filename
           && existingBlob?.sha256 === expectedSha256
-          && existingBlob.size === expectedSize, "RESOURCE_COMMAND_REUSED", "commandId 已用于不同的资源转存", { status: 409 });
-        if (!isResourceKnowledgeReady(existingVersion) && existingVersion.parseStatus !== "failed" && existingVersion.embeddingStatus !== "failed") {
-          snapshot = await this.#processVersion(versionId);
+          && existingBlob.size === expectedSize, "RESOURCE_COMMAND_REUSED", "commandId 已用于不同的流式资源导入", { status: 409 });
+        if (!isResourceKnowledgeReady(existingVersion)) {
+          snapshot = await this.#processVersion(versionId, input?.summary || null);
         }
         return {
           revision: snapshot.revision,
@@ -433,7 +441,7 @@ export class ResourceService {
         transform(chunk, _encoding, callback) {
           size += chunk.length;
           if (size > expectedSize || size > maxFileBytes) {
-            callback(new ApiError("RESOURCE_STREAM_SIZE_MISMATCH", "流式资源大小与 Artifact 不一致", { status: 502 }));
+            callback(new ApiError("RESOURCE_STREAM_SIZE_MISMATCH", "流式资源大小与声明不一致", { status: 502 }));
             return;
           }
           digest.update(chunk);
@@ -443,7 +451,7 @@ export class ResourceService {
       try {
         await pipeline(source, meter, createWriteStream(temporaryPath, { flags: "wx", mode: 0o600 }));
         const sha256 = digest.digest("hex");
-        invariant(size === expectedSize && sha256 === expectedSha256, "RESOURCE_STREAM_HASH_MISMATCH", "Artifact 转存内容校验失败", { status: 502 });
+        invariant(size === expectedSize && sha256 === expectedSha256, "RESOURCE_STREAM_HASH_MISMATCH", "流式资源内容校验失败", { status: 502 });
         const blobStoragePath = `resources/blobs/${sha256.slice(0, 2)}/${sha256}`;
         const blobFilePath = this.#actorFile(blobStoragePath);
         await fs.mkdir(path.dirname(blobFilePath), { recursive: true });
@@ -466,13 +474,13 @@ export class ResourceService {
             blob = createResourceBlob({ id: this.#newId("blob"), actorId: this.actor.actorId, sha256, size, mime, storagePath: blobStoragePath }, { clock: this.clock });
             store.blobs.push(blob);
           }
-          invariant(!store.versions.some((entry) => entry.id === versionId) && !store.bindings.some((entry) => entry.id === bindingId), "RESOURCE_PROMOTION_ID_COLLISION", "资源转存标识冲突", { status: 409 });
+          invariant(!store.versions.some((entry) => entry.id === versionId) && !store.bindings.some((entry) => entry.id === bindingId), "RESOURCE_STREAM_IMPORT_ID_COLLISION", "流式资源导入标识冲突", { status: 409 });
           version = createResourceVersion({ id: versionId, actorId: this.actor.actorId, resourceId, blobId: blob.id, filename, parserVersion: this.parserVersion }, { clock: this.clock });
           binding = createResourceBinding({ id: bindingId, actorId: this.actor.actorId, resourceVersionId: versionId, ownerType, ownerId, path: bindingPath, createdSequence }, { clock: this.clock });
           store.versions.push(version);
           store.bindings.push(binding);
         }, { expectedRevision: snapshot.revision, clock: this.clock });
-        const processed = await this.#processVersion(versionId);
+        const processed = await this.#processVersion(versionId, input?.summary || null);
         return {
           revision: processed.revision,
           pendingRevision: persisted.revision,
@@ -498,7 +506,7 @@ export class ResourceService {
     }, { expectedRevision: (await this.#repository.read()).revision, clock: this.clock });
   }
 
-  async #processVersion(versionId) {
+  async #processVersion(versionId, summaryRequest = null) {
     let snapshot = await this.#repository.read();
     let version = snapshot.data.versions.find((entry) => entry.id === versionId);
     invariant(version, "RESOURCE_VERSION_NOT_FOUND", "资源版本不存在", { status: 404 });
@@ -515,6 +523,24 @@ export class ResourceService {
         mime: blob.mime,
         version: clone(version),
       });
+      if (summaryRequest?.required) {
+        invariant(this.summaryGenerator, "RESOURCE_SUMMARY_GENERATOR_REQUIRED", "文件上传需要可用的简介模型", { status: 503, retryable: true });
+        const summary = generatedSummary(await this.summaryGenerator({
+          actor: this.actor,
+          filename: version.filename,
+          mime: blob.mime,
+          sha256: blob.sha256,
+          parsed: clone(parsed),
+          providerId: String(summaryRequest.providerId || ""),
+          modelId: String(summaryRequest.modelId || ""),
+        }));
+        parsed.metadata = {
+          ...(parsed.metadata || documentMetadata(parsed.text, version.filename)),
+          summary,
+          keywords: [],
+          summaryVersion: RESOURCE_SUMMARY_VERSION,
+        };
+      }
       const envelope = processingEnvelope(version.id, parsed, this.clock);
       await writeFileAtomically(this.#actorFile(processingPath("parsed", version.id)), `${JSON.stringify(envelope, null, 2)}\n`);
       snapshot = await this.#setVersionProcessing(version.id, {
@@ -535,7 +561,7 @@ export class ResourceService {
         parseError: publicFailureMessage(error),
         embeddingError: null,
       });
-      if (error?.code === "RESOURCE_OCR_NOT_CONFIGURED") throw error;
+      if (error?.code === "RESOURCE_OCR_NOT_CONFIGURED" || summaryRequest?.required) throw error;
       return failed;
     }
 
@@ -709,8 +735,9 @@ export class ResourceService {
     for (const collectionId of scope.collectionIds) await this.#authorize("collection", collectionId, "read");
     if (scope.projectId) await this.#authorize("project", scope.projectId, "read");
     if (scope.conversationId) await this.#authorize("conversation", scope.conversationId, "read");
-    const limit = Number(input.limit ?? 80);
-    invariant(Number.isSafeInteger(limit) && limit >= 1 && limit <= 200, "RESOURCE_CATALOG_LIMIT_INVALID", "文件概览数量无效", { status: 400 });
+    const all = input.all === true;
+    const limit = all ? Number.MAX_SAFE_INTEGER : Number(input.limit ?? 80);
+    invariant(all || (Number.isSafeInteger(limit) && limit >= 1 && limit <= 200), "RESOURCE_CATALOG_LIMIT_INVALID", "文件概览数量无效", { status: 400 });
     const snapshot = await this.#repository.read();
     const groupedBindings = new Map();
     for (const binding of snapshot.data.bindings.filter((entry) => bindingMatchesScope(entry, scope, Number.MAX_SAFE_INTEGER))) {
@@ -718,13 +745,18 @@ export class ResourceService {
       values.push(binding);
       groupedBindings.set(binding.resourceVersionId, values);
     }
-    const items = [];
-    for (const version of snapshot.data.versions) {
-      if (items.length >= limit || !groupedBindings.has(version.id) || version.parseStatus !== "ready") continue;
-      const parsedEnvelope = await readJson(this.#actorFile(processingPath("parsed", version.id)), "RESOURCE_PARSED_OUTPUT_MISSING");
+    const visibleVersions = snapshot.data.versions
+      .filter((version) => groupedBindings.has(version.id) && version.parseStatus === "ready")
+      .slice(0, limit);
+    const items = await Promise.all(visibleVersions.map(async (version) => {
+      const parsedPath = this.#actorFile(processingPath("parsed", version.id));
+      const parsedEnvelope = await readJson(parsedPath, "RESOURCE_PARSED_OUTPUT_MISSING");
       invariant(parsedEnvelope.resourceVersionId === version.id, "RESOURCE_PROCESSING_OUTPUT_MISMATCH", "资源处理结果与版本不匹配", { status: 500, expose: false });
+      if (input.summary?.required && parsedEnvelope.content?.metadata?.summaryVersion !== RESOURCE_SUMMARY_VERSION) {
+        invariant(false, "RESOURCE_SUMMARY_REQUIRED", "文件缺少当前格式的模型简介，请重新上传", { status: 409 });
+      }
       const metadata = parsedEnvelope.content?.metadata || documentMetadata(parsedEnvelope.content?.text, version.filename);
-      items.push({
+      return {
         // These immutable identities are consumed only by the Work-context
         // receipt filter. The model-facing catalog renderer removes them.
         resourceId: version.resourceId,
@@ -734,9 +766,35 @@ export class ResourceService {
         summary: String(metadata.summary || "").slice(0, 360),
         keywords: (Array.isArray(metadata.keywords) ? metadata.keywords : []).map(String).slice(0, 10),
         bindings: clone(groupedBindings.get(version.id)).map((binding) => ({ ownerType: binding.ownerType, ownerId: binding.ownerId, path: binding.path })),
-      });
-    }
+      };
+    }));
     return { revision: snapshot.revision, items };
+  }
+
+  async materializationDescriptors(input = {}) {
+    const conversationId = assertId(String(input.conversationId || ""), "conversationId");
+    const versionIds = [...new Set((Array.isArray(input.versionIds) ? input.versionIds : []).map((entry) => assertId(String(entry), "resourceVersionId")))];
+    invariant(versionIds.length <= 256, "RESOURCE_FILE_SELECTION_INVALID", "本轮选择的文件数量无效", { status: 400 });
+    if (!versionIds.length) return [];
+    await this.#authorize("conversation", conversationId, "read");
+    const snapshot = await this.#repository.read();
+    return versionIds.map((versionId) => {
+      const version = snapshot.data.versions.find((entry) => entry.id === versionId);
+      invariant(version, "RESOURCE_VERSION_NOT_FOUND", "选择的文件版本不存在", { status: 404, details: { resourceVersionId: versionId } });
+      const allowed = snapshot.data.bindings.some((entry) => entry.resourceVersionId === versionId
+        && entry.ownerType === "conversation" && entry.ownerId === conversationId && entry.invalidatedSequence === null);
+      invariant(allowed, "RESOURCE_FILE_SELECTION_FORBIDDEN", "选择的文件不属于当前对话", { status: 403, details: { resourceVersionId: versionId } });
+      const blob = snapshot.data.blobs.find((entry) => entry.id === version.blobId);
+      invariant(blob, "RESOURCE_BLOB_MISSING", "选择的文件内容不存在", { status: 500, expose: false });
+      return Object.freeze({
+        resourceVersionId: version.id,
+        filename: version.filename,
+        sha256: blob.sha256,
+        size: blob.size,
+        mime: blob.mime,
+        localPath: this.#actorFile(blob.storagePath),
+      });
+    });
   }
 
   async read(input = {}) {

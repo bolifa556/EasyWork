@@ -7,13 +7,12 @@ import {
   assertId,
   assertInteger,
   assertIsoTimestamp,
-  assertNullableId,
   assertNullableString,
   assertSha256,
   assertString,
 } from "../entities/common.mjs";
 
-export const ARTIFACT_STORE_SCHEMA_VERSION = 1;
+export const ARTIFACT_STORE_SCHEMA_VERSION = 2;
 export const ARTIFACT_LIFECYCLES = Object.freeze(["active", "pinned", "deleted", "expired"]);
 export const ARTIFACT_CONTENT_LOCATIONS = Object.freeze(["host-small-file", "remote-reference"]);
 
@@ -68,9 +67,9 @@ export function assertArtifactVersion(version, field = "ArtifactVersion") {
 export function assertArtifactRecord(record) {
   invariant(record && typeof record === "object" && !Array.isArray(record), "ARTIFACT_RECORD_INVALID", "Artifact 记录无效", { status: 500, expose: false });
   const keys = [
-    "schemaVersion", "entityType", "revision", "id", "actorId", "taskId", "conversationId", "workspaceId", "projectId",
+    "schemaVersion", "entityType", "revision", "id", "actorId", "taskId", "conversationId", "workspaceId",
     "name", "kind", "mime", "size", "sha256", "source", "contentLocation", "lifecycle", "activeVersionId", "versions",
-    "originArtifact", "locators", "promotion", "expiresAt", "pinnedAt", "deletedAt", "createdAt", "updatedAt",
+    "originArtifact", "locators", "expiresAt", "pinnedAt", "deletedAt", "createdAt", "updatedAt",
   ];
   invariant(Object.keys(record).length === keys.length && keys.every((key) => Object.hasOwn(record, key)), "ARTIFACT_RECORD_INVALID", "Artifact 记录字段无效", { status: 500, expose: false });
   invariant(record.schemaVersion === ARTIFACT_STORE_SCHEMA_VERSION && record.entityType === "ArtifactRecord", "ARTIFACT_RECORD_SCHEMA_INVALID", "Artifact 记录 schema 无效", { status: 500, expose: false });
@@ -80,7 +79,6 @@ export function assertArtifactRecord(record) {
   assertId(record.taskId, "ArtifactRecord.taskId");
   assertId(record.conversationId, "ArtifactRecord.conversationId");
   assertId(record.workspaceId, "ArtifactRecord.workspaceId");
-  assertNullableId(record.projectId, "ArtifactRecord.projectId");
   assertArtifactName(record.name, "ArtifactRecord.name");
   assertEnum(record.kind, ARTIFACT_KINDS, "ArtifactRecord.kind");
   assertMime(record.mime, "ArtifactRecord.mime");
@@ -123,17 +121,6 @@ export function assertArtifactRecord(record) {
       invariant(typeof locator.remotePath === "string" && locator.actorRelativePath === null && typeof locator.serverIdentity === "string", "ARTIFACT_REMOTE_LOCATOR_INVALID", "远端 Artifact 定位符无效", { status: 500, expose: false });
     }
   }
-  if (record.promotion !== null) {
-    invariant(record.promotion && typeof record.promotion === "object", "ARTIFACT_PROMOTION_INVALID", "Artifact 转存记录无效", { status: 500, expose: false });
-    const promotionKeys = ["projectId", "resourceVersionId", "bindingId", "promotedAt"];
-    invariant(Object.keys(record.promotion).length === promotionKeys.length && promotionKeys.every((key) => Object.hasOwn(record.promotion, key)), "ARTIFACT_PROMOTION_INVALID", "Artifact 转存记录字段无效", { status: 500, expose: false });
-    assertId(record.promotion.projectId, "ArtifactRecord.promotion.projectId");
-    assertId(record.promotion.resourceVersionId, "ArtifactRecord.promotion.resourceVersionId");
-    assertId(record.promotion.bindingId, "ArtifactRecord.promotion.bindingId");
-    assertIsoTimestamp(record.promotion.promotedAt, "ArtifactRecord.promotion.promotedAt");
-    invariant(record.projectId === record.promotion.projectId, "ARTIFACT_PROMOTION_PROJECT_MISMATCH", "Artifact 转存项目不一致", { status: 500, expose: false });
-  }
-  invariant(record.projectId === null || record.promotion !== null, "ARTIFACT_PROJECT_WITHOUT_PROMOTION", "Artifact 项目关联缺少转存记录", { status: 500, expose: false });
   assertNullableString(record.expiresAt, "ArtifactRecord.expiresAt", { max: 64 });
   assertNullableString(record.pinnedAt, "ArtifactRecord.pinnedAt", { max: 64 });
   assertNullableString(record.deletedAt, "ArtifactRecord.deletedAt", { max: 64 });
@@ -172,7 +159,6 @@ export function publicArtifactSummary(record) {
     taskId: record.taskId,
     conversationId: record.conversationId,
     workspaceId: record.workspaceId,
-    projectId: record.projectId,
     name: record.name,
     kind: record.kind,
     mime: record.mime,
@@ -191,6 +177,5 @@ export function publicArtifactDetail(record) {
   return {
     ...publicArtifactSummary(record),
     versions: clone(record.versions),
-    promotion: clone(record.promotion),
   };
 }

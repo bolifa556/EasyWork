@@ -462,10 +462,11 @@ export class WebAgentRuntime {
       }
       let availableTools = this.tools.definitions(mode);
       if (mode === "work") {
-        const canDiscoverRewritableCandidate = availableTools.some((tool) => ["memory_search", "conversation_reference_read"].includes(tool.name));
+        const canDiscoverRewritableCandidate = availableTools.some((tool) => tool.name === "conversation_reference_search")
+          || [...candidatePool.values()].some((candidate) => String(candidate?.knowledge?.key || "").startsWith("memory:"));
         const hasRewritableCandidate = [...candidatePool.values()].some((candidate) => (
           String(candidate?.knowledge?.key || "").startsWith("memory:")
-          || String(candidate?.toolName || "") === "conversation_reference_read"
+          || String(candidate?.toolName || "") === "conversation_reference_search"
         ));
         if (!canDiscoverRewritableCandidate && !hasRewritableCandidate) {
           availableTools = availableTools.filter((tool) => tool.name !== "handoff_rewrite_candidate");
@@ -701,7 +702,7 @@ export class WebAgentRuntime {
             const candidate = candidatePool.get(input.candidateId);
             const rewritable = candidate && (
               String(candidate?.knowledge?.key || "").startsWith("memory:")
-              || String(candidate?.toolName || "") === "conversation_reference_read"
+              || String(candidate?.toolName || "") === "conversation_reference_search"
             );
             if (!rewritable) {
               messages.push({
@@ -800,9 +801,14 @@ export class WebAgentRuntime {
             const modelMessages = allObserved ? [] : await tool.modelMessages({ input, output, presented });
             supplementalModelMessages.push(...(Array.isArray(modelMessages) ? modelMessages : []));
             if (tool.timelineRead && rendered && !allObserved) {
-              const timelineOutput = mode === "work" && observationsFiltered && resultCandidates.length
+              const candidateTimelineOutput = mode === "work" && observationsFiltered && resultCandidates.length
                 ? mergedPresentation(resultCandidates)
                 : presented;
+              const timelineOutput = await tool.timelineOutput({
+                input,
+                output: rawOutput,
+                presented: candidateTimelineOutput,
+              });
               await emit("run.context.read", { callId: call.id, name: call.name, input, output: timelineOutput });
             }
             toolCache.set(cacheKey, { content, rendered, presented });

@@ -23,6 +23,7 @@ import { RealtimeBroker } from "../realtime-broker.mjs";
 import { RealtimeEventJournal } from "../realtime.mjs";
 import { AtomicJsonRepository } from "../repository.mjs";
 import { ResourceService } from "../resources/service.mjs";
+import { cosine } from "../resources/embedding-client.mjs";
 import { SlurmSchedulerAdapter } from "../scheduler/slurm.mjs";
 import { SchedulerService } from "../scheduler/service.mjs";
 import { agentSchedulerActivity, agentSubmissionReceipts, SchedulerSubmissionLedger, SchedulerSubmissionTracker } from "../scheduler/submissions.mjs";
@@ -30,7 +31,6 @@ import { createAgentBindingKey } from "../scope.mjs";
 import {
   filterEligibleSkillObservations,
   isAutomaticSkillApplicable,
-  isAutomaticSkillRelevantToRequest,
   isForcedWorkSkill,
   isSkillApplicableToMode,
 } from "../skills/applicability.mjs";
@@ -38,17 +38,13 @@ import { SkillService } from "../skills/service.mjs";
 import { taskTopic } from "../orchestrator/contract.mjs";
 import { VersioningService } from "../versioning/service.mjs";
 import { WebAgentRuntime } from "../web-agent/runtime.mjs";
-import {
-  filterRelevantHistoricalObservations,
-  WebAgentObservationLedger,
-} from "../web-agent/observations.mjs";
+import { WebAgentObservationLedger } from "../web-agent/observations.mjs";
 import {
   conversationKnowledgeUnit,
   createDefaultWebAgentTools,
   renderSemanticContext,
   semanticState,
 } from "../web-agent/tools.mjs";
-import { workSourceIntent } from "../web-agent/source-intent.mjs";
 import { WorkspaceService } from "../workspaces/service.mjs";
 import { createVirtualWorkspaceId } from "../workspaces/contract.mjs";
 import { RemoteAgentConversationGarbageCollector } from "./agent-conversation-gc.mjs";
@@ -99,6 +95,23 @@ function estimateMemoryTokens(value) {
   return Math.max(1, Math.ceil(wide * 1.1 + narrow / 4));
 }
 
+async function rankReferencedConversationTurns(embedder, { query, turns }) {
+  const candidates = Array.isArray(turns) ? turns.filter((turn) => String(turn?.content || "").trim()) : [];
+  if (!String(query || "").trim() || !candidates.length) return [];
+  const [embedded, configuration] = await Promise.all([
+    embedder.embedTexts([String(query), ...candidates.map((turn) => String(turn.content))]),
+    embedder.memoryConfiguration().catch(() => ({ minimumScore: 0.12 })),
+  ]);
+  const queryVector = embedded?.vectors?.[0];
+  if (!Array.isArray(queryVector) || !queryVector.length) return [];
+  const minimumScore = Math.max(0, Math.min(1, Number(configuration?.minimumScore ?? 0.12)));
+  return candidates.map((turn, index) => ({
+    id: String(turn.id),
+    score: cosine(queryVector, embedded?.vectors?.[index + 1]),
+  })).filter((turn) => turn.score >= minimumScore)
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id));
+}
+
 function selectedWorkspaceName(routing = {}, workspace = null) {
   const workspaceId = String(routing.workspaceId || "").normalize("NFKC").trim();
   const explicit = String(routing.workspaceLabel || "").normalize("NFKC").trim();
@@ -141,7 +154,7 @@ export function workCurrentState(raw = {}, routing = {}) {
 // promoted into EasyWork memory merely because the Web Agent inspected them.
 export function memoryExtractionObservations(fragments = []) {
   return (Array.isArray(fragments) ? fragments : [])
-    .filter((fragment) => String(fragment?.toolName || "") !== "conversation_reference_read" && fragment?.rewritten !== true);
+    .filter((fragment) => String(fragment?.toolName || "") !== "conversation_reference_search" && fragment?.rewritten !== true);
 }
 
 function handoffEventReferences(fragments = []) {
@@ -240,8 +253,7 @@ export function settledConversationHistory(history, currentMessageId = null, { r
   // history and remote reconstruction must never reopen an unanswered request
   // as a new instruction.  Once a later retry succeeds, that failed request is
   // no longer trailing, so role-only tail trimming is insufficient: prefer the
-  // durable assistant.replyToMessageId edge and retain the adjacent-pair rule
-  // only for legacy messages that predate reply edges.
+  // durable assistant.replyToMessageId edge.
   const selected = (history || []).filter((entry) => !currentMessageId || entry.id !== currentMessageId);
   if (retainTrailingUsers) return selected;
   const byId = new Map(selected.flatMap((entry) => entry?.id ? [[String(entry.id), entry]] : []));
@@ -263,11 +275,13 @@ export function settledConversationHistory(history, currentMessageId = null, { r
       cursor = cursor.replyToMessageId ? byId.get(String(cursor.replyToMessageId)) : null;
     }
   }
-  return selected.filter((entry, index) => {
+  return selected.filter((entry) => {
+    if (entry.role === "assistant") {
+      return Boolean(entry.replyToMessageId && byId.get(String(entry.replyToMessageId))?.role === "user");
+    }
     if (entry.role !== "user") return true;
     if (entry.id && repliedUserIds.has(String(entry.id))) return true;
-    const next = selected[index + 1];
-    return next?.role === "assistant" && !next.replyToMessageId;
+    return false;
   });
 }
 
@@ -309,8 +323,7 @@ export function conversationCompactionBatch(history, keepCount = 4) {
 
   // Never leave an assistant response on the retained side while moving the
   // user request it directly answers into the checkpoint.  Reply edges are
-  // authoritative; the adjacent-pair fallback keeps old conversations that
-  // predate replyToMessageId internally consistent as well.
+  // authoritative.
   const indexes = new Map(messages.flatMap((message, index) => message?.id ? [[String(message.id), index]] : []));
   for (;;) {
     let nextBoundary = boundary;
@@ -318,11 +331,6 @@ export function conversationCompactionBatch(history, keepCount = 4) {
       if (message?.role !== "assistant" || !message.replyToMessageId) continue;
       const requestIndex = indexes.get(String(message.replyToMessageId));
       if (Number.isSafeInteger(requestIndex) && requestIndex < nextBoundary) nextBoundary = requestIndex;
-    }
-    if (messages[boundary]?.role === "assistant"
-      && !messages[boundary]?.replyToMessageId
-      && messages[boundary - 1]?.role === "user") {
-      nextBoundary = Math.min(nextBoundary, boundary - 1);
     }
     if (nextBoundary === boundary) break;
     boundary = nextBoundary;
@@ -366,11 +374,8 @@ export function relevantConversationMessages(messages, {
   const requestedLimit = Math.min(20, Math.max(1, Number(limit) || 8));
   return entries
     .map((message, index) => {
-      const legacyRequest = message?.role === "assistant" && !message?.replyToMessageId && entries[index - 1]?.role === "user"
-        ? entries[index - 1]
-        : null;
       const request = message?.role === "assistant"
-        ? byId.get(String(message.replyToMessageId || "")) || legacyRequest
+        ? byId.get(String(message.replyToMessageId || ""))
         : null;
       const searchable = [request?.content, message?.content].filter(Boolean).join("\n");
       return { message, index, score: textRelevance(searchable, query) };
@@ -405,10 +410,35 @@ function effectiveScope(actor, summary, branchId, input = {}, taskId = null, pre
     memorySnapshotVersionIds: Object.freeze((input.memorySnapshotVersionIds || []).map(String)),
     resourceBindingSnapshotId: input.resourceBindingSnapshotId == null ? null : String(input.resourceBindingSnapshotId),
     selectedCollectionIds: Object.freeze((input.selectedCollectionIds || []).map(String)),
+    selectedResourceVersions: Object.freeze((input.selectedResourceVersions || []).map(String)),
     selectedSkillVersions: Object.freeze((input.selectedSkillVersions || []).map((entry) => Object.freeze({ skillId: String(entry.skillId), version: String(entry.version) }))),
     capabilities: Object.freeze((input.capabilities || []).map(String)),
     contextEpoch: Number(input.contextEpoch || 0),
   });
+}
+
+function resourceSummaryExcerpt(parsed, maximumCharacters = 110_000) {
+  const text = String(parsed?.text || "").trim();
+  if (text.length <= maximumCharacters) return text;
+  const chunks = (Array.isArray(parsed?.chunks) ? parsed.chunks : [])
+    .map((entry) => String(entry?.text || "").trim())
+    .filter(Boolean);
+  if (!chunks.length) return text.slice(0, maximumCharacters);
+  const average = Math.max(1, Math.ceil(chunks.reduce((total, entry) => total + entry.length, 0) / chunks.length));
+  const count = Math.max(3, Math.min(chunks.length, Math.floor(maximumCharacters / average)));
+  const indices = new Set([0, chunks.length - 1]);
+  for (let index = 1; index < count - 1; index += 1) indices.add(Math.round(index * (chunks.length - 1) / (count - 1)));
+  let remaining = maximumCharacters;
+  const selected = [];
+  for (const index of [...indices].sort((left, right) => left - right)) {
+    if (remaining <= 0) break;
+    const heading = `[文件片段 ${index + 1}/${chunks.length}]\n`;
+    const content = chunks[index].slice(0, Math.max(0, remaining - heading.length));
+    if (!content) continue;
+    selected.push(`${heading}${content}`);
+    remaining -= heading.length + content.length + 2;
+  }
+  return selected.join("\n\n");
 }
 
 const CJK_TOKEN_CHARACTER = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -780,16 +810,6 @@ class ConversationInteractionFacade {
     };
   }
 
-  async #legacySkillPinsAtTask(sourceTask) {
-    const summaries = await this.container.taskStore.listTasks({ conversationId: sourceTask.conversationId, limit: 1000 });
-    const tasks = await Promise.all(summaries.filter((task) => task.createdAt <= sourceTask.createdAt).map((task) => this.container.taskStore.getTask(task.id)));
-    const pins = new Map();
-    for (const task of tasks.filter((task) => task && task.agentBindingId === sourceTask.agentBindingId && task.status === "completed").sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
-      for (const pin of task.skillPins || []) pins.set(pin.skillId, pin);
-    }
-    return [...pins.values()];
-  }
-
   async #tryNativeAgentFork({ sourceTask, targetConversationId, targetBranchId, inheritedConversationUnits = [] }) {
     if (!sourceTask || sourceTask.status !== "completed") return { applied: false, reason: "boundary_not_completed" };
     const sourceBinding = await this.container.taskRuntime.loadBinding(sourceTask.agentBindingId);
@@ -842,7 +862,7 @@ class ConversationInteractionFacade {
         // inherits the exact Skill capabilities that transcript could use.
         // Pins are copied as identities only; execute() materializes a fresh
         // branch-local discovery view from the immutable server cache.
-        skillPins: clone(boundary?.skillSnapshot?.skillPins || sourceBinding.native?.skillCheckpoints?.[sourceTask.id]?.skillPins || await this.#legacySkillPinsAtTask(sourceTask)),
+        skillPins: clone(boundary?.skillSnapshot?.skillPins || sourceBinding.native?.skillCheckpoints?.[sourceTask.id]?.skillPins || []),
         ...((boundary?.skillSnapshot || sourceBinding.native?.skillCheckpoints?.[sourceTask.id]) ? { skillSnapshot: clone(boundary?.skillSnapshot || sourceBinding.native.skillCheckpoints[sourceTask.id]) } : {}),
       },
       activeRunId: null,
@@ -1300,7 +1320,7 @@ class ConversationInteractionFacade {
   listConversations(input) { return this.base.listConversations(input); }
   searchConversations(input) { return this.base.searchConversations(input); }
   searchReferenceCandidates(input) { return this.base.searchReferenceCandidates(input); }
-  readConversationReference(input) { return this.base.readConversationReference(input); }
+  searchConversationReference(input) { return this.base.searchConversationReference(input); }
   getConversationSummaries(ids) { return this.base.getConversationSummaries(ids); }
   getConversation(id) { return this.base.getConversation(id); }
   assertReadable(id) { return this.base.assertReadable(id); }
@@ -1647,19 +1667,6 @@ function resourceCoverageKnowledge(fragment) {
   };
 }
 
-function isLegacyCompleteResourceRead(fragment) {
-  if (String(fragment?.toolName || "") !== "resource_read") return false;
-  if (!/^resource:[^:]+:read_0$/u.test(String(fragment?.knowledge?.key || ""))) return false;
-  const resources = Array.isArray(fragment?.presented?.resources) ? fragment.presented.resources : [];
-  return resources.length > 0 && resources.every((entry) => entry?.nextOffset === null || entry?.nextOffset === undefined);
-}
-
-function resourceCatalogCoverageKnowledge(item) {
-  const resourceId = String(item?.resourceId || "").trim();
-  const version = String(item?.resourceVersionId || "").trim();
-  return resourceId && version ? { key: `resource:${resourceId}:file`, version, content: "" } : null;
-}
-
 export class RemoteTaskLifecycle {
   constructor(container, extraction) {
     this.container = container;
@@ -1689,6 +1696,40 @@ export class RemoteTaskLifecycle {
     const messages = await allMessages(this.container.baseConversations, scope.conversationId, scope.branchId);
     const fragments = await workConversationTranscriptFragments(messages, this.extraction.messageId, this.container.runtime.prompts, { tasks });
     return this.filterHandoff({ scope, fragments });
+  }
+
+  async #stageSelectedFiles(scope, agentBindingId) {
+    const versionIds = Array.isArray(scope?.selectedResourceVersions) ? scope.selectedResourceVersions : [];
+    if (!versionIds.length) return [];
+    invariant(typeof this.container.resources?.materializationDescriptors === "function", "RESOURCE_FILE_STAGE_UNAVAILABLE", "文件服务不支持远端投递", { status: 503 });
+    invariant(typeof this.container.agentTransport?.stageFiles === "function", "AGENT_FILE_STAGE_UNAVAILABLE", "远端 Agent 不支持文件投递", { status: 503 });
+    const descriptors = await this.container.resources.materializationDescriptors({
+      conversationId: scope.conversationId,
+      versionIds,
+    });
+    const staged = await this.container.agentTransport.stageFiles({
+      serverId: scope.serverId,
+      adapterId: scope.agentId,
+      bindingId: agentBindingId,
+      messageId: this.extraction.messageId,
+      files: descriptors,
+    });
+    return staged.map((entry) => {
+      const content = `用户在本轮明确附加了原始文件“${entry.filename}”。请直接从以下只读路径读取并使用该文件：\n${entry.remotePath}`;
+      return {
+        toolName: "user_file",
+        rendered: content,
+        presented: { resources: [{ filename: entry.filename, text: content }] },
+        knowledge: {
+          key: `user-file:${this.extraction.messageId}:${entry.resourceVersionId}`,
+          version: entry.sha256,
+          content,
+        },
+        reference: { kind: "文件", name: entry.filename },
+        priority: 120,
+        required: true,
+      };
+    });
   }
 
   async filterHandoff({ scope, fragments }) {
@@ -1726,23 +1767,6 @@ export class RemoteTaskLifecycle {
     });
     const acceptedKnowledgeKeys = new Set(acceptedKnowledge.map((entry) => `${entry.key}\0${entry.version}`));
 
-    // Before complete-file coverage identities existed, direct reads were
-    // acknowledged as resource:<id>:read_0. Promote only reads already proven
-    // delivered to this exact native session; an unacknowledged or partial read
-    // must never hide the rest of a file.
-    const promotedCoverage = knowledgeFragments
-      .filter((entry) => isLegacyCompleteResourceRead(entry)
-        && !acceptedKnowledgeKeys.has(`${entry.knowledge.key}\0${entry.knowledge.version}`))
-      .map(resourceCoverageKnowledge)
-      .filter(Boolean);
-    if (promotedCoverage.length) {
-      await this.container.contextHub.acknowledgeKnowledge({
-        bindingKey,
-        nativeSessionId,
-        units: promotedCoverage,
-      });
-    }
-
     // Knowledge identities describe provenance. Content receipts additionally
     // prevent the same bytes from returning through another retrieval route
     // (for example resource_read followed by resource_search).
@@ -1773,28 +1797,6 @@ export class RemoteTaskLifecycle {
           && (!resourceCoverageKnowledge(entry)
             || pendingResourceCoverageKeys.has(`${resourceCoverageKnowledge(entry).key}\0${resourceCoverageKnowledge(entry).version}`))
         : remaining.has(String(entry?.rendered || ""))));
-  }
-
-  async filterResourceCatalog({ scope, catalog }) {
-    const items = Array.isArray(catalog?.items) ? catalog.items : [];
-    if (!items.length) return { ...(catalog || {}), items: [] };
-    const bindingKey = createAgentBindingKey(scope, scope.agentId);
-    await this.#synchronizeNativeTurnReceipt(bindingKey, scope.conversationId, scope.branchId);
-    const binding = await this.container.taskRuntime.loadBinding(bindingKey);
-    const nativeSessionId = binding?.native?.sessionId || binding?.native?.threadId || binding?.state?.sessionId || null;
-    if (!nativeSessionId) return catalog;
-    const markers = items.map(resourceCatalogCoverageKnowledge);
-    const candidates = markers.filter(Boolean);
-    if (!candidates.length) return catalog;
-    const pending = await this.container.contextHub.unacknowledgedKnowledge({ bindingKey, nativeSessionId, units: candidates });
-    const pendingKeys = new Set(pending.map((entry) => `${entry.key}\0${entry.version}`));
-    return {
-      ...catalog,
-      items: items.filter((item, index) => {
-        const marker = markers[index];
-        return !marker || pendingKeys.has(`${marker.key}\0${marker.version}`);
-      }),
-    };
   }
 
   async filterForcedSkillCatalog({ scope, skills }) {
@@ -1936,7 +1938,8 @@ export class RemoteTaskLifecycle {
     const existing = await this.container.taskStore.getTask(taskId);
     if (existing) {
       if (this.extraction.runId) await this.container.webInteractionStore.addTask(this.extraction.runId, taskId);
-      const handoffFragments = await this.filterHandoff({ scope, fragments: selectedHandoffFragments });
+      const fileFragments = existing.status === "queued" ? await this.#stageSelectedFiles(scope, existing.agentBindingId) : [];
+      const handoffFragments = await this.filterHandoff({ scope, fragments: [...selectedHandoffFragments, ...fileFragments] });
       const historyFragments = existing.status === "queued"
         ? await this.conversationHistoryForBinding(scope, taskId)
         : [];
@@ -1971,10 +1974,11 @@ export class RemoteTaskLifecycle {
     const detail = await this.container.baseConversations.getConversation(scope.conversationId);
     const taskScope = effectiveScope(this.container.actor, detail.summary, scope.branchId || detail.summary.activeBranchId, scope, taskId, true);
     const agentBindingId = createAgentBindingKey(taskScope, scope.agentId);
+    const fileFragments = await this.#stageSelectedFiles({ ...taskScope, agentId: scope.agentId }, agentBindingId);
     // Re-evaluate delivery against the actual binding immediately before the
     // Task is staged. The Web model's selected set remains provenance for
     // memory extraction; only this receipt-filtered delta is sent remotely.
-    const handoffFragments = await this.filterHandoff({ scope: { ...taskScope, agentId: scope.agentId }, fragments: selectedHandoffFragments });
+    const handoffFragments = await this.filterHandoff({ scope: { ...taskScope, agentId: scope.agentId }, fragments: [...selectedHandoffFragments, ...fileFragments] });
     const contextSessionId = `ctx_${crypto.createHash("sha256").update(taskId).digest("hex").slice(0, 32)}`;
     let contextSession;
     try {
@@ -2102,13 +2106,24 @@ export class RemoteTaskLifecycle {
     if (this.extraction.runId) await this.container.webInteractionStore.addTask(this.extraction.runId, current.id);
     if (current.status === "running") {
       try {
+        const stagedFiles = await this.#stageSelectedFiles(scope, current.agentBindingId);
+        const fileFragments = await this.filterHandoff({ scope, fragments: stagedFiles });
+        const appendPrompt = fileFragments.length
+          ? await this.container.runtime.prompts.remoteDelivery({
+              entries: fileFragments.map((fragment) => ({
+                kind: "memory",
+                source: { type: "user-file" },
+                content: { format: "text", value: fragment.rendered },
+              })),
+            }, prompt)
+          : prompt;
         const command = await this.container.orchestrator.append(current.id, {
-          prompt,
+          prompt: appendPrompt,
           commandId: derivedCommandId(idempotencyKey, "append"),
           sourceMessageId: this.extraction.messageId,
           conversationRunId: this.extraction.runId,
         });
-        return { operation: "append", taskId: current.id, task: current, command };
+        return { operation: "append", taskId: current.id, task: current, command, handoffFragments: fileFragments };
       } catch (error) {
         if (!directRemoteTaskId || error?.code !== "TASK_APPEND_STATE_INVALID") throw error;
         const raced = await this.container.orchestrator.getTask(current.id);
@@ -2622,10 +2637,6 @@ class WebInteractionService {
     const persistentRun = await this.store.get(input.runId);
     let taskId = mode === "work" ? persistentRun?.taskIds?.at(-1) || null : null;
     const requestedScope = clone(input.scope || {});
-    const explicitResourceSelection = Boolean(
-      (Array.isArray(requestedScope.selectedCollectionIds) && requestedScope.selectedCollectionIds.length)
-      || requestedScope.resourceSelectionRequested === true
-    );
     const directRemoteTaskHint = String(requestedScope.directRemoteTaskId || "").trim();
     delete requestedScope.directRemoteTaskId;
     const project = detail.summary.projectId ? await this.container.projects.get(detail.summary.projectId) : null;
@@ -2848,24 +2859,30 @@ class WebInteractionService {
       })();
       return resolvedAgentBindingScopePromise;
     };
-    const requestedWorkSources = mode === "work"
-      ? workSourceIntent(target.content)
-      : Object.freeze({ memory: true, resources: true, skills: true });
-    const allowWorkSkills = mode !== "work" || requestedWorkSources.skills || scope.selectedSkillVersions.length > 0;
     let requestRelevantInstalledSkillsPromise = null;
     const requestRelevantInstalledSkills = () => {
       requestRelevantInstalledSkillsPromise ||= (async () => {
         if (skipWebAgentModel) return [];
+        await this.container.skills.ensureDiscoveryDescriptions(async ({ name, authorDescription, entrypoint, files, sha256 }) => {
+          const prompt = await this.container.runtime.prompts.skillDiscovery({ name, authorDescription, entrypoint, files });
+          return this.container.runtime.completeAuxiliary({
+            actor: this.container.actor,
+            providerId: input.providerId,
+            modelId: input.modelId,
+            mode: "chat",
+            runId: `skill_discovery_${crypto.createHash("sha256").update(`${sha256}:${input.providerId}:${input.modelId}`).digest("hex").slice(0, 32)}`,
+            system: prompt.system,
+            input: prompt.input,
+            maxOutputTokens: 400,
+          });
+        });
         const result = await this.container.skills.listInstalledKnowledge();
         let items = (Array.isArray(result?.items) ? result.items : []).filter((skill) => isSkillApplicableToMode({ skill, mode }));
-        const explicitlySelected = new Set(scope.selectedSkillVersions.map((entry) => String(entry.skillId)));
         if (mode === "work" && scope.serverId) {
           const automaticallyApplicable = await this.container.filterSkillCatalogForServer(scope.serverId, items);
           const applicableIds = new Set(automaticallyApplicable.map((entry) => String(entry.skillId)));
           items = items.filter((skill) => applicableIds.has(String(skill.skillId)));
         }
-        items = items.filter((skill) => (mode === "work" && isForcedWorkSkill(skill)) || (allowWorkSkills && (explicitlySelected.has(String(skill.skillId))
-          || isAutomaticSkillRelevantToRequest({ skill, request: target.content, mode }))));
         return items;
       })();
       return requestRelevantInstalledSkillsPromise;
@@ -2890,34 +2907,38 @@ class WebInteractionService {
             sourceMessageIds: messages.map((message) => message.id),
           })
         )).then((fragments) => this.container.memory.filterObservations?.(fragments) ?? fragments);
-    // Filtering historical observations also migrates already-acknowledged
-    // complete reads to file-version coverage receipts. Do this before exposing
-    // the catalog, so a same-session Work turn does not even see files it has
-    // already delivered.
-    const historicalCoverageReadyPromise = mode === "work" && !skipWebAgentModel && taskLifecycle
-      ? priorObservationsPromise.then(async (fragments) => {
-          await filterWorkObservations(fragments);
-          return true;
-        })
-      : Promise.resolve(true);
+    const visibleMemoryEntriesPromise = skipWebAgentModel
+      ? Promise.resolve([])
+      : this.container.memory.contextEntries(scope, { query: "", all: true, tokenEstimator: estimateMemoryTokens })
+        .then((entries) => this.container.memoryCoordinator.excludeConversationEntries(entries, scope.conversationId, scope.branchId));
+    const memoryCatalogFragmentsPromise = visibleMemoryEntriesPromise
+      .then((entries) => {
+          const seen = new Set();
+          return entries.flatMap((entry) => {
+            const content = String(entry?.content || "").replace(/\r\n/g, "\n").trim();
+            if (!content) return [];
+            const digest = crypto.createHash("sha256").update(content).digest("hex");
+            if (seen.has(digest)) return [];
+            seen.add(digest);
+            return [{
+              toolName: "memory_catalog",
+              rendered: content,
+              presented: { memory: [{ content }] },
+              knowledge: {
+                key: `memory:${String(entry?.source?.id || entry?.id || digest)}`,
+                version: String(entry?.source?.version || entry?.id || digest),
+                content,
+              },
+              priority: Number(entry?.priority || 0),
+            }];
+          });
+        });
     let applicableInstalledSkillCatalogPromise = null;
     const applicableInstalledSkillCatalog = () => {
       applicableInstalledSkillCatalogPromise ||= (async () => {
         let items = await requestRelevantInstalledSkills();
         if (taskLifecycle) {
           items = await taskLifecycle.filterForcedSkillCatalog({ scope: await resolvedAgentBindingScope(), skills: items });
-        }
-        if (mode === "work" && items.length) {
-          const probes = items.map((item) => ({
-            toolName: "skill_list",
-            rendered: String(item.name || item.skillId || "Skill"),
-            presented: {},
-            knowledge: item.knowledge,
-            priority: 0,
-          }));
-          const visible = await filterWorkObservations(probes);
-          const identities = new Set(visible.map((entry) => `${entry?.knowledge?.key || ""}\0${entry?.knowledge?.version || ""}`));
-          items = items.filter((item) => identities.has(`${item?.knowledge?.key || ""}\0${item?.knowledge?.version || ""}`));
         }
         return items;
       })();
@@ -2950,37 +2971,28 @@ class WebInteractionService {
           return evidence;
         })()
       : Promise.resolve([]);
-    const hasSelectedResourceScope = requestedScope.selectedCollectionIds.length > 0 || requestedScope.resourceSelectionRequested === true;
+    const selectedResourceVersions = new Set((requestedScope.selectedResourceVersions || []).map(String));
     // Composer selections are only the newest way a resource can enter the
     // effective scope. Conversation attachments and files bound directly to a
     // project remain available on later turns after their chips are cleared.
     // Probe the authorized catalog before allowing the empty-handoff fast path.
-    const allowWorkResources = mode !== "work" || requestedWorkSources.resources || hasSelectedResourceScope;
-    // Chat and Work must discover files from the same authorized catalog.
-    // Work additionally filters entries already known by the target native
-    // session, while Chat consumes the catalog directly.
-    const scopedResourceCatalogPromise = !skipWebAgentModel && allowWorkResources
-      ? Promise.all([
-          historicalCoverageReadyPromise,
-          this.container.resources.catalog({ scope, limit: 80 }),
-        ]).then(async ([, catalog]) => taskLifecycle
-          ? taskLifecycle.filterResourceCatalog({ scope: await resolvedAgentBindingScope(), catalog })
-          : catalog)
+    const scopedResourceCatalogPromise = !skipWebAgentModel
+      ? (async () => {
+          const catalog = await this.container.resources.catalog({
+            scope,
+            all: true,
+            summary: { required: true, providerId: input.providerId, modelId: input.modelId },
+          });
+          return {
+            ...catalog,
+            items: mode === "work"
+              ? (catalog.items || []).filter((entry) => !selectedResourceVersions.has(String(entry.resourceVersionId)))
+              : (catalog.items || []),
+          };
+        })()
       : Promise.resolve({ items: [] });
     const workResourceToolsPromise = mode === "work" && !skipWebAgentModel
-      ? scopedResourceCatalogPromise.then((catalog) => hasSelectedResourceScope || (Array.isArray(catalog?.items) && catalog.items.length > 0))
-      : Promise.resolve(mode !== "work");
-    const workMemoryToolsPromise = mode === "work" && !skipWebAgentModel && requestedWorkSources.memory
-      ? this.container.searchContext({
-          scope,
-          query: "",
-          sources: ["memory"],
-          limit: 1,
-          excludeMessageId: target.id,
-          excludeAgentBindingId: requestedScope.agentId
-            ? createAgentBindingKey(scope, requestedScope.agentId)
-            : null,
-        }).then((result) => Array.isArray(result?.memory) && result.memory.length > 0)
+      ? scopedResourceCatalogPromise.then((catalog) => Array.isArray(catalog?.items) && catalog.items.length > 0)
       : Promise.resolve(mode !== "work");
     const workSkillToolsPromise = mode === "work" && !skipWebAgentModel
       ? installedSkillCatalog().then((catalog) => catalog.length > 0)
@@ -2989,7 +3001,7 @@ class WebInteractionService {
     const toolsPromise = skipWebAgentModel ? Promise.resolve({
       resolve: () => null,
       definitions: () => [],
-    }) : Promise.all([workMemoryToolsPromise, workSkillToolsPromise, workResourceToolsPromise]).then(([workMemoryTools, workSkillTools, workResourceTools]) => createDefaultWebAgentTools({
+    }) : Promise.all([workSkillToolsPromise, workResourceToolsPromise]).then(([workSkillTools, workResourceTools]) => createDefaultWebAgentTools({
       context: {
         // The Web Agent execution scope also carries routing-only fields such as
         // agentId.  Context and memory services intentionally accept only the
@@ -3012,17 +3024,6 @@ class WebInteractionService {
         state: ({ fields } = {}) => this.container.contextState(scope, requestedScope, fields, { includeCapabilities: true }),
       },
       skills: {
-        list: async () => {
-          const items = await installedSkillCatalog();
-          // Receipt identities are control-plane data and must never be shown
-          // to the model. The Web Agent only receives the readable catalog.
-          return items.map((item) => {
-            const entry = { ...item };
-            delete entry.knowledge;
-            delete entry.applicability;
-            return entry;
-          });
-        },
         read: async ({ name, query }) => {
           const installed = await installedSkillCatalog();
           const normalizedName = String(name || "").trim().toLocaleLowerCase("zh-CN");
@@ -3039,26 +3040,43 @@ class WebInteractionService {
         },
       },
       conversationReferences: {
-        read: async ({ referenceId, query, roles, cursor }) => {
+        search: async ({ referenceId, query, cursor }) => {
           const configuration = await this.container.embedding.memoryConfiguration().catch(() => ({ pageSize: 20 }));
-          const result = await this.container.baseConversations.readConversationReference({
+          const result = await this.container.baseConversations.searchConversationReference({
             conversationId: input.conversationId,
             messageId: target.id,
             referenceId,
-            ...(query ? { query } : {}),
-            ...(roles?.length ? { roles } : {}),
+            query,
             ...(cursor ? { cursor } : {}),
             limit: configuration.pageSize,
           });
+          const [memoryVersionIds, visibleMemories] = await Promise.all([
+            this.container.memoryCoordinator.referenceMemoryVersionIds({ sourceIds: result.memorySourceIds }),
+            visibleMemoryEntriesPromise,
+          ]);
+          const visibleSemanticKeys = new Set(visibleMemories.map((entry) => String(entry?.semanticKey || "")).filter(Boolean));
+          const memory = (await this.container.memory.contextEntriesByVersionIds(scope, memoryVersionIds, {
+            query,
+            all: true,
+            tokenEstimator: estimateMemoryTokens,
+          })).filter((entry) => !visibleSemanticKeys.has(String(entry?.semanticKey || "")))
+            .map((entry) => ({
+              ...entry,
+              referenceId,
+              referenceTitle: result.reference.title,
+              sourceConversationId: result.reference.conversationId,
+              sourceSnapshotId: result.reference.snapshotId,
+            }));
           return {
-            conversation: result.items,
+            memory,
+            recentConversation: result.recentItems,
+            matchedConversation: result.items,
             nextCursor: result.nextCursor,
             reference: result.reference,
           };
         },
       },
     }, this.container.runtime.prompts, {
-      workMemoryTools,
       workResourceTools,
       workSkillTools,
       conversationReferences,
@@ -3081,68 +3099,42 @@ class WebInteractionService {
     const resourceCatalogPromise = !skipWebAgentModel
       ? Promise.all([workResourceToolsPromise, scopedResourceCatalogPromise]).then(async ([resourceToolsAvailable, catalog]) => {
           const catalogItems = Array.isArray(catalog?.items) ? catalog.items : [];
-          if (!resourceToolsAvailable || (!hasSelectedResourceScope && catalogItems.length === 0)) return "";
-          const collections = await this.container.collections.list();
-          const collectionNames = new Map(collections.map((entry) => [entry.id, entry.name]));
-          const entries = catalogItems.map((item) => {
-            const visibleItem = { ...item };
-            delete visibleItem.resourceId;
-            delete visibleItem.resourceVersionId;
-            const sources = [...new Set(item.bindings.map((binding) => {
-              if (binding.ownerType === "collection") return collectionNames.get(binding.ownerId) || "文件集";
-              if (binding.ownerType === "project") return project?.name || "当前项目";
-              return "当前对话附件";
-            }))];
-            return { ...visibleItem, source: sources.join("、") || "文件库" };
-          });
+          if (!resourceToolsAvailable || catalogItems.length === 0) return "";
+          const entries = catalogItems.map((item) => ({
+            filename: item.filename,
+            summary: item.summary,
+          }));
           return this.container.runtime.prompts.resourceCatalog(entries);
         })
+      : Promise.resolve("");
+    const skillCatalogPromise = !skipWebAgentModel
+      ? installedSkillCatalog().then((entries) => this.container.runtime.prompts.skillCatalog(entries))
       : Promise.resolve("");
     const conversationReferenceCatalogPromise = !skipWebAgentModel && conversationReferences.length
       ? this.container.runtime.prompts.conversationReferenceCatalog(conversationReferences)
       : Promise.resolve("");
-    const [model, tools, , , history, priorObservations, workEnvironment, resourceCatalog, conversationReferenceCatalog, explicitlySelectedSkills, requestRelevantSkills] = await Promise.all([
+    const [model, tools, , , history, priorObservations, memoryCatalogFragments, workEnvironment, skillCatalog, resourceCatalog, conversationReferenceCatalog, explicitlySelectedSkills, requestRelevantSkills] = await Promise.all([
       modelPromise,
       toolsPromise,
       workResourceToolsPromise,
       rememberRoutePromise,
       historyPromise,
       priorObservationsPromise,
+      memoryCatalogFragmentsPromise,
       workEnvironmentPromise,
+      skillCatalogPromise,
       resourceCatalogPromise,
       conversationReferenceCatalogPromise,
       explicitlySelectedSkillEvidencePromise,
       requestRelevantInstalledSkills(),
     ]);
-    const sourceFilteredPriorObservations = priorObservations.filter((fragment) => {
-          const toolName = String(fragment?.toolName || "");
-          if (toolName === "conversation_sync") return false;
-          // An explicit @ reference belongs to exactly one user message. It may
-          // be reread from that message's frozen snapshot, but its observation
-          // is never silently restored into a later turn.
-          if (toolName === "conversation_reference_read") return false;
-          if (mode !== "work") return true;
-          if (toolName === "memory_search") return requestedWorkSources.memory;
-          if (toolName === "resource_search" || toolName === "resource_read") return allowWorkResources;
-          if (toolName === "skill_list" || toolName === "skill_search") return allowWorkSkills;
-          return true;
-        });
-    const relevantHistoricalObservations = mode === "work"
-      ? filterRelevantHistoricalObservations(sourceFilteredPriorObservations, {
-          request: target.content,
-          skills: requestRelevantSkills,
-          // A project file set remains searchable on every turn, but it must
-          // not rehydrate every old read merely because the project owns a
-          // collection. Only an explicit composer selection restores the
-          // whole selected resource scope.
-          includeAllResources: explicitResourceSelection,
-        })
-      : sourceFilteredPriorObservations;
     const forcedSkillIds = new Set((mode === "work" ? requestRelevantSkills.filter(isForcedWorkSkill) : []).map((skill) => `skill:${skill.skillId}`));
-    const modelObservations = relevantHistoricalObservations.filter((fragment) => !forcedSkillIds.has(String(fragment.knowledge?.key || "")));
-    const initialObservationFragments = mode === "work"
-      ? await filterWorkObservations(modelObservations)
-      : filterEligibleSkillObservations(modelObservations, new Set(requestRelevantSkills.map((skill) => String(skill.skillId))));
+    const modelObservations = priorObservations.filter((fragment) => !forcedSkillIds.has(String(fragment.knowledge?.key || "")));
+    const eligibleSkillIds = new Set(requestRelevantSkills.map((skill) => String(skill.skillId)));
+    const initialObservationFragments = [
+      ...memoryCatalogFragments,
+      ...filterEligibleSkillObservations(modelObservations, eligibleSkillIds),
+    ];
     let initialHandoffFragments = [];
     if (mode === "work" && explicitlySelectedSkills.length) {
       const skillTool = tools.resolve("skill_search", "chat");
@@ -3175,7 +3167,7 @@ class WebInteractionService {
         payload: { state: workEnvironment.state },
       });
     }
-    const modelContext = [workEnvironment.rendered, conversationReferenceCatalog, resourceCatalog]
+    const modelContext = [workEnvironment.rendered, skillCatalog, resourceCatalog, conversationReferenceCatalog]
       .filter(Boolean)
       .map((content) => ({ role: "system", content }))
       .concat(history);
@@ -3208,7 +3200,7 @@ class WebInteractionService {
         emitStarted: false,
         skipModel: skipWebAgentModel,
         ...(taskLifecycle ? {
-          observationFilter: filterWorkObservations,
+          observationFilter: (fragments) => filterEligibleSkillObservations(fragments, eligibleSkillIds),
           handoffFilter: filterWorkObservations,
         } : {}),
       });
@@ -3251,7 +3243,7 @@ class WebInteractionService {
         });
         taskLifecycle.settleForcedSkillDelivery(agentScope, dispatch);
         taskId = dispatch.taskId;
-        if (dispatch.operation === "create") sentHandoffFragments = [...(dispatch.handoffFragments || [])];
+        sentHandoffFragments = [...(dispatch.handoffFragments || [])];
         const deliveredReferences = handoffEventReferences(dispatch.handoffFragments || []);
         const deliveredContext = (dispatch.handoffFragments || []).some((fragment) => (
           !String(fragment?.knowledge?.key || "").startsWith("skill:")
@@ -3572,14 +3564,11 @@ export class ActorServiceContainer {
       actor,
       relativePath: ["runtime", "conversation-deletion-cleanup", "state.json"],
       schemaVersion: 1,
-      // The legacy shape stored completed revisions.  Keep that shape as the
-      // on-disk default so the one-time migration can also distinguish a new
-      // actor from an actor whose pending queue has already been initialised.
-      defaultData: () => ({ local: {}, remote: {} }),
+      defaultData: () => ({ mode: "pending", local: {}, remote: {} }),
       validate: (data) => Boolean(
         data && typeof data === "object" && !Array.isArray(data)
           && Object.keys(data).every((key) => ["mode", "local", "remote"].includes(key))
-          && (data.mode === undefined || data.mode === "pending")
+          && data.mode === "pending"
           && data.local && typeof data.local === "object" && !Array.isArray(data.local)
           && data.remote && typeof data.remote === "object" && !Array.isArray(data.remote)
           && Object.entries(data.local).every(([id, revision]) => id && typeof revision === "string")
@@ -3588,47 +3577,6 @@ export class ActorServiceContainer {
       ),
       queue: runtime.queue,
     });
-  }
-
-  async #migrateConversationDeletionCleanupState() {
-    for (;;) {
-      const current = await this.conversationDeletionCleanup.read();
-      if (current.data.mode === "pending") return current.data;
-
-      // Version 1 originally persisted every completed cleanup revision.  Do
-      // one final tombstone scan while upgrading, invert those completion
-      // markers into a compact pending queue, and persist the mode marker.
-      // Every later startup reads only this queue and never revisits historical
-      // tombstones.
-      const [deleted, servers] = await Promise.all([
-        this.baseConversations.listDeletedConversations(),
-        this.servers.list(),
-      ]);
-      const serverIdentities = [...new Set(servers
-        .map((entry) => entry.profile?.serverIdentity)
-        .filter(Boolean)
-        .map(String))];
-      const local = {};
-      const remote = {};
-      for (const conversation of deleted) {
-        const revision = String(conversation.revision || 1);
-        if (current.data.local[conversation.id] !== revision) local[conversation.id] = revision;
-        for (const serverIdentity of serverIdentities) {
-          if (current.data.remote[serverIdentity]?.[conversation.id] === revision) continue;
-          remote[serverIdentity] = remote[serverIdentity] || {};
-          remote[serverIdentity][conversation.id] = revision;
-        }
-      }
-      try {
-        const migrated = await this.conversationDeletionCleanup.replace({ mode: "pending", local, remote }, {
-          expectedRevision: current.revision,
-          clock: this.clock,
-        });
-        return migrated.data;
-      } catch (error) {
-        if (error?.code !== "REVISION_CONFLICT") throw error;
-      }
-    }
   }
 
   async #resumeConversationDeletionTransactions() {
@@ -3840,11 +3788,13 @@ export class ActorServiceContainer {
     this.providers = this.runtime.providers;
     this.providerUsage = this.runtime.providerUsage;
     this.projects = new ProjectService({ ...common, collections: this.collections, deleteCoordinator: (input) => this.catalogConsistency.deleteProject(input) });
+    this.embedding = new DynamicEmbeddingAdapter({ platform: this.runtime.platform, fetchImpl: this.runtime.fetchImpl });
     this.baseConversations = new ConversationService({
       ...common,
       cursorSecret: this.runtime.secrets.cursorSecret,
       authorizeProject: async (projectId) => Boolean(await this.projects.get(projectId)),
       projectMemoryMode: async (projectId) => (await this.projects.get(projectId))?.memoryMode || "global",
+      referenceTurnRanker: (input) => rankReferencedConversationTurns(this.embedding, input),
       // Prepare the local cleanup transaction before the tombstone becomes
       // visible.  The facade launches cleanup after commit; on a crash in that
       // narrow boundary startup can now recover from this durable entry.
@@ -3859,7 +3809,6 @@ export class ActorServiceContainer {
       },
     });
     this.workDrafts = new WorkDraftService(common);
-    this.embedding = new DynamicEmbeddingAdapter({ platform: this.runtime.platform, fetchImpl: this.runtime.fetchImpl });
     this.memory = new PersistentMemoryService({ ...common, embedder: this.embedding });
     this.memoryCoordinator = new MemoryCoordinator({
       ...common,
@@ -3931,6 +3880,23 @@ export class ActorServiceContainer {
         ocrExtractor: this.runtime.ocrExtractor || this.runtime.visionExtractor,
       }),
       embedder: this.embedding,
+      summaryGenerator: async ({ filename, sha256, parsed, providerId, modelId }) => {
+        invariant(providerId && modelId, "RESOURCE_SUMMARY_ROUTE_REQUIRED", "文件上传需要当前网页模型", { status: 409 });
+        const prompt = await this.runtime.prompts.resourceSummary({
+          filename,
+          content: resourceSummaryExcerpt(parsed),
+        });
+        return this.runtime.completeAuxiliary({
+          actor: this.actor,
+          providerId,
+          modelId,
+          mode: "chat",
+          runId: `resource_summary_${crypto.createHash("sha256").update(`${sha256}:${providerId}:${modelId}`).digest("hex").slice(0, 32)}`,
+          system: prompt.system,
+          input: prompt.input,
+          maxOutputTokens: 600,
+        });
+      },
     });
     this.catalogConsistency = new CatalogConsistencyService({
       ...common,
@@ -3948,7 +3914,6 @@ export class ActorServiceContainer {
         return result;
       },
       resources: this.resources,
-      artifacts: { detachProject: (input) => this.artifacts.detachProject(input) },
       memories: {
         invalidateProject: ({ projectId, commandId }) => this.memory.invalidateScopes({
           scopes: [{ level: "project", id: projectId }],
@@ -3975,7 +3940,6 @@ export class ActorServiceContainer {
     this.sshWorker = this.runtime.sshPool.workerFor(this.actor);
     this.sshRestorePromise = this.sshWorker.restore().catch(() => []);
     await this.#pruneOrphanedServerConversationBindings();
-    await this.#migrateConversationDeletionCleanupState();
     await this.#resumeConversationDeletionTransactions();
     this.serverCapabilities = new ServerCapabilityService({
       servers: this.servers,
@@ -3988,25 +3952,10 @@ export class ActorServiceContainer {
       mutationQueue: this.runtime.queue,
       cursorSecret: this.runtime.secrets.artifactSecret,
       authorizeTask: async ({ taskId }) => Boolean(await this.taskStore.getTask(taskId)),
-      authorizeProject: async ({ projectId }) => Boolean(await this.projects.get(projectId)),
       remoteSource: {
         inspect: (input) => this.remoteArtifactSource(input.task.route.serverId).then((source) => source.inspect(input)),
         verifyAvailable: (input) => this.remoteArtifactSourceByIdentity(input.serverIdentity).then((source) => source.verifyAvailable(input)),
         openReadStream: (input) => this.remoteArtifactSourceByIdentity(input.serverIdentity).then((source) => source.openReadStream(input)),
-      },
-      resourcePromoter: {
-        promote: async ({ projectId, artifact, commandId, openSource }) => {
-          const promoted = await this.resources.ingestStream({
-            commandId,
-            filename: artifact.name,
-            mime: artifact.mime,
-            expectedSize: artifact.size,
-            expectedSha256: artifact.sha256,
-            binding: { ownerType: "project", ownerId: projectId, path: null },
-            openSource,
-          });
-          return { resourceVersionId: promoted.version.id, bindingId: promoted.binding.id };
-        },
       },
     });
     this.taskReports = new TaskReportService({

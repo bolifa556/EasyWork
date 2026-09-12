@@ -49,14 +49,13 @@ async function allProjectConversations(conversations, projectId) {
 export class CatalogConsistencyService {
   constructor(options) {
     invariant(options?.actor?.actorId, "ACTOR_CONTEXT_REQUIRED", "CatalogConsistencyService 需要 ActorContext", { status: 500, expose: false });
-    invariant(options?.projects && options?.collections && options?.conversations && options?.resources && typeof options?.artifacts?.detachProject === "function" && typeof options?.memories?.invalidateProject === "function", "CATALOG_CONSISTENCY_DEPENDENCIES_REQUIRED", "目录一致性服务依赖不完整", { status: 500, expose: false });
+    invariant(options?.projects && options?.collections && options?.conversations && options?.resources && typeof options?.memories?.invalidateProject === "function", "CATALOG_CONSISTENCY_DEPENDENCIES_REQUIRED", "目录一致性服务依赖不完整", { status: 500, expose: false });
     this.actor = options.actor;
     this.projects = options.projects;
     this.collections = options.collections;
     this.conversations = options.conversations;
     this.deleteConversation = options.deleteConversation || ((input) => this.conversations.delete(input));
     this.resources = options.resources;
-    this.artifacts = options.artifacts;
     this.memories = options.memories;
     this.clock = options.clock || (() => new Date());
     this.faultInjector = options.faultInjector || null;
@@ -189,10 +188,6 @@ export class CatalogConsistencyService {
         }
         return { conversationIds: plan.conversations.map((entry) => entry.id) };
       }, async () => ({ conversations: (await allProjectConversations(this.conversations, input.projectId)).map((entry) => ({ id: entry.id })) }));
-      const detachedArtifacts = await this.#step(operation, "detach-artifacts", () => this.artifacts.detachProject({
-        projectId: input.projectId,
-        commandId: `${input.commandId}:detach-artifacts`,
-      }));
       const cleanup = await this.#step(operation, "remove-resource-bindings", () => this.resources.removeOwnerBindings({ ownerType: "project", ownerId: input.projectId }));
       const memoryCleanup = await this.#step(operation, "invalidate-project-memory", () => this.memories.invalidateProject({
         projectId: input.projectId,
@@ -205,7 +200,6 @@ export class CatalogConsistencyService {
         conversationPolicy,
         movedConversationIds: conversationPolicy === "move-out" ? handledConversations?.conversationIds || [] : [],
         deletedConversationIds: conversationPolicy === "delete" ? handledConversations?.conversationIds || [] : [],
-        detachedArtifactIds: detachedArtifacts?.detachedArtifactIds || [],
         commandId: input.commandId,
       });
     } catch (error) {

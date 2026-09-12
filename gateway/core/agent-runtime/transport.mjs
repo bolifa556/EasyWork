@@ -2062,6 +2062,78 @@ export class AgentRuntimeTransport {
     return Object.freeze({ agentId, ...(configScope === "default" ? {} : { configScope }), updatedBindings: entries.length });
   }
 
+  async stageFiles({ adapterId, bindingId, messageId, files = [] } = {}) {
+    const agentId = String(adapterId || "");
+    runtimeAgentDefinition(agentId);
+    const safeBindingId = assertRuntimeIdentifier(bindingId, "agentBindingId");
+    const safeMessageId = assertRuntimeIdentifier(messageId, "messageId");
+    invariant(Array.isArray(files) && files.length <= 256, "AGENT_FILE_SELECTION_INVALID", "远端 Agent 文件选择无效", { status: 400 });
+    if (!files.length) return [];
+    const home = await this.executor.home();
+    const paths = remoteAgentPaths(home, agentId, safeBindingId);
+    await this.#prepareRuntime(paths, agentId);
+    const results = [];
+    const names = new Set();
+    for (const file of files) {
+      const filename = String(file?.filename || "").normalize("NFKC").trim();
+      const sha256 = String(file?.sha256 || "").toLowerCase();
+      const size = Number(file?.size);
+      const localPath = String(file?.localPath || "");
+      invariant(filename && filename !== "." && filename !== ".." && !/[\\/\0]/u.test(filename), "AGENT_FILE_NAME_INVALID", "远端 Agent 文件名无效", { status: 400 });
+      invariant(!names.has(filename), "AGENT_FILE_NAME_CONFLICT", "本轮选择了多个同名文件，请只保留一个版本", { status: 409, details: { filename } });
+      names.add(filename);
+      invariant(/^[a-f0-9]{64}$/u.test(sha256), "AGENT_FILE_HASH_INVALID", "远端 Agent 文件摘要无效", { status: 400 });
+      invariant(Number.isSafeInteger(size) && size >= 0, "AGENT_FILE_SIZE_INVALID", "远端 Agent 文件大小无效", { status: 400 });
+      invariant(path.isAbsolute(localPath), "AGENT_FILE_SOURCE_INVALID", "远端 Agent 文件来源无效", { status: 500, expose: false });
+      invariant(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(String(file.resourceVersionId || "")), "AGENT_FILE_RESOURCE_VERSION_INVALID", "远端 Agent 文件版本无效", { status: 500, expose: false });
+      const objectRoot = `${paths.filesRoot}/objects/${sha256}`;
+      const objectPath = `${objectRoot}/${filename}`;
+      const turnRoot = `${paths.filesRoot}/turns/${safeMessageId}`;
+      const turnPath = `${turnRoot}/${filename}`;
+      const preparedObjectRoot = await this.executor.exec([
+        `mkdir -p -- ${shellQuote(objectRoot)}`,
+        `chmod 0700 -- ${shellQuote(paths.filesRoot)} ${shellQuote(`${paths.filesRoot}/objects`)} ${shellQuote(objectRoot)}`,
+      ].join(" && "), { maxOutputBytes: 2048 });
+      invariant(preparedObjectRoot.code === 0, "AGENT_FILE_DIRECTORY_FAILED", "无法准备远端 Agent 文件目录", { status: 502, retryable: true });
+      const existing = await this.executor.exec([
+        `if [ -f ${shellQuote(objectPath)} ] && [ "$(stat -c '%s' -- ${shellQuote(objectPath)})" = ${shellQuote(String(size))} ] && [ "$(sha256sum -- ${shellQuote(objectPath)} | cut -d' ' -f1)" = ${shellQuote(sha256)} ]; then printf ready; fi`,
+      ].join("; "), { maxOutputBytes: 1024 });
+      if (String(existing.stdout || "").trim() !== "ready") {
+        const temporaryObject = `${objectRoot}/.upload-${crypto.randomUUID()}`;
+        try {
+          await this.executor.upload(localPath, temporaryObject);
+          const verified = await this.executor.exec([
+            `test -f ${shellQuote(temporaryObject)}`,
+            `test "$(stat -c '%s' -- ${shellQuote(temporaryObject)})" = ${shellQuote(String(size))}`,
+            `test "$(sha256sum -- ${shellQuote(temporaryObject)} | cut -d' ' -f1)" = ${shellQuote(sha256)}`,
+            `chmod 0400 -- ${shellQuote(temporaryObject)}`,
+            `mv -Tf -- ${shellQuote(temporaryObject)} ${shellQuote(objectPath)}`,
+          ].join(" && "), { maxOutputBytes: 2048 });
+          invariant(verified.code === 0, "AGENT_FILE_STAGE_VERIFY_FAILED", "远端 Agent 文件校验失败", { status: 502, retryable: true });
+        } catch (error) {
+          await this.executor.exec(`rm -f -- ${shellQuote(temporaryObject)}`, { maxOutputBytes: 1024 }).catch(() => undefined);
+          throw error;
+        }
+      }
+      const temporaryLink = `${turnRoot}/.file-${crypto.randomUUID()}`;
+      const linked = await this.executor.exec([
+        `mkdir -p -- ${shellQuote(turnRoot)}`,
+        `chmod 0700 -- ${shellQuote(paths.filesRoot)} ${shellQuote(objectRoot)} ${shellQuote(turnRoot)}`,
+        `ln -- ${shellQuote(objectPath)} ${shellQuote(temporaryLink)}`,
+        `mv -Tf -- ${shellQuote(temporaryLink)} ${shellQuote(turnPath)}`,
+      ].join(" && "), { maxOutputBytes: 2048 });
+      invariant(linked.code === 0, "AGENT_FILE_VIEW_FAILED", "无法建立本轮远端 Agent 文件视图", { status: 502, retryable: true });
+      results.push(Object.freeze({
+        resourceVersionId: String(file.resourceVersionId),
+        filename,
+        sha256,
+        size,
+        remotePath: turnPath,
+      }));
+    }
+    return results;
+  }
+
   async #deploySkills(plan, paths) {
     invariant(this.skillDeployment && typeof this.skillDeployment.ensure === "function", "AGENT_SKILL_DEPLOYMENT_UNAVAILABLE", "远端 Skill 部署能力不可用", { status: 503, retryable: true });
     const cached = await this.skillDeployment.ensure(plan);
@@ -2119,6 +2191,7 @@ export class AgentRuntimeTransport {
       paths.runtimeState,
       paths.runtimeLogs,
       paths.skillsRoot,
+      paths.filesRoot,
       paths.runtimeReleases,
       versionHookPaths(paths).root,
       versionHookPaths(paths).sessionTasks,
@@ -2129,6 +2202,7 @@ export class AgentRuntimeTransport {
       `${paths.easyworkRoot}/runtime/agents`,
       paths.agentRuntimeRoot,
       paths.skillsRoot,
+      paths.filesRoot,
       ...directories,
     ])];
     const quote = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;

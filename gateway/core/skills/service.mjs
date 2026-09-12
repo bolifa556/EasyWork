@@ -46,6 +46,37 @@ function defaultApplicabilityStore(actorId) {
   return { actorId, items: [] };
 }
 
+function defaultDiscoveryStore(actorId) {
+  return { actorId, items: [] };
+}
+
+function validateDiscoveryStore(store, actorId) {
+  if (!store || typeof store !== "object" || Array.isArray(store) || store.actorId !== actorId || !Array.isArray(store.items)) return false;
+  if (Object.keys(store).length !== 2) return false;
+  const seen = new Set();
+  return store.items.every((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.keys(entry).length !== 5) return false;
+    const key = `${entry.skillId}\0${entry.version}\0${entry.sha256}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return typeof entry.skillId === "string" && SAFE_SEGMENT_PATTERN.test(entry.skillId)
+      && typeof entry.version === "string" && SAFE_SEGMENT_PATTERN.test(entry.version)
+      && typeof entry.sha256 === "string" && /^[a-f0-9]{64}$/u.test(entry.sha256)
+      && typeof entry.description === "string" && entry.description.trim().length > 0 && entry.description.length <= 600
+      && Number.isFinite(Date.parse(entry.updatedAt));
+  });
+}
+
+function normalizeDiscoveryDescription(value) {
+  const result = String(value || "")
+    .replace(/^```[^\n]*\n?/u, "")
+    .replace(/\n?```$/u, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  invariant(result.length > 0, "SKILL_DISCOVERY_DESCRIPTION_EMPTY", "Skill 发现简介模型没有返回有效内容", { status: 502, retryable: true });
+  return result.slice(0, 600);
+}
+
 function validateApplicabilityStore(store, actorId) {
   if (!store || typeof store !== "object" || Array.isArray(store) || store.actorId !== actorId || !Array.isArray(store.items)) return false;
   if (Object.keys(store).length !== 2) return false;
@@ -351,6 +382,7 @@ export class SkillService {
   #repository;
   #applicabilityRepository;
   #deploymentRepository;
+  #discoveryRepository;
 
   constructor(options) {
     invariant(options?.actor?.actorId, "ACTOR_CONTEXT_REQUIRED", "SkillService 需要 ActorContext", { status: 500, expose: false });
@@ -397,6 +429,15 @@ export class SkillService {
         && new Set(store.items.map((entry) => entry.marketSkillId)).size === store.items.length
         && store.items.every((entry) => entry && Object.keys(entry).length === 2
           && ["marketSkillId", "deploymentId"].every((field) => typeof entry[field] === "string" && SAFE_SEGMENT_PATTERN.test(entry[field]))),
+    });
+    this.#discoveryRepository = new AtomicJsonRepository({
+      dataRoot: this.dataRoot,
+      actor: this.actor,
+      relativePath: "skills/discovery.json",
+      schemaVersion: 1,
+      defaultData: () => defaultDiscoveryStore(this.actor.actorId),
+      validate: (store) => validateDiscoveryStore(store, this.actor.actorId),
+      queue: inlineRepositoryQueue,
     });
   }
 
@@ -518,12 +559,77 @@ export class SkillService {
     };
   }
 
-  // Internal catalog used before exposing Skill discovery to the Web Agent.
-  // The version identity is kept out of the model-facing presentation, but it
-  // lets the context receipt suppress Skills already known by this exact
-  // native Agent session and expose them again after an update/session switch.
+  async ensureDiscoveryDescriptions(generator) {
+    invariant(typeof generator === "function", "SKILL_DISCOVERY_GENERATOR_REQUIRED", "Skill 发现简介需要可用模型", { status: 503 });
+    const [currentInstalled, currentDiscovery] = await Promise.all([this.#repository.read(), this.#discoveryRepository.read()]);
+    const activeKeys = currentInstalled.data.registries.flatMap((registry) => {
+      const version = currentInstalled.data.versions.find((entry) => entry.id === registry.activeVersionId);
+      return version ? [`${registry.skillId}\0${version.version}\0${version.sha256}`] : [];
+    }).sort();
+    const discoveryKeys = currentDiscovery.data.items.map((entry) => `${entry.skillId}\0${entry.version}\0${entry.sha256}`).sort();
+    if (activeKeys.length === discoveryKeys.length && activeKeys.every((entry, index) => entry === discoveryKeys[index])) {
+      return { generated: 0 };
+    }
+    return this.#mutate(async () => {
+      const [installed, discovery] = await Promise.all([this.#repository.read(), this.#discoveryRepository.read()]);
+      const active = installed.data.registries.flatMap((registry) => {
+        const version = installed.data.versions.find((entry) => entry.id === registry.activeVersionId);
+        return version ? [{ registry, version }] : [];
+      });
+      const cached = new Map(discovery.data.items.map((entry) => [`${entry.skillId}\0${entry.version}\0${entry.sha256}`, entry]));
+      const generated = await Promise.all(active.map(async ({ registry, version }) => {
+        const key = `${registry.skillId}\0${version.version}\0${version.sha256}`;
+        if (cached.has(key)) return cached.get(key);
+        const verified = await this.#loadVerifiedPackage(version);
+        let remaining = MAX_SKILL_SEARCH_TOTAL_BYTES;
+        const files = [];
+        const ordered = [...verified.files].sort((left, right) => {
+          const leftPrimary = left.relativePath === version.manifest.entrypoint || left.relativePath === "SKILL.md" ? 0 : 1;
+          const rightPrimary = right.relativePath === version.manifest.entrypoint || right.relativePath === "SKILL.md" ? 0 : 1;
+          return leftPrimary - rightPrimary || left.relativePath.localeCompare(right.relativePath);
+        });
+        for (const file of ordered) {
+          if (remaining <= 0 || file.content.includes(0)) continue;
+          const bytes = file.content.subarray(0, Math.min(file.content.length, MAX_SKILL_SEARCH_FILE_BYTES, remaining));
+          if (!bytes.length) continue;
+          files.push({ path: file.relativePath, content: bytes.toString("utf8") });
+          remaining -= bytes.length;
+        }
+        const description = normalizeDiscoveryDescription(await generator({
+          skillId: registry.skillId,
+          name: registry.displayName,
+          authorDescription: registry.description,
+          version: version.version,
+          sha256: version.sha256,
+          entrypoint: version.manifest.entrypoint,
+          files,
+        }));
+        return {
+          skillId: registry.skillId,
+          version: version.version,
+          sha256: version.sha256,
+          description,
+          updatedAt: this.clock().toISOString(),
+        };
+      }));
+      const nextDiscovery = { actorId: this.actor.actorId, items: generated };
+      if (JSON.stringify(nextDiscovery) !== JSON.stringify(discovery.data)) {
+        await this.#discoveryRepository.replace(nextDiscovery, {
+          expectedRevision: discovery.revision,
+          clock: this.clock,
+        });
+      }
+      return { generated: generated.filter((entry) => !cached.has(`${entry.skillId}\0${entry.version}\0${entry.sha256}`)).length };
+    });
+  }
+
   async listInstalledKnowledge() {
-    const [snapshot, applicability] = await Promise.all([this.#repository.read(), this.#applicabilityBySkill()]);
+    const [snapshot, applicability, discovery] = await Promise.all([
+      this.#repository.read(),
+      this.#applicabilityBySkill(),
+      this.#discoveryRepository.read(),
+    ]);
+    const discoveryByVersion = new Map(discovery.data.items.map((entry) => [`${entry.skillId}\0${entry.version}\0${entry.sha256}`, entry.description]));
     return {
       revision: snapshot.revision,
       items: snapshot.data.registries
@@ -535,15 +641,10 @@ export class SkillService {
             skillId: registry.skillId,
             name: registry.displayName,
             description: registry.description,
+            discoveryDescription: discoveryByVersion.get(`${registry.skillId}\0${version.version}\0${version.sha256}`) || "",
             updatedAt: registry.updatedAt,
             revision: snapshot.revision,
-            // Keep legacy/default applicability distinguishable from an
-            // explicit user rule. Automatic Work discovery may then apply a
-            // conservative server/scheduler heuristic without overriding a
-            // rule the user deliberately configured.
-            ...(applicability.has(registry.skillId)
-              ? { applicability: applicability.get(registry.skillId) }
-              : {}),
+            applicability: applicability.get(registry.skillId) || clone(DEFAULT_SKILL_APPLICABILITY),
             knowledge: {
               key: `skill:${registry.skillId}`,
               version: `semantic-v1:${version.version}:${version.sha256}`,

@@ -55,6 +55,43 @@ afterEach(async () => {
   while (temporaryDirectories.length) await rm(temporaryDirectories.pop(), { recursive: true, force: true });
 });
 
+it("stages selected files inside the exact binding beside its Skill directory", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "easywork-agent-file-stage-"));
+  temporaryDirectories.push(root);
+  const localPath = path.join(root, "input.txt");
+  const content = Buffer.from("private selected file");
+  await writeFile(localPath, content);
+  const sha256 = crypto.createHash("sha256").update(content).digest("hex");
+  const executor = new FakeExecutor();
+  const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+  const paths = remoteAgentPaths("/home/tester", "codex", "binding:conversation-1:workspace-1");
+  const [staged] = await transport.stageFiles({
+    adapterId: "codex",
+    bindingId: "binding:conversation-1:workspace-1",
+    messageId: "message-1",
+    files: [{ resourceVersionId: "resource-version-1", filename: "input.txt", sha256, size: content.length, localPath }],
+  });
+  assert.equal(staged.filename, "input.txt");
+  assert.equal(staged.resourceVersionId, "resource-version-1");
+  assert.equal(staged.remotePath, `${paths.filesRoot}/turns/message-1/input.txt`);
+  assert.equal(executor.uploads.length, 1);
+  assert.equal(executor.uploads[0].localPath, localPath);
+  assert.match(executor.uploads[0].remotePath, new RegExp(`^${`${paths.filesRoot}/objects/${sha256}/.upload-`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.ok(executor.commands.some((command) => command.includes(executor.uploads[0].remotePath)
+    && command.includes(`${paths.filesRoot}/objects/${sha256}/input.txt`)
+    && command.includes("mv -Tf")));
+  assert.ok(executor.commands.some((command) => command.includes(`${paths.filesRoot}/turns/message-1`) && command.includes("mv -Tf")));
+  await assert.rejects(() => transport.stageFiles({
+    adapterId: "codex",
+    bindingId: "binding:conversation-1:workspace-1",
+    messageId: "message-2",
+    files: [
+      { resourceVersionId: "one", filename: "same.txt", sha256, size: content.length, localPath },
+      { resourceVersionId: "two", filename: "same.txt", sha256, size: content.length, localPath },
+    ],
+  }), (error) => error?.code === "AGENT_FILE_NAME_CONFLICT");
+});
+
 async function artifactFixture({ hashOverride = null, archive = "raw", archiveBinary = null } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "easywork-agent-runtime-"));
   temporaryDirectories.push(root);

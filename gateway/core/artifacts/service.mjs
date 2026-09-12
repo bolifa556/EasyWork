@@ -114,7 +114,6 @@ function filtersFrom(input) {
   return {
     taskId: input.taskId === undefined ? null : String(input.taskId),
     conversationId: input.conversationId === undefined ? null : String(input.conversationId),
-    projectId: input.projectId === undefined ? null : String(input.projectId),
     workspaceId: input.workspaceId === undefined ? null : String(input.workspaceId),
     lifecycle: [...new Set(lifecycle)].sort(),
   };
@@ -124,7 +123,6 @@ function summaryMatches(summary, filters) {
   return (
     (filters.taskId === null || summary.taskId === filters.taskId)
     && (filters.conversationId === null || summary.conversationId === filters.conversationId || filters.inheritedTaskIds?.includes(summary.taskId))
-    && (filters.projectId === null || summary.projectId === filters.projectId)
     && (filters.workspaceId === null || summary.workspaceId === filters.workspaceId)
     && filters.lifecycle.includes(summary.lifecycle)
   );
@@ -156,15 +154,12 @@ export class ArtifactService {
     invariant(options?.actor?.actorId, "ACTOR_CONTEXT_REQUIRED", "ArtifactService 需要 ActorContext", { status: 500, expose: false });
     invariant(typeof options?.dataRoot === "string" && path.isAbsolute(options.dataRoot), "DATA_ROOT_INVALID", "ArtifactService 需要绝对 dataRoot", { status: 500, expose: false });
     invariant(typeof options?.authorizeTask === "function", "ARTIFACT_TASK_AUTHORIZER_REQUIRED", "ArtifactService 需要 Task 授权器", { status: 500, expose: false });
-    invariant(typeof options?.authorizeProject === "function", "ARTIFACT_PROJECT_AUTHORIZER_REQUIRED", "ArtifactService 需要 Project 授权器", { status: 500, expose: false });
     const tokenSecret = String(options.downloadSecret || options.cursorSecret || "");
     invariant(tokenSecret.length >= 32, "ARTIFACT_TOKEN_SECRET_INVALID", "Artifact token secret 至少需要 32 个字符", { status: 500, expose: false });
     this.actor = options.actor;
     this.dataRoot = options.dataRoot;
     this.authorizeTask = options.authorizeTask;
-    this.authorizeProject = options.authorizeProject;
     this.remoteSource = options.remoteSource || null;
-    this.resourcePromoter = options.resourcePromoter || null;
     this.clock = options.clock || (() => new Date());
     this.idFactory = options.idFactory || ((kind) => `${kind}_${crypto.randomUUID()}`);
     this.maxInlineBytes = Number(options.maxInlineBytes ?? 1024 * 1024);
@@ -197,11 +192,6 @@ export class ArtifactService {
     invariant(task.actorId === this.actor.actorId, "ARTIFACT_TASK_FORBIDDEN", "Task 不属于当前 Actor", { status: 403 });
     const allowed = await this.authorizeTask({ actor: this.actor, task: clone(task), taskId: task.id, action });
     invariant(allowed !== false, "ARTIFACT_TASK_FORBIDDEN", "当前 Actor 无权访问该 Task 的 Artifact", { status: 403 });
-  }
-
-  async #authorizeProject(projectId, action) {
-    const allowed = await this.authorizeProject({ actor: this.actor, projectId, action });
-    invariant(allowed !== false, "ARTIFACT_PROJECT_FORBIDDEN", "当前 Actor 无权操作该项目", { status: 403 });
   }
 
   async #readRecord(id) {
@@ -306,7 +296,6 @@ export class ArtifactService {
           taskId: task.id,
           conversationId: task.conversationId,
           workspaceId: task.route.workspaceId,
-          projectId: null,
           name,
           kind,
           mime,
@@ -319,7 +308,6 @@ export class ArtifactService {
           versions: [{ id: versionId, ordinal: 1, source: "host", contentLocation: "host-small-file", size: content.length, sha256, mime, capturedAt: now }],
           originArtifact,
           locators: [{ versionId, source: "host", actorRelativePath: blob.relativePath, remotePath: null, serverIdentity: null }],
-          promotion: null,
           expiresAt: normalizeExpiresAt(payload.expiresAt, now, this.defaultRetentionMs),
           pinnedAt: null,
           deletedAt: null,
@@ -398,7 +386,6 @@ export class ArtifactService {
         taskId: task.id,
         conversationId: task.conversationId,
         workspaceId: task.route.workspaceId,
-        projectId: null,
         name,
         kind,
         mime,
@@ -411,7 +398,6 @@ export class ArtifactService {
         versions: [{ id: versionId, ordinal: 1, source: "remote", contentLocation: "remote-reference", size, sha256, mime, capturedAt: now }],
         originArtifact,
         locators: [{ versionId, source: "remote", actorRelativePath: null, remotePath: inspected.canonicalPath, serverIdentity: task.route.serverIdentity }],
-        promotion: null,
         // A remote Artifact stores only a lightweight reference; EasyWork does
         // not copy the file onto the host. Keep that reference with the
         // conversation unless the producer explicitly supplies an expiry.
@@ -443,7 +429,7 @@ export class ArtifactService {
   }
 
   async list(input = {}) {
-    assertAllowedKeys(input, ["cursor", "limit", "taskId", "conversationId", "projectId", "workspaceId", "lifecycle"], "list");
+    assertAllowedKeys(input, ["cursor", "limit", "taskId", "conversationId", "workspaceId", "lifecycle"], "list");
     const limit = Number(input.limit ?? 20);
     invariant(Number.isSafeInteger(limit) && limit >= 1 && limit <= this.maxListLimit, "ARTIFACT_LIST_LIMIT_INVALID", "Artifact 列表 limit 无效", { status: 400, details: { max: this.maxListLimit } });
     const filters = filtersFrom(input);
@@ -519,82 +505,6 @@ export class ArtifactService {
 
   async delete(input) {
     return this.#changeLifecycle(input, "delete", "deleted");
-  }
-
-  async promoteToProject(input) {
-    assertAllowedKeys(input, ["artifactId", "projectId", "expectedRevision", "commandId"], "promoteToProject");
-    invariant(typeof this.resourcePromoter?.promote === "function", "ARTIFACT_RESOURCE_PROMOTER_UNAVAILABLE", "Artifact 转存服务不可用", { status: 503 });
-    const projectId = String(input.projectId || "");
-    invariant(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(projectId), "ARTIFACT_PROJECT_ID_INVALID", "projectId 无效", { status: 400 });
-    await this.#authorizeProject(projectId, "write");
-    return this.#runCommand(input.commandId, "promote", { artifactId: input.artifactId, projectId, expectedRevision: input.expectedRevision }, async ({ summaries }) => {
-      const record = await this.#readRecord(input.artifactId);
-      invariant(!["deleted", "expired"].includes(record.lifecycle), "ARTIFACT_NOT_AVAILABLE", "已删除或过期的 Artifact 不能转存", { status: 410 });
-      invariant(record.promotion === null || record.promotion.projectId === projectId, "ARTIFACT_ALREADY_PROMOTED", "Artifact 已转存到其他项目", { status: 409 });
-      if (record.promotion !== null) {
-        return {
-          summaries: summaries.map((entry) => entry.id === record.id ? publicArtifactSummary(record) : entry),
-          result: { artifact: clone(redactSensitive(publicArtifactDetail(record))), promotion: clone(record.promotion) },
-        };
-      }
-      assertExpectedRevision(record.revision, input.expectedRevision);
-      const promoted = await this.resourcePromoter.promote({
-        actor: this.actor,
-        projectId,
-        artifact: clone(redactSensitive(publicArtifactDetail(record))),
-        commandId: input.commandId,
-        openSource: (range) => this.#openRecord(record, range),
-      });
-      invariant(promoted && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(String(promoted.resourceVersionId || "")) && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(String(promoted.bindingId || "")), "ARTIFACT_PROMOTION_RESULT_INVALID", "Artifact 转存结果无效", { status: 500, expose: false });
-      const now = nowIso(this.clock);
-      const promotion = { projectId, resourceVersionId: String(promoted.resourceVersionId), bindingId: String(promoted.bindingId), promotedAt: now };
-      const next = updatedRecord(record, {
-        projectId,
-        promotion,
-        lifecycle: "pinned",
-        pinnedAt: now,
-        deletedAt: null,
-        expiresAt: null,
-      }, this.clock);
-      await this.storage.writeRecord(next);
-      return {
-        summaries: summaries.map((entry) => entry.id === next.id ? publicArtifactSummary(next) : entry),
-        result: { artifact: clone(redactSensitive(publicArtifactDetail(next))), promotion: clone(promotion) },
-      };
-    });
-  }
-
-  async detachProject(input) {
-    assertAllowedKeys(input, ["projectId", "commandId"], "detachProject");
-    const projectId = String(input.projectId || "");
-    invariant(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(projectId), "ARTIFACT_PROJECT_ID_INVALID", "projectId 无效", { status: 400 });
-    return this.#runCommand(input.commandId, "detach-project", { projectId }, async ({ summaries }) => {
-      const candidateIds = summaries.filter((entry) => entry.projectId === projectId).map((entry) => entry.id);
-      const replacements = new Map();
-      const detachedArtifactIds = [];
-      for (const artifactId of candidateIds) {
-        const record = await this.#readRecord(artifactId);
-        if (record.projectId !== projectId) {
-          replacements.set(record.id, publicArtifactSummary(record));
-          continue;
-        }
-        const now = nowIso(this.clock);
-        const next = updatedRecord(record, {
-          projectId: null,
-          promotion: null,
-          lifecycle: "active",
-          pinnedAt: null,
-          expiresAt: new Date(Date.parse(now) + this.defaultRetentionMs).toISOString(),
-        }, this.clock);
-        await this.storage.writeRecord(next);
-        replacements.set(next.id, publicArtifactSummary(next));
-        detachedArtifactIds.push(next.id);
-      }
-      return {
-        summaries: summaries.map((entry) => replacements.get(entry.id) || entry),
-        result: { projectId, detachedArtifactIds },
-      };
-    });
   }
 
   async issueDownload(input) {

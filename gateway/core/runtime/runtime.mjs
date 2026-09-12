@@ -713,13 +713,12 @@ export class EasyWorkRuntime {
     });
 
     router.route("GET", "/api/artifacts", (request) => {
-      const query = strictQuery(request.query, ["cursor", "limit", "taskId", "conversationId", "projectId", "workspaceId", "lifecycle"], "Artifact 列表");
+      const query = strictQuery(request.query, ["cursor", "limit", "taskId", "conversationId", "workspaceId", "lifecycle"], "Artifact 列表");
       return request.services.artifacts.list({
         ...(query.cursor ? { cursor: query.cursor } : {}),
         ...(query.limit ? { limit: Number(query.limit) } : {}),
         ...(query.taskId ? { taskId: query.taskId } : {}),
         ...(query.conversationId ? { conversationId: query.conversationId } : {}),
-        ...(query.projectId ? { projectId: query.projectId } : {}),
         ...(query.workspaceId ? { workspaceId: query.workspaceId } : {}),
         ...(query.lifecycle ? { lifecycle: query.lifecycle } : {}),
       });
@@ -730,13 +729,6 @@ export class EasyWorkRuntime {
       artifactId: request.params.id,
       ttlMs: request.body?.ttlMs,
     }));
-    router.route("POST", "/api/artifacts/:id/save-as-resource", (request) => request.services.artifacts.promoteToProject({
-      artifactId: request.params.id,
-      projectId: requiredObject(request.body, "保存 Artifact 到项目").projectId,
-      expectedRevision: expectedRevision(request),
-      commandId: commandId(request),
-    }));
-
     router.route("POST", "/api/previews", (request) => request.services.createPreview(requiredObject(request.body, "创建 Preview")));
     router.route("GET", "/api/previews/:id", (request) => request.services.previews.get({ previewId: request.params.id }));
     router.route("HEAD", "/api/previews/:id", (request) => request.services.previews.head({ previewId: request.params.id }));

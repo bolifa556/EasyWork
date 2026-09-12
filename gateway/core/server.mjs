@@ -178,6 +178,9 @@ export async function createGatewayServer(options = {}) {
         const expectedSize = Number(url.searchParams.get("size"));
         const expectedSha256 = String(request.headers["x-content-sha256"] || "");
         const createdSequence = Number(url.searchParams.get("createdSequence") || 0);
+        const providerId = String(url.searchParams.get("providerId") || "").trim();
+        const modelId = String(url.searchParams.get("modelId") || "").trim();
+        invariant(providerId && modelId, "RESOURCE_SUMMARY_ROUTE_REQUIRED", "文件上传需要当前网页模型", { status: 400 });
         const services = await runtime.servicesForActor(session.actor);
         const uploaded = await services.resources.ingestStream({
           commandId: idempotencyKey(request),
@@ -188,6 +191,7 @@ export async function createGatewayServer(options = {}) {
           expectedSha256,
           createdSequence,
           binding: { ownerType, ownerId, path: bindingPath || null },
+          summary: { required: true, providerId, modelId },
           openSource: async () => request,
         });
         const result = apiSuccess(uploaded, { requestId: id });

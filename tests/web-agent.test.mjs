@@ -4,39 +4,10 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { PromptRepository } from "../gateway/core/prompts/index.mjs";
-import { WebAgentRuntime, createDefaultWebAgentTools, workSourceIntent } from "../gateway/core/web-agent/index.mjs";
+import { WebAgentRuntime, createDefaultWebAgentTools } from "../gateway/core/web-agent/index.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const prompts = new PromptRepository({ promptRoot: path.join(repositoryRoot, "prompts") });
-
-test("Work 在模型入口前遵守用户明确限定的资料来源", () => {
-  assert.deepEqual(workSourceIntent("只基于当前会话已确认的信息回答，不要读取文件。"), {
-    memory: false,
-    resources: false,
-    skills: false,
-  });
-  assert.deepEqual(workSourceIntent("只基于当前网页对话刚刚形成的两条证据回答，不要读取记忆、Skill、文件或远端工作区。"), {
-    memory: false,
-    resources: false,
-    skills: false,
-  });
-  assert.deepEqual(workSourceIntent("只依据本次换绑收到的网页正文历史，不再读取文件或运行命令。"), {
-    memory: false,
-    resources: false,
-    skills: false,
-  });
-  assert.deepEqual(workSourceIntent("核对本项目关联资料中是否存在 S07-ARCHIVE-HANDOFF.md。"), {
-    memory: false,
-    resources: true,
-    skills: false,
-  });
-  assert.equal(workSourceIntent("只读取远端工作区 README 第一段。").resources, false);
-  assert.deepEqual(workSourceIntent("核对项目长期记忆、关联文件和已安装 Skill。"), {
-    memory: true,
-    resources: true,
-    skills: true,
-  });
-});
 
 function contextServices(overrides = {}, skillOverrides = {}, referenceOverrides = {}) {
   return {
@@ -68,7 +39,13 @@ function contextServices(overrides = {}, skillOverrides = {}, referenceOverrides
       ...skillOverrides,
     },
     conversationReferences: {
-      read: async () => ({ conversation: [], nextCursor: null }),
+      search: async () => ({
+        reference: { title: "引用对话" },
+        memory: [],
+        recentConversation: [],
+        matchedConversation: [],
+        nextCursor: null,
+      }),
       ...referenceOverrides,
     },
   };
@@ -85,6 +62,17 @@ function visibleCandidateIds(messages) {
 function submitVisible(messages, select = (candidateIds) => candidateIds) {
   const candidateIds = select(visibleCandidateIds(messages));
   return { toolCalls: [{ id: `submit_${candidateIds.length}`, name: "handoff_submit", input: { candidateIds } }] };
+}
+
+function memoryCatalogFragment({ key, content, name = key, version = "record-v1", priority = 90 }) {
+  return {
+    toolName: "memory_catalog",
+    rendered: content,
+    presented: { memory: [{ content }] },
+    knowledge: { key: `memory:${key}`, version, content },
+    reference: { kind: "记忆", name },
+    priority,
+  };
 }
 
 test("Work 的单次模型请求超时会给出可重试原因而不占满整轮预算", async () => {
@@ -194,25 +182,21 @@ test("Work 网页 Agent 只检索上下文并提交 handoff，不接触远程 Ta
 });
 
 test("Work 读取只产生候选，并只交付 handoff_submit 明确选中的内容", async () => {
-  let round = 0;
+  const memories = [
+    memoryCatalogFragment({ key: "selected", content: "生产发布采用蓝绿部署。" }),
+    memoryCatalogFragment({ key: "not-selected", content: "测试环境使用临时颜色。" }),
+  ];
   const runtime = new WebAgentRuntime({
     model: {
       async complete({ messages }) {
-        round += 1;
-        if (round === 1) return { toolCalls: [{ id: "memory", name: "memory_search", input: { query: "部署" } }] };
         return submitVisible(messages, (candidateIds) => candidateIds.slice(0, 1));
       },
     },
-    tools: await createDefaultWebAgentTools(contextServices({
-      search: async () => ({ memory: [
-        { semanticKey: "selected", content: "生产发布采用蓝绿部署。", source: { id: "selected", version: "1" } },
-        { semanticKey: "not-selected", content: "测试环境使用临时颜色。", source: { id: "not-selected", version: "1" } },
-      ] }),
-    }), prompts),
+    tools: await createDefaultWebAgentTools(contextServices(), prompts),
     prompts,
   });
 
-  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "发布生产服务", runId: "web_explicit_selection" });
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "发布生产服务", initialObservationFragments: memories, runId: "web_explicit_selection" });
   assert.equal(result.observedFragments.length, 2);
   assert.equal(result.selectedHandoffFragments.length, 1);
   assert.equal(result.handoffFragments.length, 1);
@@ -224,29 +208,31 @@ test("Work 临时整理记忆时保留原标题和稳定身份，且不改写已
   const events = [];
   let round = 0;
   let candidateId = "";
+  const memory = memoryCatalogFragment({
+    key: "project:部署约定",
+    name: "部署约定",
+    content: "旧部署参数使用 7001 端口。",
+  });
   const runtime = new WebAgentRuntime({
     model: { async complete({ messages }) {
       round += 1;
-      if (round === 1) return { toolCalls: [{ id: "memory", name: "memory_search", input: { query: "旧部署参数" } }] };
-      if (round === 2) {
+      if (round === 1) {
         [candidateId] = visibleCandidateIds(messages);
         return { toolCalls: [{ id: "rewrite", name: "handoff_rewrite_candidate", input: { candidateId, revisedContent: "当前环境应使用新部署参数；旧端口信息已移除。" } }] };
       }
       return { toolCalls: [{ id: "submit", name: "handoff_submit", input: { candidateIds: [candidateId] } }] };
     } },
-    tools: await createDefaultWebAgentTools(contextServices({
-      search: async () => ({ memory: [{ semanticKey: "部署约定", content: "旧部署参数使用 7001 端口。", source: { id: "project:部署约定", version: "9" } }] }),
-    }), prompts),
+    tools: await createDefaultWebAgentTools(contextServices(), prompts),
     prompts,
     eventSink: async (event) => events.push(event),
   });
 
-  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "按当前环境部署", runId: "rewrite-memory" });
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "按当前环境部署", initialObservationFragments: [memory], runId: "rewrite-memory" });
   assert.equal(result.content, "相关记忆：\n- 当前环境应使用新部署参数；旧端口信息已移除。");
   assert.equal(result.observedFragments[0].knowledge.content, "旧部署参数使用 7001 端口。");
   assert.deepEqual(result.handoffFragments[0].knowledge, {
     key: "memory:project:部署约定",
-    version: "record-v1",
+    version: memory.knowledge.version,
     content: "当前环境应使用新部署参数；旧端口信息已移除。",
   });
   assert.equal(result.handoffFragments[0].rewritten, true);
@@ -258,40 +244,97 @@ test("Work 临时整理记忆时保留原标题和稳定身份，且不改写已
   }]);
 });
 
-test("显式 @ 对话只按本轮 reference_id 读取冻结消息，并可临时整理后发送", async () => {
+test("显式 @ 对话检索冻结记忆和完整回合，时间线只显示标题，并可临时整理后发送", async () => {
   const events = [];
   const catalog = [{ referenceId: "cref_11111111111111111111111111111111", title: "训练参数讨论" }];
   let round = 0;
   let candidateId = "";
   const services = contextServices({}, {}, {
-    read: async ({ referenceId, query }) => {
+    search: async ({ referenceId, query }) => {
       assert.equal(referenceId, catalog[0].referenceId);
       assert.equal(query, "batch size");
       return {
-        conversation: [{
-          id: "msg_source_1",
-          role: "assistant",
-          content: "当时建议 batch size 设为 64。",
+        reference: {
           referenceId,
-          referenceTitle: "训练参数讨论",
-          sourceConversationId: "conv_source",
-          sourceSnapshotId: "csnap_frozen",
+          title: "训练参数讨论",
+          conversationId: "conv_source",
+          snapshotId: "csnap_frozen",
+        },
+        memory: [{
+          source: { id: "mem_batch", version: 3 },
+          semanticKey: "训练批大小约定",
+          content: "该项目显存有限，批大小不得高于 64。",
         }],
+        recentConversation: [
+          {
+            id: "msg_recent_question",
+            role: "user",
+            content: "最近一次训练是否稳定？",
+            contextKind: "recent",
+            referenceTurnId: "msg_recent_question",
+            referenceId,
+            referenceTitle: "训练参数讨论",
+            sourceConversationId: "conv_source",
+            sourceSnapshotId: "csnap_frozen",
+          },
+          {
+            id: "msg_recent_answer",
+            role: "assistant",
+            content: "最近一次训练已经稳定完成。",
+            contextKind: "recent",
+            referenceTurnId: "msg_recent_question",
+            referenceId,
+            referenceTitle: "训练参数讨论",
+            sourceConversationId: "conv_source",
+            sourceSnapshotId: "csnap_frozen",
+          },
+        ],
+        matchedConversation: [
+          {
+            id: "msg_source_question",
+            role: "user",
+            content: "第二轮应该怎么设训练参数？",
+            contextKind: "matched",
+            referenceTurnId: "msg_source_question",
+            referenceId,
+            referenceTitle: "训练参数讨论",
+            sourceConversationId: "conv_source",
+            sourceSnapshotId: "csnap_frozen",
+          },
+          {
+            id: "msg_source_answer",
+            role: "assistant",
+            content: "当时建议 batch size 设为 64。",
+            contextKind: "matched",
+            referenceTurnId: "msg_source_question",
+            referenceId,
+            referenceTitle: "训练参数讨论",
+            sourceConversationId: "conv_source",
+            sourceSnapshotId: "csnap_frozen",
+          },
+        ],
         nextCursor: "cursor_next",
       };
     },
   });
   const registry = await createDefaultWebAgentTools(services, prompts, { conversationReferences: catalog });
-  assert.ok(registry.resolve("conversation_reference_read", "chat"));
-  assert.ok(registry.resolve("conversation_reference_read", "work"));
-  assert.throws(() => registry.resolve("conversation_reference_read", "work").validate({ referenceId: "cref_22222222222222222222222222222222" }), /not available/);
+  assert.ok(registry.resolve("conversation_reference_search", "chat"));
+  assert.ok(registry.resolve("conversation_reference_search", "work"));
+  assert.throws(() => registry.resolve("conversation_reference_search", "work").validate({ referenceId: "cref_22222222222222222222222222222222", query: "batch size" }), /not available/);
+  assert.throws(() => registry.resolve("conversation_reference_search", "work").validate({ referenceId: catalog[0].referenceId }), /query is required/);
   const runtime = new WebAgentRuntime({
     model: { async complete({ messages }) {
       round += 1;
-      if (round === 1) return { toolCalls: [{ id: "read", name: "conversation_reference_read", input: { referenceId: catalog[0].referenceId, query: "batch size" } }] };
+      if (round === 1) return { toolCalls: [{ id: "read", name: "conversation_reference_search", input: { referenceId: catalog[0].referenceId, query: "batch size" } }] };
       if (round === 2) {
-        [candidateId] = visibleCandidateIds(messages);
-        assert.match(messages.find((message) => message.name === "conversation_reference_read").content, /cursor_next/);
+        const toolMessage = messages.find((message) => message.name === "conversation_reference_search");
+        assert.match(toolMessage.content, /该项目显存有限/);
+        assert.match(toolMessage.content, /最近上下文/);
+        assert.match(toolMessage.content, /最近一次训练已经稳定完成/);
+        assert.match(toolMessage.content, /检索到的较早上下文/);
+        assert.match(toolMessage.content, /当时建议 batch size 设为 64/);
+        assert.match(toolMessage.content, /cursor_next/);
+        candidateId = visibleCandidateIds(messages).filter((id) => toolMessage.content.includes(id)).at(-1);
         return { toolCalls: [{ id: "rewrite", name: "handoff_rewrite_candidate", input: { candidateId, revisedContent: "该建议来自旧环境；当前训练先从 batch size 32 开始。" } }] };
       }
       return { toolCalls: [{ id: "submit", name: "handoff_submit", input: { candidateIds: [candidateId] } }] };
@@ -303,7 +346,7 @@ test("显式 @ 对话只按本轮 reference_id 读取冻结消息，并可临时
 
   const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "继续调参", runId: "explicit-reference" });
   assert.deepEqual(result.handoffFragments[0].knowledge, {
-    key: "conversation-reference:conv_source:csnap_frozen:msg_source_1",
+    key: "conversation-reference:conv_source:csnap_frozen:msg_source_question",
     version: "snapshot-v1",
     content: "该建议来自旧环境；当前训练先从 batch size 32 开始。",
   });
@@ -313,6 +356,15 @@ test("显式 @ 对话只按本轮 reference_id 读取冻结消息，并可临时
     detail: "该建议来自旧环境；当前训练先从 batch size 32 开始。",
     edited: true,
   }]);
+  assert.deepEqual(events.find((event) => event.kind === "run.context.read").payload.output, {
+    conversation: [
+      {
+        title: "训练参数讨论",
+        referenceTitle: "训练参数讨论",
+        sourceConversationId: "conv_source",
+      },
+    ],
+  });
 });
 
 test("聊天与 Work 都不暴露状态工具，真正的聊天历史查询仍可展示", async () => {
@@ -335,7 +387,6 @@ test("强制 Skill 确定性交付，不进入网页模型的候选或已读池"
     const runtime = new WebAgentRuntime({
       model: { async complete({ messages }) {
         modelCalls += 1;
-        assert.equal(otherTools, true, "仅有强制技能时无需启动网页模型");
         assert.doesNotMatch(JSON.stringify(messages), /CPU 使用规则|CPU 分区|cpu-policy/);
         return { toolCalls: [{ id: "empty", name: "handoff_submit", input: { candidateIds: [] } }] };
       } },
@@ -343,7 +394,7 @@ test("强制 Skill 确定性交付，不进入网页模型的候选或已读池"
       prompts, eventSink: async (event) => events.push(event),
     });
     const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "检查环境", runId: `required-skill-${otherTools}`, requiredHandoffFragments: [required] });
-    assert.equal(modelCalls, otherTools ? 1 : 0);
+    assert.equal(modelCalls, 0, "只有后端确定性交付内容时无需启动网页模型");
     assert.equal(result.observedFragments.length, 0);
     assert.deepEqual(result.handoffFragments.map((item) => item.knowledge.key), ["skill:cpu-policy"]);
     assert.match(JSON.stringify(events.find((event) => event.kind === "run.handoff.ready").payload), /CPU 使用规则/);
@@ -475,7 +526,7 @@ test("网页 Agent 同一轮不重复执行完全相同的读取", async () => {
   assert.equal(result.handoffFragments.length, 1);
 });
 
-test("网页 Agent 的不同查询命中同一知识版本时不重复注入上下文", async () => {
+test("网页 Agent 的不同文件查询命中同一知识版本时不重复注入上下文", async () => {
   let round = 0;
   let searches = 0;
   const events = [];
@@ -485,8 +536,8 @@ test("网页 Agent 的不同查询命中同一知识版本时不重复注入上�
       async complete({ messages }) {
         modelMessages.push(structuredClone(messages));
         round += 1;
-        if (round === 1) return { toolCalls: [{ id: "memory-first", name: "memory_search", input: { query: "用户回答偏好" } }] };
-        if (round === 2) return { toolCalls: [{ id: "memory-synonym", name: "memory_search", input: { query: "此前约定的回复方式" } }] };
+        if (round === 1) return { toolCalls: [{ id: "resource-first", name: "resource_search", input: { query: "用户回答偏好" } }] };
+        if (round === 2) return { toolCalls: [{ id: "resource-synonym", name: "resource_search", input: { query: "此前约定的回复方式" } }] };
         return { content: "我会继续使用三句以内的简短回答。" };
       },
     },
@@ -494,10 +545,12 @@ test("网页 Agent 的不同查询命中同一知识版本时不重复注入上�
       search: async () => {
         searches += 1;
         return {
-          memory: [{
-            semanticKey: "answer-style",
-            content: "用户偏好回答不超过三句话。",
-            source: { id: "answer-style", version: "memory-v1" },
+          resources: [{
+            resourceId: "answer-style",
+            resourceVersionId: "resource-v1",
+            chunkId: "preference",
+            filename: "preferences.md",
+            text: "用户偏好回答不超过三句话。",
           }],
         };
       },
@@ -518,7 +571,7 @@ test("网页 Agent 的不同查询命中同一知识版本时不重复注入上�
   assert.equal(events.filter((event) => event.kind === "run.context.read").length, 1);
   assert.equal(result.observedFragments.length, 1);
   assert.equal(result.content, "我会继续使用三句以内的简短回答。");
-  const secondToolResult = modelMessages[2].find((message) => message.toolCallId === "memory-synonym");
+  const secondToolResult = modelMessages[2].find((message) => message.toolCallId === "resource-synonym");
   assert.match(secondToolResult.content, /同一版本已经在当前上下文中/);
   assert.doesNotMatch(secondToolResult.content, /用户偏好回答不超过三句话/);
   const injectedFacts = modelMessages[2]
@@ -532,7 +585,7 @@ test("Work 跨轮直接复用已读候选，不为恢复上下文重复读取", 
   let reads = 0;
   const events = [];
   const remembered = {
-    toolName: "memory_search",
+    toolName: "memory_catalog",
     rendered: "相关记忆：\n- 用户偏好保留现有部署参数。",
     presented: { memory: [{ content: "用户偏好保留现有部署参数。" }] },
     knowledge: {
@@ -573,39 +626,22 @@ test("Work 跨轮直接复用已读候选，不为恢复上下文重复读取", 
 test("Work handoff removes repeated memory paraphrases and file-backed memory echoes", async () => {
   const events = [];
   let modelRound = 0;
+  const memories = [
+    memoryCatalogFragment({ key: "memory_project_observed", content: "本项目代号为 QA-MEMORY-VIOLET-731，仅在本项目内使用。", version: "1" }),
+    memoryCatalogFragment({ key: "memory_project_preference", content: "用户指定项目代号 QA-MEMORY-VIOLET-731，其他项目不得沿用。", version: "1" }),
+    memoryCatalogFragment({ key: "memory_file_echo", content: "现行密语 QA-FILESET-AZURE-214；旧值 QA-FILESET-OLD-000 已失效。", version: "1", priority: 20 }),
+  ];
   const runtime = new WebAgentRuntime({
     model: {
       complete: async ({ messages }) => {
         modelRound += 1;
         return modelRound === 1 ? ({
           reasoning: "读取项目记忆和关联文件。",
-          toolCalls: [
-            { id: "memory", name: "memory_search", input: { query: "项目代号和密语" } },
-            { id: "file", name: "resource_read", input: { filename: "qa.md", start: 0 } },
-          ],
+          toolCalls: [{ id: "file", name: "resource_read", input: { filename: "qa.md", start: 0 } }],
         }) : submitVisible(messages);
       },
     },
     tools: await createDefaultWebAgentTools(contextServices({
-      search: async ({ sources }) => sources.includes("memory") ? ({
-        memory: [
-          {
-            semanticKey: "project-code",
-            content: "本项目代号为 QA-MEMORY-VIOLET-731，仅在本项目内使用。",
-            source: { id: "memory_project_observed", version: "1" },
-          },
-          {
-            semanticKey: "project-code",
-            content: "用户指定项目代号 QA-MEMORY-VIOLET-731，其他项目不得沿用。",
-            source: { id: "memory_project_preference", version: "1" },
-          },
-          {
-            semanticKey: "download-passphrase",
-            content: "现行密语 QA-FILESET-AZURE-214；旧值 QA-FILESET-OLD-000 已失效。",
-            source: { id: "memory_file_echo", version: "1" },
-          },
-        ],
-      }) : ({ resources: [] }),
       readResource: async () => ({
         resources: [{
           resourceId: "resource_qa",
@@ -620,12 +656,12 @@ test("Work handoff removes repeated memory paraphrases and file-backed memory ec
     eventSink: async (event) => events.push(event),
   });
 
-  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "交付项目背景", runId: "web_semantic_dedupe" });
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "交付项目背景", initialObservationFragments: memories, runId: "web_semantic_dedupe" });
   assert.deepEqual(result.handoffFragments.map((entry) => entry.knowledge.key), [
     "memory:memory_project_preference",
     "resource:resource_qa:chunk_qa",
   ]);
-  assert.equal(events.find((event) => event.kind === "run.context.read" && event.payload.name === "memory_search").payload.output.memory.length, 2);
+  assert.equal(events.filter((event) => event.kind === "run.context.read").length, 1);
   assert.equal(result.content.match(/QA-MEMORY-VIOLET-731/g)?.length, 1);
   assert.equal(result.content.match(/QA-FILESET-AZURE-214/g)?.length, 1);
 });
@@ -757,36 +793,27 @@ test("Work 显式选择的 Skill 作为初始语义候选交付且不会重复",
 
 test("Work handoff discards model-authored execution claims and only forwards semantic tool evidence", async () => {
   const events = [];
-  const results = [
-    { content: "任务已经执行完成，验收通过。", toolCalls: [{ id: "memory", name: "memory_search", input: { query: "部署偏好" } }] },
-  ];
+  const memory = memoryCatalogFragment({
+    key: "record_private",
+    name: "deployment-preference",
+    content: "用户偏好复用现有部署参数。",
+    version: "version_private",
+  });
   const runtime = new WebAgentRuntime({
-    model: { complete: async ({ messages }) => results.length ? results.shift() : submitVisible(messages) },
-    tools: await createDefaultWebAgentTools(contextServices({
-      search: async () => ({
-        memory: [{
-          id: "memory_version_private",
-          kind: "memory",
-          semanticKey: "deployment-preference",
-          content: "用户偏好复用现有部署参数。",
-          source: { type: "memory", id: "record_private", version: "version_private" },
-          priority: 99,
-        }],
-      }),
-    }), prompts),
+    model: { complete: async ({ messages }) => ({ content: "任务已经执行完成，验收通过。", ...submitVisible(messages) }) },
+    tools: await createDefaultWebAgentTools(contextServices(), prompts),
     prompts,
     eventSink: async (event) => events.push(event),
   });
-  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "执行远端任务", runId: "web_claim_filter" });
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "执行远端任务", initialObservationFragments: [memory], runId: "web_claim_filter" });
   assert.doesNotMatch(result.content, /执行完成|验收通过/);
   assert.equal(result.content, "相关记忆：\n- 用户偏好复用现有部署参数。");
   assert.doesNotMatch(result.content, /memory_version_private|record_private|version_private|priority|kind|source/);
-  const read = events.find((event) => event.kind === "run.context.read");
-  assert.deepEqual(read.payload.output, { memory: [{ title: "deployment-preference", content: "用户偏好复用现有部署参数。" }] });
+  assert.equal(events.some((event) => event.kind === "run.context.read"), false);
   assert.deepEqual(events.find((event) => event.kind === "run.handoff.ready").payload.references, [
     { kind: "记忆", name: "deployment-preference", detail: "用户偏好复用现有部署参数。" },
   ]);
-  assert.equal(result.iterations, 2);
+  assert.equal(result.iterations, 1);
   assert.equal(events.filter((event) => event.kind === "run.reasoning.delta").length, 0);
   assert.equal(events.some((event) => event.kind === "run.output.delta"), false);
 });
@@ -823,7 +850,7 @@ test("Work 连续返回过程文本后仍可完成选择，不受两次协议尝
   const events = [];
   const choices = [];
   const optionalMemory = {
-    toolName: "memory_search",
+    toolName: "memory_catalog",
     rendered: "相关记忆：\n- 与当前请求无关的旧信息。",
     presented: { memory: [{ content: "与当前请求无关的旧信息。" }] },
     knowledge: { key: "memory:unrelated", version: "memory-v1", content: "与当前请求无关的旧信息。" },
@@ -1092,7 +1119,6 @@ test("网页 Agent 可绕过 Embedding 直接读取文件，并临时把图片�
 test("Work 网页 Agent 只从已过滤目录发现 Skill，不重复读取服务器状态", async () => {
   const events = [];
   const modelResults = [
-    { toolCalls: [{ id: "catalog", name: "skill_list", input: {} }] },
     { toolCalls: [{ id: "skill", name: "skill_search", input: { name: "本科生算力平台使用规范", query: "服务器状态" } }] },
   ];
   const visibleTools = [];
@@ -1126,11 +1152,15 @@ test("Work 网页 Agent 只从已过滤目录发现 Skill，不重复读取服�
     eventSink: async (event) => events.push(event),
   });
 
-  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "检测当前服务器状态", runId: "web_work_skill_discovery" });
-  assert.equal(result.toolCallCount, 3);
-  assert.equal(result.iterations, 3);
-  assert.equal(visibleTools.length, 3);
-  assert.ok(visibleTools.every((names) => ["skill_list", "skill_search"].every((name) => names.includes(name))));
+  const catalog = await prompts.skillCatalog([
+    { name: "本科生算力平台使用规范", discoveryDescription: "用户要在 USTC 算力平台检查节点或 Slurm 状态时使用。" },
+    { name: "图片处理", discoveryDescription: "用户需要处理图片时使用。" },
+  ]);
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "检测当前服务器状态", context: [{ role: "system", content: catalog }], runId: "web_work_skill_discovery" });
+  assert.equal(result.toolCallCount, 2);
+  assert.equal(result.iterations, 2);
+  assert.equal(visibleTools.length, 2);
+  assert.ok(visibleTools.every((names) => names.includes("skill_search") && !names.includes("skill_list")));
   assert.ok(visibleTools.every((names) => !names.includes("context_get_state") && !names.includes("conversation_search")));
   assert.equal(result.content, "");
   assert.equal(result.handoffFragments.length, 1);
@@ -1188,7 +1218,7 @@ test("Work 没有候选或读取工具时确定性交付空补充且不调用网
 test("Work 没有新读取工具时仍可选择已读候选，不能把仅可提交解释为无需补充", async () => {
   let calls = 0;
   const memory = {
-    toolName: "memory_search",
+    toolName: "memory_catalog",
     rendered: "相关记忆：\n- 项目使用 venv。",
     presented: { memory: [{ content: "项目使用 venv。" }] },
     knowledge: { key: "memory:project-env", version: "v1", content: "项目使用 venv。" },
@@ -1200,7 +1230,7 @@ test("Work 没有新读取工具时仍可选择已读候选，不能把仅可提
       calls += 1;
       assert.deepEqual(tools.map((tool) => tool.name), ["handoff_rewrite_candidate", "handoff_submit"]);
       assert.equal(toolChoice, "required");
-      assert.match(messages[0].content, /当前上下文已经给出的已读知识可以直接使用/);
+      assert.match(messages[0].content, /当前上下文已有的知识可直接复用/);
       assert.doesNotMatch(messages[0].content, /无需补充资料，调用/);
       return submitVisible(messages);
     } },
@@ -1243,14 +1273,13 @@ test("网页 Agent 按模型原始顺序流式输出，并在查询出现后把�
 
 test("Work 暴露只读资料、临时整理与唯一提交工具，Chat 不含状态工具", async () => {
   const registry = await createDefaultWebAgentTools(contextServices(), prompts);
-  const chatTools = ["memory_search", "resource_search", "resource_read", "conversation_search", "skill_list", "skill_search"].sort();
-  const workTools = ["memory_search", "resource_search", "resource_read", "skill_list", "skill_search", "handoff_rewrite_candidate", "handoff_submit"].sort();
+  const chatTools = ["resource_search", "resource_read", "conversation_search", "skill_search"].sort();
+  const workTools = ["resource_search", "resource_read", "skill_search", "handoff_rewrite_candidate", "handoff_submit"].sort();
   assert.deepEqual(registry.definitions("chat").map((tool) => tool.name).sort(), chatTools);
   assert.deepEqual(registry.definitions("work").map((tool) => tool.name).sort(), workTools);
   for (const name of workTools) {
     assert.equal(registry.resolve(name, "work").mutating, false);
   }
-  assert.equal(registry.resolve("skill_list", "work").handoff, false);
   assert.equal(registry.resolve("handoff_submit", "work").terminal, true);
   assert.equal(registry.resolve("context_get_state", "work"), null);
   assert.equal(registry.resolve("context_get_state", "chat"), null);
@@ -1290,7 +1319,7 @@ test("Work 没有关联文件资源时不暴露文件工具，但 Chat 仍可按
   assert.ok(registry.resolve("resource_read", "chat"));
 });
 
-test("Work 没有可查询记忆或适用 Skill 时不暴露空工具，但 Chat 仍保留完整读取能力", async () => {
+test("Work 没有适用 Skill 时不暴露 Skill 正文工具，记忆目录不需要查询工具", async () => {
   const registry = await createDefaultWebAgentTools(contextServices(), prompts, {
     workMemoryTools: false,
     workSkillTools: false,
@@ -1298,8 +1327,8 @@ test("Work 没有可查询记忆或适用 Skill 时不暴露空工具，但 Chat
   assert.equal(registry.resolve("memory_search", "work"), null);
   assert.equal(registry.resolve("skill_list", "work"), null);
   assert.equal(registry.resolve("skill_search", "work"), null);
-  assert.ok(registry.resolve("memory_search", "chat"));
-  assert.ok(registry.resolve("skill_list", "chat"));
+  assert.equal(registry.resolve("memory_search", "chat"), null);
+  assert.equal(registry.resolve("skill_list", "chat"), null);
   assert.ok(registry.resolve("skill_search", "chat"));
   assert.ok(registry.resolve("handoff_submit", "work"));
 });

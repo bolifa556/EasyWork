@@ -92,7 +92,6 @@ export type ArtifactSummary = EntityRevision & {
   taskId: string;
   conversationId: string;
   workspaceId: string;
-  projectId: string | null;
   name: string;
   kind: string;
   mime: string;

@@ -168,7 +168,7 @@ export class MemoryCoordinator {
       // from their own turns. Independent conversations still contribute
       // project memory according to the normal scope rules.
       if (family.has(originBranchKey) && originBranchKey !== currentBranchKey) continue;
-      for (const versionId of completed.result?.storedVersionIds || []) allowed.add(String(versionId));
+      for (const versionId of completed.result?.memoryVersionIds || []) allowed.add(String(versionId));
     }
     const selected = await this.memory.snapshot({
       ...canonicalScope,
@@ -295,10 +295,25 @@ export class MemoryCoordinator {
       const representedByBranchHistory = visibleSourceIds.has(String(origin?.sourceId || ""))
         || visibleSourceIds.has(String(origin?.parentMessageId || ""));
       if (!fromCurrentConversation && !representedByBranchHistory) continue;
-      for (const versionId of completed.result?.storedVersionIds || []) excludedVersionIds.add(String(versionId));
+      for (const versionId of completed.result?.memoryVersionIds || []) excludedVersionIds.add(String(versionId));
     }
     if (!excludedVersionIds.size) return entries;
     return entries.filter((entry) => !excludedVersionIds.has(String(entry?.id || "")));
+  }
+
+  async referenceMemoryVersionIds({ sourceIds = [] } = {}) {
+    const visibleSourceIds = new Set((Array.isArray(sourceIds) ? sourceIds : []).map(String).filter(Boolean));
+    if (!visibleSourceIds.size) return [];
+    const state = await this.#repository().read();
+    const versionIds = new Set();
+    for (const completed of Object.values(state.data.completed)) {
+      const origin = completed?.origin;
+      if (!origin) continue;
+      if (!visibleSourceIds.has(String(origin.sourceId || ""))
+        && !visibleSourceIds.has(String(origin.parentMessageId || ""))) continue;
+      for (const versionId of completed.result?.memoryVersionIds || []) versionIds.add(String(versionId));
+    }
+    return [...versionIds];
   }
 
   async forgetConversation({ conversationId, taskIds = [], sourceIds: explicitSourceIds = [], reason = "deleted conversation", source }) {
@@ -403,6 +418,7 @@ export class MemoryCoordinator {
     const candidates = parseMemoryToolCalls(output, levels)
       .filter((candidate) => durableMemoryCandidate(candidate, { userMessage, assistantMessage, observedKnowledge: knowledgeEvidence, mode }));
     const stored = [];
+    const memoryVersionIds = [];
     for (const candidate of candidates) {
       if (!levels.includes(candidate.level)) continue;
       const memoryScope = { level: candidate.level, id: scopeId(scope, candidate.level) };
@@ -412,7 +428,10 @@ export class MemoryCoordinator {
         // Identical semantic content is already durable. A new message source
         // must not create a no-op version that is then retrieved as a second
         // copy on a later turn.
-        if (latest?.content === candidate.content) break;
+        if (latest?.content === candidate.content) {
+          memoryVersionIds.push(latest.id);
+          break;
+        }
         try {
           const result = await this.memory.append({
             scope: memoryScope,
@@ -430,6 +449,7 @@ export class MemoryCoordinator {
             ...(existing ? { expectedRevision: existing.revision } : {}),
           });
           stored.push(result);
+          memoryVersionIds.push(result.version.id);
           break;
         } catch (error) {
           if (!["MEMORY_REVISION_CONFLICT", "REVISION_CONFLICT"].includes(error?.code)) throw error;
@@ -440,10 +460,10 @@ export class MemoryCoordinator {
     const snapshot = await this.memory.snapshot({ ...scope, memoryBaselineSequence: null, memorySnapshotSequence: 0, memorySnapshotVersionIds: [] });
     await this.#update((data) => {
       data.completed[dedupeKey] = {
-        result: { extracted: result.extracted, storedVersionIds: stored.map((entry) => entry.version.id) },
+        result: { extracted: result.extracted, memoryVersionIds: [...new Set(memoryVersionIds)] },
         evidence: candidates.map((candidate) => ({
           semanticKey: candidate.semanticKey,
-          kind: candidate.kind || "legacy-extraction",
+          kind: candidate.kind || "observed-fact",
           ...(candidate.evidence ? { ...candidate.evidence, messageId: candidate.evidence.role === "user" ? parentMessageId : source?.id } : {}),
         })),
         memorySequence: snapshot.sequence,

@@ -47,14 +47,15 @@ function serviceOptions(dataRoot, currentActor, overrides = {}) {
   };
 }
 
-test("自动 Skill 发现同时匹配明确平台标识和当前调度器", () => {
+test("Skill 发现只按显式适用范围匹配服务器和调度器", () => {
   const slurmSkill = {
     name: "本科生算力平台使用规范",
     description: "适用于 USTC 登录节点、Slurm 队列和 GPU 作业。",
+    applicability: { mode: "work", serverKind: "compute", allowServers: ["107.ustc.edu.cn"] },
   };
   assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, serverName: "reta服务器", scheduler: "none" }), false);
   assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, server: { name: "scnet-gpu", host: "qdeshell.hpccube.com" }, scheduler: "slurm" }), false);
-  assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, serverName: "107.ustc.edu.cn", scheduler: "unknown" }), true);
+  assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, serverName: "107.ustc.edu.cn", scheduler: "slurm" }), true);
   assert.equal(isAutomaticSkillApplicable({ skill: slurmSkill, serverName: "ordinary-server", scheduler: "unknown" }), false);
   assert.equal(isAutomaticSkillApplicable({
     skill: { name: "通用 Slurm 基线", description: "为 Slurm CPU 作业生成 README、JSON 结果并检查 UTC 时间。" },
@@ -113,7 +114,7 @@ test("上传 Skill 会在 Actor skills 目录保存不可变版本，并登记�
       assert.deepEqual(descriptor.files.map((file) => file.path), ["README.md", "scripts/main.mjs"]);
       assert.match(packageRoot, currentActor.actorType === "user" ? /[\\/]users[\\/]same_skill[\\/]/ : /[\\/]guests[\\/]same_skill[\\/]/);
       const catalog = await service.listInstalledKnowledge();
-      assert.equal(Object.hasOwn(catalog.items[0], "applicability"), false);
+      assert.deepEqual(catalog.items[0].applicability, { mode: "all", serverKind: "all", allowServers: [], denyServers: [], forceEnabled: false });
       assert.deepEqual(catalog.items.map((entry) => ({ skillId: entry.skillId, knowledge: entry.knowledge })), [{
         skillId: "shell-helper",
         knowledge: { key: "skill:shell-helper", version: `semantic-v1:1.0.0:${uploaded.version.sha256}` },
@@ -122,7 +123,7 @@ test("上传 Skill 会在 Actor skills 目录保存不可变版本，并登记�
   });
 });
 
-test("内部 Skill 目录只在用户显式配置后携带 applicability", async () => {
+test("内部 Skill 目录始终携带当前 applicability，个人配置覆盖默认范围", async () => {
   await fixture(async (dataRoot) => {
     const service = new SkillService(serviceOptions(dataRoot, actor()));
     await service.uploadVersion(skillInput());

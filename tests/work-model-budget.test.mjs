@@ -92,26 +92,13 @@ test("正常持续输出跨过无响应时长也能完成；用户仍可停止�
   await assert.rejects(stopped, /用户停止/);
 });
 
-test("Skill 发现目录不遗漏排在第 50 项之后的技能，也不截断名称简介", async () => {
+test("Skill 发现目录完整注入，不遗漏排在第 50 项之后的技能", async () => {
   const prompts = new PromptRepository({ promptRoot: path.resolve("prompts") });
-  const catalog = Array.from({ length: 61 }, (_, i) => ({ name: `技能-${i}`, description: "适用条件".repeat(220) + `末尾条件-${i}` }));
-  const tools = await createDefaultWebAgentTools({ context: {}, skills: { list: async () => catalog } }, prompts);
-  const tool = tools.resolve("skill_list", "work");
-  const presented = tool.present({ output: await tool.execute({ actor: {} }) });
-  const rendered = await tool.render(presented);
-  assert.equal(presented.skills.length, catalog.length);
+  const catalog = Array.from({ length: 61 }, (_, i) => ({ name: `技能-${i}`, discoveryDescription: `解决第 ${i} 类需求，用户请求对应工作时使用。` }));
+  const rendered = await prompts.skillCatalog(catalog);
   assert.match(rendered, /技能-60/);
-  assert.match(rendered, /末尾条件-60/);
-  let calls = 0;
-  const runtime = new WebAgentRuntime({
-    tools, prompts, limits: WORK_WEB_AGENT_LIMITS,
-    model: { complete: async ({ messages }) => {
-      if (++calls === 1) return { toolCalls: [{ id: "catalog", name: "skill_list", input: {} }] };
-      assert.match(messages.find(message => message.toolCallId === "catalog").content, /末尾条件-60/);
-      return { toolCalls: [{ id: "submit", name: "handoff_submit", input: { candidateIds: [] } }] };
-    } },
-  });
-  await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "帮我按对应规范处理。" });
+  assert.match(rendered, /解决第 60 类需求/);
+  assert.equal((rendered.match(/^- 技能-/gmu) || []).length, catalog.length);
 });
 
 test("明确选中的资料超过 128 条时仍全部交付", async () => {

@@ -109,10 +109,22 @@ function semanticConversation(entries, limit, formatting) {
     const key = `${role}\0${content}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    result.push({ role, content });
+    const referenceTitle = nonEmptyText(entry?.referenceTitle);
+    const sourceConversationId = nonEmptyText(entry?.sourceConversationId);
+    result.push({
+      role,
+      content,
+      ...(entry?.id ? { id: String(entry.id) } : {}),
+      ...(entry?.referenceId ? { referenceId: String(entry.referenceId) } : {}),
+      ...(referenceTitle ? { referenceTitle } : {}),
+      ...(sourceConversationId ? { sourceConversationId } : {}),
+      ...(entry?.sourceSnapshotId ? { sourceSnapshotId: String(entry.sourceSnapshotId) } : {}),
+      ...(entry?.referenceTurnId ? { referenceTurnId: String(entry.referenceTurnId) } : {}),
+      ...(entry?.contextKind ? { contextKind: String(entry.contextKind) } : {}),
+    });
   }
   return withinTextBudget(result, (entry) => entry.content, MAX_PRESENTED_CHARACTERS, formatting.truncationSuffix)
-    .map(({ entry, text: content }) => ({ role: entry.role, content }));
+    .map(({ entry, text: content }) => ({ ...entry, content }));
 }
 
 function semanticSkills(entries, formatting) {
@@ -153,18 +165,6 @@ function semanticSkills(entries, formatting) {
         ...(instructions.length ? { instructions } : {}),
       };
     });
-}
-
-function semanticSkillSummaries(entries) {
-  const seen = new Set();
-  return (Array.isArray(entries) ? entries : []).flatMap((entry) => {
-    const name = nonEmptyText(entry?.name ?? entry?.displayName);
-    const description = nonEmptyText(entry?.description);
-    const key = `${name}\0${description}`;
-    if ((!name && !description) || seen.has(key)) return [];
-    seen.add(key);
-    return [{ ...(name ? { name } : {}), ...(description ? { description } : {}) }];
-  });
 }
 
 function semanticSearchResult(source, output, limit, formatting) {
@@ -341,20 +341,108 @@ export async function conversationKnowledgeUnit(entry, prompts) {
   return { key: `conversation:${identity}`, version: identity, content };
 }
 
-async function conversationReferenceKnowledgeUnit(entry, prompts) {
-  const rawContent = nonEmptyText(typeof entry === "string" ? entry : entry?.content ?? entry?.text);
-  if (!rawContent) return null;
-  const role = entry?.role === "assistant" ? "assistant" : entry?.role === "user" ? "user" : "system";
-  const content = await prompts.conversationMessage(role, rawContent);
-  const sourceConversationId = nonEmptyText(entry?.sourceConversationId);
-  const sourceSnapshotId = nonEmptyText(entry?.sourceSnapshotId);
-  const messageId = nonEmptyText(entry?.id);
-  if (!sourceConversationId || !sourceSnapshotId || !messageId) return null;
+async function conversationReferenceKnowledgeUnit(entries, prompts) {
+  const messages = (Array.isArray(entries) ? entries : [entries]).flatMap((entry) => {
+    const content = nonEmptyText(typeof entry === "string" ? entry : entry?.content ?? entry?.text);
+    if (!content) return [];
+    const role = entry?.role === "assistant" ? "assistant" : entry?.role === "user" ? "user" : "message";
+    return [{ role, content }];
+  });
+  if (!messages.length) return null;
+  const first = Array.isArray(entries) ? entries[0] : entries;
+  const content = await prompts.conversationTranscript(messages);
+  const sourceConversationId = nonEmptyText(first?.sourceConversationId);
+  const sourceSnapshotId = nonEmptyText(first?.sourceSnapshotId);
+  const turnId = nonEmptyText(first?.referenceTurnId ?? first?.id);
+  if (!sourceConversationId || !sourceSnapshotId || !turnId) return null;
   return {
-    key: `conversation-reference:${sourceConversationId}:${sourceSnapshotId}:${messageId}`,
+    key: `conversation-reference:${sourceConversationId}:${sourceSnapshotId}:${turnId}`,
     version: "snapshot-v1",
     content,
   };
+}
+
+function groupedReferenceTurns(entries) {
+  const groups = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const identity = nonEmptyText(entry?.referenceTurnId ?? entry?.id) || `turn:${groups.length}`;
+    const previous = groups.at(-1);
+    if (previous?.identity === identity) previous.entries.push(entry);
+    else groups.push({ identity, entries: [entry] });
+  }
+  return groups;
+}
+
+function semanticConversationReference(output, formatting) {
+  return {
+    reference: {
+      title: nonEmptyText(output?.reference?.title) || "引用对话",
+      referenceId: nonEmptyText(output?.reference?.referenceId),
+      conversationId: nonEmptyText(output?.reference?.conversationId),
+      snapshotId: nonEmptyText(output?.reference?.snapshotId),
+    },
+    memory: semanticMemory(output?.memory, formatting),
+    recentConversation: semanticConversation(output?.recentConversation, Number.MAX_SAFE_INTEGER, formatting),
+    matchedConversation: semanticConversation(output?.matchedConversation, Number.MAX_SAFE_INTEGER, formatting),
+    ...(output?.nextCursor ? { nextCursor: output.nextCursor } : {}),
+  };
+}
+
+async function renderReferenceTurns(entries, prompts, separator) {
+  const rendered = [];
+  for (const group of groupedReferenceTurns(entries)) {
+    const content = await prompts.conversationTranscript(group.entries);
+    if (content) rendered.push(`<turn>\n${content}\n</turn>`);
+  }
+  return rendered.join(separator);
+}
+
+async function renderConversationReference(presented, prompts) {
+  const templates = await prompts.webToolPresentation();
+  const sections = [templates.conversationReferenceHeading.replace("{{TITLE}}", presented.reference.title)];
+  if (presented.memory.length) {
+    const items = presented.memory.map((entry) => templates.listItem.replace("{{ITEM}}", indented(entry.content, templates)));
+    sections.push(templates.conversationReferenceMemorySection.replace("{{ITEMS}}", items.join(templates.itemSeparator)));
+  }
+  if (presented.recentConversation.length) {
+    const turns = await renderReferenceTurns(presented.recentConversation, prompts, templates.itemSeparator);
+    if (turns) sections.push(templates.conversationReferenceRecentSection.replace("{{ITEMS}}", turns));
+  }
+  if (presented.matchedConversation.length) {
+    const turns = await renderReferenceTurns(presented.matchedConversation, prompts, templates.itemSeparator);
+    if (turns) sections.push(templates.conversationReferenceMatchesSection.replace("{{ITEMS}}", turns));
+  }
+  return sections.join(templates.sectionSeparator);
+}
+
+async function conversationReferenceHandoffItems(output, formatting, prompts, toolName) {
+  const title = nonEmptyText(output?.reference?.title) || "引用对话";
+  const reference = { kind: "对话", name: title };
+  const items = [];
+  for (const entry of Array.isArray(output?.memory) ? output.memory : []) {
+    const presented = semanticConversationReference({ reference: output.reference, memory: [entry] }, formatting);
+    const rendered = await renderConversationReference(presented, prompts);
+    const knowledge = knowledgeForSearchResult("memory", entry, { memory: presented.memory });
+    if (rendered && knowledge.content) items.push({ toolName, rendered, presented, knowledge, reference, priority: 100 });
+  }
+  const conversations = [
+    ...(Array.isArray(output?.recentConversation) ? output.recentConversation : []),
+    ...(Array.isArray(output?.matchedConversation) ? output.matchedConversation : []),
+  ];
+  const seenTurns = new Set();
+  for (const group of groupedReferenceTurns(conversations)) {
+    if (seenTurns.has(group.identity)) continue;
+    seenTurns.add(group.identity);
+    const contextKind = nonEmptyText(group.entries[0]?.contextKind);
+    const presented = semanticConversationReference({
+      reference: output.reference,
+      ...(contextKind === "recent" ? { recentConversation: group.entries } : { matchedConversation: group.entries }),
+    }, formatting);
+    const rendered = await renderConversationReference(presented, prompts);
+    const knowledge = await conversationReferenceKnowledgeUnit(group.entries, prompts);
+    if (rendered && knowledge) items.push({ toolName, rendered, presented, knowledge, reference, priority: 100 });
+  }
+  return items;
 }
 
 function pruneObservedSearchResults(source, output, observedFragments, formatting) {
@@ -401,15 +489,15 @@ function handoffReference(source, entry, presented) {
 
 async function semanticHandoffItems(source, output, formatting, prompts, toolName) {
   const entries = Array.isArray(output?.[source]) ? output[source] : [];
+  const groups = entries.map((entry, index) => ({ identity: `entry:${index}`, entries: [entry] }));
   const items = [];
-  for (const entry of entries) {
-    const presented = semanticSearchResult(source, { [source]: [entry] }, 1, formatting);
+  for (const group of groups) {
+    const entry = group.entries[0];
+    const presented = semanticSearchResult(source, { [source]: group.entries }, group.entries.length, formatting);
     const rendered = await renderSemanticContext(presented, prompts);
     if (!rendered) continue;
     const knowledge = source === "conversation"
-      ? toolName === "conversation_reference_read"
-        ? await conversationReferenceKnowledgeUnit(entry, prompts)
-        : await conversationKnowledgeUnit(entry, prompts)
+      ? await conversationKnowledgeUnit(entry, prompts)
       : knowledgeForSearchResult(source, entry, presented);
     if (!knowledge) continue;
     items.push({
@@ -418,7 +506,7 @@ async function semanticHandoffItems(source, output, formatting, prompts, toolNam
       presented,
       knowledge,
       reference: handoffReference(source, entry, presented),
-      priority: source === "skills" || toolName === "conversation_reference_read" ? 100 : source === "resources" ? 90 : 80,
+      priority: source === "skills" ? 100 : source === "resources" ? 90 : 80,
     });
   }
   return items;
@@ -460,6 +548,9 @@ export class WebAgentToolRegistry {
       handoffItems: typeof definition.handoffItems === "function"
         ? definition.handoffItems
         : async ({ presented, rendered }) => rendered ? [{ toolName: name, rendered, presented }] : [],
+      timelineOutput: typeof definition.timelineOutput === "function"
+        ? definition.timelineOutput
+        : ({ presented }) => presented,
       modelSuffix: typeof definition.modelSuffix === "function" ? definition.modelSuffix : async () => "",
       modelMessages: typeof definition.modelMessages === "function" ? definition.modelMessages : async () => [],
     });
@@ -482,7 +573,6 @@ export class WebAgentToolRegistry {
 }
 
 export async function createDefaultWebAgentTools(services, prompts, {
-  workMemoryTools = true,
   workResourceTools = true,
   workSkillTools = true,
   conversationReferences = [],
@@ -490,12 +580,10 @@ export async function createDefaultWebAgentTools(services, prompts, {
   if (!prompts || typeof prompts.webTools !== "function") throw new TypeError("Web Agent prompt repository is required");
   const [promptConfig, formatting] = await Promise.all([prompts.webTools(), prompts.webToolPresentation()]);
   const registry = new WebAgentToolRegistry();
-  const memoryModes = workMemoryTools ? ["chat", "work"] : ["chat"];
   const resourceModes = workResourceTools ? ["chat", "work"] : ["chat"];
   const skillModes = workSkillTools ? ["chat", "work"] : ["chat"];
   const conversationModes = ["chat"];
   for (const [name, sources, modes] of [
-    ["memory_search", ["memory"], memoryModes],
     ["resource_search", ["resources"], resourceModes],
     ["conversation_search", ["conversation"], conversationModes],
   ]) {
@@ -577,38 +665,40 @@ export async function createDefaultWebAgentTools(services, prompts, {
     .filter(Boolean));
   if (referenceIds.size) {
     registry.register({
-      name: "conversation_reference_read",
-      description: promptConfig.tools.conversation_reference_read.description,
+      name: "conversation_reference_search",
+      description: promptConfig.tools.conversation_reference_search.description,
       modes: ["chat", "work"],
       timelineRead: true,
-      inputSchema: promptConfig.tools.conversation_reference_read.inputSchema,
+      inputSchema: promptConfig.tools.conversation_reference_search.inputSchema,
       validate: (input) => {
         const referenceId = nonEmptyText(input?.referenceId);
         if (!referenceIds.has(referenceId)) throw new TypeError("referenceId is not available in this turn");
         const query = nonEmptyText(input?.query);
-        const roles = uniqueStrings(Array.isArray(input?.roles) ? input.roles : [])
-          .filter((role) => ["system", "user", "assistant", "tool"].includes(role));
+        if (!query) throw new TypeError("query is required");
         const cursor = nonEmptyText(input?.cursor);
         return {
           referenceId,
-          ...(query ? { query } : {}),
-          ...(roles.length ? { roles } : {}),
+          query,
           ...(cursor ? { cursor } : {}),
         };
       },
-      execute: ({ input, actor, scope, signal }) => services.conversationReferences.read({ actor, scope, ...input, signal }),
-      present: ({ output }) => ({
-        ...semanticSearchResult("conversation", output, 20, formatting),
-        ...(output?.nextCursor ? { nextCursor: output.nextCursor } : {}),
-      }),
+      execute: ({ input, actor, scope, signal }) => services.conversationReferences.search({ actor, scope, ...input, signal }),
+      present: ({ output }) => semanticConversationReference(output, formatting),
       render: async (presented) => {
-        const content = await renderSemanticContext(presented, prompts);
+        const content = await renderConversationReference(presented, prompts);
         const continuation = presented?.nextCursor
           ? await prompts.webToolResult("conversationReferenceContinuation", { NEXT_CURSOR: presented.nextCursor })
           : "";
         return [content, continuation].filter(Boolean).join(formatting.sectionSeparator);
       },
-      handoffItems: ({ output }) => semanticHandoffItems("conversation", output, formatting, prompts, "conversation_reference_read"),
+      handoffItems: ({ output }) => conversationReferenceHandoffItems(output, formatting, prompts, "conversation_reference_search"),
+      timelineOutput: ({ output }) => ({
+        conversation: [{
+          title: nonEmptyText(output?.reference?.title) || "引用对话",
+          referenceTitle: nonEmptyText(output?.reference?.title) || "引用对话",
+          sourceConversationId: nonEmptyText(output?.reference?.conversationId),
+        }],
+      }),
       modelSuffix: ({ output }) => output?.nextCursor
         ? prompts.webToolResult("conversationReferenceContinuation", { NEXT_CURSOR: output.nextCursor })
         : "",
@@ -632,19 +722,6 @@ export async function createDefaultWebAgentTools(services, prompts, {
     present: ({ output }) => semanticSearchResult("skills", output, 1, formatting),
     render: (presented) => renderSemanticContext(presented, prompts),
     handoffItems: ({ output }) => semanticHandoffItems("skills", output, formatting, prompts, "skill_search"),
-  });
-  registry.register({
-    name: "skill_list",
-    description: promptConfig.tools.skill_list.description,
-    modes: skillModes,
-    handoff: false,
-    inputSchema: promptConfig.tools.skill_list.inputSchema,
-    validate: () => ({}),
-    execute: ({ actor, signal }) => services.skills.list({ actor, signal }),
-    present: ({ output }) => ({ skills: semanticSkillSummaries(output?.skills ?? output?.items ?? output) }),
-    // This is the discovery directory, not selected source text. Silently
-    // clipping it makes skills near the end impossible for the model to find.
-    render: (presented) => renderSemanticContext(presented, prompts, { maxCharacters: Number.MAX_SAFE_INTEGER }),
   });
   registry.register({
     name: "handoff_rewrite_candidate",

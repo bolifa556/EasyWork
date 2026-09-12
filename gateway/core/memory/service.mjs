@@ -506,17 +506,22 @@ export class PersistentMemoryService {
     invariant(Number.isSafeInteger(asOfSequence) && asOfSequence >= 0 && asOfSequence <= state.data.sequence, "MEMORY_SEQUENCE_INVALID", "Memory snapshot sequence 无效", { status: 400 });
     const explicitVersions = options.versionIds ?? scope.memorySnapshotVersionIds;
     const snapshotVersionIds = new Set(explicitVersions || []);
+    const onlyVersionIds = options.onlyVersionIds === true;
+    if (onlyVersionIds && !snapshotVersionIds.size) {
+      return { sequence: state.data.sequence, asOfSequence, entries: [] };
+    }
     const invalidated = invalidatedVersionIds(state.data, asOfSequence);
     const baselineSequence = scope.memoryBaselineSequence ?? options.baselineSequence ?? null;
     invariant(baselineSequence === null || (Number.isSafeInteger(baselineSequence) && baselineSequence >= 0 && baselineSequence <= asOfSequence), "MEMORY_BASELINE_INVALID", "Memory baseline 无效", { status: 400 });
     const invalidatedAtBaseline = baselineSequence === null ? invalidated : invalidatedVersionIds(state.data, baselineSequence);
     const query = queryTokens(options.query, { suppressIncidentalHanUnigrams: true });
     const requiredAnchors = requiredExplicitQueryAnchors(options.query);
-    const limit = Number(options.limit ?? 50);
-    invariant(Number.isSafeInteger(limit) && limit > 0 && limit <= 500, "MEMORY_LIMIT_INVALID", "Memory limit 无效", { status: 400 });
+    const all = options.all === true;
+    const limit = all ? Number.MAX_SAFE_INTEGER : Number(options.limit ?? 50);
+    invariant(all || (Number.isSafeInteger(limit) && limit > 0 && limit <= 500), "MEMORY_LIMIT_INVALID", "Memory limit 无效", { status: 400 });
     const entries = [];
     for (const record of Object.values(state.data.records)) {
-      if (!scopeMatches(record.scope, scope)) continue;
+      if (!onlyVersionIds && !scopeMatches(record.scope, scope)) continue;
       const version = selectedVersion(record, { asOfSequence, snapshotVersionIds, invalidated, baselineSequence, invalidatedAtBaseline });
       if (!version || (version.sensitivity === "restricted" && !options.includeRestricted)) continue;
       // Runtime measurements, absolute paths and unfinished activity summaries
@@ -596,7 +601,7 @@ export class PersistentMemoryService {
     entries.sort((left, right) => right.score - left.score || right.version.sequence - left.version.sequence || left.recordId.localeCompare(right.recordId));
     const configuration = query.size ? await this.retrievalConfiguration() : DEFAULT_RETRIEVAL;
     const diversified = query.size ? diversifyMemoryEntries(entries, configuration.diversityLambda) : entries;
-    return { sequence: state.data.sequence, asOfSequence, entries: diversified.slice(0, limit) };
+    return { sequence: state.data.sequence, asOfSequence, entries: all ? diversified : diversified.slice(0, limit) };
   }
 
   async snapshot(scope, options = {}) {
@@ -649,6 +654,16 @@ export class PersistentMemoryService {
       // that were extracted from that same session without exposing IDs.
       origin: structuredClone(entry.version.source),
     }));
+  }
+
+  async contextEntriesByVersionIds(scope, versionIds, options = {}) {
+    const ids = [...new Set((Array.isArray(versionIds) ? versionIds : []).map(String).filter(Boolean))];
+    if (!ids.length) return [];
+    return this.contextEntries(scope, {
+      ...options,
+      versionIds: ids,
+      onlyVersionIds: true,
+    });
   }
 }
 

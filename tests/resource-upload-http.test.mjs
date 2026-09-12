@@ -25,7 +25,20 @@ test("资源上传使用二进制流并绕过 JSON 请求体上限", async (t) =
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const helpFile = path.join(root, "help.md");
   await fs.writeFile(helpFile, "# EasyWork\n", "utf8");
-  const gateway = await createGatewayServer({ runtimeOptions: { dataRoot: path.join(root, "data"), helpFile } });
+  const gateway = await createGatewayServer({ runtimeOptions: {
+    dataRoot: path.join(root, "data"),
+    helpFile,
+    webModelFactory: () => ({
+      complete: async ({ messages }) => ({
+        content: String(messages[0]?.content || "").includes("# 文件发现简介")
+          ? "一个用于验证流式上传与大文件处理的纯文本文件。"
+          : "",
+        reasoning: "",
+        toolCalls: [],
+        usage: null,
+      }),
+    }),
+  } });
   const address = await gateway.start({ host: "127.0.0.1", port: 0 });
   t.after(() => gateway.close());
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -48,6 +61,8 @@ test("资源上传使用二进制流并绕过 JSON 请求体上限", async (t) =
     filename: "nested.txt",
     path: "folder/nested.txt",
     size: String(bytes.length),
+    providerId: "platform-web",
+    modelId: "summary-model",
   });
   const headers = {
     authorization: `Bearer ${token}`,

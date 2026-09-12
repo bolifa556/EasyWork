@@ -1,16 +1,7 @@
 import { invariant } from "../errors.mjs";
 
-const COMPUTE_PLATFORM_PATTERN = /(?:slurm|sbatch|srun|squeue|scontrol|pbs|qsub|qstat|gpu|qos|算力平台|计算节点|登录节点|调度器|队列|分区|作业|超算|集群)/iu;
-const SLURM_PATTERN = /(?:slurm|sbatch|srun|squeue|scontrol)/iu;
-const PBS_PATTERN = /(?:\bpbs\b|qsub|qstat)/iu;
-const GENERIC_SERVER_TOKENS = new Set(["server", "servers", "host", "hosts", "localhost", "local", "remote", "easywork"]);
-const GENERIC_COMPUTE_IDENTIFIERS = new Set([
-  "api", "cli", "cpu", "cuda", "gpu", "hpc", "http", "https", "json", "mcp", "nvidia", "pbs", "posix", "qos", "ssh", "url", "yaml",
-]);
 const SERVER_KINDS = new Set(["all", "compute", "standard"]);
 const SKILL_MODES = new Set(["all", "chat", "work"]);
-const CHAT_ONLY_SKILL_PATTERN = /(?:仅|只)?适用于\s*(?:chat|聊天)(?:\s*模式)?(?:\s*对话)?|(?:chat|聊天)[\s_-]*only/iu;
-const WORK_ONLY_SKILL_PATTERN = /(?:仅|只)?适用于\s*(?:work|工作)(?:\s*模式)?(?:\s*对话)?|(?:work|工作)[\s_-]*only/iu;
 export const DEFAULT_SKILL_APPLICABILITY = Object.freeze({ mode: "all", serverKind: "all", allowServers: Object.freeze([]), denyServers: Object.freeze([]), forceEnabled: false });
 
 function serverRules(value, field) {
@@ -38,11 +29,8 @@ export function normalizeSkillApplicability(value = {}) {
 
 export function isSkillApplicableToMode({ skill, mode = "work" } = {}) {
   invariant(["chat", "work"].includes(mode), "SKILL_CONVERSATION_MODE_INVALID", "技能对话模式无效", { status: 400 });
-  if (skill?.applicability?.mode) return skill.applicability.mode === "all" || skill.applicability.mode === mode;
-  const skillText = [skill?.name, skill?.description].filter(Boolean).join("\n").normalize("NFKC");
-  const chatOnly = CHAT_ONLY_SKILL_PATTERN.test(skillText);
-  const workOnly = WORK_ONLY_SKILL_PATTERN.test(skillText);
-  return chatOnly === workOnly || (mode === "chat" ? !workOnly : !chatOnly);
+  const applicability = normalizeSkillApplicability(skill?.applicability || DEFAULT_SKILL_APPLICABILITY);
+  return applicability.mode === "all" || applicability.mode === mode;
 }
 
 export function isForcedWorkSkill(skill) {
@@ -69,78 +57,10 @@ export function isSkillApplicableToServer({ skill, server = {}, scheduler = "unk
   return true;
 }
 
-function platformTokens(value) {
-  return new Set(
-    String(value || "")
-      .toLocaleLowerCase("en-US")
-      .match(/[a-z0-9]{3,}/gu)
-      ?.filter((token) => !GENERIC_SERVER_TOKENS.has(token) && !/^\d+$/.test(token)) || [],
-  );
-}
-
-function serverText(server = {}, serverName = "") {
-  return [server.id, server.serverId, server.serverIdentity, server.name, server.host, serverName]
-    .map((value) => String(value || "").trim())
-    .filter(Boolean)
-    .join("\n");
-}
-
-function explicitlyNamesServer(skillText, currentServerText) {
-  const serverTokens = platformTokens(currentServerText);
-  if (!serverTokens.size) return false;
-  const skillTokens = platformTokens(skillText);
-  return [...serverTokens].some((token) => skillTokens.has(token));
-}
-
-function explicitPlatformIdentifiers(skillText) {
-  const text = String(skillText || "");
-  const identifiers = [];
-  const patterns = [
-    /(?:适用于|面向|针对|部署到|运行于|运行在|在)\s*([A-Z][A-Z0-9]{2,})\b(?=[\s\S]{0,24}(?:算力平台|平台|登录节点|计算节点|集群|超算))/gu,
-    /\b([A-Z][A-Z0-9]{2,})\b\s*(?:本科生)?(?:算力平台|平台|集群|超算)/gu,
-    /(?:算力平台|平台|集群|超算)\s*(?:是|为|：|:)?\s*([A-Z][A-Z0-9]{2,})\b/gu,
-  ];
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) identifiers.push(match[1]);
-  }
-  return new Set(identifiers
-    .map((token) => token.toLocaleLowerCase("en-US"))
-    .filter((token) => !GENERIC_COMPUTE_IDENTIFIERS.has(token)));
-}
-
-function matchesExplicitPlatformIdentity(skillText, currentServerText) {
-  const identifiers = explicitPlatformIdentifiers(skillText);
-  if (!identifiers.size) return true;
-  const currentTokens = platformTokens(currentServerText);
-  return [...identifiers].some((identifier) => currentTokens.has(identifier));
-}
-
 export function isAutomaticSkillApplicable({ skill, server = {}, serverName = "", scheduler = "unknown" } = {}) {
-  const currentServerText = serverText(server, serverName);
-  if (skill?.applicability) {
-    const descriptor = { ...server };
-    if (!descriptor.name && serverName) descriptor.name = serverName;
-    return isSkillApplicableToServer({ skill, server: descriptor, scheduler });
-  }
-  const skillText = [skill?.name, skill?.description].filter(Boolean).join("\n");
-  if (!COMPUTE_PLATFORM_PATTERN.test(skillText)) return true;
-  if (!matchesExplicitPlatformIdentity(skillText, currentServerText)) return false;
-
-  const normalizedScheduler = String(scheduler || "unknown").trim().toLocaleLowerCase("en-US");
-  const requiresSlurm = SLURM_PATTERN.test(skillText);
-  const requiresPbs = PBS_PATTERN.test(skillText);
-
-  if (normalizedScheduler === "slurm") return !requiresPbs || requiresSlurm;
-  if (normalizedScheduler === "pbs") return !requiresSlurm || requiresPbs;
-  if (normalizedScheduler === "generic") return !requiresSlurm && !requiresPbs;
-  if (normalizedScheduler === "none") return false;
-  return explicitlyNamesServer(skillText, currentServerText);
-}
-
-export function isAutomaticSkillRelevantToRequest({ skill, mode = "work" } = {}) {
-  // Visibility is a scope decision. Semantic selection belongs to the Web
-  // Agent, which can also see the preceding user turns and negations.
-  return isSkillApplicableToMode({ skill, mode: String(mode || "work").trim().toLocaleLowerCase("en-US") });
+  const descriptor = { ...server };
+  if (!descriptor.name && serverName) descriptor.name = serverName;
+  return isSkillApplicableToServer({ skill, server: descriptor, scheduler });
 }
 
 export function filterEligibleSkillObservations(fragments, eligibleSkillIds = []) {

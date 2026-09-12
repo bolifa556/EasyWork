@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { ConversationService } from "../gateway/core/conversations/service.mjs";
 import { createEasyWorkRuntime } from "../gateway/core/runtime/runtime.mjs";
 import {
   ActorServiceContainer,
@@ -15,7 +14,7 @@ import {
 
 test("显式 @ 对话引用不作为自动记忆提取证据", () => {
   const memory = { toolName: "memory_search", knowledge: { key: "memory:1", version: "1", content: "记忆" } };
-  const reference = { toolName: "conversation_reference_read", knowledge: { key: "conversation-reference:1", version: "1", content: "引用" } };
+  const reference = { toolName: "conversation_reference_search", knowledge: { key: "conversation-reference:1", version: "1", content: "引用" } };
   assert.deepEqual(memoryExtractionObservations([memory, reference]), [memory]);
 });
 
@@ -116,7 +115,6 @@ test("分支和回溯跳过净零变更 Task 已移除的临时 Checkpoint", () 
 });
 
 function projectMemoryModelFactory({ runId }, onMemoryInput = () => undefined) {
-  let iteration = 0;
   return {
     async complete({ messages, tools = [] }) {
       const system = String(messages[0]?.content || "");
@@ -130,16 +128,8 @@ function projectMemoryModelFactory({ runId }, onMemoryInput = () => undefined) {
       }
       const user = messages.findLast((entry) => entry.role === "user")?.content || "";
       if (user.includes("记住")) return { content: "已确认项目服务端口为 8789。", reasoning: "", toolCalls: [], usage: null };
-      if (iteration++ === 0) {
-        return {
-          content: "",
-          reasoning: "",
-          toolCalls: [{ id: `${runId}:search`, name: "memory_search", input: { query: "项目服务端口" } }],
-          usage: null,
-        };
-      }
-      const tool = messages.findLast((entry) => entry.role === "tool");
-      return { content: `跨对话读取：${tool.content}`, reasoning: "", toolCalls: [], usage: null };
+      const memory = messages.find((entry) => entry.role === "system" && String(entry.content).includes("项目服务端口为 8789"));
+      return { content: `跨对话读取：${memory?.content || "未找到"}`, reasoning: "", toolCalls: [], usage: null };
     },
   };
 }
@@ -288,100 +278,6 @@ test("删除对话会失效该对话提升到项目层的派生记忆", async (t
     contextEpoch: 0,
   });
   assert.deepEqual((await services.memory.select(scope)).entries, []);
-});
-
-test("旧墓碑只迁移一次，清理成功后消费记录且后续启动不再扫描历史删除对话", async (t) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "easywork-runtime-memory-delete-resume-"));
-  const dataRoot = path.join(root, "data");
-  let firstRuntime = await createEasyWorkRuntime({ dataRoot, webModelFactory: projectMemoryModelFactory });
-  let secondRuntime = null;
-  let thirdRuntime = null;
-  t.after(async () => {
-    await firstRuntime?.close().catch(() => undefined);
-    await secondRuntime?.close().catch(() => undefined);
-    await thirdRuntime?.close().catch(() => undefined);
-    await fs.rm(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 40 });
-  });
-  const registered = await firstRuntime.auth.register({ username: `memory-reconcile-${Date.now()}`, password: "password-value", deviceId: "device-a" });
-  const session = await firstRuntime.auth.resolveSession(registered.token);
-  const firstServices = await firstRuntime.servicesForActor(session.actor);
-  const project = await firstServices.projects.create({ name: "Interrupted Deletion Project" });
-  const first = await firstServices.conversations.sendMessage({
-    mode: "chat",
-    projectId: project.id,
-    content: "记住这个项目的服务端口",
-    expectedRevision: 0,
-    commandId: "delete-resume-first-message",
-    response: { providerId: "platform-web", modelId: "memory-model", scope: {} },
-  });
-  await firstServices.interactions.waitFor(first.response.runId);
-  await firstServices.waitForIdle();
-  const current = await firstServices.baseConversations.getConversation(first.conversation.id);
-  await firstServices.baseConversations.delete({
-    conversationId: first.conversation.id,
-    expectedRevision: current.summary.revision,
-    commandId: "delete-resume-direct-tombstone",
-  });
-  // Simulate an on-disk state written by the previous completed-marker
-  // implementation.  The next runtime must migrate it exactly once.
-  const legacyCleanup = await firstServices.conversationDeletionCleanup.read();
-  await firstServices.conversationDeletionCleanup.replace({ local: {}, remote: {} }, {
-    expectedRevision: legacyCleanup.revision,
-    clock: firstRuntime.clock,
-  });
-  await firstRuntime.close();
-  firstRuntime = null;
-
-  secondRuntime = await createEasyWorkRuntime({ dataRoot, webModelFactory: projectMemoryModelFactory });
-  const secondServices = await secondRuntime.servicesForActor(session.actor);
-  await secondServices.waitForIdle();
-  const reconciledScope = await secondServices.memoryCoordinator.freezeScope({
-    actorType: session.actor.actorType,
-    actorId: session.actor.actorId,
-    userId: session.actor.userId,
-    projectId: project.id,
-    conversationId: "conversation_after_interrupted_delete",
-    workspaceId: null,
-    taskId: null,
-    serverId: null,
-    serverIdentity: null,
-    versionDomainId: null,
-    memoryMode: "project-only",
-    branchId: "branch_after_interrupted_delete",
-    memorySnapshotSequence: 0,
-    memorySnapshotVersionIds: [],
-    resourceBindingSnapshotId: null,
-    selectedCollectionIds: [],
-    selectedSkillVersions: [],
-    capabilities: [],
-    contextEpoch: 0,
-  });
-  let entries = (await secondServices.memory.select(reconciledScope)).entries;
-  for (let attempt = 0; entries.length && attempt < 100; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    entries = (await secondServices.memory.select(reconciledScope)).entries;
-  }
-  assert.deepEqual(entries, []);
-  const consumed = (await secondServices.conversationDeletionCleanup.read()).data;
-  assert.equal(consumed.mode, "pending");
-  assert.deepEqual(consumed.local, {});
-
-  await secondRuntime.close();
-  secondRuntime = null;
-  const originalListDeleted = ConversationService.prototype.listDeletedConversations;
-  let historicalScans = 0;
-  ConversationService.prototype.listDeletedConversations = function patchedListDeletedConversations(...args) {
-    historicalScans += 1;
-    return originalListDeleted.apply(this, args);
-  };
-  try {
-    thirdRuntime = await createEasyWorkRuntime({ dataRoot, webModelFactory: projectMemoryModelFactory });
-    const thirdServices = await thirdRuntime.servicesForActor(session.actor);
-    await thirdServices.waitForIdle();
-  } finally {
-    ConversationService.prototype.listDeletedConversations = originalListDeleted;
-  }
-  assert.equal(historicalScans, 0);
 });
 
 test("删除登记跨越墓碑提交崩溃窗口，提交前中断不误删、提交后中断可恢复", async (t) => {
@@ -546,6 +442,9 @@ test("全部模式强制 Skill 在 Chat 按需读取，下一轮复用正文且�
     let iteration = 0;
     return {
       async complete({ messages, tools = [] }) {
+        if (String(messages[0]?.content || "").includes("你为一个已安装 Skill 生成发现简介")) {
+          return { content: "当用户需要核验签收记录或沿用核验规则时使用，要求保留蓝色签收记录。", reasoning: "", toolCalls: [], usage: null };
+        }
         if (!tools.some((tool) => tool.name === "skill_search")) {
           return { content: "", reasoning: "", toolCalls: [], usage: null };
         }
@@ -589,7 +488,7 @@ test("全部模式强制 Skill 在 Chat 按需读取，下一轮复用正文且�
   assert.ok(modelInputs[0].some((entry) => String(entry.content).includes(skillBody)));
 });
 
-test("Work 自动 Skill 目录按服务器调度器过滤旧版平台 Skill，并尊重显式适用规则", async (t) => {
+test("Work Skill 目录只依据显式适用范围过滤，不从名称简介猜测服务器", async (t) => {
   const container = await isolatedContainer(t, "user-work-skills");
   container.servers = {
     async get() {
@@ -608,7 +507,7 @@ test("Work 自动 Skill 目录按服务器调度器过滤旧版平台 Skill，�
     { skillId: "explicit-compute", name: "显式计算规范", description: "计算任务。", applicability: { serverKind: "compute", allowServers: [], denyServers: [] } },
   ]);
 
-  assert.deepEqual(filtered.map((entry) => entry.skillId), ["legacy-standard", "explicit-all"]);
+  assert.deepEqual(filtered.map((entry) => entry.skillId), ["legacy-compute", "legacy-standard", "explicit-all"]);
 });
 
 test("Work 读取按个人 Skill 的允许禁止规则过滤，强制启用或手动点选不能绕过", async (t) => {
@@ -633,7 +532,7 @@ test("Work 读取按个人 Skill 的允许禁止规则过滤，强制启用或�
   assert.deepEqual(selectedIds, ["allowed"]);
 });
 
-test("Work 自动 Skill 目录不会把明确 USTC 的旧版 Skill 发送给 scnet", async (t) => {
+test("没有显式服务器范围的 Skill 在不同服务器保持可见", async (t) => {
   const container = await isolatedContainer(t, "user-work-scnet-skills");
   container.servers = {
     async get() {
@@ -650,7 +549,7 @@ test("Work 自动 Skill 目录不会把明确 USTC 的旧版 Skill 发送给 scn
     { skillId: "generic-slurm", name: "通用 Slurm 基线", description: "生成 sbatch 脚本并检查 CPU 和内存参数。" },
   ]);
 
-  assert.deepEqual(filtered.map((entry) => entry.skillId), ["generic-slurm"]);
+  assert.deepEqual(filtered.map((entry) => entry.skillId), ["legacy-ustc", "generic-slurm"]);
 });
 
 test("Work 只有运行中追加绕过网页 Agent，中断后的新请求重新检索上下文", async () => {

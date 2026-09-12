@@ -64,6 +64,49 @@ async function temporaryFixture(run) {
   }
 }
 
+test("上传时由指定模型生成发现简介，当前目录拒绝缺少新简介的数据", async () => {
+  await temporaryFixture(async (dataRoot) => {
+    const calls = [];
+    const currentActor = actor();
+    const service = new ResourceService(fixtureOptions(dataRoot, currentActor, {
+      summaryGenerator: async (input) => {
+        calls.push(input);
+        return "一份记录蓝绿发布步骤、回滚条件和验证命令的部署说明，适合回答发布操作问题。";
+      },
+    }));
+    const uploaded = await service.ingest({
+      content: "先发布绿色版本，再验证健康检查，失败时回滚蓝色版本。",
+      filename: "deploy.md",
+      mime: "text/markdown",
+      binding: { ownerType: "conversation", ownerId: "conversation_a" },
+      expectedRevision: 0,
+      summary: { required: true, providerId: "provider-a", modelId: "model-a" },
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].providerId, "provider-a");
+    const catalog = await service.catalog({ scope: { conversationId: "conversation_a" }, all: true, summary: { required: true } });
+    assert.equal(catalog.items[0].summary, "一份记录蓝绿发布步骤、回滚条件和验证命令的部署说明，适合回答发布操作问题。");
+    const [descriptor] = await service.materializationDescriptors({ conversationId: "conversation_a", versionIds: [uploaded.version.id] });
+    assert.equal(descriptor.filename, "deploy.md");
+    assert.equal(descriptor.resourceVersionId, uploaded.version.id);
+    assert.equal(path.isAbsolute(descriptor.localPath), true);
+
+    const old = await service.ingest({
+      content: "旧格式内容",
+      filename: "old.txt",
+      mime: "text/plain",
+      binding: { ownerType: "conversation", ownerId: "conversation_a" },
+      expectedRevision: uploaded.revision,
+    });
+    await assert.rejects(() => service.catalog({
+      scope: { conversationId: "conversation_a" },
+      all: true,
+      summary: { required: true },
+    }), (error) => error?.code === "RESOURCE_SUMMARY_REQUIRED");
+    assert.ok(old.version.id);
+  });
+});
+
 test("ingest 先持久化 pending，再将原文件、解析结果和向量引用写入 Actor 目录", async () => {
   await temporaryFixture(async (dataRoot) => {
     const currentActor = actor();
@@ -105,7 +148,7 @@ test("ingest 先持久化 pending，再将原文件、解析结果和向量引�
   });
 });
 
-test("Artifact promotion streams into a content-addressed Resource and replays without reopening the source", async () => {
+test("stream upload creates a content-addressed Resource and replays without reopening the request", async () => {
   await temporaryFixture(async (dataRoot) => {
     const service = new ResourceService(fixtureOptions(dataRoot, actor()));
     const chunks = [Buffer.alloc(700_000, 0x61), Buffer.alloc(700_000, 0x62), Buffer.alloc(700_000, 0x63)];
@@ -113,8 +156,8 @@ test("Artifact promotion streams into a content-addressed Resource and replays w
     const sha256 = (await import("node:crypto")).default.createHash("sha256").update(content).digest("hex");
     let opened = 0;
     const input = {
-      commandId: "promote_artifact_a",
-      filename: "artifact.bin.txt",
+      commandId: "stream_upload_a",
+      filename: "upload.bin.txt",
       mime: "text/plain",
       expectedSize: content.length,
       expectedSha256: sha256,

@@ -40,13 +40,6 @@ function catalogFixture(dataRoot, options = {}) {
     },
     ...resourceAdapters(),
   });
-  const artifactCalls = [];
-  const artifacts = {
-    detachProject: async ({ projectId, commandId }) => {
-      artifactCalls.push({ projectId, commandId });
-      return { projectId, detachedArtifactIds: [`artifact_${projectId}`] };
-    },
-  };
   const memoryCalls = [];
   const memories = {
     invalidateProject: async ({ projectId, commandId }) => {
@@ -54,8 +47,8 @@ function catalogFixture(dataRoot, options = {}) {
       return { invalidated: 2 };
     },
   };
-  consistency = new CatalogConsistencyService({ ...common, projects, collections, conversations, resources, artifacts, memories, faultInjector: options.faultInjector });
-  return { queue, collections, projects, conversations, resources, consistency, artifactCalls, memoryCalls };
+  consistency = new CatalogConsistencyService({ ...common, projects, collections, conversations, resources, memories, faultInjector: options.faultInjector });
+  return { queue, collections, projects, conversations, resources, consistency, memoryCalls };
 }
 
 test("File sets and projects are Actor-scoped, versioned, and projects default to project-only memory", async () => {
@@ -75,7 +68,7 @@ test("File sets and projects are Actor-scoped, versioned, and projects default t
   }
 });
 
-test("project delete saga retries after a crash, moves conversations out, detaches Artifacts, and removes project resources", async () => {
+test("project delete saga retries after a crash, moves conversations out, and removes project resources", async () => {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-catalog-"));
   let injected = false;
   try {
@@ -102,8 +95,6 @@ test("project delete saga retries after a crash, moves conversations out, detach
 
     const completed = await fixture.projects.delete(deletion);
     assert.deepEqual(completed.movedConversationIds, [conversation.conversation.id]);
-    assert.deepEqual(completed.detachedArtifactIds, ["artifact_project_a"]);
-    assert.equal(fixture.artifactCalls.length, 1);
     assert.deepEqual(fixture.memoryCalls, [{ projectId: "project_a", commandId: "delete_project_a:invalidate-memory" }]);
     assert.equal(completed.cleanup.memory.invalidated, 2);
     await assert.rejects(() => fixture.projects.get(project.id), (error) => error?.code === "PROJECT_NOT_FOUND");

@@ -8,7 +8,6 @@ import test from "node:test";
 import { createActorContext } from "../gateway/core/actor.mjs";
 import { PromptRepository } from "../gateway/core/prompts/index.mjs";
 import {
-  filterRelevantHistoricalObservations,
   WebAgentObservationLedger,
   renderWebAgentObservations,
 } from "../gateway/core/web-agent/observations.mjs";
@@ -75,67 +74,11 @@ test("网页分支只复制分叉点前的已读知识并重绑消息边界", as
   }
 });
 
-test("Work 只恢复与当前请求相关的历史正文，未发送的旧 Skill 不会永久占据上下文", () => {
-  const computeSkill = fragment({
-    key: "skill:compute-rules",
-    name: "代码与计算任务规范",
-    content: "在算力平台组织项目、配置环境、生成 Slurm 作业并检查运行日志。",
-  });
-  computeSkill.reference = { kind: "Skill", name: "代码与计算任务规范" };
-  const deploymentPreference = fragment({
-    key: "memory:deployment-preference",
-    name: "deployment-preference",
-    content: "用户的部署偏好是保留现有参数。",
-  });
-  deploymentPreference.reference = { kind: "记忆", name: "deployment-preference" };
-  const answerPreference = fragment({
-    key: "memory:answer-preference",
-    name: "answer-preference",
-    content: "用户偏好回答不超过三句话。",
-  });
-  answerPreference.reference = { kind: "记忆", name: "answer-preference" };
-
-  assert.deepEqual(
-    filterRelevantHistoricalObservations([computeSkill, deploymentPreference, answerPreference], {
-      request: "继续按我的部署偏好处理",
-      skills: [{ skillId: "compute-rules", name: "代码与计算任务规范", description: "适用于 Slurm 计算项目" }],
-    }).map((entry) => entry.knowledge.key),
-    ["memory:deployment-preference"],
-  );
-  assert.deepEqual(
-    filterRelevantHistoricalObservations([computeSkill], {
-      request: "创建 Python 项目并提交 Slurm 作业",
-      skills: [{ skillId: "compute-rules", name: "代码与计算任务规范", description: "适用于 Slurm 计算项目" }],
-    }).map((entry) => entry.knowledge.key),
-    ["skill:compute-rules"],
-  );
-  assert.deepEqual(
-    filterRelevantHistoricalObservations([computeSkill], {
-      request: "只读取 docs/handoff-note.md，不要运行作业，也不要提交 Git",
-      skills: [{ skillId: "compute-rules", name: "代码与计算任务规范", description: "适用于 Slurm 计算项目" }],
-    }),
-    [],
-  );
-  assert.deepEqual(
-    filterRelevantHistoricalObservations([computeSkill], {
-      request: "只把第三行改成“CPU-only，不申请 GPU”，不要运行作业",
-      skills: [{ skillId: "compute-rules", name: "代码与计算任务规范", description: "适用于 CPU、GPU 和 Slurm 作业" }],
-    }),
-    [],
-  );
-});
-
-test("Work 按文件名复用历史文件，显式文件集范围可恢复已读文件", () => {
-  const readme = fragment({ key: "resource:readme:chunk", name: "README.md", content: "验证安装章节" });
-  const unrelated = fragment({ key: "resource:notes:chunk", name: "notes.md", content: "其他背景" });
-  assert.deepEqual(
-    filterRelevantHistoricalObservations([readme, unrelated], { request: "只读取 README.md 的验证安装章节" })
-      .map((entry) => entry.knowledge.key),
-    ["resource:readme:chunk"],
-  );
-  assert.deepEqual(
-    filterRelevantHistoricalObservations([readme, unrelated], { request: "根据附加资料处理", includeAllResources: true })
-      .map((entry) => entry.knowledge.key),
-    ["resource:readme:chunk", "resource:notes:chunk"],
-  );
+test("完整记忆目录作为当前格式候选渲染，不依赖请求文本预筛选", async () => {
+  const memory = fragment({ key: "memory:answer-style", name: "answer-style", content: "用户希望回答使用短句。" });
+  memory.toolName = "memory_catalog";
+  memory.reference = { kind: "记忆", name: "answer-style" };
+  const rendered = await renderWebAgentObservations([memory], "work", prompts);
+  assert.match(rendered, /用户希望回答使用短句/);
+  assert.match(rendered, /candidate_id: candidate_/);
 });

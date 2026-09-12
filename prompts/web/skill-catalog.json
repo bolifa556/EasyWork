@@ -1,0 +1,6 @@
+{
+  "document": "# 本轮可用 Skill 目录\n\n以下目录已经过模式、服务器和权限过滤，只用于判断可能需要的操作规范。需要正文时按目录中的完整名称调用 skill_search。\n\n{{ITEMS}}",
+  "empty": "（当前没有可用 Skill）",
+  "item": "- {{NAME}}：{{DESCRIPTION}}",
+  "separator": "\n"
+}

@@ -4,13 +4,11 @@ import path from "node:path";
 import { invariant } from "../errors.mjs";
 
 const WEB_TOOL_NAMES = Object.freeze([
-  "memory_search",
   "resource_search",
   "resource_read",
   "conversation_search",
-  "conversation_reference_read",
+  "conversation_reference_search",
   "skill_search",
-  "skill_list",
   "handoff_rewrite_candidate",
   "handoff_submit",
 ]);
@@ -89,6 +87,30 @@ export class PromptRepository {
     })).trim();
   }
 
+  async resourceSummary({ filename = "", content = "" } = {}) {
+    const [system, input] = await Promise.all([
+      this.#read("resources", "summary-system.md"),
+      this.#render(["resources", "summary-input.md"], {
+        FILENAME: promptValue(filename).replace(/\s+/g, " ").trim().slice(0, 4096),
+        CONTENT: promptValue(content).trim(),
+      }),
+    ]);
+    return { system: system.trim(), input: input.trim() };
+  }
+
+  async skillDiscovery({ name = "", authorDescription = "", entrypoint = "", files = [] } = {}) {
+    const [system, input] = await Promise.all([
+      this.#read("skills", "discovery-system.md"),
+      this.#render(["skills", "discovery-input.md"], {
+        NAME: promptValue(name).trim(),
+        AUTHOR_DESCRIPTION: promptValue(authorDescription).trim(),
+        ENTRYPOINT: promptValue(entrypoint).trim(),
+        FILES: (Array.isArray(files) ? files : []).map((file) => `## ${promptValue(file?.path).trim()}\n${promptValue(file?.content).trim()}`).join("\n\n"),
+      }),
+    ]);
+    return { system: system.trim(), input: input.trim() };
+  }
+
   async builtinSkills() {
     const config = await this.#json("skills", "builtins.json");
     invariant(Object.keys(config).length === 1 && Array.isArray(config.skills) && config.skills.length > 0, "BUILTIN_SKILL_PROMPTS_INVALID", "内置 Skill Prompt 不完整", { status: 500, expose: false });
@@ -114,11 +136,19 @@ export class PromptRepository {
     invariant(["document", "empty", "item", "separator"].every((key) => typeof config[key] === "string"), "RESOURCE_CATALOG_PROMPT_INVALID", "文件概览 Prompt 不完整", { status: 500, expose: false });
     const inline = (value, maximum) => promptValue(value).replace(/\s+/g, " ").trim().slice(0, maximum);
     const items = (Array.isArray(entries) ? entries : []).map((entry) => renderPromptTemplate(config.item, {
-      SOURCE: inline(entry?.source, 240),
       FILENAME: inline(entry?.filename, 260),
-      TITLE: inline(entry?.title, 180),
-      KEYWORDS: (Array.isArray(entry?.keywords) ? entry.keywords : []).map((value) => inline(value, 40)).filter(Boolean).slice(0, 10).join("、"),
       SUMMARY: inline(entry?.summary, 380),
+    }));
+    return renderPromptTemplate(config.document, { ITEMS: items.length ? items.join(config.separator) : config.empty }).trim();
+  }
+
+  async skillCatalog(entries = []) {
+    const config = await this.#json("web", "skill-catalog.json");
+    invariant(["document", "empty", "item", "separator"].every((key) => typeof config[key] === "string"), "SKILL_CATALOG_PROMPT_INVALID", "Skill 目录 Prompt 不完整", { status: 500, expose: false });
+    const inline = (value, maximum) => promptValue(value).replace(/\s+/g, " ").trim().slice(0, maximum);
+    const items = (Array.isArray(entries) ? entries : []).map((entry) => renderPromptTemplate(config.item, {
+      NAME: inline(entry?.name, 180),
+      DESCRIPTION: inline(entry?.discoveryDescription || entry?.description, 500),
     }));
     return renderPromptTemplate(config.document, { ITEMS: items.length ? items.join(config.separator) : config.empty }).trim();
   }
@@ -165,8 +195,13 @@ export class PromptRepository {
       "observationChatHeading",
       "observationCandidate",
       "observationItem",
+      "observationMemoryItem",
       "observationDefaultKind",
       "observationDefaultName",
+      "conversationReferenceHeading",
+      "conversationReferenceMemorySection",
+      "conversationReferenceRecentSection",
+      "conversationReferenceMatchesSection",
     ];
     invariant(
       typeof config.emptyResult === "string"

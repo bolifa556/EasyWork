@@ -65,6 +65,53 @@ test("MemoryCoordinator 只保存当前 Scope 可用层级并冻结最新快照"
   assert.deepEqual(selected.entries.map((entry) => entry.scope.level), ["project"]);
 });
 
+test("引用对话可按来源消息定位其记忆，重复事实仍保留本次来源映射", async (t) => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), "easywork-memory-reference-provenance-"));
+  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  const dataRoot = path.join(parent, "data");
+  const memory = new PersistentMemoryService({ dataRoot, actor });
+  const coordinator = new MemoryCoordinator({
+    dataRoot,
+    actor,
+    memory,
+    extractor: async () => [memoryCall("conversation", "训练批大小约定", "训练批大小不得高于 64。")],
+  });
+  const sourceScope = scope();
+  const first = await coordinator.recordExchange({
+    scope: sourceScope,
+    userMessage: "记下批大小",
+    assistantMessage: "训练批大小不得高于 64。",
+    providerId: "provider",
+    modelId: "model",
+    parentMessageId: "question_first",
+    source: { type: "conversation-message", id: "answer_first", version: "1" },
+  });
+  assert.equal(first.stored.length, 1);
+  const second = await coordinator.recordExchange({
+    scope: sourceScope,
+    userMessage: "再确认一次",
+    assistantMessage: "训练批大小不得高于 64。",
+    providerId: "provider",
+    modelId: "model",
+    parentMessageId: "question_second",
+    source: { type: "conversation-message", id: "answer_second", version: "2" },
+  });
+  assert.equal(second.stored.length, 0);
+
+  const versionIds = await coordinator.referenceMemoryVersionIds({ sourceIds: ["question_second"] });
+  assert.deepEqual(versionIds, [first.stored[0].version.id]);
+  const targetScope = scope({
+    conversationId: "conversation_target",
+    branchId: "branch_target",
+    memorySnapshotSequence: 1,
+    memorySnapshotVersionIds: [],
+  });
+  assert.equal((await memory.contextEntries(targetScope, { query: "批大小", all: true })).length, 0);
+  const referenced = await memory.contextEntriesByVersionIds(targetScope, versionIds, { query: "批大小", all: true });
+  assert.deepEqual(referenced.map((entry) => entry.content), ["训练批大小不得高于 64。"]);
+  assert.deepEqual(await coordinator.referenceMemoryVersionIds({ sourceIds: ["unrelated_message"] }), []);
+});
+
 test("候选解析只接受后端已暴露的记忆工具及最小语义参数", () => {
   assert.deepEqual(parseMemoryToolCalls("not tool calls", ["project"]), []);
   assert.deepEqual(parseMemoryToolCalls([{ name: "remember_user", input: { subject: "x", content: "y" } }], ["project"]), []);

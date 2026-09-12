@@ -379,10 +379,41 @@ test("对话 @ 引用冻结发送时快照，读取只能使用当前消息绑�
     expectedRevision: 1,
     commandId: "frozen-source-answer",
   });
+  const secondQuestion = await api.sendMessage({
+    conversationId: source.conversation.id,
+    role: "user",
+    content: "第二轮训练参数问题应该怎么处理？",
+    expectedRevision: sourceAnswer.conversation.revision,
+    commandId: "frozen-source-second-question",
+  });
+  const secondAnswer = await api.sendMessage({
+    conversationId: source.conversation.id,
+    role: "assistant",
+    content: "当时建议 batch size 设为 64。",
+    expectedRevision: secondQuestion.conversation.revision,
+    commandId: "frozen-source-second-answer",
+  });
+  let latestSource = secondAnswer;
+  for (let index = 0; index < 10; index += 1) {
+    const question = await api.sendMessage({
+      conversationId: source.conversation.id,
+      role: "user",
+      content: `最近上下文问题 ${index + 1}`,
+      expectedRevision: latestSource.conversation.revision,
+      commandId: `frozen-source-recent-question-${index}`,
+    });
+    latestSource = await api.sendMessage({
+      conversationId: source.conversation.id,
+      role: "assistant",
+      content: `最近上下文回答 ${index + 1}`,
+      expectedRevision: question.conversation.revision,
+      commandId: `frozen-source-recent-answer-${index}`,
+    });
+  }
   const renamed = await api.rename({
     conversationId: source.conversation.id,
     title: "被冻结的来源名称",
-    expectedRevision: sourceAnswer.conversation.revision,
+    expectedRevision: latestSource.conversation.revision,
     commandId: "frozen-source-title",
   });
   const target = await api.sendMessage({
@@ -406,28 +437,48 @@ test("对话 @ 引用冻结发送时快照，读取只能使用当前消息绑�
     expectedRevision: renamed.conversation.revision,
     commandId: "frozen-source-later",
   });
-  const firstPage = await api.readConversationReference({
+  const firstPage = await api.searchConversationReference({
     conversationId: target.conversation.id,
     messageId: target.messageId,
     referenceId: reference.referenceId,
+    query: "问题",
     limit: 1,
   });
-  assert.deepEqual(firstPage.items.map((message) => message.content), ["最初问题"]);
+  assert.deepEqual(firstPage.items.map((message) => message.content), ["第二轮训练参数问题应该怎么处理？", "当时建议 batch size 设为 64。"]);
+  assert.deepEqual(firstPage.items.map((message) => message.role), ["user", "assistant"]);
+  assert.equal(new Set(firstPage.items.map((message) => message.referenceTurnId)).size, 1);
+  assert.equal(firstPage.recentItems.length, 20);
+  assert.equal(firstPage.recentItems[0].content, "最近上下文问题 1");
+  assert.equal(firstPage.recentItems.at(-1).content, "最近上下文回答 10");
+  assert.ok(firstPage.memorySourceIds.includes(source.messageId));
   assert.ok(firstPage.nextCursor);
-  const secondPage = await api.readConversationReference({
+  const secondPage = await api.searchConversationReference({
     conversationId: target.conversation.id,
     messageId: target.messageId,
     referenceId: reference.referenceId,
+    query: "问题",
     cursor: firstPage.nextCursor,
     limit: 1,
   });
-  assert.deepEqual(secondPage.items.map((message) => message.content), ["冻结快照中的答案"]);
+  assert.deepEqual(secondPage.items.map((message) => message.content), ["最初问题", "冻结快照中的答案"]);
+  assert.deepEqual(secondPage.items.map((message) => message.role), ["user", "assistant"]);
+  assert.equal(new Set(secondPage.items.map((message) => message.referenceTurnId)).size, 1);
   assert.equal(secondPage.nextCursor, null);
-  assert.equal([...firstPage.items, ...secondPage.items].some((message) => message.content.includes("新增")), false);
-  await assert.rejects(api.readConversationReference({
+  assert.equal([...firstPage.recentItems, ...firstPage.items, ...secondPage.items].some((message) => message.content.includes("新增")), false);
+  const answerMatch = await api.searchConversationReference({
+    conversationId: target.conversation.id,
+    messageId: target.messageId,
+    referenceId: reference.referenceId,
+    query: "batch size",
+    limit: 1,
+  });
+  assert.deepEqual(answerMatch.items.map((message) => message.content), ["第二轮训练参数问题应该怎么处理？", "当时建议 batch size 设为 64。"]);
+  assert.equal(answerMatch.nextCursor, null);
+  await assert.rejects(api.searchConversationReference({
     conversationId: target.conversation.id,
     messageId: target.messageId,
     referenceId: "cref_00000000000000000000000000000000",
+    query: "参数",
   }), (error) => error.code === "CONVERSATION_REFERENCE_NOT_BOUND");
 }));
 
