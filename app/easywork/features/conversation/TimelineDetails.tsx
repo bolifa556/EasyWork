@@ -1,9 +1,8 @@
 "use client";
 
-import { createContext, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { RealtimeEnvelope } from "@/app/core/contracts";
 import { useAppRuntime } from "../../runtime/AppRuntime";
-import { createTimelineDetailLoader } from "./timeline-detail-loader.mjs";
 import { getTimelineDetailCache } from "./timeline-detail-cache.mjs";
 import { timelineDetailIds } from "@/shared/timeline-projection.mjs";
 import { useDisclosurePending } from "./DisclosureMotion";
@@ -14,11 +13,8 @@ const PageDetailContext = createContext<ReturnType<typeof getTimelineDetailCache
 export function TimelineDetailScope({ scope, events, children }: { scope: string; events: RealtimeEnvelope[]; children: ReactNode }) {
   const { api } = useAppRuntime();
   const cache = useMemo(() => getTimelineDetailCache(scope), [scope]);
-  const currentEvents = useRef(events);
-  currentEvents.current = events;
   const prefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
-    cache.ingest(currentEvents.current);
     cache.activate(async (url: string, signal: AbortSignal) => (await api.get<{ events: RealtimeEnvelope[]; missingEventIds: string[] }>(url, signal)).data);
     return () => {
       if (prefetchTimer.current !== null) clearTimeout(prefetchTimer.current);
@@ -40,8 +36,8 @@ export function TimelineDetailScope({ scope, events, children }: { scope: string
 }
 
 function CachedTimelineDetails({ cache, events, children }: { cache: ReturnType<typeof getTimelineDetailCache>; events: RealtimeEnvelope[]; children: (events: RealtimeEnvelope[]) => ReactNode }) {
-  const version = useSyncExternalStore(cache.subscribe, cache.snapshot, () => 0);
-  const hydrated = useMemo(() => events.map((event) => timelineDetailIds(event).length ? cache.get(event) || event : event), [cache, events, version]);
+  useSyncExternalStore(cache.subscribe, cache.snapshot, () => 0);
+  const hydrated = events.map((event) => timelineDetailIds(event).length ? cache.get(event) || event : event);
   return <DetailContext.Provider value={cache.load}>{children(hydrated)}</DetailContext.Provider>;
 }
 
@@ -53,24 +49,14 @@ export function TimelineDetails({ events, children }: { events: RealtimeEnvelope
 
 function LocalTimelineDetails({ events, children }: { events: RealtimeEnvelope[]; children: (events: RealtimeEnvelope[]) => ReactNode }) {
   const { api } = useAppRuntime();
-  const [loaded, setLoaded] = useState<Map<string, RealtimeEnvelope>>(() => new Map());
-  const loadedRef = useRef(loaded);
-  const byId = useMemo(() => new Map(events.map((event) => [event.eventId, event])), [events]);
-  const byIdRef = useRef(byId);
-  byIdRef.current = byId;
-  const load = useMemo(() => createTimelineDetailLoader({
-    getEvent: (id: string) => byIdRef.current.get(id),
-    isLoaded: (id: string) => loadedRef.current.has(id),
-    request: async (url: string, signal: AbortSignal) => (await api.get<{ events: RealtimeEnvelope[]; missingEventIds: string[] }>(url, signal)).data,
-    onLoaded: (incoming: RealtimeEnvelope[]) => {
-      const next = new Map(loadedRef.current);
-      for (const event of incoming) next.set(event.eventId, event);
-      loadedRef.current = next;
-      setLoaded(next);
-    },
-  }), [api]);
-  const hydrated = useMemo(() => events.map((event) => loaded.get(event.eventId) || event), [events, loaded]);
-  return <DetailContext.Provider value={load}>{children(hydrated)}</DetailContext.Provider>;
+  const localId = useId();
+  const cache = useMemo(() => getTimelineDetailCache(`local:${localId}`), [localId]);
+  useEffect(() => {
+    cache.activate(async (url: string, signal: AbortSignal) => (await api.get<{ events: RealtimeEnvelope[]; missingEventIds: string[] }>(url, signal)).data);
+    return () => cache.deactivate();
+  }, [api, cache]);
+  useEffect(() => { cache.ingest(events); }, [cache, events]);
+  return <CachedTimelineDetails cache={cache} events={events}>{children}</CachedTimelineDetails>;
 }
 
 export function useTimelineDetails(ids: string[], open: boolean) {
@@ -81,7 +67,6 @@ export function useTimelineDetails(ids: string[], open: boolean) {
   useEffect(() => {
     if (!open || !key) return;
     let cancelled = false;
-    setFailure(null);
     void load(key.split(",")).catch((error) => {
       if (!cancelled) setFailure({ key, message: error instanceof Error ? error.message : "详情读取失败", unavailable: error?.code === "TIMELINE_DETAIL_UNAVAILABLE" });
     });
@@ -90,7 +75,13 @@ export function useTimelineDetails(ids: string[], open: boolean) {
   const currentFailure = open && failure?.key === key ? failure : null;
   const loading = open && Boolean(key);
   useDisclosurePending(loading && !currentFailure);
-  return { loading, ready: !loading || Boolean(currentFailure), failure: currentFailure?.message || "", unavailable: currentFailure?.unavailable === true, retry: () => retry((value) => value + 1) };
+  return {
+    loading,
+    ready: !loading || Boolean(currentFailure),
+    failure: currentFailure?.message || "",
+    unavailable: currentFailure?.unavailable === true,
+    retry: () => { setFailure(null); retry((value) => value + 1); },
+  };
 }
 
 export function TimelineDetailStatus({ state }: { state: ReturnType<typeof useTimelineDetails> }) {

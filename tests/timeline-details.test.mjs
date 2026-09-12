@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import ts from "typescript";
-import { summarizeTimelineEvent, timelineReplayView, groupAgentActivity } from "../shared/timeline-projection.mjs";
+import { summarizeTimelineEvent, timelineReplayView, groupAgentActivity, groupBackgroundResults } from "../shared/timeline-projection.mjs";
 import { mergeConversationEvents } from "../app/easywork/features/conversation/conversation-event-retention.mjs";
 import { RealtimeEventJournal } from "../gateway/core/realtime.mjs";
 
@@ -40,6 +40,45 @@ test("history projects headings without losing native text, file paths or detail
   const replay = { events: [background], lastSequence: 5, nextAfterSequence: 5, hasMore: false };
   assert.equal(timelineReplayView(replay).events[0], background);
   assert.ok(JSON.stringify(timelineReplayView(replay, "summary")).length < JSON.stringify(replay).length / 10);
+});
+
+test("conversation background summaries retain their title and only adjacent reads share one disclosure", () => {
+  const background = {
+    ...event("e6", "run.context.read", {}, "web-agent"),
+    payload: {
+      output: {
+        conversation: [{
+          id: "message-a",
+          role: "assistant",
+          content: "第一段内容",
+          referenceTitle: "训练参数讨论",
+          sourceConversationId: "conversation-a",
+        }],
+      },
+    },
+  };
+  assert.deepEqual(summarizeTimelineEvent(background).payload.output.conversation, [{
+    id: "message-a",
+    role: "assistant",
+    referenceTitle: "训练参数讨论",
+    sourceConversationId: "conversation-a",
+    timelineTitle: "第一段内容",
+    timelineHasDetail: true,
+  }]);
+
+  const groups = groupBackgroundResults([
+    { id: "a1", source: "conversation", value: { referenceTitle: "训练参数讨论", sourceConversationId: "conversation-a" } },
+    { id: "a2", source: "conversation", value: { referenceTitle: "训练参数讨论", sourceConversationId: "conversation-a" } },
+    { id: "memory", source: "memory", value: { title: "环境约定" } },
+    { id: "a3", source: "conversation", value: { referenceTitle: "训练参数讨论", sourceConversationId: "conversation-a" } },
+    { id: "b1", source: "conversation", value: { referenceTitle: "训练参数讨论", sourceConversationId: "conversation-b" } },
+  ]);
+  assert.deepEqual(groups.map((group) => [group.type, group.type === "conversation" ? group.title : group.result.source, group.type === "conversation" ? group.results.map((item) => item.id) : [group.result.id]]), [
+    ["conversation", "训练参数讨论", ["a1", "a2"]],
+    ["result", "memory", ["memory"]],
+    ["conversation", "训练参数讨论", ["a3"]],
+    ["conversation", "训练参数讨论", ["b1"]],
+  ]);
 });
 
 test("full detail upgrades a summary and a later summary cannot overwrite it", () => {

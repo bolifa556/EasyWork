@@ -22,6 +22,8 @@ function keywordTone(value: string) {
 
 export default function HelpView() {
   const runtime = useAppRuntime();
+  const bootstrapReady = Boolean(runtime.bootstrap);
+  const actorId = runtime.bootstrap?.actor.id;
   const helpCache = cachedHelpDocument();
   const [content, setContent] = useState(() => helpCache?.content || "");
   const [loading, setLoading] = useState(() => !helpCache);
@@ -49,9 +51,9 @@ export default function HelpView() {
   }, [load]);
 
   useEffect(() => {
-    if (runtime.loading || !runtime.bootstrap) return;
+    if (runtime.loading || !bootstrapReady) return;
     void runtime.api.post("/api/auth/help-seen", {}).catch(() => undefined);
-  }, [runtime.api, runtime.loading, runtime.bootstrap?.actor.id]);
+  }, [actorId, bootstrapReady, runtime.api, runtime.loading]);
 
   return <section className={styles.page}>
     {loading ? <div className={styles.loading} role="status"><span className={styles.loadingRing} data-loading-spinner="" aria-hidden="true" /><span>正在读取帮助</span></div> : error ? <section className={styles.unavailable}><TriangleAlert size={24} /><strong>{error}</strong><button type="button" onClick={() => void load().catch((reason) => setError(reason instanceof Error ? reason.message : "帮助读取失败"))}>重新读取</button></section> : <article className={styles.document}><ReactMarkdown

@@ -351,7 +351,8 @@ const markdownComponents: Components = {
     const artifactId = node?.properties?.["data-artifact-id"] ?? node?.properties?.dataArtifactId;
     return artifactId && renderArtifact ? renderArtifact(String(artifactId)) : <div {...props}>{children}</div>;
   },
-  a: function MarkdownLink({ node: _node, children, ...props }) {
+  a: function MarkdownLink({ node, children, ...props }) {
+    void node;
     return <a {...props} target="_blank" rel="noreferrer">{children}</a>;
   },
   pre: function MarkdownPre({ children }) {

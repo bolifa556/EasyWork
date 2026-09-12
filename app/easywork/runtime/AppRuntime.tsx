@@ -392,7 +392,6 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     const initialView = parseRoute(initialUrl.pathname, initialUrl.search);
     if (!firstDeviceVisit) localStorage.removeItem(DEVICE_INTRO_AUTO_KEY);
     if (destination !== window.location.pathname + window.location.search) {
-      setView(initialView);
       window.history.replaceState(null, "", destination);
     }
     preloadFeature(initialView.kind);

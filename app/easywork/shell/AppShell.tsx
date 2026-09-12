@@ -232,7 +232,10 @@ export function AppShell() {
       } } };
     });
   }, [bootstrapConversationKey, navigationPage]);
-  const expandedProjects = expandedProjectsCache.key === expansionKey ? expandedProjectsCache.items : new Set(activeProjectId ? [activeProjectId] : []);
+  const expandedProjects = useMemo(
+    () => expandedProjectsCache.key === expansionKey ? expandedProjectsCache.items : new Set(activeProjectId ? [activeProjectId] : []),
+    [activeProjectId, expandedProjectsCache, expansionKey],
+  );
   const expandedProjectLists = expandedProjectListsCache.key === expansionKey ? expandedProjectListsCache.items : EMPTY_PROJECT_IDS;
   const showAllChats = showAllChatsCache.key === bootstrapConversationKey && showAllChatsCache.value;
   const allStandaloneChats = standaloneChatsCache?.key === bootstrapConversationKey ? standaloneChatsCache.items : null;
@@ -902,7 +905,7 @@ export function AppShell() {
                 return <div key={project.id}>
                   <div className={styles.treeProject}><button aria-expanded={expanded} className={`${styles.treeItem} ${runtime.view.kind === "project" && runtime.view.projectId === project.id ? styles.active : ""}`} onClick={() => {
                     if (normalizedQuery) return;
-                    setExpandedProjectsCache((cache) => {
+                    setExpandedProjectsCache(() => {
                       const next = new Set(expandedProjects);
                       if (expanded) next.delete(project.id); else next.add(project.id);
                       return { key: expansionKey, items: next };

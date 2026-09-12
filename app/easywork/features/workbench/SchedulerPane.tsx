@@ -423,7 +423,7 @@ function ClusterSchedulerPane({ serverId, workspaceId, conversationId, branchId,
     }
   }, [remember, runtime.api, serverId]);
 
-  const loadDashboard = useCallback(async (signal?: AbortSignal, _refresh = true) => {
+  const loadDashboard = useCallback(async (signal?: AbortSignal) => {
     if (!schedulerDashboardCache.has(serverId)) setLoading(true);
     // A failed resource probe must not discard a successful job query.
     await Promise.allSettled([loadResources(signal), loadCurrentJobs(signal)]);
