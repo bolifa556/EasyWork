@@ -3,12 +3,36 @@
   min-width:0;
   min-height:0;
   overflow:hidden;
+  grid-template-columns:minmax(0,1fr);
   grid-template-rows:0fr;
   opacity:0;
   transition:grid-template-rows 240ms cubic-bezier(.22,1,.36,1), opacity 180ms ease, margin-block 240ms cubic-bezier(.22,1,.36,1);
 }
-.motion > div { min-height:0; overflow:hidden; }
+.motion > div { min-width:0; min-height:0; overflow:hidden; }
 .motion[data-expanded="true"] { grid-template-rows:1fr; opacity:1; }
 .motion[data-expanded="false"] { margin-block:0; }
 .motion[data-reveal-together="true"] { transition:none; }
-@media (prefers-reduced-motion:reduce) { .motion { transition:none; } }
+/* A delayed cue replaces the existing arrow without adding a row or reserving
+   an arbitrary body height. Nested cues stay hidden inside their waiting parent. */
+:global(:is(section,div,article)):has(> .motion[data-disclosure-pending="true"]) > :global(button[aria-expanded]) { position:relative; }
+:global(:is(section,div,article)):has(> .motion[data-disclosure-pending="true"]) > :global(button[aria-expanded] > svg:last-child) { visibility:hidden; }
+:global(:is(section,div,article)):has(> .motion[data-disclosure-pending="true"]) > :global(button[aria-expanded])::after {
+  content:"";
+  position:absolute;
+  right:2px;
+  top:calc(50% - 3px);
+  width:11px;
+  height:2px;
+  border-radius:2px;
+  background:currentColor;
+  box-shadow:0 4px 0 currentColor;
+  opacity:.25;
+  pointer-events:none;
+  animation:pendingPulse 1.4s ease-in-out infinite;
+}
+.pendingAnnouncement { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+@keyframes pendingPulse { 50% { opacity:.5; } }
+@media (prefers-reduced-motion:reduce) {
+  .motion { transition:none; }
+  :global(:is(section,div,article)):has(> .motion[data-disclosure-pending="true"]) > :global(button[aria-expanded])::after { animation:none; }
+}

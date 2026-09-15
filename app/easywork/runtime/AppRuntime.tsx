@@ -21,7 +21,8 @@ import { prefetchRouteData } from "./startup-data";
 import { startupDestination } from "./startup-route";
 import { prefetchHelpDocument } from "../features/help/help-document";
 import { useFilePreviewTabs } from "./useFilePreviewTabs";
-import { announceConversationsChanged } from "./cacheEvents";
+import { announceConversationsChanged, subscribeConversationsChanged, type ConversationsChangedDetail } from "./cacheEvents";
+import { applyBootstrapConversationChange, preserveConversationRows } from "./conversation-list";
 export type { WorkspacePreviewTab } from "./useFilePreviewTabs";
 
 const SESSION_KEY = "easywork.session";
@@ -215,6 +216,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(() => sessionSource.read());
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
   const bootstrapGeneration = useRef(0);
+  const pendingBootstrapChanges = useRef(new Set<ConversationsChangedDetail[]>());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<AppView>(() => typeof window === "undefined"
@@ -267,13 +269,20 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     const generation = ++bootstrapGeneration.current;
     const route = parseRoute(window.location.pathname, window.location.search);
     const query = route.kind === "conversation" ? `?conversationId=${encodeURIComponent(route.conversationId)}` : "";
-    const result = await retryGateway(() => api.get<BootstrapResponse>(`/api/bootstrap${query}`));
+    const changes: ConversationsChangedDetail[] = [];
+    pendingBootstrapChanges.current.add(changes);
+    let result;
+    try { result = await retryGateway(() => api.get<BootstrapResponse>(`/api/bootstrap${query}`)); }
+    finally { pendingBootstrapChanges.current.delete(changes); }
     if (requestedSession !== sessionSource.read() || generation !== bootstrapGeneration.current) return;
     setBootstrap((current) => {
       if (!current || current.actor.id !== result.data.actor.id) return result.data;
       const incomingIds = new Set(result.data.runningTasks.map((task) => task.id));
-      return { ...result.data, runningTasks: mergeTaskSnapshots(current.runningTasks, result.data.runningTasks)
-        .filter((task) => incomingIds.has(task.id) && isActiveTask(task)) };
+      const next = { ...result.data,
+        recentConversations: preserveConversationRows(current.recentConversations, result.data.recentConversations),
+        runningTasks: mergeTaskSnapshots(current.runningTasks, result.data.runningTasks)
+          .filter((task) => incomingIds.has(task.id) && isActiveTask(task)) };
+      return changes.reduce((snapshot, change) => applyBootstrapConversationChange(snapshot, change)!, next);
     });
     setError(null);
   }, [api, sessionSource, setBootstrap]);
@@ -300,19 +309,20 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       } };
     });
   }, [setBootstrap]);
+  useEffect(() => subscribeConversationsChanged(change => {
+    for (const changes of pendingBootstrapChanges.current) changes.push(change);
+    setBootstrap(current => applyBootstrapConversationChange(current, change));
+  }), []);
   useEffect(() => {
     if (!token || !bootstrap?.actor.id) return;
-    let timer: number | undefined;
     const unsubscribe = realtime.subscribe(`conversations:${bootstrap.actor.id}`, (event, { initialReplay }) => {
       if (initialReplay || event.kind !== "conversation.title.updated" || !event.ids.conversationId) return;
-      // Coalesce replayed metadata into one list refresh. Each window receives
-      // this account-scoped stream, so it needs no additional tab broadcast.
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        announceConversationsChanged({ conversationId: event.ids.conversationId!, kind: "renamed" }, { broadcast: false });
-      }, 100);
+      const payload = event.payload as { title?: string; conversationRevision?: number };
+      // Apply each title to its existing row. Each window receives this stream,
+      // so no full bootstrap refresh or additional tab broadcast is needed.
+      announceConversationsChanged({ conversationId: event.ids.conversationId, kind: "renamed", title: payload.title, revision: payload.conversationRevision }, { broadcast: false });
     });
-    return () => { window.clearTimeout(timer); unsubscribe(); };
+    return unsubscribe;
   }, [token, bootstrap?.actor.id, realtime]);
 
   useEffect(() => {

@@ -32,7 +32,8 @@ import {
 import type { ConversationSummary, Page, ProjectSummary } from "@/app/core/contracts";
 import { commandId } from "@/app/core/gateway/client";
 import { useAppRuntime } from "../runtime/AppRuntime";
-import { announceConversationsChanged, subscribeConversationsChanged } from "../runtime/cacheEvents";
+import { announceConversationsChanged, subscribeConversationsChanged, type ConversationsChangedDetail } from "../runtime/cacheEvents";
+import { applyConversationListChange, mergeConversationListChange, reconcileConversationPage } from "../runtime/conversation-list";
 import { LoadingState } from "../ui/LoadingState";
 import { FeatureErrorBoundary } from "../ui/FeatureErrorBoundary";
 import { AccountDialog } from "./AccountDialog";
@@ -151,6 +152,7 @@ function ScrollingTitle({ title }: { title: string }) {
 
 export function AppShell() {
   const runtime = useAppRuntime();
+  const { api, refreshBootstrap } = runtime;
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => setHydrated(true), []);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState(false);
@@ -166,7 +168,8 @@ export function AppShell() {
   const [standaloneChatsCache, setStandaloneChatsCache] = useState<{ key: string; items: ConversationSummary[] } | null>(null);
   const [loadingAllChatsKey, setLoadingAllChatsKey] = useState<string | null>(null);
   const [projectConversationCache, setProjectConversationCache] = useState<{ key: string; pages: Record<string, ProjectConversationPage> }>({ key: "", pages: {} });
-  const [conversationCacheGeneration, setConversationCacheGeneration] = useState(0);
+  const [searchRevision, setSearchRevision] = useState(0);
+  const conversationChanges = useRef<{ key: string; items: Map<string, ConversationsChangedDetail> }>({ key: "", items: new Map() });
   const [searchConversationCache, setSearchConversationCache] = useState<{ key: string; items: ConversationSearchHit[]; nextCursor: string | null; loading: boolean; error: string | null }>({ key: "", items: [], nextCursor: null, loading: false, error: null });
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -219,7 +222,10 @@ export function AppShell() {
   const activeConversation = navigation?.conversation ?? null;
   const activeProjectId = activeConversation?.projectId ?? (runtime.view.kind === "project" ? runtime.view.projectId : null);
   const expansionKey = actorId || "guest";
-  const bootstrapConversationKey = `${actorId || "guest"}:${conversationCacheGeneration}:${runtime.bootstrap?.conversationCursor || "end"}:${conversations.map((item) => `${item.id}:${item.revision}`).join(",")}:${projects.map((project) => `${project.id}:${project.revision}:${project.conversationCount}`).join(",")}`;
+  // Data revisions update rows; only an account change replaces list state.
+  const bootstrapConversationKey = actorId || "guest";
+  const mergeConversationRows = useCallback((current: ConversationSummary[], incoming: ConversationSummary[], projectId: string | null, placement: "prepend" | "append" = "prepend") =>
+    reconcileConversationPage(current, incoming, projectId, conversationChanges.current.key === bootstrapConversationKey ? conversationChanges.current.items.values() : [], placement), [bootstrapConversationKey]);
   const searchConversationKey = `${bootstrapConversationKey}\n${normalizedQuery}`;
   const navigationPage = runtime.bootstrap?.conversationNavigation?.projectConversations;
   useEffect(() => {
@@ -232,6 +238,25 @@ export function AppShell() {
       } } };
     });
   }, [bootstrapConversationKey, navigationPage]);
+  useEffect(() => {
+    const updates = mergeConversationPages(conversations, navigationPage?.items, activeConversation ? [activeConversation] : []);
+    setStandaloneChatsCache(cache => {
+      if (!cache || cache.key !== bootstrapConversationKey) return cache;
+      const items = mergeConversationRows(cache.items, updates, null);
+      return items === cache.items ? cache : { ...cache, items };
+    });
+    setProjectConversationCache(cache => {
+      if (cache.key !== bootstrapConversationKey) return cache;
+      let changed = false;
+      const pages = Object.fromEntries(Object.entries(cache.pages).map(([id, page]) => {
+        const items = mergeConversationRows(page.items, updates, id);
+        if (items === page.items) return [id, page];
+        changed = true;
+        return [id, { ...page, items }];
+      }));
+      return changed ? { ...cache, pages } : cache;
+    });
+  }, [activeConversation, bootstrapConversationKey, conversations, navigationPage, mergeConversationRows]);
   const expandedProjects = useMemo(
     () => expandedProjectsCache.key === expansionKey ? expandedProjectsCache.items : new Set(activeProjectId ? [activeProjectId] : []),
     [activeProjectId, expandedProjectsCache, expansionKey],
@@ -281,17 +306,50 @@ export function AppShell() {
 
   useEffect(() => () => sidebarResizeCleanup.current?.(), []);
 
-  useEffect(() => subscribeConversationsChanged((detail) => {
-    if (detail.kind === "renamed") setConversationCacheGeneration((current) => current + 1);
-    setSearchConversationCache((current) => ({ ...current, key: "" }));
-    void runtime.refreshBootstrap().catch(() => undefined);
-  }), [runtime]);
+  const updateConversationRows = useEffectEvent((detail: ConversationsChangedDetail) => {
+    if (conversationChanges.current.key !== bootstrapConversationKey) conversationChanges.current = { key: bootstrapConversationKey, items: new Map() };
+    const change = mergeConversationListChange(conversationChanges.current.items.get(detail.conversationId), detail);
+    conversationChanges.current.items.set(change.conversationId, change);
+    setStandaloneChatsCache(cache => {
+      if (!cache || cache.key !== bootstrapConversationKey) return cache;
+      const items = applyConversationListChange(cache.items, change, null);
+      return items === cache.items ? cache : { ...cache, items };
+    });
+    setProjectConversationCache(cache => {
+      if (cache.key !== bootstrapConversationKey) return cache;
+      let changed = false;
+      const pages = Object.fromEntries(Object.entries(cache.pages).map(([id, page]) => {
+        const items = applyConversationListChange(page.items, change, id);
+        if (items === page.items) return [id, page];
+        changed = true;
+        return [id, { ...page, items }];
+      }));
+      return changed ? { ...cache, pages } : cache;
+    });
+    setSearchRevision(value => value + 1);
+  });
+  useEffect(() => {
+    let active = true;
+    const unsubscribe = subscribeConversationsChanged(change => {
+      updateConversationRows(change);
+      if (change.kind === "renamed" && (change.title || change.conversation)) return;
+      if (!change.conversation && change.kind !== "deleted") {
+        void api.get<{ summary: ConversationSummary }>(`/api/conversations/${encodeURIComponent(change.conversationId)}`).then(result => {
+          if (active) announceConversationsChanged({ ...change, conversation: result.data.summary }, { broadcast: false });
+        }).catch(() => undefined);
+        return;
+      }
+      void refreshBootstrap().catch(() => undefined);
+    });
+    return () => { active = false; unsubscribe(); };
+  }, [api, bootstrapConversationKey, refreshBootstrap]);
 
   useEffect(() => {
     if (!normalizedQuery) return undefined;
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      setSearchConversationCache({ key: searchConversationKey, items: [], nextCursor: null, loading: true, error: null });
+      setSearchConversationCache(current => current.key === searchConversationKey ? { ...current, loading: true, error: null }
+        : { key: searchConversationKey, items: [], nextCursor: null, loading: true, error: null });
       void (async () => {
         const params = new URLSearchParams({ query: normalizedQuery, limit: "20", messageLimit: "12" });
         const result = await runtime.api.get<ConversationSearchPage>(`/api/conversation-search?${params}`, controller.signal);
@@ -309,7 +367,7 @@ export function AppShell() {
       });
     }, 180);
     return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [normalizedQuery, runtime.api, searchConversationKey]);
+  }, [normalizedQuery, runtime.api, searchConversationKey, searchRevision]);
 
   const loadMoreSearchResults = async () => {
     if (!normalizedQuery || searchConversationCache.key !== searchConversationKey || !searchConversationCache.nextCursor || searchConversationCache.loading) return;
@@ -386,7 +444,7 @@ export function AppShell() {
       }
       setStandaloneChatsCache((current) => current && current.key !== bootstrapConversationKey
         ? current
-        : { key: bootstrapConversationKey, items: mergeConversationPages(items) });
+        : { key: bootstrapConversationKey, items: mergeConversationRows(current?.items ?? [], mergeConversationPages(items), null, "append") });
       setShowAllChatsCache((current) => current.key !== bootstrapConversationKey
         ? current
         : { key: bootstrapConversationKey, value: true });
@@ -442,7 +500,7 @@ export function AppShell() {
         key: bootstrapConversationKey,
         pages: {
           ...cache.pages,
-          [projectId]: { items: mergeConversationPages(items), nextCursor: cursor, loaded: true, loading: false, error: null },
+          [projectId]: { items: mergeConversationRows(cache.pages[projectId]?.items ?? [], mergeConversationPages(items), projectId, "append"), nextCursor: cursor, loaded: true, loading: false, error: null },
         },
       }));
       return true;
@@ -463,7 +521,7 @@ export function AppShell() {
       }));
       return false;
     }
-  }, [projectConversationPages, bootstrapConversationKey, runtime.api]);
+  }, [projectConversationPages, bootstrapConversationKey, runtime.api, mergeConversationRows]);
 
   useEffect(() => {
     if (!runtime.bootstrap) return;
@@ -636,9 +694,9 @@ export function AppShell() {
   const conversationAction = async (item: ConversationSummary, action: "move" | "pin", projectId?: string | null) => {
     try {
       const body = action === "move" ? { projectId: projectId ?? null } : { pinned: !item.pinned };
-      await runtime.api.patch(`/api/conversations/${encodeURIComponent(item.id)}`, body, { expectedRevision: item.revision, idempotencyKey: commandId(`conversation-${action}`) });
+      const result = await runtime.api.patch<{ conversation: ConversationSummary }>(`/api/conversations/${encodeURIComponent(item.id)}`, body, { expectedRevision: item.revision, idempotencyKey: commandId(`conversation-${action}`) });
       setMenu(null);
-      await runtime.refreshBootstrap();
+      announceConversationsChanged({ conversationId: item.id, kind: "updated", conversation: result.data.conversation });
     } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "对话操作失败", "error"); }
   };
 
@@ -696,13 +754,12 @@ export function AppShell() {
     renameInFlight.current = true;
     setConversationRename((current) => current?.item.id === editing.item.id ? { ...current, saving: true } : current);
     try {
-      await runtime.api.patch(`/api/conversations/${encodeURIComponent(editing.item.id)}`, { title }, {
+      const result = await runtime.api.patch<{ conversation: ConversationSummary }>(`/api/conversations/${encodeURIComponent(editing.item.id)}`, { title }, {
         expectedRevision: editing.item.revision,
         idempotencyKey: commandId("conversation-rename"),
       });
       setConversationRename(null);
-      await runtime.refreshBootstrap();
-      announceConversationsChanged({ conversationId: editing.item.id, kind: "renamed" });
+      announceConversationsChanged({ conversationId: editing.item.id, kind: "renamed", conversation: result.data.conversation });
       runtime.notify("对话已重命名", "success");
     } catch (reason) {
       setConversationRename((current) => current?.item.id === editing.item.id ? { ...current, saving: false } : current);
@@ -763,6 +820,7 @@ export function AppShell() {
       setProjectPendingDelete(null);
       await runtime.refreshBootstrap();
       for (const conversationId of result.data.deletedConversationIds ?? []) announceConversationsChanged({ conversationId, kind: "deleted" });
+      for (const conversationId of result.data.movedConversationIds ?? []) announceConversationsChanged({ conversationId, kind: "updated" });
       const currentConversationDeleted = runtime.view.kind === "conversation" && (result.data.deletedConversationIds ?? []).includes(runtime.view.conversationId);
       if ((runtime.view.kind === "project" && runtime.view.projectId === pending.item.id) || currentConversationDeleted) runtime.navigate({ kind: "home" }, { replace: true });
       runtime.notify(deleteConversations ? "项目及其所有对话已删除" : "项目已删除，对话已保留", "success");

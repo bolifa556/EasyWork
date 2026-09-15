@@ -1,8 +1,13 @@
+import type { ConversationSummary } from "@/app/core/contracts";
+
 export const CONVERSATIONS_CHANGED_EVENT = "easywork:conversations-changed";
 
 export type ConversationsChangedDetail = {
   conversationId: string;
   kind: "created" | "updated" | "deleted" | "renamed";
+  conversation?: Omit<ConversationSummary, "runningTaskId"> & { runningTaskId?: string | null };
+  title?: string;
+  revision?: number;
 };
 
 const CHANNEL_NAME = "easywork-conversations";

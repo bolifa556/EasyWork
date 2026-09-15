@@ -4,7 +4,7 @@ import path from "node:path";
 import { assertNoSensitiveFields, invariant } from "./errors.mjs";
 import { AtomicJsonRepository, clearRepositoryReadCache } from "./repository.mjs";
 import { actorDataRoot } from "./paths.mjs";
-import { summarizeTimelineEvent } from "../../shared/timeline-projection.mjs";
+import { summarizeTimelinePage } from "../../shared/timeline-projection.mjs";
 
 export const JOURNAL_SCHEMA_VERSION = 2;
 
@@ -239,10 +239,7 @@ export class RealtimeEventJournal {
     });
     const offset = firstAfter(data.events, afterSequence);
     const events = data.events.slice(offset, offset + limit);
-    const projected = view === "summary" ? events.map((event) => {
-      if (!this.summaries.has(event)) this.summaries.set(event, summarizeTimelineEvent(event));
-      return this.summaries.get(event);
-    }) : events;
+    const projected = view === "summary" ? summarizeTimelinePage(events, this.summaries) : events;
     return {
       topic: data.topic,
       events: structuredClone(projected),

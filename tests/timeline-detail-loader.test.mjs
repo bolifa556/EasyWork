@@ -53,6 +53,16 @@ test("network failure allows an explicit retry without fetching hidden rows", as
   assert.deepEqual(f.requests.map((r) => r.ids), [["one"], ["one"]]);
 });
 
+test("explicit expansion never waits for unrelated queued prefetch in its request", async () => {
+  const ids = Array.from({ length: 40 }, (_, index) => `cold-${index}`);
+  const f = fixture([...ids.map(id => event(id)), event("visible")]);
+  await Promise.all([f.load.prefetch([...ids, "visible"]), f.load(["visible"])]);
+  assert.deepEqual(f.requests[0].ids, ["visible"]);
+  assert.ok(f.requests.slice(1).every(request => request.ids.length <= 8));
+  assert.equal(f.requests.flatMap(request => request.ids).length, 41);
+  assert.equal(f.loaded.size, 41);
+});
+
 test("large visible groups are batched without omission and web/task detail routes stay separate", async () => {
   const ids = Array.from({ length: 205 }, (_, index) => `e${index}`);
   const f = fixture([...ids.map((id) => event(id)), event("web", "conversation:conversation")]);

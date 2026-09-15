@@ -8,7 +8,7 @@ import { AtomicJsonRepository, atomicWriteJson, clearRepositoryReadCache } from 
 import { ReadCache } from "../gateway/core/read-cache.mjs";
 import { RealtimeEventJournal, JOURNAL_SCHEMA_VERSION } from "../gateway/core/realtime.mjs";
 import { createTimelineDetailLoader } from "../app/easywork/features/conversation/timeline-detail-loader.mjs";
-import { getTimelineDetailCache, clearTimelineDetailCache } from "../app/easywork/features/conversation/timeline-detail-cache.mjs";
+import { createTimelineDetailSnapshot, getTimelineDetailCache, clearTimelineDetailCache } from "../app/easywork/features/conversation/timeline-detail-cache.mjs";
 import { upgradeJournal, journalContentFingerprint, migrateJournals } from "../scripts/migrate-realtime-journals.mjs";
 
 const actor = { actorType: "user", actorId: "cache-user", deviceId: "device", sessionId: "session" };
@@ -95,13 +95,56 @@ test("current-page prefetch shares explicit requests, survives revisits and stay
   page.ingest(events.map(summary));
   page.activate(async url => { requests += 1; return { events: idsOf(url).map(id => events.find(event => event.eventId === id)) }; });
   await Promise.all([page.prefetch(), page.load(["a"])]);
-  assert.equal(requests, 1); assert.equal(page.get(events[0]).payload.event.text, "正文");
+  assert.equal(requests, 2); assert.equal(page.get(events[0]).payload.event.text, "正文");
   page.deactivate();
   const revisited = getTimelineDetailCache("actor-a:conversation-a");
   revisited.ingest(events.map(summary)); revisited.activate(async () => { throw new Error("must reuse cached detail"); });
   await revisited.prefetch(); await revisited.load(["a", "b"]);
   assert.equal(getTimelineDetailCache("actor-b:conversation-a").get(events[0]), undefined);
   assert.equal(getTimelineDetailCache("actor-a:conversation-b").get(events[0]), undefined);
+  clearTimelineDetailCache();
+});
+
+test("detail snapshots update only their own message and retain unchanged React snapshots", async () => {
+  clearTimelineDetailCache();
+  const events = [detail("first"), detail("second", 2)];
+  const page = getTimelineDetailCache("actor:snapshots");
+  page.ingest(events.map(summary));
+  page.activate(async url => ({ events: events.filter(event => idsOf(url).includes(event.eventId)) }));
+  const first = createTimelineDetailSnapshot(page, [summary(events[0])]);
+  const second = createTimelineDetailSnapshot(page, [summary(events[1])]);
+  const originalFirst = first(), originalSecond = second();
+  assert.equal(first(), originalFirst);
+  await page.load(["second"]);
+  assert.equal(first(), originalFirst);
+  assert.notEqual(second(), originalSecond);
+  const hydratedSecond = second();
+  await page.load(["first"]);
+  assert.notEqual(first(), originalFirst);
+  assert.equal(second(), hydratedSecond);
+  assert.equal(first()[0], events[0]);
+  assert.equal(second()[0], events[1]);
+  clearTimelineDetailCache();
+});
+
+test("prefetch warms recent history in small batches and leaves old collapsed details on demand", async () => {
+  clearTimelineDetailCache();
+  const events = Array.from({ length: 205 }, (_, i) => detail(`recent-${i}`, i + 1));
+  const page = getTimelineDetailCache("actor:recent");
+  const requests = [];
+  page.ingest(events.map(summary));
+  page.activate(async url => { const ids = idsOf(url); requests.push(ids); return { events: events.filter(event => ids.includes(event.eventId)) }; });
+  await page.prefetch();
+  assert.equal(requests[0][0], "recent-204");
+  assert.ok(requests.every(ids => ids.length <= 8));
+  assert.equal(requests.flat().length, 24);
+  assert.equal(page.get(events[0]), undefined);
+  assert.equal(page.get(events.at(-1)), events.at(-1));
+  page.ingest(events.map(summary)); await page.prefetch();
+  assert.equal(requests.flat().length, 24);
+  await page.load(["recent-0"]);
+  assert.deepEqual(requests.at(-1), ["recent-0"]);
+  assert.equal(page.get(events[0]), events[0]);
   clearTimelineDetailCache();
 });
 
@@ -118,6 +161,41 @@ test("leaving a page aborts queued prefetch and ignores a late response", async 
   assert.equal((await prefetch).name, "AbortError");
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(requests, 1); assert.equal(page.get(events[0]), undefined);
+  clearTimelineDetailCache();
+});
+
+test("viewport-selected prefetch warms only those details and shares a later intent request", async () => {
+  clearTimelineDetailCache();
+  const events = Array.from({ length: 80 }, (_, index) => detail(`visible-${index}`, index + 1));
+  const page = getTimelineDetailCache("actor:viewport");
+  const calls = [];
+  page.ingest(events.map(summary));
+  page.activate(async url => { const ids = idsOf(url); calls.push(ids); return { events: events.filter(event => ids.includes(event.eventId)) }; });
+  await Promise.all([page.prefetch(["visible-12", "visible-13"]), page.load(["visible-12"])]);
+  assert.deepEqual(calls.flat().sort(), ["visible-12", "visible-13"]);
+  assert.equal(page.get(events[79]), undefined, "offscreen latest history must not displace the visible target");
+  await page.prefetch(["visible-12", "visible-13"]);
+  assert.equal(calls.flat().length, 2);
+  clearTimelineDetailCache();
+});
+
+test("viewport warming collects adjacent targets, prioritizes the center and drops scrolled-away rows", async () => {
+  clearTimelineDetailCache();
+  const events = Array.from({ length: 12 }, (_, index) => detail(`row-${index}`, index + 1));
+  const page = getTimelineDetailCache("actor:visible-selection");
+  const calls = [];
+  page.ingest(events.map(summary));
+  page.activate(async url => { const ids = idsOf(url); calls.push(ids); return { events: events.filter(event => ids.includes(event.eventId)) }; });
+  const leave = page.watchVisible(["row-0"], 500);
+  page.watchVisible(["row-10"], 120);
+  page.watchVisible(["row-9"], 0);
+  leave();
+  await new Promise(resolve => setTimeout(resolve, 120));
+  assert.deepEqual(calls, [["row-9", "row-10"]]);
+  page.watchVisible(["row-3"], 0);
+  page.deactivate();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(calls.length, 1);
   clearTimelineDetailCache();
 });
 

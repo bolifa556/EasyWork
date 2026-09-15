@@ -7,7 +7,9 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { Copy } from "lucide-react";
 import { copyText } from "../../ui/clipboard";
-import { codeWheelPosition } from "./code-scroll";
+import { codeScrollThumbWidth, codeWheelPosition } from "./code-scroll";
+import { highlightCode } from "./code-highlight";
+import type { RootContent } from "hast";
 import styles from "./MarkdownContent.module.css";
 import { ensureBlankLineBeforeTables, ensureSectionBlockBoundaries, protectShellVariablesFromInlineMath } from "./markdown-normalization.mjs";
 import { remarkArtifactCards } from "./artifact-markdown.mjs";
@@ -208,21 +210,29 @@ function BlockCopyButton({ content, label = "复制内容" }: { content: string;
 
 type CodeScrollState = { max: number; value: number; thumbWidth: number; visible: boolean };
 
+function codeTokenNodes(nodes: RootContent[]): ReactNode {
+  return nodes.map((node, index) => node.type === "text" ? node.value : node.type === "element"
+    ? <span key={index} className={Array.isArray(node.properties.className) ? node.properties.className.join(" ") : undefined}>{codeTokenNodes(node.children)}</span>
+    : null);
+}
+
 export function MarkdownCodeBlock({ children, source, terminal = false, activity = false, copy = true, viewportClassName = "" }: { children: ReactNode; source: string; terminal?: boolean; activity?: boolean; copy?: boolean; viewportClassName?: string }) {
   const blockRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLPreElement>(null);
   const scrollbarRef = useRef<HTMLInputElement>(null);
   const [scroll, setScroll] = useState<CodeScrollState>({ max: 0, value: 0, thumbWidth: 30, visible: false });
+  const codeContent = useMemo(() => {
+    const child = Children.toArray(children)[0];
+    if (!isValidElement<{ children?: ReactNode; className?: string }>(child) || typeof child.props.children !== "string") return children;
+    const highlighted = highlightCode(child.props.children, fencedCodeLanguage(children));
+    return highlighted ? <code className={child.props.className}>{codeTokenNodes(highlighted.children)}</code> : children;
+  }, [children]);
   const syncScroll = useCallback(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
     const max = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
     const trackWidth = Math.max(0, scrollbarRef.current?.clientWidth || viewport.clientWidth);
-    const proportionalThumb = viewport.scrollWidth > 0 ? Math.round(trackWidth * viewport.clientWidth / viewport.scrollWidth) : trackWidth;
-    const maximumThumb = Math.min(180, Math.max(72, Math.round(trackWidth * 0.24)));
-    const thumbWidth = max > 1
-      ? Math.min(trackWidth, maximumThumb, Math.max(32, proportionalThumb))
-      : trackWidth;
+    const thumbWidth = codeScrollThumbWidth(viewport.clientWidth, viewport.scrollWidth, trackWidth);
     const value = Math.min(max, Math.max(0, viewport.scrollLeft));
     setScroll((current) => current.max === max
       && current.value === value
@@ -237,7 +247,9 @@ export function MarkdownCodeBlock({ children, source, terminal = false, activity
     if (!block || !viewport) return;
     syncScroll();
     const handleWheel = (event: WheelEvent) => {
-      const next = codeWheelPosition(viewport, event);
+      const track = scrollbarRef.current?.getBoundingClientRect();
+      const overScrollbar = Boolean(track && track.height > 0 && event.clientY >= track.top && event.clientY <= track.bottom);
+      const next = codeWheelPosition(viewport, event, overScrollbar);
       if (next === null) return;
       event.preventDefault();
       event.stopPropagation();
@@ -264,7 +276,7 @@ export function MarkdownCodeBlock({ children, source, terminal = false, activity
       data-code-viewport=""
       className={`${styles.remoteTerminal} ${styles.markdownTerminal} ${terminal ? styles.terminalFence : styles.codeFence} ${viewportClassName}`}
       onScroll={syncScroll}
-    >{children}</pre>
+    >{codeContent}</pre>
     <input
       ref={scrollbarRef}
       className={`${styles.codeScrollbar} ${scroll.visible ? "" : styles.codeScrollbarHidden}`}

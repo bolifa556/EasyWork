@@ -1,23 +1,11 @@
 "use client";
 
-import { createContext, memo, useCallback, useContext, useId, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
 import styles from "./DisclosureMotion.module.css";
 
-type DisclosureGate = {
-  setPending: (id: string, pending: boolean) => void;
-  revealTogether: boolean;
-};
-
+type DisclosureGate = { setPending: (id: string, pending: boolean) => void; revealTogether: boolean };
 const GateContext = createContext<DisclosureGate | null>(null);
 
-// Some callers stop providing detail text as soon as they close. Retain the
-// rendered subtree, including its open descendants, throughout the exit.
-const RetainedContent = memo(function RetainedContent({ children }: { open: boolean; children: ReactNode }) {
-  return children;
-}, (previous, next) => !next.open || previous.children === next.children);
-
-// Open descendants prepare while their enclosing disclosure is still hidden.
-// The enclosing level is revealed only when all of its visible content is ready.
 export function useDisclosurePending(pending: boolean) {
   const gate = useContext(GateContext);
   const id = useId();
@@ -28,6 +16,12 @@ export function useDisclosurePending(pending: boolean) {
   }, [id, pending, report]);
 }
 
+// Some callers stop providing detail text as soon as they close. Retain the
+// rendered subtree, including its open descendants, throughout the exit.
+const RetainedContent = memo(function RetainedContent({ children }: { open: boolean; children: ReactNode }) {
+  return children;
+}, (previous, next) => !next.open || previous.children === next.children);
+
 export function DisclosureMotion({ open, ready = true, className = "", children }: {
   open: boolean;
   ready?: boolean;
@@ -37,12 +31,13 @@ export function DisclosureMotion({ open, ready = true, className = "", children 
   const parent = useContext(GateContext);
   const [motion, setMotion] = useState({ requestedOpen: open, mounted: open, expanded: false });
   const [pendingChildren, setPendingChildren] = useState<ReadonlySet<string>>(() => new Set());
+  const [showPending, setShowPending] = useState(false);
   if (motion.requestedOpen !== open) {
     setMotion({ requestedOpen: open, mounted: open || motion.mounted, expanded: false });
   }
   const expanded = open && motion.expanded;
   const setPending = useCallback((id: string, pending: boolean) => {
-    setPendingChildren((current) => {
+    setPendingChildren(current => {
       if (current.has(id) === pending) return current;
       const next = new Set(current);
       if (pending) next.add(id); else next.delete(id);
@@ -50,8 +45,14 @@ export function DisclosureMotion({ open, ready = true, className = "", children 
     });
   }, []);
   const waiting = open && (!ready || pendingChildren.size > 0);
-  useDisclosurePending(waiting);
+  useDisclosurePending(waiting && !expanded);
   const gate = useMemo(() => ({ setPending, revealTogether: !expanded || Boolean(parent?.revealTogether) }), [expanded, parent?.revealTogether, setPending]);
+  const preparing = waiting && !expanded;
+  useEffect(() => {
+    if (!preparing) return;
+    const timer = window.setTimeout(() => setShowPending(true), 180);
+    return () => { window.clearTimeout(timer); setShowPending(false); };
+  }, [preparing]);
 
   useLayoutEffect(() => {
     if (!open) {
@@ -63,8 +64,8 @@ export function DisclosureMotion({ open, ready = true, className = "", children 
     }
     // New live data or a nested click must never collapse an already open level.
     if (expanded || waiting) return;
-    // Commit the complete body at zero height before starting its one transition.
-    // Nested bodies settle first, without a separate entrance animation.
+    // Prepare the complete first view, including already-open descendants, at
+    // zero height. One entrance prevents late activity rows displacing text.
     const reveal = () => setMotion((current) => ({ ...current, expanded: true }));
     let frame = requestAnimationFrame(() => {
       if (parent?.revealTogether) reveal();
@@ -74,16 +75,19 @@ export function DisclosureMotion({ open, ready = true, className = "", children 
   }, [expanded, open, parent?.revealTogether, motion.mounted, waiting]);
 
   if (!open && !motion.mounted) return null;
-  return <div
+  return <><div
     className={`${styles.motion} ${className}`}
     data-disclosure-state={!open ? "closing" : expanded ? "open" : "preparing"}
     data-expanded={expanded}
     data-reveal-together={Boolean(parent?.revealTogether)}
+    data-disclosure-pending={preparing && showPending || undefined}
     aria-busy={waiting || undefined}
     aria-hidden={!open || !expanded}
     inert={!open || !expanded}
     onTransitionEnd={(event) => {
       if (event.target === event.currentTarget && event.propertyName === "grid-template-rows" && !open) setMotion((current) => ({ ...current, mounted: false }));
     }}
-  ><GateContext.Provider value={gate}><RetainedContent open={open}>{children}</RetainedContent></GateContext.Provider></div>;
+  ><GateContext.Provider value={gate}><RetainedContent open={open}>{children}</RetainedContent></GateContext.Provider></div>
+    {preparing && showPending ? <span className={styles.pendingAnnouncement} role="status">正在准备展开内容</span> : null}
+  </>;
 }

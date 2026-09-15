@@ -28,12 +28,49 @@ async function loadProjection() {
     ["parseRemoteArtifactLinks", "../shared/remote-artifact-links.mjs"],
     ["artifactAnswerMarkdown, artifactDisplayName, conversationArtifactCards, referencedArtifactCards", "../app/easywork/features/conversation/artifact-presentation.mjs"],
     ["groupAgentActivity, groupBackgroundResults, timelineDetailIds", "../shared/timeline-projection.mjs"],
+    ["isWorkProtocolReasoning", "../shared/timeline-protocol.mjs"],
     ["markdownFence, markdownLabel, splitRemoteFinalPresentation", "../app/easywork/features/conversation/conversation-copy.mjs"],
   ].map(([names, file]) => `import { ${names} } from ${JSON.stringify(new URL(file, import.meta.url).href)};`).join("\n");
   const compiled = ts.transpileModule(imports + declarations + "\nexport { activitySegments, buildWebTrace };", { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022, jsx: ts.JsxEmit.React } }).outputText;
   return await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 }
 const { conversationTimelineMarkdown: projection, activitySegments, buildWebTrace } = await loadProjection();
+
+test("history already contains every Agent activity heading before any detail is hydrated", () => {
+  const outline = entries => groupAgentActivity(activitySegments(entries)).map(group => [group.type, group.id]);
+  for (const key of ["text", "content", "message", "summary", "output", "diff"]) {
+    const full = [event(1, "reasoning", { [key]: "长思考".repeat(1000) }), event(2, "message", { text: "已经完成检查。" }), event(3, "reasoning", { [key]: "下一步".repeat(1000) }), event(4, "message", { text: "结果已经整理。" })];
+    const summaries = full.map(summarizeTimelineEvent);
+    assert.deepEqual(outline(summaries), outline(full), key);
+    assert.deepEqual(outline([full[0], ...summaries.slice(1)]), outline(full), `${key}: partial hydration`);
+    assert.equal(outline(summaries).filter(([kind]) => kind === "thinking").length, 2);
+  }
+});
+
+test("web history and full detail agree on visible protocol and prose headings", () => {
+  const full = [event(1, "run.started", { mode: "work" }, "web-agent"),
+    event(2, "run.reasoning.delta", { iteration: 1, content: JSON.stringify({ name: "resource_search", arguments: { query: "文件".repeat(1500) } }) }, "web-agent"),
+    event(3, "run.context.read", { name: "resource_read", output: { memory: [{ title: "环境", content: "长内容".repeat(1500) }] } }, "web-agent"),
+    event(4, "run.reasoning.delta", { iteration: 2, content: "普通思考。".repeat(1000) }, "web-agent")];
+  const outline = events => buildWebTrace(events).entries.map(entry => [entry.type, entry.id]);
+  assert.deepEqual(outline(full.map(summarizeTimelineEvent)), outline(full));
+  assert.equal(outline(full).filter(([type]) => type === "reasoning").length, 1);
+});
+
+test("re-projecting web thoughts never grows the original deferred-ID lists", () => {
+  const full = [event(1, "run.started", { mode: "work" }, "web-agent"),
+    event(2, "run.reasoning.delta", { iteration: 1, content: "第一段思考".repeat(1000) }, "web-agent"),
+    event(3, "run.reasoning.delta", { iteration: 1, content: "第二段思考".repeat(1000) }, "web-agent"),
+    event(4, "run.handoff.ready", { userMessage: "执行任务", contextBrief: "背景" }, "web-agent"),
+    event(5, "run.handoff.dispatched", { operation: "create" }, "web-agent")];
+  const summaries = full.map(summarizeTimelineEvent);
+  for (const event of summaries) if (event.payload.timelineDetailIds) Object.freeze(event.payload.timelineDetailIds);
+  for (let index = 0; index < 5; index++) {
+    const trace = buildWebTrace(summaries);
+    assert.deepEqual(trace.entries[0].detailIds, ["e2", "e3"]);
+    assert.deepEqual(trace.handoff.detailIds, ["e4", "e5"]);
+  }
+});
 
 for (const producer of ["agent:codex", "agent:claude-code", "agent:opencode"]) test(`${producer} 累积流更新、终态和按需详情保持同一个思考栏目`, () => {
   let retained = [];

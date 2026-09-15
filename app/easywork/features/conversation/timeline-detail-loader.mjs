@@ -1,5 +1,5 @@
 // Explicit expansion and current-page prefetch share requests. Background work
-// uses one slot, leaving capacity for the row the user actually opens.
+// uses one slot and small batches, leaving capacity for explicit expansion.
 export function createTimelineDetailLoader({ getEvent, isLoaded, request, onLoaded, concurrency = 4 }) {
   const unavailable = () => Object.assign(new Error("活动详情不可用"), { code: "TIMELINE_DETAIL_UNAVAILABLE" });
   const aborted = () => Object.assign(new Error("详情加载已取消"), { name: "AbortError" });
@@ -61,10 +61,10 @@ export function createTimelineDetailLoader({ getEvent, isLoaded, request, onLoad
       const entries = [];
       for (const [id, waiter] of candidates) {
         const event = getEvent(id);
-        if (event && routeFor(event) === route) {
+        if (event && waiter.background === first.background && routeFor(event) === route) {
           entries.push([id, waiter]);
           queued.delete(id);
-          if (entries.length === 100) break;
+          if (entries.length === (first.background ? 8 : 100)) break;
         }
       }
       void read(route, entries, first.background);

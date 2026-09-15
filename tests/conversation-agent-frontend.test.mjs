@@ -87,7 +87,7 @@ test("对话删除或重命名只按事件失效服务器详情缓存，不引�
   ]);
   assert.match(events, /easywork:conversations-changed/);
   assert.match(shell, /announceConversationsChanged\(\{ conversationId: item\.id, kind: "deleted" \}\)/);
-  assert.match(shell, /announceConversationsChanged\(\{ conversationId: editing\.item\.id, kind: "renamed" \}\)/);
+  assert.match(shell, /announceConversationsChanged\(\{ conversationId: editing\.item\.id, kind: "renamed", conversation: result\.data\.conversation \}\)/);
   assert.match(servers, /addEventListener\(CONVERSATIONS_CHANGED_EVENT, changed\)/);
   assert.match(servers, /const changed = \(\) => \{ void load\(\)\.finally/);
   assert.doesNotMatch(servers, /setInterval/);
@@ -410,17 +410,17 @@ test("正文解析普通、带空格和被转义的粗体标记，且不改写�
   assert.match(styles, /\.activityInline\s*\{[^}]*font-family:inherit;[^}]*font-size:inherit;/s);
 });
 
-test("代码块使用正文排版、单色暖背景并在块内横向滚动", async () => {
+test("代码块使用正文字体和小字号、保留暖背景并在块内横向滚动", async () => {
   const [markdown, styles] = await Promise.all([readFile(markdownPath, "utf8"), readFile(markdownStylePath, "utf8")]);
   assert.match(markdown, /function MarkdownCodeBlock/);
   assert.match(markdown, /type="range"[\s\S]+?aria-label="横向滚动代码"/);
   assert.match(markdown, /const blockRef = useRef<HTMLDivElement>\(null\)/);
   assert.match(markdown, /block\.addEventListener\("wheel", handleWheel, \{ passive: false \}\)/);
   assert.match(markdown, /<div ref=\{blockRef\} className=\{`\$\{styles\.copyableCodeBlock\}/);
-  assert.match(markdown, /const next = codeWheelPosition\(viewport, event\);\s*if \(next === null\) return;\s*event\.preventDefault\(\);\s*event\.stopPropagation\(\);\s*viewport\.scrollLeft = next;/);
+  assert.match(markdown, /const next = codeWheelPosition\(viewport, event, overScrollbar\);\s*if \(next === null\) return;\s*event\.preventDefault\(\);\s*event\.stopPropagation\(\);\s*viewport\.scrollLeft = next;/);
   assert.match(styles, /\.copyableCodeBlock\s*\{[^}]*display:\s*block;[^}]*width:\s*100%;[^}]*min-width:\s*0;[^}]*max-width:\s*100%;[^}]*overflow:\s*hidden;[^}]*background:\s*var\(--code-block-surface\);[^}]*margin:\s*0;/s);
-  assert.match(styles, /\.remoteTerminal\s*\{[^}]*min-width:\s*0;[^}]*max-width:\s*100%;[^}]*overflow-x:\s*auto;[^}]*scrollbar-width:\s*none;[^}]*background:\s*transparent;[^}]*padding:\s*3px 4px 7px 12px;[^}]*font-family:\s*inherit;[^}]*font-size:\s*inherit;[^}]*font-weight:\s*400;/s);
-  assert.match(styles, /\.remoteTerminal code\s*\{[^}]*width:\s*max-content;[^}]*min-width:\s*100%;[^}]*max-width:\s*none;[^}]*font-family:\s*inherit;[^}]*font-weight:\s*400;[^}]*padding-right:\s*60px;[^}]*white-space:\s*pre;[^}]*overflow-wrap:\s*normal;[^}]*word-break:\s*normal;/s);
+  assert.match(styles, /\.remoteTerminal\s*\{[^}]*min-width:\s*0;[^}]*max-width:\s*100%;[^}]*overflow-x:\s*auto;[^}]*scrollbar-width:\s*none;[^}]*background:\s*transparent;[^}]*padding:\s*10px 14px;[^}]*font-family:\s*var\(--ew-font\);[^}]*font-size:\s*\.9em;[^}]*font-weight:\s*400;/s);
+  assert.match(styles, /\.remoteTerminal code\s*\{[^}]*width:\s*max-content;[^}]*min-width:\s*100%;[^}]*max-width:\s*none;[^}]*font-family:\s*inherit;[^}]*font-weight:\s*400;[^}]*padding-right:\s*44px;[^}]*white-space:\s*pre;[^}]*overflow-wrap:\s*normal;[^}]*word-break:\s*normal;/s);
   assert.doesNotMatch(styles, /\.remoteTerminal\s*\{[^}]*background:\s*linear-gradient/s);
   assert.doesNotMatch(styles, /\.remoteTerminal code\s*\{[^}]*font-family:\s*var\(--ew-mono\)/s);
   assert.match(styles, /\.remoteTerminal::\-webkit-scrollbar\s*\{[^}]*height:0;/s);
@@ -428,7 +428,7 @@ test("代码块使用正文排版、单色暖背景并在块内横向滚动", as
   assert.doesNotMatch(styles, /cursor:ew-resize/);
   assert.match(styles, /\.codeScrollbar::\-webkit-slider-runnable-track\s*\{[^}]*height:3px;[^}]*background:transparent;/s);
   assert.match(styles, /\.copyableCodeBlock:hover \.codeScrollbar,\.codeScrollbar:focus-visible\s*\{[^}]*opacity:1;[^}]*pointer-events:auto;/s);
-  assert.match(styles, /\.copyableCodeBlock > \.blockCopyButton\s*\{[^}]*z-index:6;[^}]*top:6px;/s);
+  assert.match(styles, /\.copyableCodeBlock > \.blockCopyButton\s*\{[^}]*z-index:6;[^}]*top:8px;[^}]*border:0;[^}]*background:transparent;/s);
 });
 
 test("Agent 调用中的操作、文件与阶段文本使用紧凑垂直节奏", async () => {
@@ -476,9 +476,10 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(timeline, /const discardedReasoningIterations = new Set<number>\(\)/);
   assert.match(timeline, /const payload = payloadRecord\(event\.payload\)[\s\S]+?payload\.discardedReasoningIterations/);
   assert.match(timeline, /if \(discardedReasoningIterations\.has\(iteration\)\) continue/);
-  assert.match(timeline, /const WEB_AGENT_PROTOCOL_TOOLS = new Set\([\s\S]+?resource_search[\s\S]+?handoff_submit/);
-  assert.match(timeline, /function webToolProtocolShape[\s\S]+?WEB_AGENT_PROTOCOL_TOOLS\.has/);
-  assert.match(timeline, /function isWorkProtocolReasoning[\s\S]+?webToolProtocolShape\(JSON\.parse\(content\)\)/);
+  const protocol = await readFile(new URL("../shared/timeline-protocol.mjs", import.meta.url), "utf8");
+  assert.match(protocol, /const WEB_AGENT_PROTOCOL_TOOLS = new Set\([\s\S]+?resource_search[\s\S]+?handoff_submit/);
+  assert.match(protocol, /function webToolProtocolShape[\s\S]+?WEB_AGENT_PROTOCOL_TOOLS\.has/);
+  assert.match(protocol, /function isWorkProtocolReasoning[\s\S]+?webToolProtocolShape\(JSON\.parse\(content\)\)/);
   assert.match(timeline, /if \(workMode && isWorkProtocolReasoning\(nextStream\)\) continue/);
   assert.match(timeline, /if \(previous\?\.type !== "reasoning"\)/);
   assert.doesNotMatch(timeline, /previous\?\.iteration !== iteration/);
@@ -949,7 +950,7 @@ test("Agent 调用活动区保留完整命令、文件与事件内容，并采�
   assert.match(styles, /\.eventSummary:hover\s*\{\s*background:transparent;/s);
   assert.match(styles, /\.eventSummary:hover \.eventCopy > strong\s*\{\s*color:var\(--ew-ink\);/s);
   assert.match(styles, /\.backgroundResult > button\s*\{[^}]*grid-template-columns:auto minmax\(0,auto\) 14px;/s);
-  assert.match(styles, /\.backgroundResult > button,\.backgroundResultStatic\s*\{[^}]*width:max-content;[^}]*align-items:baseline;/s);
+  assert.match(styles, /\.backgroundResult > button,\.backgroundResultStatic\s*\{[^}]*width:max-content;[^}]*align-items:center;/s);
   assert.match(styles, /\.backgroundResult > button:hover\s*\{[^}]*background:transparent;[^}]*color:var\(--ew-ink\);/s);
   assert.match(styles, /\.handoffHeading:hover\s*\{[^}]*background:transparent;[^}]*color:#5d5852;/s);
   assert.match(styles, /\.commandList\s*\{[^}]*margin:0 7px 3px 11px;[^}]*border-left:/s);

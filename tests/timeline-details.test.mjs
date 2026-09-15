@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import ts from "typescript";
-import { summarizeTimelineEvent, timelineReplayView, groupAgentActivity, groupBackgroundResults } from "../shared/timeline-projection.mjs";
+import { summarizeTimelineEvent, summarizeTimelinePage, TIMELINE_INLINE_PAGE_BYTES, timelineReplayView, groupAgentActivity, groupBackgroundResults } from "../shared/timeline-projection.mjs";
 import { mergeConversationEvents } from "../app/easywork/features/conversation/conversation-event-retention.mjs";
 import { RealtimeEventJournal } from "../gateway/core/realtime.mjs";
 
@@ -82,11 +82,59 @@ test("conversation background summaries retain their title and only adjacent rea
 });
 
 test("full detail upgrades a summary and a later summary cannot overwrite it", () => {
-  const full = event("e1", "reasoning", { text: "完整思考" });
+  const full = event("e1", "reasoning", { text: "完整思考".repeat(1000) });
   const summary = summarizeTimelineEvent(full);
   const hydrated = mergeConversationEvents([summary], [full]);
   assert.equal(hydrated[0], full);
   assert.equal(mergeConversationEvents(hydrated, [summary]), hydrated);
+});
+
+test("short thoughts, memory and state travel with history while large siblings remain lazy", () => {
+  const thought = event("e1", "reasoning", { text: "先核对环境，再读取文件。" });
+  assert.equal(summarizeTimelineEvent(thought), thought);
+  const webThought = { ...event("e2", "run.reasoning.delta", {}, "web-agent"), payload: { content: "已找到对应的技能。" } };
+  assert.equal(summarizeTimelineEvent(webThought), webThought);
+  const background = { ...webThought, kind: "run.context.read", payload: { input: { privateQuery: "query" }, output: { memory: [{ title: "环境", content: "使用 Python 3.12。" }, { title: "详细记录", content: "大段内容".repeat(2000) }], skills: [{ name: "测试", description: "运行测试", instructions: ["检查结果"] }] } } };
+  const summarized = summarizeTimelineEvent(background);
+  assert.equal(summarized.payload.output.memory[0].content, "使用 Python 3.12。");
+  assert.equal(summarized.payload.output.memory[0].timelineDetailInline, true);
+  assert.equal(summarized.payload.output.memory[1].content, undefined);
+  assert.equal(summarized.payload.output.skills[0].timelineDetailInline, true);
+  assert.deepEqual(summarized.payload.timelineDetailIds, [background.eventId]);
+  assert.deepEqual(summarized.payload.input, {});
+  const state = { ...webThought, kind: "run.context.state", payload: { state: { server: { name: "旧服务器", scheduler: "slurm", metadata: "large".repeat(1000) }, workspace: { path: "/previous/workspace" }, agent: { name: "Codex" } } } };
+  const projected = summarizeTimelineEvent(state);
+  assert.equal(projected.payload.timelineDetailIds, undefined);
+  assert.deepEqual(projected.payload.state, { server: { name: "旧服务器", scheduler: "slurm" }, workspace: { path: "/previous/workspace" }, agent: { name: "Codex" } });
+  assert.equal(state.payload.state.server.metadata.length, 5000);
+});
+
+test("inline limits count UTF-8 bytes and each cached replay page has its own 64 KiB budget", () => {
+  assert.ok(summarizeTimelineEvent(event("e1", "reasoning", { text: "汉".repeat(800) })).payload.timelineDetailIds);
+  const events = Array.from({ length: 90 }, (_, index) => event(`e${index + 1}`, "reasoning", { text: "汉".repeat(500) }));
+  const cache = new WeakMap();
+  const projected = summarizeTimelinePage(events, cache);
+  const inline = projected.filter(item => !item.payload.timelineDetailIds);
+  assert.ok(inline.length > 30 && inline.length < events.length);
+  assert.ok(inline.reduce((bytes, item) => bytes + Buffer.byteLength(JSON.stringify(item.payload)), 0) <= TIMELINE_INLINE_PAGE_BYTES);
+  assert.equal(projected.at(-1).payload.event.timelineHasText, true);
+  assert.deepEqual(summarizeTimelinePage(events, cache), projected);
+  assert.equal(summarizeTimelinePage(events.slice(-1), cache)[0], events.at(-1), "page-budget fallback must not poison the cached inline projection");
+});
+
+test("the gateway applies inline budgets to real paged replay and preserves full detail", async t => {
+  const dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "timeline-inline-"));
+  t.after(() => fs.rm(dataRoot, { recursive: true, force: true }));
+  const journal = new RealtimeEventJournal({ dataRoot, actor });
+  t.after(() => journal.close());
+  const events = [];
+  for (let index = 0; index < 48; index++) events.push(await journal.append("task:one", { actor, producer: "agent:codex", kind: "reasoning", payload: { event: { text: "字".repeat(600) } } }));
+  const replay = await journal.replay("task:one", { view: "summary", limit: 100 });
+  assert.ok(replay.events[0].payload.event.text.length > 0);
+  assert.ok(replay.events.at(-1).payload.timelineDetailIds.length > 0);
+  const tail = await journal.replay("task:one", { view: "summary", afterSequence: events.at(-2).sequence });
+  assert.equal(tail.events[0].payload.event.text, events.at(-1).payload.event.text);
+  assert.deepEqual((await journal.details("task:one", [events.at(-1).eventId])).events, [events.at(-1)]);
 });
 
 test("a file item hydrates every contributing patch, not just the last event", async () => {

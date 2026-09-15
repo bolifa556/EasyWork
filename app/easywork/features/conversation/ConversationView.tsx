@@ -1806,7 +1806,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
           projectId: initialProjectId ?? null,
           ...(references.length ? { references: references.map(({ conversationId: referencedConversationId }): ConversationReferenceRequest => ({ type: "conversation", conversationId: referencedConversationId })) } : {}),
         }, { expectedRevision: 0, idempotencyKey: `${submissionId}:conversation` });
-        announceConversationsChanged({ conversationId: result.data.conversation.id, kind: "created" });
+        announceConversationsChanged({ conversationId: result.data.conversation.id, kind: "created", conversation: result.data.conversation });
         try {
           const uploadedVersionIds = await uploadConversationFiles(result.data.conversation.id, resources.files, submissionId, selection);
           await api.post(`/api/conversations/${encodeURIComponent(result.data.conversation.id)}/respond`, {
@@ -1828,7 +1828,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         ...(references.length ? { references: references.map(({ conversationId: referencedConversationId }): ConversationReferenceRequest => ({ type: "conversation", conversationId: referencedConversationId })) } : {}),
       }, { expectedRevision: 0, idempotencyKey: `${submissionId}:conversation` });
       const id = result.data.conversation.id;
-      announceConversationsChanged({ conversationId: id, kind: "created" });
+      announceConversationsChanged({ conversationId: id, kind: "created", conversation: result.data.conversation });
       const branchId = result.data.branchId;
       let workspaceId = workspace;
       let resolvedPath = workspacePath ?? selectedWorkspace?.canonicalPath;

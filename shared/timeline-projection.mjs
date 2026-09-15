@@ -1,8 +1,37 @@
-// Historical timeline transport contains disclosure headings, not their bodies.
-// This is a view of the journal; native events and their full text stay durable.
+// History carries stable headings and small readable bodies. Large detail stays
+// on demand; this projection never changes the durable native journal.
+import { isWorkProtocolReasoning } from "./timeline-protocol.mjs";
 const record = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
 const preview = (value, size = 160) => String(value || "").replace(/\s+/g, " ").slice(0, size);
 const pick = (value, keys) => Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, value[key]]));
+export const TIMELINE_INLINE_ITEM_BYTES = 2 * 1024;
+export const TIMELINE_INLINE_PAGE_BYTES = 64 * 1024;
+const encoder = new TextEncoder();
+
+// Reject large native text before JSON serialization/UTF-8 allocation. This
+// bounded precheck stops at the inline limit, even for nested payloads.
+function mightFitInline(value, budget) {
+  budget.remaining -= typeof value === "string" ? value.length + 2 : 2;
+  if (budget.remaining < 0) return false;
+  if (value && typeof value === "object") {
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue;
+      budget.remaining -= key.length + 3;
+      if (budget.remaining < 0 || !mightFitInline(value[key], budget)) return false;
+    }
+  }
+  return true;
+}
+
+function inlineBudget(bytes = TIMELINE_INLINE_PAGE_BYTES) {
+  return { remaining: bytes, take(value) {
+    if (this.remaining <= 0 || !mightFitInline(value, { remaining: Math.min(this.remaining, TIMELINE_INLINE_ITEM_BYTES) })) return false;
+    const size = encoder.encode(JSON.stringify(value)).byteLength;
+    if (size > TIMELINE_INLINE_ITEM_BYTES || size > this.remaining) return false;
+    this.remaining -= size;
+    return true;
+  } };
+}
 
 function resultHeading(value) {
   const item = record(value);
@@ -15,25 +44,40 @@ export function timelineDetailIds(event) {
   return Array.isArray(event?.payload?.timelineDetailIds) ? event.payload.timelineDetailIds : [];
 }
 
-export function summarizeTimelineEvent(event) {
+export function summarizeTimelineEvent(event, budget) {
+  // Also safe as Array.map's callback (its second argument is an index).
+  if (!budget || typeof budget.take !== "function") budget = inlineBudget();
   const original = record(event.payload);
   if (timelineDetailIds(event).length) return event;
   const payload = { ...original };
   let deferred = false;
   if (event.producer === "web-agent") {
     if (event.kind === "run.reasoning.delta") {
+      if (budget.take(original)) return event;
       payload.timelineHasText = Boolean(original.content?.trim());
-      payload.timelineProtocol = /^[\s]*[\[{]/.test(original.content || "") && /handoff_submit|candidateIds|tool_calls/.test(original.content || "");
+      payload.timelineProtocol = isWorkProtocolReasoning(original.content);
       payload.content = "";
       deferred = payload.timelineHasText;
     } else if (event.kind === "run.context.state") {
-      payload.state = { timelineAvailable: true };
-      deferred = true;
+      const state = record(original.state);
+      const display = { server: pick(record(state.server), ["name", "scheduler"]), workspace: pick(record(state.workspace), ["name", "path"]), agent: pick(record(state.agent), ["name"]) };
+      const inline = budget.take(display);
+      payload.state = inline ? display : { timelineAvailable: true };
+      deferred = !inline;
     } else if (event.kind === "run.context.read") {
       payload.input = {};
-      payload.output = Object.fromEntries(Object.entries(record(original.output)).map(([kind, values]) =>
-        [kind, Array.isArray(values) ? values.map(resultHeading) : values == null ? values : resultHeading(values)]));
-      deferred = true;
+      payload.output = Object.fromEntries(Object.entries(record(original.output)).map(([kind, values]) => {
+        const project = (value) => {
+          const heading = resultHeading(value);
+          // Conversation excerpts are title-only in this UI.
+          if (kind === "conversation") { deferred = true; return heading; }
+          const body = { ...heading, ...pick(record(value), ["content", "text", "summary", "value", "description", "instructions"]), timelineDetailInline: true };
+          if (budget.take(body)) return body;
+          deferred = true;
+          return heading;
+        };
+        return [kind, Array.isArray(values) ? values.map(project) : values == null ? values : project(values)];
+      }));
     } else if (["run.handoff.ready", "run.handoff.dispatched"].includes(event.kind)) {
       for (const key of ["userMessage", "contextBrief", "displayBrief"]) if (key in payload) payload[key] = "";
       if (Array.isArray(payload.references)) payload.references = payload.references.map((ref) => ({ ...pick(record(ref), ["kind", "name", "edited"]), timelineHasDetail: Boolean(ref.detail) }));
@@ -48,8 +92,12 @@ export function summarizeTimelineEvent(event) {
   } else if (String(event.producer).startsWith("agent:") && !["message", "final", "approval_request", "approval_response", "input_request", "input_response"].includes(event.kind)) {
     const nested = record(original.event || original);
     const summary = { ...nested };
-    if (event.kind === "reasoning") summary.timelineHasText = Boolean(nested.text || nested.content);
-    for (const key of ["text", "content", "output", "result", "diff", "patch", "raw", "metadata"]) if (key in summary) summary[key] = "";
+    if (event.kind === "reasoning") {
+      if (budget.take(original)) return event;
+      const text = [nested.text, nested.content, nested.command, nested.message, nested.summary, nested.output, nested.diff, record(nested.failure).message].find(value => typeof value === "string" && value);
+      summary.timelineHasText = Boolean(String(text || "").replace(/<\/?think>/gi, "").trim());
+    }
+    for (const key of ["text", "content", "output", "result", "diff", "patch", "raw", "metadata", ...(event.kind === "reasoning" ? ["message", "summary"] : [])]) if (key in summary) summary[key] = "";
     if (nested.command) summary.command = preview(nested.command);
     if (nested.input) summary.input = Object.fromEntries(Object.entries(record(nested.input)).map(([key, value]) => [key, typeof value === "string" ? preview(value) : typeof value === "number" || typeof value === "boolean" ? value : null]));
     const fileHeading = (file) => ({ ...pick(record(file), ["path", "file", "filename", "filePath", "file_path", "kind", "type", "operation"]),
@@ -61,13 +109,30 @@ export function summarizeTimelineEvent(event) {
     else Object.assign(payload, summary);
     deferred = true;
   }
-  if (!deferred) return event;
-  payload.timelineDetailIds = [event.eventId];
+  if (deferred) payload.timelineDetailIds = [event.eventId];
+  if (Object.keys(payload).length === Object.keys(original).length && Object.keys(payload).every(key => payload[key] === original[key])) return event;
   return { ...event, payload };
 }
 
+export function summarizeTimelinePage(events, cache = new WeakMap()) {
+  let remaining = TIMELINE_INLINE_PAGE_BYTES;
+  return events.map(event => {
+    let projection = cache.get(event);
+    if (!projection) {
+      const budget = inlineBudget();
+      const summary = summarizeTimelineEvent(event, budget);
+      const bytes = TIMELINE_INLINE_PAGE_BYTES - budget.remaining;
+      projection = { summary, bytes, outline: bytes ? summarizeTimelineEvent(event, inlineBudget(0)) : summary };
+      cache.set(event, projection);
+    }
+    if (projection.bytes > remaining) return projection.outline;
+    remaining -= projection.bytes;
+    return projection.summary;
+  });
+}
+
 export function timelineReplayView(replay, view) {
-  return view === "summary" ? { ...replay, events: replay.events.map(summarizeTimelineEvent) } : replay;
+  return view === "summary" ? { ...replay, events: summarizeTimelinePage(replay.events) } : replay;
 }
 
 function conversationBackgroundTitle(value) {
