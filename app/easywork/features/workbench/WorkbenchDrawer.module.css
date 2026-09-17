@@ -100,7 +100,12 @@
 .terminalStage { position:relative; min-width:0; min-height:0; overflow:hidden; }
 .xtermHost { box-sizing:border-box; width:100%; min-width:0; height:100%; min-height:0; padding:10px 10px 8px; overflow:hidden; background:#403f37; }
 .xtermHost :global(.xterm) { height: 100%; }
-.xtermHost :global(.xterm-viewport) { overscroll-behavior: contain; scrollbar-color: rgba(232, 221, 198, .24) transparent; }
+.xtermHost :global(.xterm-viewport) { overscroll-behavior: contain; scrollbar-color:rgba(232,221,198,.24) transparent; scrollbar-width:thin; }
+.xtermHost :global(.xterm-viewport)::-webkit-scrollbar { width:8px; height:8px; background:transparent; }
+.xtermHost :global(.xterm-viewport)::-webkit-scrollbar-button { display:none; width:0; height:0; }
+.xtermHost :global(.xterm-viewport)::-webkit-scrollbar-thumb { border:2px solid transparent; border-radius:999px; background:rgba(232,221,198,.24); background-clip:padding-box; }
+.xtermHost :global(.xterm-viewport)::-webkit-scrollbar-thumb:hover { background:rgba(232,221,198,.38); background-clip:padding-box; }
+.xtermHost :global(.xterm-viewport)::-webkit-scrollbar-track,.xtermHost :global(.xterm-viewport)::-webkit-scrollbar-corner { background:transparent; }
 .terminalSearch { display: flex; width: min(250px, 32vw); min-height: 31px; align-items: center; gap: 6px; padding: 3px 5px 3px 8px; border: 1px solid rgba(232, 221, 198, .16); border-radius: 8px; background: rgba(20, 21, 18, .28); color: rgba(232, 221, 198, .65); }
 .terminalSearch input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #f1e7d0; font: 0.78rem var(--ew-mono); }
 .terminalSearch button { display: grid; width: 25px; height: 25px; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: inherit; }
@@ -110,7 +115,12 @@
 .terminalSwitcherButton:hover,
 .terminalSwitcherButton[aria-expanded="true"] { border-color: rgb(232 221 198 / 18%); background: rgb(255 255 255 / 7%); }
 .terminalSwitcherButton span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
-.terminalSwitcherMenu { position: absolute; z-index: 9; top: calc(100% + 6px); left: 0; display: grid; width: 210px; max-height: min(320px, 48dvh); gap: 2px; padding: 6px; overflow: auto; border: 1px solid rgb(232 221 198 / 13%); border-radius: 10px; background: rgb(48 49 42 / 98%); box-shadow: 0 14px 32px rgb(15 16 13 / 32%); }
+.terminalSwitcherMenu { position: absolute; z-index: 9; top: calc(100% + 6px); left: 0; display: grid; width: 210px; max-height: min(320px, 48dvh); gap: 2px; padding: 6px; overflow: auto; border: 1px solid rgb(232 221 198 / 13%); border-radius: 10px; background: rgb(48 49 42 / 98%); box-shadow: 0 14px 32px rgb(15 16 13 / 32%); scrollbar-color:rgb(232 221 198 / 24%) transparent; scrollbar-width:thin; }
+.terminalSwitcherMenu::-webkit-scrollbar { width:8px; height:8px; background:transparent; }
+.terminalSwitcherMenu::-webkit-scrollbar-button { display:none; width:0; height:0; }
+.terminalSwitcherMenu::-webkit-scrollbar-thumb { border:2px solid transparent; border-radius:999px; background:rgb(232 221 198 / 24%); background-clip:padding-box; }
+.terminalSwitcherMenu::-webkit-scrollbar-thumb:hover { background:rgb(232 221 198 / 38%); background-clip:padding-box; }
+.terminalSwitcherMenu::-webkit-scrollbar-track,.terminalSwitcherMenu::-webkit-scrollbar-corner { background:transparent; }
 .terminalSwitcherMenu > button { display: grid; width: 100%; min-height: 34px; grid-template-columns: 14px minmax(0, 1fr) auto 14px; align-items: center; gap: 7px; padding: 5px 7px; border: 0; border-radius: 7px; background: transparent; color: #e8dfc8; font: inherit; font-size: .77rem; text-align: left; cursor: pointer; }
 .terminalSwitcherMenu > button:hover { background: rgb(255 255 255 / 7%); }
 .terminalSwitcherMenu > button > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -146,6 +156,27 @@
 .submitBar input,
 .submitBar select { min-width: 0; height: 36px; padding: 6px 10px; border: 1px solid var(--ew-line-strong); border-radius: 9px; background: rgba(255, 255, 255, 0.58); color: var(--ew-ink); outline: 0; font-size: 0.82rem; }
 .schedulerScroll { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; padding: 12px 13px 20px; }
+.schedulerScroll,
+.jobTableViewport,
+.processTable {
+  scrollbar-color: rgb(99 108 98 / 28%) transparent;
+  scrollbar-width: thin;
+}
+.schedulerScroll::-webkit-scrollbar,
+.jobTableViewport::-webkit-scrollbar,
+.processTable::-webkit-scrollbar { width:8px; height:8px; background:transparent; }
+.schedulerScroll::-webkit-scrollbar-button,
+.jobTableViewport::-webkit-scrollbar-button,
+.processTable::-webkit-scrollbar-button { display:none; width:0; height:0; }
+.schedulerScroll::-webkit-scrollbar-thumb,
+.jobTableViewport::-webkit-scrollbar-thumb,
+.processTable::-webkit-scrollbar-thumb { border:2px solid transparent; border-radius:999px; background:rgb(99 108 98 / 28%); background-clip:padding-box; }
+.schedulerScroll::-webkit-scrollbar-thumb:hover,
+.jobTableViewport::-webkit-scrollbar-thumb:hover,
+.processTable::-webkit-scrollbar-thumb:hover { background:rgb(82 92 80 / 40%); background-clip:padding-box; }
+.schedulerScroll::-webkit-scrollbar-track,.schedulerScroll::-webkit-scrollbar-corner,
+.jobTableViewport::-webkit-scrollbar-track,.jobTableViewport::-webkit-scrollbar-corner,
+.processTable::-webkit-scrollbar-track,.processTable::-webkit-scrollbar-corner { background:transparent; }
 .metricGrid { display: grid; grid-template-columns: repeat(3, minmax(210px, 1fr)); gap: 9px; margin-bottom: 17px; }
 .systemMetricGrid { grid-template-columns:repeat(auto-fit,minmax(175px,1fr)); gap:8px; }
 .chartCard { min-width: 0; min-height: 148px; overflow: hidden; border: 1px solid rgba(89, 85, 70, 0.105); border-radius: 13px; background: rgba(255, 255, 255, 0.38); box-shadow: 0 4px 14px rgba(52, 49, 39, 0.025); }

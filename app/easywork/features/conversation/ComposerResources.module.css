@@ -145,7 +145,15 @@
   overflow-y: auto;
   overscroll-behavior: contain;
   padding-top: 3px;
+  scrollbar-color: rgb(99 108 98 / 28%) transparent;
+  scrollbar-width: thin;
 }
+
+.options::-webkit-scrollbar { width: 8px; height: 8px; background: transparent; }
+.options::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+.options::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: rgb(99 108 98 / 28%); background-clip: padding-box; }
+.options::-webkit-scrollbar-thumb:hover { background: rgb(82 92 80 / 40%); background-clip: padding-box; }
+.options::-webkit-scrollbar-track,.options::-webkit-scrollbar-corner { background: transparent; }
 
 .options:not(:has(> button)) { overflow-y: hidden; }
 
