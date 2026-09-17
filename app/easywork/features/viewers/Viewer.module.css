@@ -93,6 +93,15 @@
 .markdown th,
 .markdown td { padding: 8px 10px; border: 1px solid var(--ew-line); text-align: left; }
 .markdown code:not(pre code) { padding: 2px 5px; border: 1px solid rgba(86, 102, 75, 0.1); border-radius: 6px; background: rgba(82, 107, 67, 0.06); color: var(--ew-green-deep); font-family: var(--ew-mono); font-size: .86em; }
+.frontmatter { display:grid; width:100%; margin:0 0 24px; border-top:1px solid var(--ew-line); border-bottom:1px solid var(--ew-line); }
+.frontmatter:last-child { margin-bottom:0; }
+.frontmatterRow { display:grid; min-width:0; grid-template-columns:minmax(72px,max-content) minmax(0,1fr); gap:18px; padding:7px 2px; }
+.frontmatterRow + .frontmatterRow { border-top:1px solid rgb(76 78 68 / 8%); }
+.frontmatter dt { color:var(--ew-ink-muted); font-size:.76rem; font-weight:600; line-height:1.7; overflow-wrap:anywhere; }
+.frontmatter dd { min-width:0; margin:0; color:var(--ew-ink); font-size:.9rem; line-height:1.7; overflow-wrap:anywhere; white-space:pre-wrap; }
+.frontmatterInvalid { gap:6px; padding:10px 2px; color:var(--ew-ink-muted); }
+.frontmatterInvalid strong { color:#9a6a2c; font-size:.78rem; font-weight:600; }
+.frontmatterInvalid pre { margin:0; overflow:auto; color:var(--ew-ink-soft); font-family:var(--ew-mono); font-size:.78rem; line-height:1.6; white-space:pre; }
 .markdown pre:not([data-code-viewport]),
 .jobOutput {
   overflow: auto;
@@ -149,6 +158,10 @@
   .codeLine > a { padding-right:5px; font-size:11px; }
   .codeLine > span { padding-left:6px; }
   .markdown { font-size: 0.91rem; }
+  .frontmatter { margin-bottom:18px; }
+  .frontmatterRow { grid-template-columns:minmax(60px,max-content) minmax(0,1fr); gap:10px; padding:6px 0; }
+  .frontmatter dt { font-size:.72rem; }
+  .frontmatter dd { font-size:.86rem; }
   .text { font-size: 0.9rem; line-height: 1.7; }
   .markdown table { display:block; max-width:100%; overflow-x:auto; white-space:nowrap; }
   .imageWrap { padding: 14px; }
