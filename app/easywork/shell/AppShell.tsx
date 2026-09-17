@@ -29,7 +29,7 @@ import {
   SquarePen,
   Trash2,
 } from "lucide-react";
-import type { ConversationSummary, Page, ProjectSummary } from "@/app/core/contracts";
+import { GatewayError, type ConversationSummary, type Page, type ProjectSummary } from "@/app/core/contracts";
 import { commandId } from "@/app/core/gateway/client";
 import { useAppRuntime } from "../runtime/AppRuntime";
 import { announceConversationsChanged, subscribeConversationsChanged, type ConversationsChangedDetail } from "../runtime/cacheEvents";
@@ -180,7 +180,7 @@ export function AppShell() {
   useMobileMenuAnchor(menu?.trigger, menuRef);
   const [conversationRename, setConversationRename] = useState<ConversationRename | null>(null);
   const [conversationPendingDelete, setConversationPendingDelete] = useState<ConversationSummary | null>(null);
-  const [deletingConversation, setDeletingConversation] = useState(false);
+  const conversationDeletesInFlight = useRef(new Set<string>());
   const [projectRename, setProjectRename] = useState<ProjectRename | null>(null);
   const [projectPendingDelete, setProjectPendingDelete] = useState<PendingProjectDelete | null>(null);
   const [deletingProject, setDeletingProject] = useState<ProjectDeleteChoice | null>(null);
@@ -332,6 +332,7 @@ export function AppShell() {
     let active = true;
     const unsubscribe = subscribeConversationsChanged(change => {
       updateConversationRows(change);
+      if (change.optimistic) return;
       if (change.kind === "renamed" && (change.title || change.conversation)) return;
       if (!change.conversation && change.kind !== "deleted") {
         void api.get<{ summary: ConversationSummary }>(`/api/conversations/${encodeURIComponent(change.conversationId)}`).then(result => {
@@ -768,27 +769,39 @@ export function AppShell() {
     } finally { renameInFlight.current = false; }
   };
 
-  const deleteConversation = async () => {
+  const deleteConversation = () => {
     const item = conversationPendingDelete;
-    if (!item || deletingConversation) return;
-    setDeletingConversation(true);
-    try {
-      // The title worker may advance the conversation revision after the
-      // sidebar item was rendered. Resolve the latest revision at commit time
-      // so an automatic title does not turn a user-confirmed delete into a
-      // stale-revision failure.
-      const latest = await runtime.api.get<{ summary: { revision: number } }>(`/api/conversations/${encodeURIComponent(item.id)}`);
-      await runtime.api.delete(`/api/conversations/${encodeURIComponent(item.id)}`, {
-        expectedRevision: latest.data.summary.revision,
-        idempotencyKey: commandId("conversation-delete"),
-      });
-      setConversationPendingDelete(null);
-      await runtime.refreshBootstrap();
-      announceConversationsChanged({ conversationId: item.id, kind: "deleted" });
-      if (runtime.view.kind === "conversation" && runtime.view.conversationId === item.id) runtime.navigate({ kind: "home" }, { replace: true });
-      runtime.notify("对话已删除", "success");
-    } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "对话删除失败", "error"); }
-    finally { setDeletingConversation(false); }
+    if (!item || conversationDeletesInFlight.current.has(item.id)) return;
+    conversationDeletesInFlight.current.add(item.id);
+    const deletionCommandId = commandId("conversation-delete");
+
+    // Complete the visible interaction synchronously. The durable delete and
+    // its heavier cleanup continue in the background.
+    setConversationPendingDelete(null);
+    announceConversationsChanged({ conversationId: item.id, kind: "deleted", optimistic: true });
+    if (runtime.view.kind === "conversation" && runtime.view.conversationId === item.id) runtime.navigate({ kind: "home" }, { replace: true });
+    runtime.notify("对话已删除", "success");
+
+    void (async () => {
+      let restoreConversation = item;
+      try {
+        // The title worker may advance the conversation revision after the
+        // sidebar item was rendered. Resolve the latest revision at commit
+        // time so an automatic title cannot make this delete stale.
+        const latest = await runtime.api.get<{ summary: ConversationSummary }>(`/api/conversations/${encodeURIComponent(item.id)}`);
+        restoreConversation = latest.data.summary;
+        await runtime.api.delete(`/api/conversations/${encodeURIComponent(item.id)}`, {
+          expectedRevision: latest.data.summary.revision,
+          idempotencyKey: deletionCommandId,
+        });
+      } catch (reason) {
+        if (reason instanceof GatewayError && reason.code === "CONVERSATION_NOT_FOUND") return;
+        announceConversationsChanged({ conversationId: item.id, kind: "created", conversation: restoreConversation, optimistic: true });
+        runtime.notify(reason instanceof Error ? `对话删除失败，已恢复：${reason.message}` : "对话删除失败，已恢复", "error");
+      } finally {
+        conversationDeletesInFlight.current.delete(item.id);
+      }
+    })();
   };
 
   const renameProject = async () => {
@@ -1021,7 +1034,7 @@ export function AppShell() {
       {accountOpen ? <AccountDialog onClose={() => setAccountOpen(false)} /> : null}
       {projectDialog ? <Modal title="新建项目" size="compact" onClose={() => setProjectDialog(null)}><form className={styles.projectDialog} autoComplete="off" onSubmit={(event) => { event.preventDefault(); void createProject(); }}><label><span>项目名称</span><input autoFocus name="easywork-project-name" autoComplete="off" value={projectName} placeholder="输入项目名称" onChange={(event) => setProjectName(event.target.value)} /></label><fieldset><legend>记忆范围</legend><button type="button" className={projectMemoryMode === "project-only" ? styles.selectedMemory : ""} onClick={() => setProjectMemoryMode("project-only")}><strong>仅项目内</strong><span>只使用该项目中的对话和文件</span></button><button type="button" className={projectMemoryMode === "global" ? styles.selectedMemory : ""} onClick={() => setProjectMemoryMode("global")}><strong>全局记忆</strong><span>也可以使用账号的全局记忆</span></button></fieldset><footer><Button type="button" onClick={() => setProjectDialog(null)}>取消</Button><Button type="submit" variant="primary" disabled={!projectName.trim() || creatingProject}>{creatingProject ? "创建中" : "创建"}</Button></footer></form></Modal> : null}
       {projectRename ? <Modal title="重命名项目" size="compact" onClose={() => { if (!projectRename.saving) setProjectRename(null); }}><form className={styles.renameDialog} onSubmit={(event) => { event.preventDefault(); void renameProject(); }}><label><span>项目名称</span><input autoFocus value={projectRename.value} onChange={(event) => setProjectRename((current) => current ? { ...current, value: event.target.value } : current)} /></label><footer><Button type="button" disabled={projectRename.saving} onClick={() => setProjectRename(null)}>取消</Button><Button type="submit" variant="primary" disabled={projectRename.saving || !projectRename.value.trim() || projectRename.value.trim() === projectRename.item.name}>{projectRename.saving ? "保存中" : "保存"}</Button></footer></form></Modal> : null}
-      {conversationPendingDelete ? <Modal title="删除对话？" size="compact" onClose={() => { if (!deletingConversation) setConversationPendingDelete(null); }}><div className={styles.deleteDialog}><p>“{conversationPendingDelete.title}”将从聊天记录中删除，此操作无法撤销。</p><footer><Button disabled={deletingConversation} onClick={() => setConversationPendingDelete(null)}>取消</Button><Button variant="danger" disabled={deletingConversation} icon={deletingConversation ? <LoaderCircle className={styles.spin} size={15} /> : <Trash2 size={15} />} onClick={() => void deleteConversation()}>{deletingConversation ? "正在删除" : "删除"}</Button></footer></div></Modal> : null}
+      {conversationPendingDelete ? <Modal title="删除对话？" size="compact" onClose={() => setConversationPendingDelete(null)}><div className={styles.deleteDialog}><p>“{conversationPendingDelete.title}”将从聊天记录中删除，此操作无法撤销。</p><footer><Button onClick={() => setConversationPendingDelete(null)}>取消</Button><Button variant="danger" icon={<Trash2 size={15} />} onClick={deleteConversation}>删除</Button></footer></div></Modal> : null}
       {projectPendingDelete ? <Modal title="删除项目？" size="compact" onClose={() => { if (!deletingProject) setProjectPendingDelete(null); }}>
         <div className={`${styles.deleteDialog} ${styles.projectDeleteDialog}`}>
           <p className={styles.projectDeleteLead}><strong>“{projectPendingDelete.item.name}”</strong>{projectPendingDelete.item.conversationCount > 0 ? `中有 ${projectPendingDelete.item.conversationCount} 个对话，请选择如何处理。` : "中还没有对话。"} 删除项目后无法恢复。</p>

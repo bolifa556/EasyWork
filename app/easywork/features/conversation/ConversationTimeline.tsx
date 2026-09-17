@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { BookOpen, Bot, Box, Brain, Check, ChevronRight, CircleStop, Code2, Copy, Database, Download, File, FileArchive, FileAudio, FileCode2, FileImage, FileSpreadsheet, FileText, FileType2, FileVideo, Gauge, GitBranch, HardDriveDownload, LoaderCircle, MessageCircle, Network, Package, Presentation, Send, ShieldCheck, Square, Terminal, Wrench, X } from "lucide-react";
 import type { ArtifactSummary, RealtimeEnvelope, TaskSummary } from "@/app/core/contracts";
 import { useAppRuntime } from "../../runtime/AppRuntime";
@@ -13,6 +13,7 @@ import { isWorkProtocolReasoning } from "@/shared/timeline-protocol.mjs";
 import { TimelineDetails, TimelineDetailStatus, timelineIntentIds, useTimelineDetails, useTimelineIntent } from "./TimelineDetails";
 import { DisclosureMotion } from "./DisclosureMotion";
 import { markdownFence, markdownLabel, splitRemoteFinalPresentation } from "./conversation-copy.mjs";
+import { hasTimelineDisclosureChoice, readTimelineDisclosure, writeTimelineDisclosure } from "./timeline-disclosure-memory.mjs";
 import styles from "./ConversationTimeline.module.css";
 
 type OutputSegment = { id: string; runId: string | null; content: string; target: "final" | "activity" | "handoff" | null; committed: boolean; first: RealtimeEnvelope };
@@ -253,14 +254,14 @@ function handoffReferences(output: unknown, skillDetails: ReadonlyMap<string, st
   });
 }
 
-function BackgroundResult({ result, index }: { result: BackgroundResultItem; index: number }) {
-  const [open, setOpen] = useState(false);
-  const state = useTimelineDetails(payloadRecord(result.value).timelineDetailInline === true ? [] : result.detailIds, open);
+function BackgroundResult({ result, index, disclosureId }: { result: BackgroundResultItem; index: number; disclosureId: string }) {
   const semanticText = semanticResultText(result.source, result.value);
   const expandable = Boolean(semanticText || payloadRecord(result.value).timelineHasDetail);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, expandable);
+  const state = useTimelineDetails(payloadRecord(result.value).timelineDetailInline === true ? [] : result.detailIds, open);
   const title = resultTitle(result.source, result.value, index);
   return <div className={`${styles.backgroundResult} ${open ? styles.backgroundResultOpen : ""}`}>
-    {expandable ? <button {...state.intent} type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+    {expandable ? <button {...state.intent} type="button" onClick={toggleOpen} aria-expanded={open}>
       <small>{sourceLabel(result.source)}</small><span>{title}</span><ChevronRight size={12} />
     </button> : <div className={styles.backgroundResultStatic}><small>{sourceLabel(result.source)}</small><span>{title}</span></div>}
     <DisclosureMotion open={open} ready={state.ready} className={styles.backgroundResultMotion}><div><div className={styles.backgroundResultDetail}>
@@ -275,8 +276,8 @@ function BackgroundConversation({ group }: { group: Extract<BackgroundDisplayIte
   </div>;
 }
 
-function BackgroundTrace({ reads }: { reads: BackgroundRead[] }) {
-  const [open, setOpen] = useState(false);
+function BackgroundTrace({ reads, disclosureId }: { reads: BackgroundRead[]; disclosureId: string }) {
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true);
   const intent = useTimelineIntent(reads.flatMap(read => read.detailIds), open);
   const results: BackgroundResultItem[] = reads.flatMap((item) => backgroundItems(item.output).map((result) => ({
     ...result, id: `${item.id}:${result.id}`, detailIds: item.detailIds,
@@ -284,18 +285,18 @@ function BackgroundTrace({ reads }: { reads: BackgroundRead[] }) {
   const displayItems = groupBackgroundResults(results) as BackgroundDisplayItem[];
   if (!results.length) return null;
   return <div className={`${styles.backgroundTrace} ${open ? styles.backgroundTraceOpen : ""}`}>
-    <button {...intent} className={styles.backgroundHeading} type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+    <button {...intent} className={styles.backgroundHeading} type="button" aria-expanded={open} onClick={toggleOpen}>
       <span data-ui-icon="" className={styles.backgroundGlyph}><BookOpen size={15} /></span>
       <span className={styles.backgroundLabel}>已查阅背景</span><ChevronRight className={styles.backgroundChevron} size={13} />
     </button>
     <DisclosureMotion open={open} className={styles.backgroundMotion}><div>{displayItems.map((item) => item.type === "conversation"
       ? <BackgroundConversation key={item.id} group={item} />
-      : <BackgroundResult key={item.id} result={item.result} index={item.index} />)}</div></DisclosureMotion>
+      : <BackgroundResult key={item.id} result={item.result} index={item.index} disclosureId={`${disclosureId}:result:${item.id}`} />)}</div></DisclosureMotion>
   </div>;
 }
 
-function CurrentStateTrace({ state, detailIds }: { state: Record<string, unknown>; detailIds: string[] }) {
-  const [open, setOpen] = useState(false);
+function CurrentStateTrace({ state, detailIds, disclosureId }: { state: Record<string, unknown>; detailIds: string[]; disclosureId: string }) {
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true);
   const detailState = useTimelineDetails(detailIds, open);
   const server = payloadRecord(state.server);
   const workspace = payloadRecord(state.workspace);
@@ -313,7 +314,7 @@ function CurrentStateTrace({ state, detailIds }: { state: Record<string, unknown
   ].filter((entry) => entry.value);
   if (!values.length && !detailIds.length) return null;
   return <div className={`${styles.backgroundTrace} ${open ? styles.backgroundTraceOpen : ""}`}>
-    <button {...detailState.intent} className={styles.backgroundHeading} type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+    <button {...detailState.intent} className={styles.backgroundHeading} type="button" aria-expanded={open} onClick={toggleOpen}>
       <span data-ui-icon="" className={styles.backgroundGlyph}><Network size={15} /></span>
       <span className={styles.backgroundLabel}>已查阅当前状态</span>
       <ChevronRight className={styles.backgroundChevron} size={13} />
@@ -496,6 +497,15 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
     : null;
   const terminal = handoffTerminal ?? persisted ?? formalTerminal;
   const running = Boolean(started && !terminal);
+  const finalOutputStarted = webEvents.some((event) => {
+    if (!["run.output.delta", "run.output.committed"].includes(event.kind)) return false;
+    const payload = payloadRecord(event.payload);
+    return payload.target === "final" && String(payload.content || "").length > 0;
+  });
+  // A run may remain active while its final answer is streaming. That is a
+  // request lifecycle state, not an indication that the model is still in its
+  // thinking phase.
+  const thinking = running && !handoff && !finalOutputStarted;
   const elapsedMs = started && terminal ? Math.max(0, Date.parse(terminal.occurredAt) - Date.parse(started.occurredAt)) : 0;
   const visibleEntries = entries.filter((entry) => (
     entry.type === "background"
@@ -513,6 +523,8 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
     handoff,
     started: Boolean(started),
     running,
+    thinking,
+    finalOutputStarted,
     elapsedMs,
     aborted: !persisted && formalTerminal?.kind === "run.aborted",
     abortReason: rawAbortReason.trim() === "请求已停止" ? "" : rawAbortReason,
@@ -520,8 +532,8 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
   };
 }
 
-function ReasoningTrace({ entry, running, disclosureId }: { entry: ReasoningEntry; running: boolean; disclosureId: string }) {
-  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, running, true);
+function ReasoningTrace({ entry, disclosureId }: { entry: ReasoningEntry; disclosureId: string }) {
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true);
   const detailState = useTimelineDetails(entry.detailIds, open);
   const content = entry.text.replace(/\n(?:[ \t]*\n){2,}/g, "\n\n").trim();
   return <section className={`${styles.reasoningTrace} ${open ? styles.reasoningTraceOpen : ""}`}>
@@ -539,30 +551,30 @@ function WebThought({ events, handoff = null }: { events: RealtimeEnvelope[]; ha
   const terminalReason = trace.failure || trace.abortReason;
   const hasBody = trace.entries.length > 0 || Boolean(handoff);
   const disclosureId = `web:${trace.conversationId}:${trace.runId}`;
-  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, trace.running, hasBody);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, hasBody, trace.thinking);
   const intent = useTimelineIntent(timelineIntentIds(events), open);
   if (!trace.started && !terminalReason) return null;
-  const label = trace.running ? "正在思考" : trace.failure ? "处理失败" : trace.aborted ? "思考已停止" : "思考完成";
-  return <section className={`${styles.webThought} ${open ? styles.webThoughtOpen : ""} ${trace.running ? styles.webThoughtRunning : ""}`}>
+  const label = trace.thinking ? "正在思考" : trace.failure ? "处理失败" : trace.aborted ? "思考已停止" : "思考完成";
+  return <section className={`${styles.webThought} ${open ? styles.webThoughtOpen : ""} ${trace.thinking ? styles.webThoughtRunning : ""}`}>
     <button {...intent} type="button" className={styles.webThoughtHeading} disabled={!hasBody} aria-expanded={hasBody ? open : undefined} onClick={() => hasBody && toggleOpen()}>
-      <span data-ui-icon="" className={styles.webThoughtGlyph}>{trace.running ? <LoaderCircle size={17} /> : trace.failure ? <X size={17} /> : trace.aborted ? <Square size={17} /> : <Brain size={17} />}</span>
+      <span data-ui-icon="" className={styles.webThoughtGlyph}>{trace.thinking ? <LoaderCircle size={17} /> : trace.failure ? <X size={17} /> : trace.aborted ? <Square size={17} /> : <Brain size={17} />}</span>
       <span className={styles.activityHeadingLabel}>{label}</span>
       {hasBody ? <ChevronRight className={styles.webThoughtChevron} size={13} /> : null}
     </button>
     <DisclosureMotion open={hasBody && open} className={styles.webThoughtMotion}><div><div className={styles.webThoughtBody}>
       {trace.entries.map((entry) => entry.type === "reasoning"
-        ? <ReasoningTrace key={entry.id} entry={entry} running={trace.running} disclosureId={`${disclosureId}:reasoning:${entry.id}`} />
+        ? <ReasoningTrace key={entry.id} entry={entry} disclosureId={`${disclosureId}:reasoning:${entry.id}`} />
         : entry.type === "background"
-          ? <BackgroundTrace key={entry.id} reads={entry.reads} />
-          : <CurrentStateTrace key={entry.id} state={entry.state} detailIds={entry.detailIds} />)}
-      {handoff ? <WorkHandoff handoff={handoff} /> : null}
+          ? <BackgroundTrace key={entry.id} reads={entry.reads} disclosureId={`${disclosureId}:${entry.id}`} />
+          : <CurrentStateTrace key={entry.id} state={entry.state} detailIds={entry.detailIds} disclosureId={`${disclosureId}:${entry.id}`} />)}
+      {handoff ? <WorkHandoff handoff={handoff} disclosureId={`${disclosureId}:handoff`} /> : null}
     </div></div></DisclosureMotion>
     {terminalReason ? <div className={styles.runFailure} role="alert">{terminalReason}</div> : null}
   </section>;
 }
 
-function WorkHandoff({ handoff }: { handoff: Handoff }) {
-  const [open, setOpen] = useState(false);
+function WorkHandoff({ handoff, disclosureId }: { handoff: Handoff; disclosureId: string }) {
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true);
   const detailState = useTimelineDetails(handoff.detailIds, open);
   const referenceGroups = useMemo(() => {
     const groups = new Map<string, HandoffReference[]>();
@@ -571,35 +583,35 @@ function WorkHandoff({ handoff }: { handoff: Handoff }) {
   }, [handoff.references]);
   if (!handoff.detailIds.length && !handoff.userMessage && !handoff.contextBrief && !handoff.references.length) return null;
   return <section className={`${styles.handoff} ${open ? styles.handoffOpen : ""}`}>
-    <button {...detailState.intent} type="button" className={styles.handoffHeading} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+    <button {...detailState.intent} type="button" className={styles.handoffHeading} aria-expanded={open} onClick={toggleOpen}>
       <span data-ui-icon="" className={styles.handoffGlyph}><Send size={15} /></span><span className={styles.handoffLabel}>发给远端 Agent</span><ChevronRight className={styles.handoffChevron} size={13} />
     </button>
     <DisclosureMotion open={open} ready={detailState.ready} className={styles.handoffMotion}><div><div className={styles.handoffRail}><div className={styles.handoffBody}>
       <TimelineDetailStatus state={detailState} />
       {handoff.userMessage ? <p>{handoff.userMessage}</p> : null}
       {handoff.contextBrief ? <p>{handoff.contextBrief}</p> : null}
-      {referenceGroups.map((group) => <HandoffReferenceGroup key={group.kind} kind={group.kind} references={group.references} />)}
+      {referenceGroups.map((group) => <HandoffReferenceGroup key={group.kind} kind={group.kind} references={group.references} disclosureId={`${disclosureId}:group:${group.kind}`} />)}
     </div></div></div></DisclosureMotion>
   </section>;
 }
 
-function HandoffReferenceGroup({ kind, references }: { kind: string; references: HandoffReference[] }) {
-  const [open, setOpen] = useState(false);
-  if (kind.toLocaleLowerCase() === "skill") return <>{references.map((reference) => <HandoffDetailReference key={`${reference.kind}:${reference.name}`} reference={reference} />)}</>;
-  if (references.length === 1) return <HandoffDetailReference reference={references[0]} />;
+function HandoffReferenceGroup({ kind, references, disclosureId }: { kind: string; references: HandoffReference[]; disclosureId: string }) {
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true);
+  if (kind.toLocaleLowerCase() === "skill") return <>{references.map((reference) => <HandoffDetailReference key={`${reference.kind}:${reference.name}`} reference={reference} disclosureId={`${disclosureId}:reference:${reference.kind}:${reference.name}`} />)}</>;
+  if (references.length === 1) return <HandoffDetailReference reference={references[0]} disclosureId={`${disclosureId}:reference:${references[0].kind}:${references[0].name}`} />;
   return <section className={`${styles.handoffReferenceGroup} ${open ? styles.handoffReferenceGroupOpen : ""}`}>
-    <button type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+    <button type="button" aria-expanded={open} onClick={toggleOpen}>
       <span>{kind}</span><strong>{references.length} 项</strong><ChevronRight size={13} />
     </button>
-    <DisclosureMotion open={open} className={styles.handoffReferenceMotion}><div>{references.map((reference) => <HandoffDetailReference key={`${reference.kind}:${reference.name}`} reference={{ ...reference, kind: "" }} />)}</div></DisclosureMotion>
+    <DisclosureMotion open={open} className={styles.handoffReferenceMotion}><div>{references.map((reference) => <HandoffDetailReference key={`${reference.kind}:${reference.name}`} reference={{ ...reference, kind: "" }} disclosureId={`${disclosureId}:reference:${reference.kind}:${reference.name}`} />)}</div></DisclosureMotion>
   </section>;
 }
 
-function HandoffDetailReference({ reference }: { reference: HandoffReference }) {
-  const [open, setOpen] = useState(false);
+function HandoffDetailReference({ reference, disclosureId }: { reference: HandoffReference; disclosureId: string }) {
   const expandable = Boolean(reference.detail?.trim());
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, expandable);
   return <section className={`${styles.handoffSkillReference} ${open ? styles.handoffSkillReferenceOpen : ""}`}>
-    {expandable ? <button type="button" className={styles.handoffSkillHeading} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+    {expandable ? <button type="button" className={styles.handoffSkillHeading} aria-expanded={open} onClick={toggleOpen}>
       <span className={styles.handoffReferenceKind}>{reference.kind}</span><strong>{reference.name}</strong>{reference.edited ? <em className={styles.handoffEdited}>本轮整理</em> : null}<ChevronRight size={13} />
     </button> : <div className={styles.handoffReference}>
       <span className={styles.handoffReferenceKind}>{reference.kind}</span><strong>{reference.name}</strong>{reference.edited ? <em className={styles.handoffEdited}>本轮整理</em> : null}
@@ -1062,12 +1074,12 @@ function EmbeddedApproval({ event, taskId, taskStatus, onApproval }: { event: Re
 }
 
 function CommandItem({ event, taskId, taskStatus, onApproval }: { event: RealtimeEnvelope; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
-  const [open, setOpen] = useState(event.status === "waiting");
+  const [open, toggleOpen] = useTimelineDisclosure(`command:${taskId || "unknown"}:${event.eventId}`, true);
   const detailState = useTimelineDetails(timelineDetailIds(event), open);
   const tool = useMemo(() => toolParts(event, open), [event, open]);
   const cancelled = ["cancelled", "interrupted"].includes(String(event.status));
   return <article className={`${styles.commandItem} ${open ? styles.itemOpen : ""} ${isRunningEvent(event) ? styles.running : ""} ${event.status === "failed" ? styles.error : ""} ${cancelled ? styles.cancelled : ""}`}>
-    <button {...detailState.intent} type="button" className={styles.commandSummary} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+    <button {...detailState.intent} type="button" className={styles.commandSummary} aria-expanded={open} onClick={toggleOpen}>
       <span className={styles.commandStatus}>{event.status === "failed" ? <X size={12} /> : ["cancelled", "interrupted"].includes(String(event.status)) ? <Square size={8} /> : tool.shell ? <Terminal size={12} /> : <Wrench size={12} />}</span>
       <span className={styles.operationKind}>{tool.label}</span><code>{tool.summary}</code><small>{eventStatusLabel(event.status)}</small><ChevronRight className={styles.itemChevron} size={13} />
     </button>
@@ -1122,16 +1134,15 @@ function operationEntries(events: RealtimeEnvelope[]) {
   return entries;
 }
 
-function OperationGroup({ events, taskId, taskStatus, onApproval }: { events: RealtimeEnvelope[]; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
+function OperationGroup({ events, disclosureId, taskId, taskStatus, onApproval }: { events: RealtimeEnvelope[]; disclosureId: string; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
   const entries = useMemo(() => operationEntries(events), [events]);
   const waiting = events.some((event) => event.status === "waiting");
   const running = events.some(isRunningEvent);
-  const failed = events.some((event) => event.status === "failed");
   const cancelled = events.every((event) => ["cancelled", "interrupted"].includes(String(event.status)));
-  const [open, setOpen] = useState(waiting);
-  return <section className={`${styles.activityGroup} ${open ? styles.groupOpen : ""} ${running ? styles.running : ""} ${failed ? styles.error : ""}`}>
-    <button type="button" className={`${styles.groupHeading} ${styles.commandGroupHeading}`} aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span data-ui-icon="" className={styles.groupGlyph}>{failed ? <X size={13} /> : <Wrench size={14} />}</span>
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true, waiting || running);
+  return <section className={`${styles.activityGroup} ${open ? styles.groupOpen : ""} ${running ? styles.running : ""}`}>
+    <button type="button" className={`${styles.groupHeading} ${styles.commandGroupHeading}`} aria-expanded={open} onClick={toggleOpen}>
+      <span data-ui-icon="" className={styles.groupGlyph}><Wrench size={14} /></span>
       <strong>{waiting ? `等待执行 ${entries.length} 个操作` : running ? `正在执行 ${entries.length} 个操作` : cancelled ? `已取消 ${entries.length} 个操作` : `执行了 ${entries.length} 个操作`}</strong>
       <ChevronRight className={styles.groupChevron} size={13} />
     </button>
@@ -1182,14 +1193,14 @@ function mergedFileEntries(events: RealtimeEnvelope[]) {
 }
 
 function FileItem({ file, taskId, taskStatus, onApproval }: { file: FileEntry; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
-  const [open, setOpen] = useState(false);
+  const [open, toggleOpen] = useTimelineDisclosure(`file:${taskId || "unknown"}:${file.id}`, true);
   const detailState = useTimelineDetails(timelineDetailIds(file.event), open);
   const name = file.path?.split(/[\\/]/).filter(Boolean).at(-1) || "未命名文件";
   const running = ["started", "updated", "running"].includes(String(file.status));
   const cancelled = ["cancelled", "interrupted"].includes(String(file.status));
   const reading = file.operation === "read";
   return <article className={`${styles.fileItem} ${open ? styles.itemOpen : ""} ${running ? styles.running : ""} ${file.status === "failed" ? styles.error : ""} ${cancelled ? styles.cancelled : ""}`}>
-    <button {...detailState.intent} type="button" className={styles.fileSummary} aria-expanded={open} onClick={() => setOpen((value) => !value)}><span className={styles.fileStatus}>{file.status === "failed" ? <X size={12} /> : cancelled ? <Square size={8} /> : <FileText size={13} />}</span><span className={styles.operationKind}>{reading ? "读取文件" : "编辑文件"}</span><span className={styles.fileCopy}><strong>{name}</strong>{file.path ? <small>{file.path}</small> : null}</span><ChevronRight className={styles.itemChevron} size={13} /></button>
+    <button {...detailState.intent} type="button" className={styles.fileSummary} aria-expanded={open} onClick={toggleOpen}><span className={styles.fileStatus}>{file.status === "failed" ? <X size={12} /> : cancelled ? <Square size={8} /> : <FileText size={13} />}</span><span className={styles.operationKind}>{reading ? "读取文件" : "编辑文件"}</span><span className={styles.fileCopy}><strong>{name}</strong>{file.path ? <small>{file.path}</small> : null}</span><ChevronRight className={styles.itemChevron} size={13} /></button>
     <DisclosureMotion open={open} ready={detailState.ready} className={styles.itemMotion}><div><div className={styles.fileDetail}><TimelineDetailStatus state={detailState} />{detailState.loading ? null : file.diff ? <DiffView content={file.diff} /> : file.output ? <><CopyButton content={file.output} label={reading ? "复制文件内容" : "复制文件修改内容"} /><pre className={styles.fileRaw}>{file.output}</pre></> : <p className={styles.fileEmpty}>{reading ? "Agent 未返回可显示的文件内容。" : "Agent 未返回可显示的差异内容。"}</p>}<EmbeddedApproval event={file.event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} /></div></div></DisclosureMotion>
   </article>;
 }
@@ -1408,13 +1419,13 @@ export function ConversationAnswer({ content, events = [], artifacts = [], artif
 
 function EventRow({ event, taskId, taskStatus, onApproval }: { event: RealtimeEnvelope; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
   const record = payloadRecord(nestedPayload(event));
-  const [open, setOpen] = useState(event.kind === "approval_request" && event.status === "waiting");
-  const text = !open ? "" : event.kind === "approval_request"
-    ? approvalRequestText(record)
-    : textFrom(record) || (event.kind !== "command" && Object.keys(record).length ? safeJson(record) : "");
   const detail = event.kind === "approval_request" ? "" : eventDetailLabel(event, record);
   const secondary = detail || (event.kind !== "approval_request" && event.producer.startsWith("agent:") ? event.producer.slice(6) : "");
   const expandable = Boolean(timelineDetailIds(event).length || textFrom(record) || Object.keys(record).length);
+  const [open, toggleOpen] = useTimelineDisclosure(`event:${taskId || "unknown"}:${event.eventId}`, expandable);
+  const text = !open ? "" : event.kind === "approval_request"
+    ? approvalRequestText(record)
+    : textFrom(record) || (event.kind !== "command" && Object.keys(record).length ? safeJson(record) : "");
   const detailState = useTimelineDetails(timelineDetailIds(event), open);
   const [responding, setResponding] = useState<ApprovalDecision | null>(null);
   const [submitted, setSubmitted] = useState<{ requestId: string; decision: ApprovalDecision } | null>(null);
@@ -1430,7 +1441,7 @@ function EventRow({ event, taskId, taskStatus, onApproval }: { event: RealtimeEn
     finally { setResponding(null); }
   };
   return <article className={`${styles.agentEvent} ${styles[`kind_${event.kind}`] || ""} ${open ? styles.itemOpen : ""} ${isRunningEvent(event) ? styles.running : ""} ${event.status === "failed" || event.kind === "error" ? styles.error : ""}`}>
-    <button {...detailState.intent} type="button" className={styles.eventSummary} aria-expanded={expandable ? open : undefined} onClick={() => expandable && setOpen((value) => !value)}><span data-ui-icon="" className={styles.eventGlyph}>{eventIcon(event)}</span><span className={styles.eventCopy}><strong>{eventLabel(event)}</strong>{secondary ? <small>{secondary}</small> : null}</span><span className={styles.eventStatus}>{event.kind === "approval_request" && event.status === "waiting" ? "等待操作" : eventStatusLabel(event.status)}</span>{expandable ? <ChevronRight className={styles.itemChevron} size={13} /> : <span />}</button>
+    <button {...detailState.intent} type="button" className={styles.eventSummary} aria-expanded={expandable ? open : undefined} onClick={() => expandable && toggleOpen()}><span data-ui-icon="" className={styles.eventGlyph}>{eventIcon(event)}</span><span className={styles.eventCopy}><strong>{eventLabel(event)}</strong>{secondary ? <small>{secondary}</small> : null}</span><span className={styles.eventStatus}>{event.kind === "approval_request" && event.status === "waiting" ? "等待操作" : eventStatusLabel(event.status)}</span>{expandable ? <ChevronRight className={styles.itemChevron} size={13} /> : <span />}</button>
     <DisclosureMotion open={expandable && open} ready={detailState.ready} className={styles.itemMotion}><div><div className={styles.eventDetail}><TimelineDetailStatus state={detailState} />{text && !detailState.loading ? <div className={styles.eventOutput}><MarkdownContent content={text} compact activity /></div> : null}{approvalPending ? <div className={styles.approvalActions}><button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve")}>{responding === "approve" ? <LoaderCircle className={styles.spin} size={13} /> : null}允许一次</button>{record.allowSession !== false ? <button type="button" disabled={Boolean(responding)} onClick={() => void respond("approve_session")}>{responding === "approve_session" ? <LoaderCircle className={styles.spin} size={13} /> : null}本会话允许</button> : null}<button type="button" className={styles.rejectApproval} disabled={Boolean(responding)} onClick={() => void respond("reject")}>{responding === "reject" ? <LoaderCircle className={styles.spin} size={13} /> : null}拒绝</button></div> : null}{approvalError ? <small className={styles.approvalError}>{approvalError}</small> : null}</div></div></DisclosureMotion>
   </article>;
 }
@@ -1575,50 +1586,18 @@ function settledEvents(events: RealtimeEnvelope[], status: string) {
   });
 }
 
-const TIMELINE_DISCLOSURE_PREFIX = "easywork.timeline-disclosure:v1:";
-
-function storedTimelineDisclosure(identity: string) {
-  if (typeof window === "undefined" || !identity) return false;
-  try { return localStorage.getItem(`${TIMELINE_DISCLOSURE_PREFIX}${identity}`) === "open"; }
-  catch { return false; }
-}
-
-function writeTimelineDisclosure(identity: string, open: boolean) {
-  if (typeof window === "undefined" || !identity) return;
-  try {
-    const key = `${TIMELINE_DISCLOSURE_PREFIX}${identity}`;
-    if (open) localStorage.setItem(key, "open");
-    else localStorage.removeItem(key);
-  } catch { /* browser storage is an enhancement; in-memory state still works */ }
-}
-
-function useTimelineDisclosure(identity: string, running: boolean, expandable: boolean) {
-  const [choice, setChoice] = useState(() => ({
-    identity,
-    running,
-    expandable,
-    open: Boolean(expandable && (running || storedTimelineDisclosure(identity))),
-  }));
-  const samePhase = choice.identity === identity && choice.running === running && choice.expandable === expandable;
-  const justFinished = choice.identity === identity && choice.running && !running;
-  const open = expandable && (samePhase
-    ? choice.open
-    : justFinished
-      ? false
-      : running || storedTimelineDisclosure(identity));
-  useEffect(() => {
-    if (samePhase) return;
-    if (justFinished) writeTimelineDisclosure(identity, false);
-    let cancelled = false;
-    queueMicrotask(() => {
-      if (!cancelled) setChoice({ identity, running, expandable, open });
-    });
-    return () => { cancelled = true; };
-  }, [identity, running, expandable, open, samePhase, justFinished]);
+function useTimelineDisclosure(identity: string, expandable: boolean, updating = false) {
+  // Until the user touches a disclosure, its open state is derived directly
+  // from the live phase. This fixes the layout on the first render and avoids
+  // a follow-up effect that would visibly move content. Page-scoped choices
+  // become authoritative after a click and survive conversation switches.
+  const [, forceRender] = useState(0);
+  const remembered = hasTimelineDisclosureChoice(identity) ? readTimelineDisclosure(identity) : null;
+  const open = Boolean(expandable && (remembered ?? updating));
   const toggleOpen = () => {
     const next = expandable ? !open : false;
-    if (!running) writeTimelineDisclosure(identity, next);
-    setChoice({ identity, running, expandable, open: next });
+    writeTimelineDisclosure(identity, next);
+    forceRender((revision) => revision + 1);
   };
   return [open, toggleOpen] as const;
 }
@@ -1656,7 +1635,7 @@ function AgentReasoning({ event }: { event: RealtimeEnvelope }) {
 }
 
 function AgentActivityItem({ segment, taskId, status, onApproval, onInput }: { segment: ActivitySegment; taskId?: string; status: string; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
-  if (segment.type === "operations") return <OperationGroup events={segment.events} taskId={taskId} taskStatus={status} onApproval={onApproval} />;
+  if (segment.type === "operations") return <OperationGroup events={segment.events} disclosureId={`operation:${taskId || "unknown"}:${segment.id}`} taskId={taskId} taskStatus={status} onApproval={onApproval} />;
   const event = segment.event;
   if (event.kind === "input_request") return <AgentInputRequest event={event} taskId={taskId} taskStatus={status} onInput={onInput} />;
   if (event.kind === "reasoning") return <AgentReasoning event={event} />;
@@ -1665,8 +1644,9 @@ function AgentActivityItem({ segment, taskId, status, onApproval, onInput }: { s
 }
 
 function AgentThinking({ segments, id, running, taskId, status, onApproval, onInput }: { segments: ActivitySegment[]; id: string; running: boolean; taskId?: string; status: string; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
-  const [open, toggleOpen] = useTimelineDisclosure(`remote-thinking:${taskId}:${id}`, running, true);
-  const intent = useTimelineIntent(timelineIntentIds(segments.flatMap(segment => segment.type === "event" ? [segment.event] : segment.events)), open);
+  const activityEvents = segments.flatMap((segment) => segment.type === "event" ? [segment.event] : segment.events);
+  const [open, toggleOpen] = useTimelineDisclosure(`remote-thinking:${taskId}:${id}`, true, running);
+  const intent = useTimelineIntent(timelineIntentIds(activityEvents), open);
   return <section className={styles.agentThinking}>
     <button {...intent} className={styles.reasoningHeading} type="button" aria-expanded={open} onClick={toggleOpen}>
       <span data-ui-icon="" className={styles.reasoningGlyph}><Brain size={15} /></span>
@@ -1687,7 +1667,7 @@ function AgentCallContents({ events, status, taskId, finalTextHint, running, onA
     : <AgentActivityItem key={group.id} segment={group} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</>;
 }
 
-function AgentCall({ events, status, task, taskId, finalTextHint = "", failure = null, detailsLoading = false, onApproval, onInput }: { events: RealtimeEnvelope[]; status: string; task?: TaskSummary; taskId?: string; finalTextHint?: string; failure?: { code: string; message: string } | null; detailsLoading?: boolean; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+function AgentCall({ events, status, task, taskId, finalTextHint = "", failure = null, detailsLoading = false, collapseWhen = false, onApproval, onInput }: { events: RealtimeEnvelope[]; status: string; task?: TaskSummary; taskId?: string; finalTextHint?: string; failure?: { code: string; message: string } | null; detailsLoading?: boolean; collapseWhen?: boolean; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
   const finalActivities = useMemo(() => [...new Set(events
     .filter((event) => event.kind === "final")
     .map((event) => splitRemoteFinalPresentation(textFrom(nestedPayload(event))).activity)
@@ -1701,15 +1681,14 @@ function AgentCall({ events, status, task, taskId, finalTextHint = "", failure =
   const stageDetail = taskPreparationDetail(status);
   const hasDetails = detailsLoading || hasActivity || Boolean(stageDetail);
   const running = !TERMINAL_TASK_STATUSES.has(status);
-  // Disclosure auto-open/auto-close follows the authoritative Task snapshot,
-  // not a partially hydrated event page.  Otherwise historical status pages
-  // can momentarily look live during reload and erase the user's saved choice.
+  // The authoritative Task snapshot still gates live loading while timeline
+  // events are hydrating; disclosure choices are remembered independently.
   const disclosureRunning = Boolean(task && !TERMINAL_TASK_STATUSES.has(task.status) && running);
   const failed = status === "failed";
   const interrupted = ["interrupted", "cancelled"].includes(status);
   const conversationId = String(events[0]?.ids.conversationId || task?.conversationId || "unknown");
   const disclosureId = `agent:${conversationId}:${taskId || "unknown"}`;
-  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, disclosureRunning, hasDetails);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, hasDetails, running && !collapseWhen);
   const intent = useTimelineIntent(timelineIntentIds(events), open);
   if (failed) return <AgentFailureNotice message={agentFailureMessage(events, task, failure)} />;
   return <section className={`${styles.agentCall} ${open ? styles.agentCallOpen : ""} ${running ? styles.agentCallRunning : ""} ${interrupted ? styles.agentCallInterrupted : ""} ${hasDetails ? "" : styles.agentCallNoDetails}`}>
@@ -1825,6 +1804,9 @@ function HydratedConversationTimeline({ events, mode = "chat", taskIdHint = "", 
   } : null;
   const webTerminalStatus = terminalWebTaskStatus(events, remoteTaskId);
   const status = remoteTaskStatus(remoteAll, taskById, remoteTaskId, settledTaskIds, webTerminalStatus);
+  const finalBodyStarted = webTrace.finalOutputStarted || Boolean(finalTextHint.trim()) || remoteAll.some((event) => (
+    event.kind === "final" && Boolean(splitRemoteFinalPresentation(textFrom(nestedPayload(event))).body.trim())
+  ));
   // Input preparation can fail before `run.started` is durably emitted (for
   // example, while validating a restored workspace binding).  The terminal
   // event is still the complete webpage-Agent trace for that turn and must be
@@ -1844,7 +1826,7 @@ function HydratedConversationTimeline({ events, mode = "chat", taskIdHint = "", 
   if (!showThought && !remoteTaskId) return null;
   return <section className={styles.workflow} aria-label="Agent 活动">
     {showThought ? <WebThought events={events} handoff={showHandoff ? webTrace.handoff : null} /> : null}
-    {mode === "work" && remoteTaskId ? <AgentCall key={remoteTaskId} events={remoteAll} status={status} task={taskById[remoteTaskId]} taskId={remoteTaskId} finalTextHint={finalTextHint} detailsLoading={loading} onApproval={onApproval} onInput={onInput} /> : null}
+    {mode === "work" && remoteTaskId ? <AgentCall key={remoteTaskId} events={remoteAll} status={status} task={taskById[remoteTaskId]} taskId={remoteTaskId} finalTextHint={finalTextHint} detailsLoading={loading} collapseWhen={finalBodyStarted} onApproval={onApproval} onInput={onInput} /> : null}
     {mode === "work" && launchFailure ? <AgentCall key={launchFailureEvent!.eventId} events={[]} status="failed" taskId={`launch:${String(launchFailureEvent!.ids.runId || launchFailureEvent!.eventId)}`} failure={launchFailure} /> : null}
   </section>;
 }
@@ -1860,7 +1842,7 @@ export function conversationTimelineMarkdown({ events, mode = "chat", taskIdHint
   const trace = buildWebTrace(events);
   const directAppend = isDirectRemoteAppendTimeline(events);
   if (!directAppend && (trace.started || trace.entries.length || trace.handoff || trace.failure || trace.abortReason)) {
-    heading(trace.running ? "正在思考" : trace.failure ? "处理失败" : trace.aborted ? "思考已停止" : "思考完成", 3);
+    heading(trace.thinking ? "正在思考" : trace.failure ? "处理失败" : trace.aborted ? "思考已停止" : "思考完成", 3);
     for (const entry of trace.entries) {
       if (entry.type === "reasoning") {
         heading("思考内容");

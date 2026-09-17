@@ -90,4 +90,6 @@ test("a later automatic title preserves earlier creation or move metadata for ol
   assert.equal(mergeConversationListChange(renamed, moved), renamed);
   const deleted = { conversationId: "a", kind: "deleted" };
   assert.equal(mergeConversationListChange(deleted, moved), deleted);
+  const restored = { conversationId: "a", kind: "created", conversation: row("a", "new-project", { revision: 3 }) };
+  assert.equal(mergeConversationListChange(deleted, restored), restored, "failed optimistic deletion can restore the row");
 });

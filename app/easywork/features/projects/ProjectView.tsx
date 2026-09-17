@@ -6,6 +6,7 @@ import { uploadResource } from "@/app/core/gateway/resource-upload";
 import { deleteResourceBindings } from "@/app/core/gateway/resource-delete";
 import { useAppRuntime } from "@/app/easywork/runtime/AppRuntime";
 import { subscribeConversationsChanged } from "@/app/easywork/runtime/cacheEvents";
+import { applyConversationListChange } from "@/app/easywork/runtime/conversation-list";
 import ProjectPage from "./ProjectPage";
 import type { ProjectFile } from "./types";
 
@@ -179,7 +180,14 @@ export default function ProjectView({ projectId }: ProjectViewProps) {
 
   useEffect(() => {
     let controller: AbortController | undefined;
-    const unsubscribe = subscribeConversationsChanged(() => {
+    const unsubscribe = subscribeConversationsChanged((change) => {
+      if (change.optimistic) {
+        setConversations((current) => applyConversationListChange(current, change, projectId));
+        return;
+      }
+      if (change.kind === "deleted") {
+        setConversations((current) => current.filter((conversation) => conversation.id !== change.conversationId));
+      }
       controller?.abort();
       controller = new AbortController();
       const signal = controller.signal;

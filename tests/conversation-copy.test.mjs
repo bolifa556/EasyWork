@@ -57,6 +57,20 @@ test("web history and full detail agree on visible protocol and prose headings",
   assert.equal(outline(full).filter(([type]) => type === "reasoning").length, 1);
 });
 
+test("final prose ends the thinking phase before the overall chat run settles", () => {
+  const started = event(1, "run.started", { mode: "chat" }, "web-agent");
+  const reasoning = event(2, "run.reasoning.delta", { iteration: 0, content: "先分析问题" }, "web-agent");
+  const beforeAnswer = buildWebTrace([started, reasoning]);
+  assert.equal(beforeAnswer.running, true);
+  assert.equal(beforeAnswer.thinking, true);
+
+  const finalDelta = event(3, "run.output.delta", { segmentId: "answer", target: "final", content: "正文开始", realtimeStreamKey: "output:answer" }, "web-agent");
+  const answering = buildWebTrace([started, reasoning, finalDelta]);
+  assert.equal(answering.running, true, "正文流式输出时整轮请求仍可运行");
+  assert.equal(answering.thinking, false, "正文开始后思考阶段已经完成");
+  assert.equal(answering.finalOutputStarted, true);
+});
+
 test("re-projecting web thoughts never grows the original deferred-ID lists", () => {
   const full = [event(1, "run.started", { mode: "work" }, "web-agent"),
     event(2, "run.reasoning.delta", { iteration: 1, content: "第一段思考".repeat(1000) }, "web-agent"),

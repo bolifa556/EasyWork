@@ -44,8 +44,8 @@ import { LoadingState } from "../../ui/LoadingState";
 import { Modal } from "../../ui/Modal";
 import { WebContextRing } from "../../ui/ProgressRing";
 import { WebContextDialog } from "./WebContextDialog";
-import { AgentConfigDialog } from "./AgentConfigDialog";
 import { copyAgentConfigurationCache, mergeCachedAgentConfigurations, writeAgentConfigurationCache, type AgentConfiguration } from "./agent-configuration-cache";
+import { AgentConfigDialog } from "./AgentConfigDialog";
 import { ConversationObjectPanel } from "./ConversationObjectPanel";
 import { AgentControl } from "./AgentControl";
 import { ConversationConnectionDialog } from "./ConversationConnectionDialog";
@@ -70,6 +70,7 @@ type BranchedConversationResult = {
 };
 type WebModelSelection = { providerId: string; modelId: string };
 type ConversationReferenceRequest = { type: "conversation"; conversationId: string };
+type SentConversationMessage = { conversation: ConversationSummary; messageId: string; branchId: string; message: ConversationMessage };
 type ConversationRoute = { serverId: string; agentId: string; workspaceId: string; workspacePath?: string };
 type ConversationServerBinding = { conversationId: string; serverId: string | null; connectionEnabled?: boolean };
 type WorkspaceRouteSnapshot = {
@@ -81,7 +82,14 @@ type WorkspaceSwitchDescriptor = {
   id: string;
   routeRevision: number;
   requiresConfirmation: boolean;
-  effects: { switchesNativeAgentSession: boolean; preservesWebConversationMemory: boolean; reusesNativeAgentSession: boolean; contextDelivery: string };
+  effects: {
+    switchesNativeAgentSession: boolean;
+    preservesNativeAgentSession: boolean;
+    changesNativeWorkspace: boolean;
+    preservesWebConversationMemory: boolean;
+    reusesNativeAgentSession: boolean;
+    contextDelivery: string;
+  };
 };
 type RemoteDirectorySnapshot = { home: string; path: string; parent: string | null; directories: Array<{ name: string; path: string }> };
 type ApprovalDecision = "approve" | "approve_session" | "reject";
@@ -222,7 +230,7 @@ const SERVER_SETUP_PERSISTED_TTL_MS = 30 * 24 * 60 * 60_000;
 const SERVER_SETUP_STORAGE_PREFIX = "easywork.server-setup:";
 const WORK_DRAFT_STORAGE_PREFIX = "easywork.work-draft:";
 const PENDING_SERVER_BINDING_PREFIX = "easywork.pending-server-binding:";
-const AGENT_LABELS: Record<string, string> = { opencode: "OpenCode", codex: "Codex", "claude-code": "Claude Code" };
+const AGENT_LABELS: Record<string, string> = { opencode: "OpenCode", codex: "Codex", "claude-code": "Claude Code", "qoder-cn": "Qoder CN" };
 
 function initialWorkbenchHeight() {
   if (typeof window === "undefined") return 520;
@@ -439,7 +447,7 @@ function composerMention(value: string) {
   return match ? { start: match.index + match[1].length, query: match[2].trim() } : null;
 }
 
-function Composer({ conversationId, referenceMode, draftKey, disabled, placeholder, activeTask, pendingWebRun = false, interruptFailure, canInterrupt, onInterrupt, onSend }: { conversationId?: string; referenceMode: Mode; draftKey: string; disabled?: boolean; placeholder: string; activeTask?: TaskSummary; pendingWebRun?: boolean; interruptFailure?: { eventId: string; occurredAt: string; message: string } | null; canInterrupt?: boolean; onInterrupt?: () => Promise<void>; onSend: (value: string, resources: ComposerResourceSelection, selection: WebModelSelection, references: ConversationReferenceSelection[], submissionId: string) => Promise<void> }) {
+function Composer({ conversationId, referenceMode, draftKey, disabled, placeholder, activeTask, pendingWebRun = false, interruptFailure, canInterrupt, onInterrupt, onSend }: { conversationId?: string; referenceMode: Mode; draftKey: string; disabled?: boolean; placeholder: string; activeTask?: TaskSummary; pendingWebRun?: boolean; interruptFailure?: { eventId: string; occurredAt: string; message: string } | null; canInterrupt?: boolean; onInterrupt?: () => Promise<void>; onSend: (value: string, resources: ComposerResourceSelection, selection: WebModelSelection, references: ConversationReferenceSelection[], submissionId: string, onAccepted: () => void) => Promise<void> }) {
   const runtime = useAppRuntime();
   const storageKey = `easywork.composer-draft:${runtime.bootstrap?.actor.id ?? "unresolved"}:${draftKey}`;
   const referenceStorageKey = `${storageKey}:references`;
@@ -554,6 +562,7 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
     if (!submissionId) submissionId = commandId("composer-submit");
     sessionStorage.setItem(submissionStorageKey, JSON.stringify({ signature, submissionId }));
     let cleared = false;
+    let accepted = false;
     setBusy(true);
     try {
       const chosenProviderId = providerId ?? selectedProvider?.id;
@@ -568,18 +577,22 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
       setExpanded(false);
       setMultiline(false);
       cleared = true;
-      await onSend(prompt, pendingResources, { providerId: chosenProviderId, modelId }, pendingReferences, submissionId);
+      await onSend(prompt, pendingResources, { providerId: chosenProviderId, modelId }, pendingReferences, submissionId, () => {
+        accepted = true;
+        sessionStorage.removeItem(submissionStorageKey);
+      });
       sessionStorage.removeItem(submissionStorageKey);
       await refreshContextUsage();
     } catch (reason) {
-      if (cleared) {
+      if (cleared && !accepted) {
         setValue(prompt);
         setResources(pendingResources);
         setReferences(pendingReferences);
         setExpanded(previousExpanded);
         setMultiline(previousMultiline);
       }
-      runtime.notify(reason instanceof Error ? reason.message : "消息发送失败", "error");
+      const message = reason instanceof Error ? reason.message : "消息发送失败";
+      runtime.notify(accepted ? `消息已发送，但回复启动失败：${message}` : message, "error");
     } finally { setBusy(false); }
   };
   useEffect(() => {
@@ -871,9 +884,11 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     : []);
   const [workspaceOptions, setWorkspaceOptions] = useState<WorkspaceSummary[]>(initialServerCache?.workspaces ?? []);
   const [installingAgent, setInstallingAgent] = useState<string | null>(null);
-  const [agentConfigAgentId, setAgentConfigAgentId] = useState<string | null>(null);
+  const [loggingInAgent, setLoggingInAgent] = useState<string | null>(null);
+  const loginAttempt = useRef(0);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
   const [manualAgentOpen, setManualAgentOpen] = useState(false);
+  const [agentConfigAgentId, setAgentConfigAgentId] = useState<string | null>(null);
   const [boundServerId, setBoundServerId] = useState<string | null>(conversationId ? initialRoute.serverId ?? null : null);
   const [conversationConnectionEnabled, setConversationConnectionEnabled] = useState(true);
   const [serverBindingLoading, setServerBindingLoading] = useState(Boolean(conversationId && !initialRoute.serverId));
@@ -933,7 +948,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       ...agent,
       configuration,
       model: String(configuration.values.model || "").trim() || agent.model || null,
-      configured: Boolean(agent.installed && agent.status === "ready" && (String(configuration.values.model || "").trim() || agent.model)),
+      configured: agent.agentId === "qoder-cn"
+        ? Boolean(agent.installed && agent.status === "ready" && agent.authentication?.authenticated)
+        : Boolean(agent.installed && agent.status === "ready" && (String(configuration.values.model || "").trim() || agent.model)),
     };
   }), [agentOptions, latestEffortConfiguration]);
 
@@ -1024,21 +1041,23 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     ? workspace
     : taskRoutedWorkspaceId ?? workspace;
   const selectedAgent = effectiveAgentOptions.find((agent) => agent.agentId === routedAgentId);
+  const agentConfigAgent = effectiveAgentOptions.find((agent) => agent.agentId === agentConfigAgentId);
   const selectedWorkspace = workspaceOptions.find((item) => item.id === routedWorkspaceId);
   const selectedBindingTask = useMemo(() => {
-    if (activeTask?.route?.agentId === routedAgentId && activeTask?.route?.workspaceId === routedWorkspaceId) return activeTask;
+    if (activeTask?.route?.agentId === routedAgentId) return activeTask;
     const candidates = Object.values(tasks)
-      .filter((task) => task.route?.agentId === routedAgentId && task.route?.workspaceId === routedWorkspaceId)
+      .filter((task) => task.route?.agentId === routedAgentId)
       .sort((left, right) => (right.startedAt || right.updatedAt).localeCompare(left.startedAt || left.updatedAt));
     // A Task that failed during version/workspace preparation has a calculated
     // binding ID but no native Agent session. Prefer the newest Task that
     // actually started so reopening the menu reads the durable prior session.
+    // Bindings remain stable when the same native session changes workspace.
     return candidates.find((task) => task.startedAt && task.agentBindingId) ?? candidates[0] ?? null;
-  }, [activeTask, routedAgentId, routedWorkspaceId, tasks]);
+  }, [activeTask, routedAgentId, tasks]);
   const bindingIdsByAgent = useMemo(() => {
     const result: Record<string, string> = {};
     const ordered = Object.values(tasks)
-      .filter((task) => task.agentBindingId && task.route?.agentId && task.route?.workspaceId === routedWorkspaceId)
+      .filter((task) => task.agentBindingId && task.route?.agentId)
       .sort((left, right) => {
         const leftRank = !["completed", "failed", "cancelled", "interrupted"].includes(left.status) ? 2 : left.startedAt ? 1 : 0;
         const rightRank = !["completed", "failed", "cancelled", "interrupted"].includes(right.status) ? 2 : right.startedAt ? 1 : 0;
@@ -1049,7 +1068,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       if (taskAgentId && task.agentBindingId && !result[taskAgentId]) result[taskAgentId] = task.agentBindingId;
     }
     return result;
-  }, [routedWorkspaceId, tasks]);
+  }, [tasks]);
   const selectedAgentBindingId = selectedBindingTask?.agentBindingId ?? null;
   // Status/SSE revisions can change many times during one task. Context usage
   // only needs a refresh when a binding appears or the task reaches a terminal
@@ -1099,6 +1118,8 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       && routedWorkspaceId
       && workspacesAvailable,
   );
+
+  useEffect(() => () => { loginAttempt.current += 1; }, []);
 
   useEffect(() => {
     const current = runtime.workspaceSidebar;
@@ -1399,7 +1420,6 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return realtime.subscribe(`conversation:${conversationId}`, (event, { initialReplay }) => {
       mergeEvents([event]);
       if (initialReplay) return;
-      if (event.kind === "run.handoff.dispatched") setAgentConfigAgentId(null);
       if (event.kind === "run.persisted" || event.kind === "message.created") {
         announceConversationsChanged({ conversationId, kind: "updated" });
         void reload().catch((reason) => notify(reason instanceof Error ? reason.message : "对话刷新失败", "error"));
@@ -1497,10 +1517,14 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       const connectionGeneration = Number(selectedServer?.connectionGeneration || 0);
       const connected = selectedServer?.status === "connected";
       const cacheFresh = Boolean(cached && cached.connectionGeneration === connectionGeneration);
+      const cachedAgents = cached
+        ? mergeCachedAgentConfigurations(cached.agents, actorId, serverId, configScope)
+        : [];
+      const cachedWorkspaces = cached?.workspaces ?? [];
       if (cached) {
         setServerCapabilities(cached.capabilities);
-        setAgentOptions(mergeCachedAgentConfigurations(cached.agents, actorId, serverId, configScope));
-        setWorkspaceOptions(cached.workspaces);
+        setAgentOptions(cachedAgents);
+        setWorkspaceOptions(cachedWorkspaces);
         setSetupLoading(false);
       } else {
         setSetupLoading(connected);
@@ -1516,10 +1540,10 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         return;
       }
       if (cacheFresh && setupRetryRevision === 0) return;
-      const readSetup = async <T,>(path: string, label: string) => {
+      const readSetup = async <T,>(path: string, label: string, timeoutMs = 6_000) => {
         const controller = new AbortController();
         setupRequests.add(controller);
-        const timeout = window.setTimeout(() => controller.abort(), 6_000);
+        const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
         try {
           return await api.get<T>(path, controller.signal);
         } catch (reason) {
@@ -1538,7 +1562,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
           setServerCapabilities(profile);
           const [agentResult, workspaceResult] = await Promise.allSettled([
             profile.features.agents.available && profile.features.agents.inspect
-              ? readSetup<{ items: AgentSummary[] }>(`/api/servers/${encodeURIComponent(serverId)}/agents?configScope=${encodeURIComponent(configScope)}&cached=1`, "Agent 列表读取")
+              ? readSetup<{ items: AgentSummary[] }>(`/api/servers/${encodeURIComponent(serverId)}/agents?configScope=${encodeURIComponent(configScope)}&cached=1`, "Agent 列表读取", 30_000)
               : Promise.resolve(null),
             profile.features.workspaces.available
               ? readSetup<{ revision: number; workspaces: WorkspaceSummary[] }>(`/api/servers/${encodeURIComponent(serverId)}/workspaces`, "工作区列表读取")
@@ -1548,14 +1572,14 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
           const nextAgents = mergeCachedAgentConfigurations(
             agentResult.status === "fulfilled" && agentResult.value && Array.isArray(agentResult.value.data.items)
               ? agentResult.value.data.items
-              : [],
+              : cachedAgents,
             actorId,
             serverId,
             configScope,
           );
           const nextWorkspaces = workspaceResult.status === "fulfilled" && workspaceResult.value && Array.isArray(workspaceResult.value.data.workspaces)
             ? workspaceResult.value.data.workspaces
-            : [];
+            : cachedWorkspaces;
           setAgentOptions(nextAgents);
           setWorkspaceOptions(nextWorkspaces);
           setCapabilityError(null);
@@ -1777,7 +1801,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
 
   const appendConversationMessage = async (content: string, idempotencyKey: string, references: ConversationReferenceSelection[] = []) => {
     if (!conversationId) throw new Error("对话尚未创建");
-    const append = (expectedRevision: number) => runtime.api.post<{ conversation: ConversationSummary; messageId: string }>(
+    const append = (expectedRevision: number) => runtime.api.post<SentConversationMessage>(
       `/api/conversations/${conversationId}/messages`,
       {
         content,
@@ -1797,15 +1821,16 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     }
   };
 
-  const send = async (content: string, resources: ComposerResourceSelection, selection: WebModelSelection, references: ConversationReferenceSelection[], submissionId: string) => {
+  const send = async (content: string, resources: ComposerResourceSelection, selection: WebModelSelection, references: ConversationReferenceSelection[], submissionId: string, onAccepted: () => void) => {
     if (!conversationId) {
       if (mode === "chat") {
-        const result = await api.post<{ conversation: ConversationSummary; messageId: string }>("/api/conversations", {
+        const result = await api.post<SentConversationMessage>("/api/conversations", {
           content,
           mode,
           projectId: initialProjectId ?? null,
           ...(references.length ? { references: references.map(({ conversationId: referencedConversationId }): ConversationReferenceRequest => ({ type: "conversation", conversationId: referencedConversationId })) } : {}),
         }, { expectedRevision: 0, idempotencyKey: `${submissionId}:conversation` });
+        onAccepted();
         announceConversationsChanged({ conversationId: result.data.conversation.id, kind: "created", conversation: result.data.conversation });
         try {
           const uploadedVersionIds = await uploadConversationFiles(result.data.conversation.id, resources.files, submissionId, selection);
@@ -1816,17 +1841,18 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         } catch (reason) {
           notify(reason instanceof Error ? reason.message : "消息资源处理失败", "error");
         }
-        await refreshBootstrap();
+        void refreshBootstrap().catch(() => undefined);
         runtime.navigate({ kind: "conversation", conversationId: result.data.conversation.id }, { replace: true });
         return;
       }
       if (!serverId || !agentId || !workspace || selectedServer?.status !== "connected") throw new Error("请先完成远程服务器、Agent 和工作区设置");
-      const result = await api.post<{ conversation: ConversationSummary; messageId: string; branchId: string }>("/api/conversations", {
+      const result = await api.post<SentConversationMessage>("/api/conversations", {
         content,
         mode,
         projectId: initialProjectId ?? null,
         ...(references.length ? { references: references.map(({ conversationId: referencedConversationId }): ConversationReferenceRequest => ({ type: "conversation", conversationId: referencedConversationId })) } : {}),
       }, { expectedRevision: 0, idempotencyKey: `${submissionId}:conversation` });
+      onAccepted();
       const id = result.data.conversation.id;
       announceConversationsChanged({ conversationId: id, kind: "created", conversation: result.data.conversation });
       const branchId = result.data.branchId;
@@ -1915,12 +1941,19 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         directRemoteTaskId: activeTask.id,
       }, resources, selection);
       const sent = await appendConversationMessage(content, `${submissionId}:message-append`, references);
+      onAccepted();
+      setMessages((currentMessages) => {
+        if (currentMessages.some((message) => message.id === sent.data.message.id)) return currentMessages;
+        const nextMessages = [...currentMessages, sent.data.message];
+        messagesRef.current = nextMessages;
+        return nextMessages;
+      });
       announceConversationsChanged({ conversationId, kind: "updated" });
       await runtime.api.post(`/api/conversations/${conversationId}/respond`, {
         messageId: sent.data.messageId,
         ...response,
       }, { idempotencyKey: `${submissionId}:respond-append` });
-      await reload();
+      void reload().catch((reason) => notify(reason instanceof Error ? reason.message : "对话刷新失败", "error"));
       return;
     }
     // Validate the complete response route before persisting the user message.
@@ -1928,11 +1961,18 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     // that looks permanently active but has no Web Agent run behind it.
     const response = responseDescriptor(undefined, resources, selection);
     const sent = await appendConversationMessage(content, `${submissionId}:message`, references);
+    onAccepted();
+    setMessages((currentMessages) => {
+      if (currentMessages.some((message) => message.id === sent.data.message.id)) return currentMessages;
+      const nextMessages = [...currentMessages, sent.data.message];
+      messagesRef.current = nextMessages;
+      return nextMessages;
+    });
     announceConversationsChanged({ conversationId, kind: "updated" });
     const uploadedVersionIds = await uploadConversationFiles(conversationId, resources.files, submissionId, selection);
     if (uploadedVersionIds.length) response.scope.selectedResourceVersions = uploadedVersionIds;
     await runtime.api.post(`/api/conversations/${conversationId}/respond`, { messageId: sent.data.messageId, ...response }, { idempotencyKey: `${submissionId}:respond` });
-    await reload();
+    void reload().catch((reason) => notify(reason instanceof Error ? reason.message : "对话刷新失败", "error"));
   };
 
   const interrupt = async () => {
@@ -2157,11 +2197,6 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       // immediately instead of silently returning until a full page reload.
       const body = { conversationId, branchId, workspaceId: currentWorkspaceId, agentId: nextAgentId, contextEpoch: 0 };
       const described = await api.post<WorkspaceSwitchDescriptor>(`/api/servers/${encodeURIComponent(serverId)}/workspace-switch/describe`, body);
-      if (described.data.requiresConfirmation) {
-        setSwitchingWorkspace(false);
-        if (!await requestRouteSwitchConfirmation("agent")) return;
-        setSwitchingWorkspace(true);
-      }
       await api.post(`/api/servers/${encodeURIComponent(serverId)}/workspace-switch`, {
         ...body,
         descriptorId: described.data.id,
@@ -2212,6 +2247,53 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     if (!serverId) return;
     const result = await api.get<{ items: AgentSummary[] }>(`/api/servers/${encodeURIComponent(serverId)}/agents?configScope=${encodeURIComponent(configScope)}&cached=1`);
     storeAgentOptions(result.data.items);
+  };
+
+  const loginAgent = async (targetAgentId: string) => {
+    if (!serverId || loggingInAgent) return;
+    const popup = window.open("about:blank", "_blank");
+    if (!popup) {
+      notify("浏览器阻止了 Qoder 登录页，请允许此站点打开新标签页后重试", "error");
+      return;
+    }
+    const attempt = ++loginAttempt.current;
+    let navigated = false;
+    setLoggingInAgent(targetAgentId);
+    try {
+      popup.document.title = "正在打开 Qoder CN 登录";
+      popup.document.body.textContent = "正在打开 Qoder CN 登录页面…";
+      const result = await api.post<{ authenticated: boolean; status: string; url: string | null }>(`/api/servers/${encodeURIComponent(serverId)}/agents/${encodeURIComponent(targetAgentId)}/login`, {}, { idempotencyKey: commandId("agent-login") });
+      if (result.data.authenticated) {
+        popup.close();
+        await refreshAgents();
+        notify("Qoder CN 已登录", "success");
+        return;
+      }
+      const url = String(result.data.url || "");
+      if (!/^https?:\/\//i.test(url)) throw new Error("Qoder CN 未返回有效的网页登录地址");
+      popup.opener = null;
+      popup.location.replace(url);
+      navigated = true;
+      for (let index = 0; index < 180 && loginAttempt.current === attempt; index += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+        if (loginAttempt.current !== attempt) return;
+        try {
+          const status = await api.get<{ authenticated: boolean }>(`/api/servers/${encodeURIComponent(serverId)}/agents/${encodeURIComponent(targetAgentId)}/auth`);
+          if (!status.data.authenticated) continue;
+          await refreshAgents();
+          notify("Qoder CN 登录成功", "success");
+          return;
+        } catch {
+          // Login polling is best effort; the native CLI remains authoritative.
+        }
+      }
+      if (loginAttempt.current === attempt) notify("尚未检测到 Qoder CN 登录，可完成网页授权后重新打开 Agent 菜单", "info");
+    } catch (reason) {
+      if (!navigated && !popup.closed) popup.close();
+      notify(reason instanceof Error ? reason.message : "Qoder CN 登录未启动", "error");
+    } finally {
+      if (loginAttempt.current === attempt) setLoggingInAgent(null);
+    }
   };
 
   const latestUser = [...messages].reverse().find((message) => message.role === "user")?.id;
@@ -2325,10 +2407,13 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   }, [loading, searchTargetAvailable, searchTargetMessageId]);
 
   const panelLabel = initialPanel?.kind === "file" ? "文件" : initialPanel?.kind === "task" ? "任务" : initialPanel?.kind === "artifact" ? "文件" : "变更";
-  const taskInputAvailable = !pendingWorkHandoff && (!activeTask
+  const selectedAgentAuthenticated = selectedAgent?.authentication?.required !== true || selectedAgent.authentication.authenticated;
+  const taskInputAvailable = selectedAgentAuthenticated && !pendingWorkHandoff && (!activeTask
     || (activeTask.status === "running" && agentOperationAvailable(selectedAgent, "append")));
   const taskPlaceholder = pendingWorkHandoff
     ? "正在思考…"
+    : !selectedAgentAuthenticated
+    ? "请先登录 Qoder CN"
     : activeTask?.status === "running" && !agentOperationAvailable(selectedAgent, "append")
     ? "当前 Agent 不支持运行中追加"
     : "继续当前工作";
@@ -2408,10 +2493,13 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
             disabled={Boolean(activeTask) || pendingWorkHandoff}
             canConfigure={Boolean(serverCapabilities?.features.agents.configure)}
             installingAgentId={installingAgent}
+            loggingInAgentId={loggingInAgent}
+            onBeforeSelect={() => requestRouteSwitchConfirmation("agent")}
             onSelect={switchAgent}
             onInstall={installAgent}
-            onManualAdd={() => setManualAgentOpen(true)}
+            onLogin={loginAgent}
             onConfigure={(agent) => setAgentConfigAgentId(agent.agentId)}
+            onManualAdd={() => setManualAgentOpen(true)}
             onAgentsChanged={refreshAgents}
             triggerLabel={!selectedAgent && routedAgentId ? AGENT_LABELS[routedAgentId] ?? routedAgentId : undefined}
             loading={setupLoading && !selectedAgent}
@@ -2425,7 +2513,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       {conversationId && initialPanel ? <div className={styles.mainTabs}><button onClick={() => runtime.navigate({ kind: "conversation", conversationId })}>对话</button><span className={styles.activeMainTab}>{panelLabel}<button aria-label={`关闭${panelLabel}`} onClick={() => runtime.navigate({ kind: "conversation", conversationId })}><X size={13} /></button></span></div> : null}
       {conversationId && initialPanel ? <ConversationObjectPanel panel={initialPanel} /> : isEmpty ? <div className={styles.empty}><div className={styles.emptyInner} onFocusCapture={(event) => { if (event.target instanceof HTMLTextAreaElement) event.currentTarget.setAttribute("data-composer-focused", ""); }} onBlurCapture={(event) => { if (event.target instanceof HTMLTextAreaElement) event.currentTarget.removeAttribute("data-composer-focused"); }}>
         <h1 key={mode} className={styles.emptyTitle}>{projectContextName ? `我们应该在${projectContextName}中做些什么？` : mode === "work" ? "准备好后，开始工作" : "有什么可以帮你？"}</h1>
-        <div className={styles.emptyComposer}><Composer key={`new:${initialProjectId ?? "standalone"}:${mode}`} conversationId={conversationId} referenceMode={mode} draftKey={`new:${initialProjectId ?? "standalone"}:${mode}`} disabled={!workReady} placeholder={mode === "work" ? workReady ? "描述要在远端完成的工作" : "请先完成工作环境设置" : "给 EasyWork 发消息"} onSend={send} /></div>
+        <div className={styles.emptyComposer}><Composer key={`new:${initialProjectId ?? "standalone"}:${mode}`} conversationId={conversationId} referenceMode={mode} draftKey={`new:${initialProjectId ?? "standalone"}:${mode}`} disabled={!workReady} placeholder={mode === "work" ? workReady ? "描述要在远端完成的工作" : !selectedAgentAuthenticated ? "请先登录 Qoder CN" : "请先完成工作环境设置" : "给 EasyWork 发消息"} onSend={send} /></div>
         {mode === "work" ? <>
           <div className={styles.setup}>
             <button className={`${styles.setupStep} ${serverId ? styles.done : ""}`} onClick={() => setConnectionDialogOpen(true)}><Server size={16} />{selectedServer ? selectedServer.name : "连接远程服务器"}</button>
@@ -2439,14 +2527,16 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
               cacheScope={configScope}
               workspacePath={workspacePath ?? selectedWorkspace?.canonicalPath ?? null}
               installingAgentId={installingAgent}
+              loggingInAgentId={loggingInAgent}
               canConfigure={Boolean(serverCapabilities?.features.agents.configure)}
               triggerVariant="setup"
               triggerLabel={selectedAgent?.installed && selectedAgent.status === "ready" && (!selectedAgent.managed || selectedAgent.configured) ? `${selectedAgent.displayName}${selectedAgent.model ? ` · ${selectedAgent.model}` : ""}` : "配置 Agent"}
-              initialPage={selectedAgent?.installed && selectedAgent.status === "ready" ? "config" : "root"}
+              initialPage="root"
               onSelect={async (nextAgentId) => { await verifyAgentSelection(nextAgentId); choose("agent", nextAgentId); }}
               onInstall={installAgent}
-              onManualAdd={() => setManualAgentOpen(true)}
+              onLogin={loginAgent}
               onConfigure={(agent) => setAgentConfigAgentId(agent.agentId)}
+              onManualAdd={() => setManualAgentOpen(true)}
               onAgentsChanged={refreshAgents}
               loadError={agentLoadError || capabilityError}
               onRetry={() => setSetupRetryRevision((revision) => revision + 1)}
@@ -2478,9 +2568,9 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       {conversationId ? <ConversationWorkspacePreview ref={workspacePreviewRef} conversationId={conversationId} /> : null}
       </div>
       {workbenchOpen && workbenchReady && serverId && routedWorkspaceId && workbenchWorkspacePath ? <Suspense fallback={null}><WorkbenchDrawer serverId={serverId} workspaceId={routedWorkspaceId} workspacePath={workbenchWorkspacePath} conversationId={conversationId} branchId={detail?.summary.activeBranchId} height={workbenchHeight} onHeightChange={setWorkbenchHeight} onClose={() => setWorkbenchOpen(false)} /></Suspense> : null}
-      {!activeTask && agentConfigAgentId && serverId && effectiveAgentOptions.find((agent) => agent.agentId === agentConfigAgentId) && serverCapabilities?.features.agents.configure ? <AgentConfigDialog serverId={serverId} configScope={configScope} agent={effectiveAgentOptions.find((agent) => agent.agentId === agentConfigAgentId)!} onChanged={refreshAgents} onClose={() => setAgentConfigAgentId(null)} /> : null}
       {workspacePickerOpen && serverId && agentId ? <WorkspaceDialog serverId={serverId} serverName={selectedServer?.name || "远程服务器"} conversationId={conversationId} branchId={detail?.summary.activeBranchId} options={workspaceOptions} current={workspace} allowVirtual={Boolean(serverCapabilities?.features.workspaces.virtual)} busy={switchingWorkspace} onClose={() => setWorkspacePickerOpen(false)} onSelect={async (nextWorkspaceId, nextWorkspace, nextWorkspacePath) => { if (nextWorkspace) setWorkspaceOptions((current) => current.some((item) => item.id === nextWorkspace.id) ? current : [...current, nextWorkspace]); if (conversationId) await switchWorkspace(nextWorkspaceId, nextWorkspace); else { choose("workspace", nextWorkspaceId, nextWorkspacePath); setWorkspacePickerOpen(false); } }} /> : null}
-      {routeSwitchConfirmation ? <Modal title={routeSwitchConfirmation === "workspace" ? "切换工作区？" : "切换 Agent？"} size="compact" onClose={() => settleRouteSwitchConfirmation(false)}><div className={styles.modeConfirm}><p>{routeSwitchConfirmation === "workspace" ? "后续请求将在所选工作区执行，当前网页对话会保留。" : "后续请求将由所选 Agent 处理，当前网页对话会保留。"}</p><footer><Button onClick={() => settleRouteSwitchConfirmation(false)}>取消</Button><Button variant="primary" onClick={() => settleRouteSwitchConfirmation(true)}>确认切换</Button></footer></div></Modal> : null}
+      {routeSwitchConfirmation ? <Modal title={routeSwitchConfirmation === "workspace" ? "切换工作区？" : "切换 Agent？"} size="compact" onClose={() => settleRouteSwitchConfirmation(false)}><div className={styles.modeConfirm}><p>{routeSwitchConfirmation === "workspace" ? "后续请求将在所选工作区执行，当前 Agent 的原生对话和网页对话都会继续。" : "后续请求将由所选 Agent 处理，并继续该 Agent 自己的原生对话；当前网页对话会保留。"}</p><footer><Button onClick={() => settleRouteSwitchConfirmation(false)}>取消</Button><Button variant="primary" onClick={() => settleRouteSwitchConfirmation(true)}>确认切换</Button></footer></div></Modal> : null}
+      {agentConfigAgent && agentConfigAgent.agentId !== "qoder-cn" && serverId && serverCapabilities?.features.agents.configure ? <AgentConfigDialog serverId={serverId} configScope={configScope} agent={agentConfigAgent} onChanged={refreshAgents} onClose={() => setAgentConfigAgentId(null)} /> : null}
       {connectionDialogOpen ? <ConversationConnectionDialog selectedServerId={serverId} conversationId={conversationId} conversationEnabled={conversationConnectionEnabled} conversationScoped={Boolean(conversationId && boundServerId)} onClose={() => setConnectionDialogOpen(false)} onChanged={async () => { await refreshBootstrap(); }} onConversationConnectionChanged={async (enabled, connectedId) => { setConversationConnectionEnabled(enabled); if (connectedId) { setBoundServerId(connectedId); setServerId(connectedId); } }} onConnected={async (connectedId) => { await refreshBootstrap(); if (!conversationId) choose("server", connectedId); else setServerId(connectedId); }} /> : null}
       {manualAgentOpen && serverId ? <ManualAgentDialog serverId={serverId} agents={effectiveAgentOptions} onClose={() => setManualAgentOpen(false)} onAdded={async (nextAgentId) => { await refreshAgents(); if (!conversationId) choose("agent", nextAgentId); }} /> : null}
     </section>

@@ -781,7 +781,7 @@ export class ConversationService {
           deletedAt: null,
         };
         const summary = await this.#summaryFrom(meta, snapshotId, chains, [message]);
-        return { conversationId, snapshotId, meta, chains, newMessages: [message], summary, result: { conversation: summary, messageId, branchId } };
+        return { conversationId, snapshotId, meta, chains, newMessages: [message], summary, result: { conversation: summary, messageId, branchId, message } };
       }
 
       const conversationId = assertConversationId(input.conversationId);
@@ -802,7 +802,7 @@ export class ConversationService {
       meta.lastMessageAt = timestamp;
       updateBranchCount(meta, branchId, chain, timestamp);
       const summary = await this.#summaryFrom(meta, snapshotId, loaded.chains, [message]);
-      return { conversationId, snapshotId, meta, chains: loaded.chains, newMessages: [message], summary, result: { conversation: summary, messageId, branchId } };
+      return { conversationId, snapshotId, meta, chains: loaded.chains, newMessages: [message], summary, result: { conversation: summary, messageId, branchId, message } };
     });
   }
 

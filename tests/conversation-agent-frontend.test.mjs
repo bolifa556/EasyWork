@@ -86,10 +86,11 @@ test("对话删除或重命名只按事件失效服务器详情缓存，不引�
     readFile(cacheEventsPath, "utf8"),
   ]);
   assert.match(events, /easywork:conversations-changed/);
-  assert.match(shell, /announceConversationsChanged\(\{ conversationId: item\.id, kind: "deleted" \}\)/);
+  assert.match(shell, /announceConversationsChanged\(\{ conversationId: item\.id, kind: "deleted", optimistic: true \}\)/);
   assert.match(shell, /announceConversationsChanged\(\{ conversationId: editing\.item\.id, kind: "renamed", conversation: result\.data\.conversation \}\)/);
   assert.match(servers, /addEventListener\(CONVERSATIONS_CHANGED_EVENT, changed\)/);
-  assert.match(servers, /const changed = \(\) => \{ void load\(\)\.finally/);
+  assert.match(servers, /const changed = \(event: Event\) =>/);
+  assert.match(servers, /if \(detail\?\.optimistic\) return/);
   assert.doesNotMatch(servers, /setInterval/);
 });
 
@@ -161,13 +162,18 @@ test("工作入口切回对话时复用文件预览的未保存修改确认", as
 });
 
 test("自动工作区建立后切换 Agent 使用当前真实路由而不要求刷新页面", async () => {
-  const view = await readFile(viewPath, "utf8");
+  const [view, control] = await Promise.all([readFile(viewPath, "utf8"), readFile(controlPath, "utf8")]);
   const switchSection = view.slice(view.indexOf("const switchAgent = async"), view.indexOf("const storeAgentOptions"));
+  const selectSection = control.slice(control.indexOf("const selectAgent = async"), control.indexOf("const completeSetupConfig"));
   assert.match(switchSection, /const currentWorkspaceId = routedWorkspaceId/);
   assert.match(switchSection, /workspaceId: currentWorkspaceId/);
   assert.match(switchSection, /setWorkspace\(currentWorkspaceId\)/);
   assert.match(switchSection, /setWorkspacePath\(currentWorkspacePath\)/);
   assert.doesNotMatch(switchSection, /workspace === VIRTUAL_WORKSPACE/);
+  assert.doesNotMatch(switchSection, /requestRouteSwitchConfirmation/);
+  assert.match(view, /onBeforeSelect=\{\(\) => requestRouteSwitchConfirmation\("agent"\)\}[\s\S]+?onSelect=\{switchAgent\}/);
+  assert.ok(selectSection.indexOf("await onBeforeSelect(agent.agentId)") < selectSection.indexOf("setSelectingAgentId(agent.agentId)"));
+  assert.match(selectSection, /agent\.agentId === selectedAgentId[\s\S]+?setOpen\(false\)[\s\S]+?setPage\("root"\)/);
 });
 
 test("网页工具只发布语义结果，远端失败原因进入对话时间线", async () => {
@@ -282,13 +288,17 @@ test("对话输入区不遮挡两侧内容，滚动条沿用透明细轨道", as
   ]);
   assert.match(styles, /\.composerWrap\s*\{[^}]*position:relative;[^}]*background:transparent;/s);
   assert.match(styles, /\.composerWrap::before\s*\{[^}]*pointer-events:none;[^}]*background:linear-gradient\(/s);
+  assert.doesNotMatch(styles, /\.composerWrap::before\s*\{[^}]*(?:backdrop-filter|mask-image)/s);
   assert.match(styles, /\.messages\s*\{[^}]*overflow-x:\s*hidden;[^}]*overflow-y:\s*auto;[^}]*scrollbar-color:\s*rgb\(99 108 98 \/ 30%\) transparent;[^}]*scrollbar-width:\s*thin;/s);
   assert.match(styles, /\.messages::-webkit-scrollbar\s*\{[^}]*width:\s*9px;[^}]*height:\s*9px;[^}]*background:\s*transparent;/s);
   assert.match(styles, /\.messages::-webkit-scrollbar-thumb\s*\{[^}]*border:\s*3px solid transparent;[^}]*border-radius:\s*999px;[^}]*background:\s*rgb\(99 108 98 \/ 30%\);[^}]*background-clip:\s*padding-box;/s);
   assert.match(styles, /\.messages::-webkit-scrollbar-track,\.messages::-webkit-scrollbar-corner\s*\{[^}]*background:\s*transparent;/s);
-  assert.match(controlStyles, /\.rootList,\.modelPanel,\.modelList\s*\{[^}]*scrollbar-color:rgb\(99 108 98 \/ 30%\) transparent;[^}]*scrollbar-width:thin;/s);
-  assert.match(controlStyles, /\.rootList::-webkit-scrollbar,\.modelPanel::-webkit-scrollbar,\.modelList::-webkit-scrollbar\s*\{[^}]*width:9px;[^}]*height:9px;[^}]*background:transparent;/s);
-  assert.match(controlStyles, /\.rootList::-webkit-scrollbar-thumb,\.modelPanel::-webkit-scrollbar-thumb,\.modelList::-webkit-scrollbar-thumb\s*\{[^}]*border:3px solid transparent;[^}]*border-radius:999px;[^}]*background:rgb\(99 108 98 \/ 30%\);[^}]*background-clip:padding-box;/s);
+  assert.match(controlStyles, /\.rootList,\.configPanel,\.modelViewport\s*\{[^}]*scrollbar-color:rgb\(99 108 98 \/ 28%\) transparent;[^}]*scrollbar-width:thin;[^}]*scrollbar-gutter:stable;/s);
+  assert.match(controlStyles, /\.rootList::-webkit-scrollbar,\.configPanel::-webkit-scrollbar,\.modelViewport::-webkit-scrollbar\s*\{[^}]*width:8px;[^}]*height:8px;[^}]*background:transparent;/s);
+  assert.match(controlStyles, /\.rootList::-webkit-scrollbar-button,\.configPanel::-webkit-scrollbar-button,\.modelViewport::-webkit-scrollbar-button\s*\{[^}]*display:none;[^}]*width:0;[^}]*height:0;/s);
+  assert.match(controlStyles, /\.rootList::-webkit-scrollbar-thumb,\.configPanel::-webkit-scrollbar-thumb,\.modelViewport::-webkit-scrollbar-thumb\s*\{[^}]*border:2px solid transparent;[^}]*border-radius:999px;[^}]*background:rgb\(99 108 98 \/ 28%\);[^}]*background-clip:padding-box;/s);
+  assert.match(styles, /\.modelList\s*\{[^}]*scrollbar-color:rgb\(99 108 98 \/ 28%\) transparent;[^}]*scrollbar-width:thin;[^}]*scrollbar-gutter:stable;/s);
+  assert.match(styles, /\.modelList::-webkit-scrollbar-button\s*\{[^}]*display:none;[^}]*width:0;[^}]*height:0;/s);
 });
 
 test("三种 Agent 的统一计划条与左侧菜单同字号，只有存在计划的对话记录可展开", async () => {
@@ -435,6 +445,8 @@ test("Agent 调用中的操作、文件与阶段文本使用紧凑垂直节奏",
   const styles = await readFile(timelineStylePath, "utf8");
   assert.match(styles, /\.agentActivity\s*\{[^}]*gap:2px;[^}]*padding:1px 0 0 var\(--activity-content-inset\);/s);
   assert.match(styles, /\.groupHeading\s*\{[^}]*min-height:29px;[^}]*padding:2px 0;/s);
+  assert.match(styles, /\.reasoningLabel\s*\{[^}]*font-size:var\(--timeline-title-size\);/s);
+  assert.match(styles, /\.commandGroupHeading strong\s*\{[^}]*font-size:var\(--timeline-title-size\);[^}]*font-weight:400;/s);
   assert.match(styles, /\.commandList\s*\{[^}]*margin:0 7px 3px 11px;/s);
   assert.match(styles, /\.commandSummary,\.fileSummary\s*\{[^}]*min-height:28px;[^}]*padding:1px 0;/s);
   assert.match(styles, /\.agentThought\s*\{[^}]*padding:2px 0;/s);
@@ -466,8 +478,8 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
     readFile(runtimePath, "utf8"),
     readFile(platformStorePath, "utf8"),
   ]);
-  assert.match(timeline, /function BackgroundTrace[\s\S]+?useState\(false\)/);
-  assert.match(timeline, /function ReasoningTrace[\s\S]+?useTimelineDisclosure\(disclosureId, running, true\)/);
+  assert.match(timeline, /function BackgroundTrace[\s\S]+?useTimelineDisclosure\(disclosureId, true\)/);
+  assert.match(timeline, /function ReasoningTrace[\s\S]+?useTimelineDisclosure\(disclosureId, true\)/);
   assert.match(timeline, /entry\.text\.replace\(\/\\n\(\?:\[ \\t\]\*\\n\)\{2,\}\/[\s\S]+?<MarkdownContent content=\{content\} compact activity \/>/);
   assert.match(timeline, /className=\{styles\.reasoningGlyph\}><MessageCircle size=\{15\} \/>/);
   assert.match(timeline, /<span className=\{styles\.reasoningLabel\}>思考内容<\/span>/);
@@ -485,13 +497,13 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.doesNotMatch(timeline, /previous\?\.iteration !== iteration/);
   assert.match(timeline, /entries\.push\(reasoning\)/);
   assert.match(timeline, /function WebThought[\s\S]+?const hasBody = trace\.entries\.length > 0 \|\| Boolean\(handoff\)/);
-  assert.match(timeline, /const \[open, toggleOpen\] = useTimelineDisclosure\(disclosureId, trace\.running, hasBody\)/);
+  assert.match(timeline, /const \[open, toggleOpen\] = useTimelineDisclosure\(disclosureId, hasBody, trace\.thinking\)/);
   assert.match(timeline, /className=\{styles\.webThoughtHeading\}[\s\S]+?aria-expanded=\{hasBody \? open : undefined\}/);
-  assert.match(timeline, /entry\.type === "reasoning"[\s\S]+?<ReasoningTrace key=\{entry\.id\} entry=\{entry\} running=\{trace\.running\}/);
+  assert.match(timeline, /entry\.type === "reasoning"[\s\S]+?<ReasoningTrace key=\{entry\.id\} entry=\{entry\} disclosureId=/);
   assert.match(timeline, /if \(event\.kind === "run\.output\.delta"\)[\s\S]+?replacement[\s\S]+?type: "reasoning"/);
   assert.doesNotMatch(timeline, /className=\{styles\.activityText\}/);
-  assert.match(timeline, /function AgentCall[\s\S]+?useTimelineDisclosure\(disclosureId, disclosureRunning, hasDetails\)/);
-  assert.match(timeline, /trace\.running \? "正在思考"/);
+  assert.match(timeline, /function AgentCall[\s\S]+?useTimelineDisclosure\(disclosureId, hasDetails, running && !collapseWhen/);
+  assert.match(timeline, /trace\.thinking \? "正在思考"/);
   assert.match(timeline, /trace\.aborted \? "思考已停止" : "思考完成"/);
   assert.match(timeline, /rawAbortReason\.trim\(\) === "请求已停止" \? "" : rawAbortReason/);
   assert.match(timeline, /const showThought = !directRemoteAppend && \([\s\S]+?webTrace\.started[\s\S]+?webTrace\.running[\s\S]+?webTrace\.entries\.length > 0[\s\S]+?webTrace\.handoff[\s\S]+?webTrace\.failure \|\| webTrace\.abortReason/);
@@ -499,7 +511,7 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(timeline, /className=\{styles\.activityHeadingLabel\}>\{label\}<\/span>[\s\S]+?styles\.webThoughtChevron/);
   assert.match(timeline, /className=\{styles\.handoffGlyph\}><Send size=\{15\} \/>/);
   assert.match(timeline, /<span className=\{styles\.handoffLabel\}>发给远端 Agent<\/span>/);
-  assert.match(timeline, /function WorkHandoff[\s\S]+?useState\(false\)[\s\S]+?styles\.handoffMotion/);
+  assert.match(timeline, /function WorkHandoff[\s\S]+?useTimelineDisclosure\(disclosureId, true\)[\s\S]+?styles\.handoffMotion/);
   assert.match(timeline, /<WebThought events=\{events\} handoff=\{showHandoff \? webTrace\.handoff : null\} \/>/);
   assert.doesNotMatch(timeline, /!showThought && showHandoff \? <WorkHandoff/);
   assert.doesNotMatch(timeline, /思考未完成|trace\.activeLabel/);
@@ -613,7 +625,7 @@ test("Agent 中断后新消息新建 Task，运行中追加才直通并复用原
 });
 
 test("新建 Work 的 Agent 状态、模型路由与权限菜单保持当前交互", async () => {
-  const [view, control, runtime] = await Promise.all([readFile(viewPath, "utf8"), readFile(controlPath, "utf8"), readFile(runtimePath, "utf8")]);
+  const [view, control, controlStyles, runtime] = await Promise.all([readFile(viewPath, "utf8"), readFile(controlPath, "utf8"), readFile(controlStylePath, "utf8"), readFile(runtimePath, "utf8")]);
   assert.match(view, /selectedServer \? selectedServer\.name : "连接远程服务器"/);
   assert.match(view, /selectedAgent\.displayName[^\n]+selectedAgent\.model/);
   assert.match(view, /selectedAgent\.configured/);
@@ -623,12 +635,42 @@ test("新建 Work 的 Agent 状态、模型路由与权限菜单保持当前交�
   assert.match(control, /需要配置api/);
   assert.match(control, /EasyWork已部署/);
   assert.match(control, /未部署/);
-  assert.match(control, /ready \? <span className=\{styles\.rowActions\}>\{agent\.managed \?/);
-  assert.match(control, /\{configAgent \? <button className=\{styles\.option\}[^\n]+打开配置/);
-  assert.match(control, /\{configAgent && \["opencode", "codex", "claude-code"\]\.includes/);
+  assert.match(control, /ready \? <span className=\{styles\.rowActions\}>/);
+  assert.match(control, /打开配置/);
+  assert.match(control, /configAgent && \["opencode", "codex", "claude-code"\]\.includes\(configAgent\.agentId\) && onConfigure/);
+  assert.match(view, /import \{ AgentConfigDialog \} from "\.\/AgentConfigDialog"/);
+  assert.match(view, /onConfigure=\{\(agent\) => setAgentConfigAgentId\(agent\.agentId\)\}/);
+  assert.match(view, /agentConfigAgent\.agentId !== "qoder-cn"[\s\S]+?<AgentConfigDialog/);
+  assert.match(control, /\{configAgent && \["opencode", "codex", "claude-code", "qoder-cn"\]\.includes/);
   assert.doesNotMatch(control, /"EasyWork 部署"|"用户部署"|"未安装"/);
   assert.doesNotMatch(control, /<option value="">未设置<\/option>/);
   assert.match(runtime, /refreshManagedConfiguration\(request\.params\.agentId\)/);
+  assert.match(control, /const needsLogin = agent\.authentication\?\.required === true && !agent\.authentication\.authenticated/);
+  assert.match(control, /onLogin\(agent\.agentId\)/);
+  assert.match(view, /agents\/\$\{encodeURIComponent\(targetAgentId\)\}\/login/);
+  assert.match(view, /window\.open\("about:blank", "_blank"\)/);
+  assert.match(view, /请先登录 Qoder CN/);
+  assert.match(view, /selectedAgent\.authentication\.authenticated/);
+  assert.match(control, /agents\/qoder-cn\/catalog/);
+  assert.match(control, /priceFactor/);
+  assert.match(control, /当前积分/);
+  assert.match(control, /qoderUsage\?\.orgResourcePackage\?\.available === true/);
+  assert.match(control, /const \[qoderModels, setQoderModels\]/);
+  assert.match(control, /qoderModels\.find\(\(model\) => model\.id === \(configuredModelId \|\| "auto"\)\)\?\.name/);
+  assert.match(control, /easywork\.qoder-catalog:v1:/);
+  assert.match(control, /modelsBusy && !visibleModels\.length/);
+  assert.doesNotMatch(control, /qoderUsageBusy \? "正在读取模型"/);
+  assert.doesNotMatch(control, /Code2/);
+  assert.match(control, /isQoderConfig && !qoderAuthenticated/);
+  assert.match(control, /disabled=\{loggingIn \|\| disabled \|\| Boolean\(selectingAgentId\)\}/);
+  assert.ok(controlStyles.indexOf(".rootRow:has(.loginAction) .rootSelect { padding-right:106px; }") > controlStyles.indexOf(".rootRow:has(.rowActions) .rootSelect { padding-right:66px; }"));
+  assert.ok(controlStyles.lastIndexOf(".rootRow:has(.loginAction) .rootSelect { padding-right:106px; }") > controlStyles.lastIndexOf(".rootRow:has(.rowActions) .rootSelect { padding-right:84px; }"));
+  assert.match(view, /triggerVariant="setup"[\s\S]+?initialPage="root"/);
+  assert.match(control, /const completeSetupConfig = async \(agent: AgentSummary\)/);
+  assert.match(control, /triggerVariant === "setup" \? <button className=\{styles\.complete\}/);
+  assert.match(control, /await onSelect\(agent\.agentId\)[\s\S]+?setOpen\(false\)[\s\S]+?setPage\("root"\)/);
+  assert.match(control, /configBusy \|\| configSaving \|\| Boolean\(selectingAgentId\) \|\| disabled/);
+  assert.match(controlStyles, /\.complete\s*\{/);
 });
 
 test("Work 绑定和 Agent 上下文不随每条运行事件反复重载", async () => {
@@ -642,6 +684,9 @@ test("Work 绑定和 Agent 上下文不随每条运行事件反复重载", async
   assert.match(view, /useState\(Boolean\(conversationId && !initialConversationCache\)\)/);
   assert.match(view, /const serverSetupCache = new Map/);
   assert.match(view, /if \(cached\)[\s\S]+?setSetupLoading\(false\)/);
+  assert.match(view, /\.filter\(\(task\) => task\.route\?\.agentId === routedAgentId\)/);
+  const selectedBindingSource = view.slice(view.indexOf("const selectedBindingTask"), view.indexOf("const selectedAgentBindingId"));
+  assert.doesNotMatch(selectedBindingSource, /task\.route\?\.workspaceId === routedWorkspaceId/);
   const setupEffect = view.slice(view.indexOf("const cached = currentServerCacheKey"), view.indexOf("if (!conversationId || loadedConversationId !== conversationId || activeMode !== \"work\")"));
   assert.doesNotMatch(setupEffect, /refreshBootstrap/);
 });
@@ -666,7 +711,11 @@ test("SSH 重连按连接代次重扫 Agent，失败时保留清单并显示原�
   assert.match(services, /connectionGeneration: Number\(connection\.generation \|\| 0\)/);
   assert.match(view, /cached\.connectionGeneration === connectionGeneration/);
   assert.match(view, /selectedServer\?\.connectionGeneration/);
-  assert.match(view, /const timeout = window\.setTimeout\(\(\) => controller\.abort\(\), 6_000\)/);
+  assert.match(view, /const readSetup = async <T,>\(path: string, label: string, timeoutMs = 6_000\)/);
+  assert.match(view, /"Agent 列表读取", 30_000\)/);
+  assert.match(view, /const cachedAgents = cached/);
+  assert.match(view, /: cachedAgents/);
+  assert.match(view, /: cachedWorkspaces/);
   assert.match(view, /Promise\.allSettled/);
   assert.match(view, /setAgentLoadError/);
   assert.match(view, /setWorkspaceLoadError/);
@@ -676,7 +725,8 @@ test("SSH 重连按连接代次重扫 Agent，失败时保留清单并显示原�
   assert.match(control, /未读取到 Agent/);
   assert.match(control, /正在读取 Agent/);
   assert.match(cache, /agent\.configuration\.configScope !== configScope/);
-  assert.match(cache, /configuration: null, model: null, configured: false/);
+  assert.match(cache, /configuration: null, model: null, configured: qoderReady/);
+  assert.match(cache, /agent\.authentication\?\.authenticated === true/);
 });
 
 test("侧栏固定头尾、中部整体滚动，并按需加载八条聊天与项目对话", async () => {
@@ -707,8 +757,17 @@ test("侧栏固定头尾、中部整体滚动，并按需加载八条聊天与�
   assert.match(styles, /\.conversationRow:hover \.titleScrollable\s*>\s*span[^\{]*\{[^}]*width:\s*max-content;[^}]*overflow:\s*visible;[^}]*text-overflow:\s*clip;/s);
   assert.match(shell, /className=\{styles\.renameInput\}/);
   assert.match(shell, /<Modal title="删除对话？"/);
-  assert.match(shell, /const latest = await runtime\.api\.get<\{ summary: \{ revision: number \} \}>/);
+  assert.match(shell, /const latest = await runtime\.api\.get<\{ summary: ConversationSummary \}>/);
   assert.match(shell, /expectedRevision: latest\.data\.summary\.revision/);
+  const optimisticDelete = shell.slice(shell.indexOf("const deleteConversation"), shell.indexOf("const renameProject"));
+  const visibleCompletion = optimisticDelete.indexOf('kind: "deleted", optimistic: true');
+  const backgroundRead = optimisticDelete.indexOf("const latest = await runtime.api.get");
+  assert.ok(visibleCompletion >= 0 && backgroundRead > visibleCompletion, "前端应先移除对话，再开始后台删除");
+  assert.match(optimisticDelete, /setConversationPendingDelete\(null\)[\s\S]+?optimistic: true[\s\S]+?runtime\.navigate[\s\S]+?runtime\.notify\("对话已删除"/);
+  assert.match(optimisticDelete, /kind: "created", conversation: restoreConversation, optimistic: true/);
+  assert.match(optimisticDelete, /对话删除失败，已恢复/);
+  assert.doesNotMatch(optimisticDelete, /setDeletingConversation|await runtime\.refreshBootstrap/);
+  assert.equal(optimisticDelete.match(/kind: "deleted"/g)?.length, 1, "后台成功后不应再触发全局前端刷新");
   assert.match(shell, /menuFixedActions[\s\S]+?menuSeparator[\s\S]+?projectDestinationList/);
   assert.match(shell, /length > 4 \? styles\.projectDestinationScrollable/);
   assert.match(styles, /\.projectDestinationScrollable\s*\{[^}]*max-height:\s*150px;[^}]*overflow-y:\s*auto;/s);
@@ -748,16 +807,28 @@ test("全站按钮与加载图标不触发文本光标、绿色焦点框或忙�
   for (const styles of [viewStyles, accountStyles, serverStyles, projectStyles]) assert.doesNotMatch(styles, /cursor\s*:\s*(?:wait|progress)/);
 });
 
-test("Agent 模型菜单按当前内容收高，配置中状态位于卸载按钮左侧", async () => {
+test("Agent 模型菜单在读取前后保持高度并铺满可滚动区域，配置中状态位于当前流程操作按钮左侧", async () => {
   const [control, styles] = await Promise.all([readFile(controlPath, "utf8"), readFile(controlStylePath, "utf8")]);
-  assert.match(control, /const visibleModels = providerId \? models : providers/);
-  assert.match(control, /const modelMenuHeight = modelsBusy \|\| !visibleModels\.length[\s\S]+?Math\.min\(300, 61 \+ visibleModels\.length \* 45\)/);
+  assert.match(control, /const visibleModels = isQoderConfig \|\| providerId \? models : providers/);
+  assert.match(control, /const modelMenuHeight = 360/);
+  assert.match(control, /const selectedModelId = isQoderConfig[\s\S]+?resolvedConfig\?\.values\.model \|\| "auto"/);
+  assert.match(control, /selectedModelId === "auto" \? "Auto" : selectedModelId/);
+  assert.match(control, /className=\{selectedModelId === item\.id \? styles\.modelSelected : ""\}/);
+  assert.match(styles, /\.modelPanel\s*\{[^}]*display:flex;[^}]*flex-direction:column;[^}]*overflow:hidden;/s);
+  assert.match(control, /<div className=\{styles\.modelViewport\}>\{modelsBusy/);
+  assert.match(styles, /\.modelViewport\s*\{[^}]*min-height:0;[^}]*flex:1 1 auto;[^}]*overflow-x:hidden;[^}]*overflow-y:auto;/s);
+  assert.match(styles, /\.modelList\s*\{[^}]*min-height:100%;[^}]*align-content:start;/s);
+  assert.match(styles, /\.modelViewport > \.menuState\s*\{[^}]*min-height:100%;/s);
   assert.match(control, /setConfigSaving\(true\)[\s\S]+?setConfigSaving\(false\)/);
   assert.match(control, /void onAgentsChanged\?\.\(\)\.catch\(\(\) => undefined\)/);
-  assert.match(control, /setPage\("config"\); void changeFields\(\{ model: item\.id \}\)/);
-  assert.doesNotMatch(control, /item\.contextWindow[\s\S]+?contextLimit/);
-  assert.match(control, /className=\{styles\.configFooter\}>\{configSaving \? <span className=\{styles\.runtimeConfiguring\}>[\s\S]+?配置中[\s\S]+?className=\{styles\.uninstall\}/);
+  assert.match(control, /const chooseModel = \(item: ModelSummary\)/);
+  assert.match(control, /item\.defaultContextWindow \|\| supportedWindows\[0\][\s\S]+?values\.contextLimit/);
+  assert.match(control, /className=\{`\$\{styles\.configFooter\} \$\{triggerVariant === "setup" \? "" : styles\.uninstallFooter\}`\}>\{configSaving \? <span className=\{styles\.runtimeConfiguring\}>[\s\S]+?配置中[\s\S]+?triggerVariant === "setup"[\s\S]+?className=\{styles\.complete\}[\s\S]+?className=\{styles\.uninstall\}/);
   assert.match(styles, /\.runtimeConfiguring\s*\{/);
+  assert.match(styles, /\.uninstallFooter\s*\{[^}]*border-top:/s);
+  assert.doesNotMatch(styles, /\.contextControls\s*\{[^}]*border-top:/s);
+  assert.doesNotMatch(styles, /\.qoderCredits\s*\{[^}]*border-top:/s);
+  assert.ok(control.indexOf("className={styles.qoderCredits}") < control.indexOf("styles.uninstallFooter"), "Qoder 积分应位于最底部卸载区上方");
 });
 
 test("Agent 配置 revision 冲突时刷新当前对话配置并只重放一次用户修改", async () => {
@@ -1025,12 +1096,12 @@ test("原生审批提交后立即由 Task 状态收起旧审批按钮", async ()
   assert.match(timeline, /operationAlreadySettled \? previous\.status/);
 });
 
-test("新对话没有 active Task 时路由派生不会读取空 route", async () => {
+test("新对话没有 live Task 时路由派生不会读取空 route", async () => {
   const view = await readFile(viewPath, "utf8");
-  assert.match(view, /activeTask\?\.route\?\.agentId/);
-  assert.match(view, /activeTask\?\.route\?\.workspaceId/);
-  assert.match(view, /task\.route\?\.agentId/);
-  assert.match(view, /task\.route\?\.workspaceId/);
+  assert.match(view, /liveTask && liveTask\.conversationId === conversationId \? liveTask\.route\?\.agentId : null/);
+  assert.match(view, /liveTask && liveTask\.conversationId === conversationId \? liveTask\.route\?\.workspaceId : null/);
+  assert.match(view, /latestConversationTask\?\.route\?\.agentId/);
+  assert.match(view, /latestConversationTask\?\.route\?\.workspaceId/);
 });
 
 test("新建 Work 环境初始化失败后仍进入已创建对话，防止重复创建", async () => {
