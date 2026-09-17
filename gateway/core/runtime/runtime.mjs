@@ -798,12 +798,25 @@ export class EasyWorkRuntime {
     router.route("GET", "/api/servers/:id/agents", async (request) => {
       const deployment = await request.services.agentDeploymentFor(request.params.id);
       const backend = await request.services.remoteBackend(request.params.id);
-      const agentIds = parseCsv(request.query.agentIds) || ["opencode", "codex", "claude-code"];
+      const agentIds = parseCsv(request.query.agentIds) || ["opencode", "codex", "claude-code", "qoder-cn"];
       const configScope = request.query.configScope || "default";
       invariant(request.query.cached == null || request.query.cached === "1", "AGENT_CONFIG_CACHE_INVALID", "Agent 配置缓存参数无效", { status: 400 });
       return { items: await Promise.all(agentIds.map(async (agentId) => {
         const status = await deployment.status(agentId);
         const adapter = request.services.agentAdapters[String(agentId)] || null;
+        let authentication = null;
+        if (agentId === "qoder-cn" && status.installed) {
+          try { authentication = await deployment.authenticationStatus(agentId); }
+          catch (error) {
+            authentication = {
+              required: true,
+              authenticated: false,
+              status: "error",
+              loginAvailable: status.status === "ready",
+              message: String(error?.message || "Qoder CN 登录状态读取失败"),
+            };
+          }
+        }
         let configuration = null;
         if (status.installed && typeof backend.agentConfiguration?.inspect === "function") {
           try {
@@ -834,8 +847,11 @@ export class EasyWorkRuntime {
         } : null;
         return {
           ...status,
-          configured: Boolean(status.installed && status.status === "ready" && model),
+          configured: agentId === "qoder-cn"
+            ? Boolean(status.installed && status.status === "ready" && authentication?.authenticated)
+            : Boolean(status.installed && status.status === "ready" && model),
           model,
+          authentication,
           configuration: publicConfiguration,
           runtimeCapabilities: adapter ? structuredClone(adapter.capabilities) : null,
         };
@@ -868,28 +884,47 @@ export class EasyWorkRuntime {
         configScope: body.configScope || "default",
       });
       const model = String(configuration?.values?.model || "").trim();
-      invariant(!runtimeStatus.managed || model, "AGENT_MODEL_NOT_CONFIGURED", `${runtimeStatus.displayName} 尚未选择模型`, {
+      const authentication = request.params.agentId === "qoder-cn"
+        ? await deployment.authenticationStatus(request.params.agentId, { force: true })
+        : null;
+      invariant(request.params.agentId === "qoder-cn" || !runtimeStatus.managed || model, "AGENT_MODEL_NOT_CONFIGURED", `${runtimeStatus.displayName} 尚未选择模型`, {
         status: 409,
         details: { agentId: request.params.agentId },
       });
-      const protocolReadiness = typeof backend.agentTransport?.checkReadiness === "function"
+      const protocolReadiness = authentication?.authenticated === false
+        ? null
+        : typeof backend.agentTransport?.checkReadiness === "function"
         ? await backend.agentTransport.checkReadiness(request.params.agentId, {
             source: runtimeStatus.source,
             configScope: body.configScope || "default",
           })
         : null;
       return {
-        ready: true,
+        ready: request.params.agentId === "qoder-cn" ? authentication?.authenticated === true : true,
         agentId: request.params.agentId,
         displayName: runtimeStatus.displayName,
         source: runtimeStatus.source,
         managed: runtimeStatus.managed,
         model: model || null,
+        authentication,
         configScope: configuration.configScope,
         inherited: configuration.inherited === true,
         configurationRevision: configuration.revision,
         protocol: protocolReadiness?.protocol || null,
       };
+    });
+    router.route("GET", "/api/servers/:id/agents/:agentId/auth", async (request) => {
+      strictQuery(request.query, [], "读取 Agent 登录状态");
+      return (await request.services.agentDeploymentFor(request.params.id)).authenticationStatus(request.params.agentId, { force: true });
+    });
+    router.route("GET", "/api/servers/:id/agents/:agentId/catalog", async (request) => {
+      const query = strictQuery(request.query, ["force"], "读取 Agent 原生模型目录");
+      invariant(query.force == null || ["0", "1"].includes(query.force), "AGENT_NATIVE_CATALOG_QUERY_INVALID", "Agent 原生模型目录参数无效", { status: 400 });
+      return (await request.services.agentDeploymentFor(request.params.id)).nativeCatalog(request.params.agentId, { force: query.force === "1" });
+    });
+    router.route("POST", "/api/servers/:id/agents/:agentId/login", async (request) => {
+      strictBody(request.body || {}, [], "登录 Agent");
+      return (await request.services.agentDeploymentFor(request.params.id)).beginLogin(request.params.agentId);
     });
     router.route("GET", "/api/servers/:id/agents/:agentId/update", async (request) => (await request.services.agentDeploymentFor(request.params.id)).checkUpdate(request.params.agentId));
     for (const [route, method] of [["install", "install"], ["update", "install"], ["uninstall", "uninstall"]]) {

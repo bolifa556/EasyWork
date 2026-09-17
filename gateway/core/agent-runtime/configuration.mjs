@@ -36,6 +36,12 @@ const SCHEMAS = Object.freeze({
     Object.freeze({ key: "effortLevel", label: "思考强度", type: "enum", nativeKey: "--effort", options: [OPTION("low", "低（low）"), OPTION("medium", "中等（medium）"), OPTION("high", "高（high）"), OPTION("xhigh", "极高（xhigh）"), OPTION("max", "最大（max，本次会话）")] }),
     Object.freeze({ key: "permissionMode", label: "权限模式", type: "enum", nativeKey: "--permission-mode", options: [OPTION("default", "逐项询问"), OPTION("acceptEdits", "自动接受文件编辑（Bash 仍询问）"), OPTION("plan", "仅规划（只读）"), OPTION("auto", "自动安全审查（仅 Anthropic API）"), OPTION("dontAsk", "仅使用预先批准的工具"), OPTION("bypassPermissions", "跳过权限检查（危险）")] }),
   ]),
+  "qoder-cn": Object.freeze([
+    Object.freeze({ key: "model", label: "模型", type: "string", nativeKey: "model.name" }),
+    CONTEXT_LIMIT("上下文容量", "model.contextWindow"),
+    Object.freeze({ key: "reasoningEffort", label: "思考强度", type: "enum", nativeKey: "--reasoning-effort", options: [OPTION("default", "由 Qoder 自动选择"), OPTION("minimal", "最低（minimal）"), OPTION("low", "低（low）"), OPTION("medium", "中等（medium）"), OPTION("high", "高（high）"), OPTION("xhigh", "极高（xhigh）")] }),
+    Object.freeze({ key: "permissionMode", label: "权限模式", type: "enum", nativeKey: "--permission-mode", options: [OPTION("default", "逐项询问"), OPTION("accept_edits", "自动接受文件编辑"), OPTION("dont_ask", "仅使用预先批准的工具"), OPTION("auto", "自动判断"), OPTION("bypass_permissions", "跳过权限检查（危险）")] }),
+  ]),
 });
 
 // These values are the effective defaults of a newly isolated conversation.
@@ -43,12 +49,14 @@ const DEFAULT_VALUES = Object.freeze({
   opencode: Object.freeze({ contextLimit: DEFAULT_AGENT_AUTO_COMPACT_WINDOW, reasoningEffort: "default", permissionMode: "allow" }),
   codex: Object.freeze({ contextLimit: DEFAULT_AGENT_AUTO_COMPACT_WINDOW, reasoningEffort: "medium", approvalPolicy: "never", sandboxMode: "auto" }),
   "claude-code": Object.freeze({ contextLimit: DEFAULT_AGENT_AUTO_COMPACT_WINDOW, effortLevel: "medium", permissionMode: "acceptEdits" }),
+  "qoder-cn": Object.freeze({ model: "auto", contextLimit: DEFAULT_AGENT_AUTO_COMPACT_WINDOW, reasoningEffort: "default", permissionMode: "accept_edits" }),
 });
 
 const EFFORT_FIELDS = Object.freeze({
   opencode: "reasoningEffort",
   codex: "reasoningEffort",
   "claude-code": "effortLevel",
+  "qoder-cn": "reasoningEffort",
 });
 
 function notFound(error) {

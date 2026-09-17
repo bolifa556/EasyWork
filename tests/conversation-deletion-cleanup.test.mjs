@@ -35,6 +35,35 @@ class EmptyRemoteExecutor {
   }
 }
 
+test("SSH 连接成功后不等待远端会话清理检查即可返回", async () => {
+  let releaseCleanup;
+  let cleanupStarted = false;
+  let capabilityWarmup = false;
+  let schedulerTracking = false;
+  const cleanup = new Promise((resolve) => { releaseCleanup = resolve; });
+  const connection = { status: "connected", connectedAt: "2026-09-17T00:00:00.000Z" };
+  const service = {
+    sshWorker: { async connect() { return connection; } },
+    scheduleDeletedAgentConversationCleanup() { cleanupStarted = true; return cleanup; },
+    serverCapabilities: { async get() { capabilityWarmup = true; } },
+    async trackSchedulerSubmissions() { schedulerTracking = true; },
+  };
+
+  let resolved = false;
+  const request = ActorServiceContainer.prototype.connectSsh.call(service, "server_fast_connect", {}).then((value) => {
+    resolved = true;
+    return value;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(cleanupStarted, true);
+  assert.equal(resolved, true, "连接响应不应等待清理检查完成");
+  assert.equal(await request, connection);
+  assert.equal(capabilityWarmup, true);
+  assert.equal(schedulerTracking, true);
+  releaseCleanup();
+});
+
 test("离线删除登记三种 Agent 会话，连接失败保留登记，成功后一次性清空且不再轮询", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "easywork-conversation-deletion-cleanup-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));

@@ -274,11 +274,27 @@ export class WorkspaceService {
     const branchId = assertId(input?.branchId || "main", "branchId");
     const workspaceId = assertId(input?.workspaceId, "workspaceId");
     const agentId = assertId(input?.agentId, "agentId");
-    const contextEpoch = Number(input?.contextEpoch ?? 0);
-    invariant(Number.isSafeInteger(contextEpoch) && contextEpoch >= 0, "WORKSPACE_CONTEXT_EPOCH_INVALID", "contextEpoch 无效", { status: 400 });
+    const requestedContextEpoch = Number(input?.contextEpoch ?? 0);
+    invariant(Number.isSafeInteger(requestedContextEpoch) && requestedContextEpoch >= 0, "WORKSPACE_CONTEXT_EPOCH_INVALID", "contextEpoch 无效", { status: 400 });
     const state = await this.repository.read();
     const workspace = state.data.workspaces.find((entry) => entry.id === workspaceId);
     invariant(workspace, "WORKSPACE_NOT_FOUND", "工作区不存在", { status: 404 });
+    const route = state.data.routes.find((entry) => entry.key === routeKey(conversationId, branchId)) || null;
+    const currentBinding = route ? state.data.bindings.find((entry) => entry.id === route.bindingId) || null : null;
+    const latestAgentBinding = state.data.bindings
+      .filter((entry) => entry.status === "active"
+        && entry.serverIdentity === workspace.serverIdentity
+        && entry.conversationId === conversationId
+        && entry.branchId === branchId
+        && entry.agentId === agentId)
+      .sort((left, right) => right.contextEpoch - left.contextEpoch
+        || String(right.updatedAt).localeCompare(String(left.updatedAt)))[0] || null;
+    // Workspace changes are directory changes inside one native Agent
+    // conversation. Agent switches restore that Agent's latest context epoch,
+    // including when it was last used in another workspace.
+    const contextEpoch = currentBinding?.agentId === agentId
+      ? currentBinding.contextEpoch
+      : latestAgentBinding?.contextEpoch ?? requestedContextEpoch;
     const key = createWorkspaceBindingKey({
       actorId: this.actor.actorId,
       serverIdentity: workspace.serverIdentity,
@@ -289,8 +305,8 @@ export class WorkspaceService {
       contextEpoch,
     });
     const targetBinding = state.data.bindings.find((entry) => entry.bindingKey === key) || null;
-    const route = state.data.routes.find((entry) => entry.key === routeKey(conversationId, branchId)) || null;
-    const currentBinding = route ? state.data.bindings.find((entry) => entry.id === route.bindingId) || null : null;
+    const workspaceChanged = Boolean(currentBinding && currentBinding.workspaceId !== workspaceId);
+    const agentChanged = Boolean(currentBinding && currentBinding.agentId !== agentId);
     const descriptorCore = {
       conversationId,
       branchId,
@@ -305,12 +321,14 @@ export class WorkspaceService {
     return {
       id: createSwitchDescriptorId(descriptorCore),
       ...descriptorCore,
-      requiresConfirmation: Boolean(currentBinding && (currentBinding.workspaceId !== workspaceId || currentBinding.agentId !== agentId)),
+      requiresConfirmation: workspaceChanged || agentChanged,
       effects: {
-        switchesNativeAgentSession: Boolean(currentBinding && currentBinding.bindingKey !== key),
+        switchesNativeAgentSession: agentChanged,
+        preservesNativeAgentSession: Boolean(currentBinding && !agentChanged),
+        changesNativeWorkspace: workspaceChanged && !agentChanged,
         preservesWebConversationMemory: true,
-        reusesNativeAgentSession: Boolean(targetBinding?.nativeSessionId),
-        contextDelivery: targetBinding ? "delta-after-watermark" : "bootstrap",
+        reusesNativeAgentSession: Boolean(agentChanged ? targetBinding?.nativeSessionId : currentBinding?.nativeSessionId),
+        contextDelivery: targetBinding || (currentBinding && !agentChanged) ? "delta-after-watermark" : "bootstrap",
         lastDeliverySequence: targetBinding?.lastDeliverySequence ?? 0,
       },
     };

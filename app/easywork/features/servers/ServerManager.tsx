@@ -21,7 +21,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { GatewayError } from "@/app/core/contracts";
 import { useAppRuntime } from "../../runtime/AppRuntime";
-import { CONVERSATIONS_CHANGED_EVENT } from "../../runtime/cacheEvents";
+import { CONVERSATIONS_CHANGED_EVENT, type ConversationsChangedDetail } from "../../runtime/cacheEvents";
 import { Button } from "../../ui/Button";
 import { Modal } from "../../ui/Modal";
 import styles from "./ServerManager.module.css";
@@ -183,25 +183,32 @@ export function ServerEditor({ server, onClose, onSaved, embedded = false }: { s
   return embedded ? form : <Modal title={editing ? "服务器配置" : "添加服务器"} size="wide" onClose={onClose}>{form}</Modal>;
 }
 
-function ConnectDialog({ server, onClose, onChanged }: { server: ServerRecord; onClose: () => void; onChanged: () => Promise<void> }) {
+function ConnectDialog({ server, busy, onBusyChange, onConnected, onClose, onChanged }: { server: ServerRecord; busy: boolean; onBusyChange: (busy: boolean) => void; onConnected: (connection: ServerRecord["connection"]) => void; onClose: () => void; onChanged: () => Promise<void> }) {
   const runtime = useAppRuntime();
   const [twoFactorCode, setTwoFactorCode] = useState("");
   const [fingerprint, setFingerprint] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const attemptActive = useRef(false);
   const connect = async (acceptedFingerprint?: string) => {
-    setBusy(true);
+    if (busy || attemptActive.current) return;
+    attemptActive.current = true;
+    onBusyChange(true);
     try {
-      await runtime.api.post(`/api/servers/${server.profile.id}/connect`, { twoFactorCode: twoFactorCode.trim() || null, ...(acceptedFingerprint ? { acceptedFingerprint } : {}) });
+      const result = await runtime.api.post<ServerRecord["connection"]>(`/api/servers/${server.profile.id}/connect`, { twoFactorCode: twoFactorCode.trim() || null, ...(acceptedFingerprint ? { acceptedFingerprint } : {}) });
+      onConnected(result.data);
       runtime.notify("SSH 已连接", "success");
-      await onChanged();
-      await runtime.refreshBootstrap();
       onClose();
+      // The connect response is authoritative. Refresh dependent views after
+      // closing the dialog so Agent discovery cannot prolong its spinner.
+      void Promise.allSettled([onChanged(), runtime.refreshBootstrap()]);
     } catch (reason) {
       if (reason instanceof GatewayError && reason.code === "SSH_HOST_KEY_CONFIRMATION_REQUIRED") {
         const detail = reason.details as { fingerprint?: string } | null;
         if (detail?.fingerprint) setFingerprint(detail.fingerprint);
       } else runtime.notify(connectionErrorMessage(reason), "error");
-    } finally { setBusy(false); }
+    } finally {
+      attemptActive.current = false;
+      onBusyChange(false);
+    }
   };
   return <Modal title="连接 SSH" subtitle={`${server.profile.username}@${server.profile.host}:${server.profile.port}`} size="compact" onClose={onClose}>
     <div className={styles.connectDialog}>
@@ -214,14 +221,15 @@ function ConnectDialog({ server, onClose, onChanged }: { server: ServerRecord; o
 
 function ShieldFingerprint() { return <span data-ui-icon="" className={styles.fingerprintIcon}><KeyRound size={21} /></span>; }
 
-function Detail({ server, onEdit, onConnect, onDisconnect }: { server: ServerRecord; onEdit: () => void; onConnect: () => void; onDisconnect: () => Promise<void> }) {
-  const connected = server.connection.status === "connected";
+function Detail({ server, connecting, onEdit, onConnect, onDisconnect }: { server: ServerRecord; connecting: boolean; onEdit: () => void; onConnect: () => void; onDisconnect: () => Promise<void> }) {
+  const status: ServerStatus = connecting ? "connecting" : server.connection.status;
+  const connected = status === "connected";
   const conversations = server.conversations ?? server.conversationIds.map((id) => ({ id, title: "未命名对话" }));
   return <div className={styles.detail}>
-    <header className={styles.detailHeading}><div data-ui-icon="" className={styles.serverMark}>{connected ? <Wifi size={23} /> : <ServerOff size={23} />}</div><div><h2>{server.profile.name}</h2><p>{server.profile.username}@{server.profile.host}:{server.profile.port}</p></div><Status value={server.connection.status} /></header>
+    <header className={styles.detailHeading}><div data-ui-icon="" className={styles.serverMark}>{connected ? <Wifi size={23} /> : <ServerOff size={23} />}</div><div><h2>{server.profile.name}</h2><p>{server.profile.username}@{server.profile.host}:{server.profile.port}</p></div><Status value={status} /></header>
     <div className={styles.facts}><div><span>认证方式</span><strong>{server.profile.authMethod === "private-key" ? "SSH 私钥" : "密码"}</strong></div><div><span>关联对话</span><strong>{server.conversationIds.length}</strong></div><div><span>最近活动</span><strong>{server.connection.lastActiveAt ? new Date(server.connection.lastActiveAt).toLocaleString("zh-CN") : "—"}</strong></div></div>
     <section className={styles.bindingSection}><div className={styles.subheading}><UsersRound size={17} /><h3>连接对话</h3></div>{conversations.length ? <div className={styles.bindingList}>{conversations.map((conversation) => <div key={conversation.id}><span title={conversation.title}>{conversation.title}</span><i>{connected ? "SSH 可用" : "等待连接"}</i></div>)}</div> : <div className={styles.noBindings}>还没有对话使用这台服务器</div>}</section>
-    <footer className={styles.detailActions}><Button onClick={onEdit}>配置</Button>{connected ? <Button variant="danger" icon={<Unplug size={16} />} onClick={() => void onDisconnect()}>断开 SSH</Button> : <Button variant="primary" icon={<Cable size={16} />} onClick={onConnect} disabled={server.connection.status === "connecting"}>连接 SSH</Button>}</footer>
+    <footer className={styles.detailActions}><Button onClick={onEdit}>配置</Button>{connected ? <Button variant="danger" icon={<Unplug size={16} />} onClick={() => void onDisconnect()}>断开 SSH</Button> : <Button variant="primary" icon={connecting ? <LoaderCircle className={styles.spin} size={16} /> : <Cable size={16} />} onClick={onConnect} disabled={connecting || server.connection.status === "connecting"}>{connecting ? "连接中" : "连接 SSH"}</Button>}</footer>
   </div>;
 }
 
@@ -236,7 +244,8 @@ export default function ServerManager() {
   const [selectedId, setSelectedId] = useState<string | null>(() => initialCache?.selectedId || null);
   const [loading, setLoading] = useState(() => !initialCache);
   const [editing, setEditing] = useState<"new" | "selected" | null>(null);
-  const [connecting, setConnecting] = useState(false);
+  const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
+  const [connectingServerIds, setConnectingServerIds] = useState<ReadonlySet<string>>(() => new Set());
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   const savedInEditor = useRef(false);
 
@@ -264,7 +273,11 @@ export default function ServerManager() {
     // Conversation titles and bindings are server-detail data too.  Refresh
     // only when an actual mutation announces an invalidation; navigation keeps
     // using the durable SPA cache and there is no polling loop.
-    const changed = () => { void load().finally(() => setLoading(false)); };
+    const changed = (event: Event) => {
+      const detail = (event as CustomEvent<ConversationsChangedDetail>).detail;
+      if (detail?.optimistic) return;
+      void load().finally(() => setLoading(false));
+    };
     window.addEventListener(CONVERSATIONS_CHANGED_EVENT, changed);
     return () => window.removeEventListener(CONVERSATIONS_CHANGED_EVENT, changed);
   }, [load]);
@@ -272,6 +285,19 @@ export default function ServerManager() {
     if (!loading) serverPageCache.set(cacheKey, { servers, selectedId, cachedAt: serverPageCache.get(cacheKey)?.cachedAt || Date.now() });
   }, [cacheKey, loading, selectedId, servers]);
   const selected = useMemo(() => servers.find((item) => item.profile.id === selectedId) ?? null, [servers, selectedId]);
+  const setConnectionPending = useCallback((serverId: string, pending: boolean) => {
+    setConnectingServerIds((current) => {
+      const next = new Set(current);
+      if (pending) next.add(serverId);
+      else next.delete(serverId);
+      return next;
+    });
+  }, []);
+  const markConnected = useCallback((serverId: string, connection: ServerRecord["connection"]) => {
+    setServers((current) => current.map((server) => server.profile.id === serverId
+      ? { ...server, connection: { ...server.connection, ...connection, status: "connected", lastError: null } }
+      : server));
+  }, []);
 
   const disconnect = async () => {
     if (!selected) return;
@@ -286,12 +312,12 @@ export default function ServerManager() {
     {loading ? <div className={styles.centerState}><LoaderCircle className={styles.spin} size={22} />正在读取远程服务器</div> : <div className={styles.manager}>
       <aside className={styles.serverList}>
         <div className={styles.serverItems}>
-          {servers.map((server) => <button key={server.profile.id} className={server.profile.id === selectedId ? styles.selectedServer : ""} onClick={() => { setSelectedId(server.profile.id); setEditing(null); setMobileDetailOpen(true); }}><span data-ui-icon="" className={styles.listIcon}><Server size={18} /></span><span><strong>{server.profile.name}</strong><small>{server.profile.host}</small></span><Status value={server.connection.status} /></button>)}
+          {servers.map((server) => <button key={server.profile.id} className={server.profile.id === selectedId ? styles.selectedServer : ""} onClick={() => { setSelectedId(server.profile.id); setEditing(null); setMobileDetailOpen(true); }}><span data-ui-icon="" className={styles.listIcon}><Server size={18} /></span><span><strong>{server.profile.name}</strong><small>{server.profile.host}</small></span><Status value={connectingServerIds.has(server.profile.id) ? "connecting" : server.connection.status} /></button>)}
           <button className={styles.addServer} onClick={() => { savedInEditor.current = false; setEditing("new"); setMobileDetailOpen(true); }}><span data-ui-icon="" className={styles.addServerIcon}><Plus size={17} /></span><strong>新建服务器</strong></button>
         </div>
       </aside>
-      <section className={styles.detailPanel}>{editing ? <ServerEditor embedded server={editing === "selected" ? selected ?? undefined : undefined} onClose={() => { setEditing(null); if (editing === "new" && !savedInEditor.current) setMobileDetailOpen(false); }} onSaved={async (serverId) => { await load(serverId); await refreshBootstrap(); savedInEditor.current = true; }} /> : selected ? <Detail server={selected} onEdit={() => { savedInEditor.current = false; setEditing("selected"); }} onConnect={() => setConnecting(true)} onDisconnect={disconnect} /> : <div className={styles.emptyDetail}><Server size={25} /><strong>选择或新建一台服务器</strong></div>}</section>
+      <section className={styles.detailPanel}>{editing ? <ServerEditor embedded server={editing === "selected" ? selected ?? undefined : undefined} onClose={() => { setEditing(null); if (editing === "new" && !savedInEditor.current) setMobileDetailOpen(false); }} onSaved={async (serverId) => { await load(serverId); await refreshBootstrap(); savedInEditor.current = true; }} /> : selected ? <Detail server={selected} connecting={connectingServerIds.has(selected.profile.id)} onEdit={() => { savedInEditor.current = false; setEditing("selected"); }} onConnect={() => setConnectionDialogOpen(true)} onDisconnect={disconnect} /> : <div className={styles.emptyDetail}><Server size={25} /><strong>选择或新建一台服务器</strong></div>}</section>
     </div>}
-    {connecting && selected ? <ConnectDialog server={selected} onClose={() => setConnecting(false)} onChanged={async () => load(selected.profile.id)} /> : null}
+    {connectionDialogOpen && selected ? <ConnectDialog server={selected} busy={connectingServerIds.has(selected.profile.id)} onBusyChange={(busy) => setConnectionPending(selected.profile.id, busy)} onConnected={(connection) => markConnected(selected.profile.id, connection)} onClose={() => setConnectionDialogOpen(false)} onChanged={async () => load(selected.profile.id)} /> : null}
   </div>;
 }

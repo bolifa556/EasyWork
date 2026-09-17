@@ -158,7 +158,7 @@ test("组合 Gateway 完成注册、严格 bootstrap、项目、流式对话并�
   assert.ok(replayedConversation.payload.data.events.some((event) => event.kind === "run.persisted"));
   const summaryReplay = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/events?view=summary`, { token });
   const reasoningHeading = summaryReplay.payload.data.events.find((event) => event.kind === "run.reasoning.delta");
-  assert.equal(reasoningHeading.payload.content, "");
+  assert.equal(reasoningHeading.payload.content, "核对上下文。");
   const details = await requestJson(active.baseUrl, `/api/conversations/${conversationId}/events/details`, { token, method: "POST", body: { eventIds: [reasoningHeading.eventId] } });
   assert.equal(details.response.status, 200);
   assert.equal(details.payload.data.events[0].payload.content, "核对上下文。");

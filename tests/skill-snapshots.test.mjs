@@ -21,6 +21,7 @@ function shellWords(command) {
 }
 class LocalExecutor {
   failManifest = false;
+  legacyPython = false;
   async readFile(file) { return fs.readFile(file); }
   async writeAtomic(file, bytes, options) {
     if (this.failManifest && file.endsWith("/skill-view.json")) { this.failManifest = false; throw new Error("manifest disk fault"); }
@@ -28,8 +29,11 @@ class LocalExecutor {
     await fs.writeFile(file, bytes, options);
   }
   async exec(command) {
+    if (command.startsWith("if command -v python3")) {
+      return { code: 0, stdout: `${this.legacyPython ? "python" : "python3"}\n`, stderr: "" };
+    }
     const args = shellWords(command);
-    if (args[0] === "python3") {
+    if (["python3", "python"].includes(args[0])) {
       const result = await runFile(process.env.EASYWORK_TEST_PYTHON || (process.platform === "win32" ? "python" : "python3"), args.slice(1), { maxBuffer: 4 * 1024 * 1024, windowsHide: true });
       return { code: 0, ...result };
     }
@@ -84,4 +88,18 @@ test("historical Skill snapshots inherit edited, added and deleted files and sur
     await fs.writeFile(descriptorFile, JSON.stringify(descriptor));
     await assert.rejects(() => restoreSkillSnapshot(executor, pathsFor(root, "tampered"), boundary), { code: "AGENT_SKILL_SNAPSHOT_CHANGED" });
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("Skill snapshots use the legacy python command when python3 is unavailable", async () => {
+  const root = (await fs.mkdtemp(path.join(os.tmpdir(), "easywork-skill-snapshot-python2-"))).replaceAll("\\", "/");
+  const executor = new LocalExecutor();
+  executor.legacyPython = true;
+  const paths = pathsFor(root, "python2-compatible");
+  try {
+    await fs.mkdir(paths.skillsRoot, { recursive: true });
+    const snapshot = await captureSkillSnapshot(executor, paths, "task-python2-compatible", []);
+    assert.equal(snapshot.root, `${paths.runtimeRoot}/skill-snapshots/task-python2-compatible`);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

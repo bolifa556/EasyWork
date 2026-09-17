@@ -164,6 +164,14 @@ function emitItem(context, method, params, item, phase) {
     if (summary) context.emit("reasoning", phase, { text: summary, delta: false }, source);
     return;
   }
+  if (type === "functionCallOutput") {
+    context.emit("tool_result", phase, {
+      name: [text(item.namespace), text(item.name)].filter(Boolean).join(".") || "functionCall",
+      callId: idOf(item.id) || "function-call",
+      text: codexResultText(item.output),
+    }, source);
+    return;
+  }
   // The authoritative Todo snapshot is turn/plan/updated. A Plan item only
   // carries model prose and is intentionally not rendered inside Agent activity.
   if (type === "plan" || type === "userMessage" || type === "hookPrompt") return;
@@ -298,9 +306,37 @@ function elicitationInput(params) {
       elicitationId: text(params.elicitationId),
     };
   }
+  if (mode === "openai/userVerification") {
+    return {
+      mode,
+      questions: [{
+        id: "proof",
+        header: text(params.title) || "用户验证",
+        question: text(params.description) || "请输入设备验证凭据。",
+        required: true,
+        allowCustom: true,
+        isSecret: true,
+        options: [],
+      }],
+      schema: { properties: { proof: { type: "string", writeOnly: true } }, required: ["proof"] },
+      challenge: text(params.challenge),
+    };
+  }
+  const questions = elicitationQuestions(params);
+  if (!questions.length && ["openai/form", "openaiForm"].includes(mode)) {
+    questions.push({
+      id: "response",
+      header: text(params.title || params.serverName) || "外部表单",
+      question: text(params.message) || "请输入表单响应。",
+      required: true,
+      allowCustom: true,
+      isSecret: false,
+      options: [],
+    });
+  }
   return {
     mode,
-    questions: elicitationQuestions(params),
+    questions,
     schema: safeDomainValue(params.requestedSchema || {}),
   };
 }
@@ -476,6 +512,7 @@ function reduceCodex(previousState, frame, producer) {
     const requestId = idOf(frame.id);
     const permissionRequest = method === "item/permissions/requestApproval";
     const fileRequest = method.includes("fileChange") || method === "applyPatchApproval";
+    const approvalKind = text(params.kind || "command");
     if (requestId) context.state.pendingApprovals[requestId] = {
       type: permissionRequest ? "permissions" : fileRequest ? "file_change" : "command_execution",
       itemId: idOf(params.itemId || params.callId),
@@ -484,12 +521,14 @@ function reduceCodex(previousState, frame, producer) {
     };
     context.emit("approval_request", "waiting", {
       requestId,
-      action: permissionRequest ? "permissions" : fileRequest ? "file_change" : "command_execution",
+      action: permissionRequest ? "permissions" : fileRequest ? "file_change" : approvalKind === "writeStdin" ? "write_stdin" : "command_execution",
       reason: text(params.reason),
       details: safeDomainValue(permissionRequest
         ? { permissions: params.permissions, cwd: params.cwd }
+        : approvalKind === "writeStdin"
+          ? { kind: approvalKind, approvalId: params.approvalId, command: params.command, cwd: params.cwd }
         : params.command
-          ? { command: params.command, cwd: params.cwd, parsedCommand: params.parsedCmd }
+          ? { command: params.command, cwd: params.cwd, parsedCommand: params.parsedCmd, commandActions: params.commandActions }
           : params.changes || params.fileChanges || {}),
     }, sourceOf(method, params, {}, { requestId, itemId: params.itemId || params.callId }));
   } else if (method === "error") {
@@ -611,6 +650,12 @@ function reduceCodex(previousState, frame, producer) {
       name: text(params.name),
       message: text(params.error || params.failureReason || params.status),
     }, sourceOf(method, params));
+  } else if (method === "modelProvider/authRecoveryStarted" || method === "modelProvider/authRecoveryCompleted") {
+    context.emit("job_status", method.endsWith("Started") ? "started" : "completed", {
+      operation: "provider_auth_recovery",
+      name: text(params.provider),
+      message: text(params.message),
+    }, sourceOf(method, params));
   } else if (method === "serverRequest/resolved") {
     const requestId = idOf(params.requestId);
     const wasInput = Boolean(requestId && context.state.pendingInputs[requestId]);
@@ -645,9 +690,11 @@ function reduceCodex(previousState, frame, producer) {
     "command/exec/outputDelta", "process/outputDelta", "process/exited",
     "thread/realtime/started", "thread/realtime/itemAdded", "thread/realtime/transcript/delta",
     "thread/realtime/transcript/done", "thread/realtime/outputAudio/delta", "thread/realtime/sdp",
+    "thread/realtime/item/started", "thread/realtime/item/transcript/delta", "thread/realtime/item/completed",
     "thread/realtime/error", "thread/realtime/closed", "windows/worldWritableWarning",
     "windowsSandbox/setupCompleted", "rawResponseItem/completed", "rawResponse/completed",
     "project/changed", "thread/project/updated", "item/fileChange/outputDelta",
+    "mcpServer/event/stream/notification",
   ].includes(method)) {
     // Current app-server notifications outside EasyWork's text coding-task
     // surface are consumed explicitly so they cannot become accidental rows.
@@ -674,7 +721,7 @@ function buildCodexOperation(operation, input) {
   if (operation === "start") {
     const prompt = requireString(input, "prompt", operation);
     if (input.threadId) {
-      return { transport: "json-rpc", calls: [rpc("turn/start", { threadId: String(input.threadId), input: [{ type: "text", text: prompt }] })] };
+      return { transport: "json-rpc", calls: [rpc("turn/start", { threadId: String(input.threadId), input: [{ type: "text", text: prompt }], ...(input.cwd ? { cwd: String(input.cwd) } : {}) })] };
     }
     return {
       transport: "json-rpc",
@@ -779,7 +826,7 @@ function buildCodexOperation(operation, input) {
   if (operation === "resume") {
     const threadId = requireString(input, "threadId", operation);
     const prompt = requireString(input, "prompt", operation);
-    return { transport: "json-rpc", calls: [rpc("thread/resume", { threadId }), rpc("turn/start", { threadId, input: [{ type: "text", text: prompt }] })] };
+    return { transport: "json-rpc", calls: [rpc("thread/resume", { threadId, ...(input.cwd ? { cwd: String(input.cwd) } : {}) }), rpc("turn/start", { threadId, input: [{ type: "text", text: prompt }], ...(input.cwd ? { cwd: String(input.cwd) } : {}) })] };
   }
   if (operation === "fork") {
     const threadId = requireString(input, "threadId", operation);

@@ -27,10 +27,16 @@ import { captureSkillSnapshot, restoreSkillSnapshot, readSkillView, selectedSkil
 const DEFAULT_OPENCODE_OUTPUT_LIMIT = 32_768;
 const PREPARED_RUNTIME_TTL_MS = 15 * 60_000;
 const SERVICE_HEALTH_TTL_MS = 60_000;
-const READINESS_RPC_TIMEOUT_MS = 8_000;
-const OPENCODE_READY_TIMEOUT_MS = 30_000;
+const READINESS_RPC_TIMEOUT_MS = 60_000;
+// OpenCode builds its provider/model catalog lazily.  On shared HPC homes the
+// first catalogue load can take well over a minute even though the service is
+// healthy; scnet-gpu 1.18.30 was observed publishing the configured model at
+// roughly 91 seconds.  Keep the process alive long enough for that native
+// startup path while retaining the short per-request timeout below.
+const OPENCODE_READY_TIMEOUT_MS = 120_000;
 const OPENCODE_READY_REQUEST_TIMEOUT_MS = 3_000;
 const OPENCODE_NATIVE_STORE_CLONE_REVISION = 4;
+const CODEX_STORAGE_PROBE_MARKER = "__EASYWORK_CODEX_STORAGE__";
 async function confirmProcessExit(process, timeoutMs) {
   if (process.closed) return true;
   invariant(typeof process.wait === "function", "AGENT_INTERRUPT_UNCONFIRMED", "无法确认远端进程是否已停止", { status: 502, retryable: true });
@@ -98,6 +104,19 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
+// Qoder scopes local transcripts by the real working-directory path. This is
+// the exact key algorithm published by @qoder-ai/qoder-agent-sdk 1.0.41 and
+// used by Qoder CN CLI 1.1.53. Keep it here instead of guessing from the
+// directory names because long workspace paths carry a native DJB2 suffix.
+function qoderProjectKey(value) {
+  const source = String(value || "");
+  const sanitized = source.replace(/[^a-zA-Z0-9]/g, "-");
+  if (sanitized.length <= 200) return sanitized;
+  let hash = 5381;
+  for (let index = 0; index < source.length; index += 1) hash = (hash * 33) ^ source.charCodeAt(index);
+  return `${sanitized.slice(0, 200)}-${Math.abs(hash).toString(36)}`;
+}
+
 function frameFromLine(line, { sse = false } = {}) {
   let text = String(line || "").trim();
   if (!text || text.startsWith(":")) return null;
@@ -128,10 +147,10 @@ async function* prefixedFrames(frames, prefix = []) {
 
 const CLAUDE_NATIVE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-async function claudeTranscriptCurrentLeafUuid({ executor, runtimeData, sessionId }) {
+async function claudeTranscriptCurrentLeafUuid({ executor, runtimeData, sessionId, configDirectory = "claude" }) {
   const normalizedSessionId = String(sessionId || "");
   if (!CLAUDE_NATIVE_UUID.test(normalizedSessionId) || !String(runtimeData || "")) return null;
-  const projectsRoot = `${String(runtimeData)}/claude/projects`;
+  const projectsRoot = `${String(runtimeData)}/${String(configDirectory)}/projects`;
   const script = [
     `transcript="$(find ${shellQuote(projectsRoot)} -type f -name ${shellQuote(`${normalizedSessionId}.jsonl`)} -print -quit 2>/dev/null)"`,
     "leaf=''",
@@ -144,10 +163,10 @@ async function claudeTranscriptCurrentLeafUuid({ executor, runtimeData, sessionI
   return CLAUDE_NATIVE_UUID.test(leafUuid) ? leafUuid : null;
 }
 
-async function claudeTranscriptLeafUuid({ executor, runtimeData, sessionId, previousTurnId = null }) {
+async function claudeTranscriptLeafUuid({ executor, runtimeData, sessionId, previousTurnId = null, configDirectory = "claude" }) {
   const normalizedSessionId = String(sessionId || "");
   if (!CLAUDE_NATIVE_UUID.test(normalizedSessionId)) return null;
-  const projectsRoot = `${String(runtimeData || "")}/claude/projects`;
+  const projectsRoot = `${String(runtimeData || "")}/${String(configDirectory)}/projects`;
   if (!String(runtimeData || "")) return null;
   const prior = CLAUDE_NATIVE_UUID.test(String(previousTurnId || "")) ? String(previousTurnId) : "";
   // Claude's terminal stream-json `result` does not expose the final transcript
@@ -184,6 +203,7 @@ async function* claudeFramesWithNativeBoundary(frames, options) {
         runtimeData: options.runtimeData,
         sessionId,
         previousTurnId,
+        configDirectory: options.configDirectory || "claude",
       });
       // The boundary frame deliberately precedes `result`: result completes
       // the Task, after which the orchestrator stops consuming native frames.
@@ -276,7 +296,7 @@ function mergeClaudeDelta(previous, current) {
 function agentFrameMerger(agentId) {
   if (agentId === "codex") return mergeCodexDelta;
   if (agentId === "opencode") return mergeOpenCodeDelta;
-  if (agentId === "claude-code") return mergeClaudeDelta;
+  if (["claude-code", "qoder-cn"].includes(agentId)) return mergeClaudeDelta;
   return null;
 }
 
@@ -309,7 +329,7 @@ function claudeThinkingTelemetrySuperseded(previous, current) {
 function agentQueueOptions(agentId) {
   return {
     merge: agentFrameMerger(agentId),
-    ...(agentId === "claude-code" ? {
+    ...(["claude-code", "qoder-cn"].includes(agentId) ? {
       discardPrevious: claudeThinkingTelemetrySuperseded,
     } : {}),
   };
@@ -473,7 +493,7 @@ async function* scopedClaudeFrames(lines, entry) {
             response: {
               subtype: "error",
               request_id: String(frame.request_id || ""),
-              error: `EasyWork 未协商 Claude Code 控制请求：${subtype || "unknown"}`,
+              error: `EasyWork 未协商 ${entry.agentId === "qoder-cn" ? "Qoder CN" : "Claude Code"} 控制请求：${subtype || "unknown"}`,
             },
           });
         }
@@ -501,7 +521,13 @@ const CLAUDE_EFFORT_ORDER = Object.freeze(["low", "medium", "high", "xhigh", "ma
 
 function claudeFrameText(frame) {
   const values = [];
-  for (const value of [frame?.result, frame?.error, frame?.message?.error]) {
+  for (const value of [
+    frame?.result,
+    frame?.error,
+    frame?.message?.error,
+    frame?.compact_error,
+    ...(Array.isArray(frame?.errors) ? frame.errors : []),
+  ]) {
     if (typeof value === "string" && value.trim()) values.push(value.trim());
   }
   const content = Array.isArray(frame?.message?.content) ? frame.message.content : [];
@@ -511,6 +537,101 @@ function claudeFrameText(frame) {
     }
   }
   return values.join("\n");
+}
+
+function compactFailure(agentLabel, frame, priorMessage = "") {
+  const detail = claudeFrameText(frame) || String(priorMessage || "").trim();
+  const failed = frame?.is_error === true
+    || (frame?.subtype && frame.subtype !== "success")
+    || frame?.compact_result === "failed";
+  const message = detail
+    ? `${agentLabel} 上下文压缩${failed ? "失败" : "未执行"}：${detail}`
+    : `${agentLabel} 原生进程已结束压缩请求，但没有返回完成边界`;
+  return new ApiError(failed ? "AGENT_COMPACT_FAILED" : "AGENT_COMPACT_NOT_APPLIED", message, {
+    status: failed ? 502 : 409,
+    retryable: failed,
+    expose: true,
+    details: {
+      subtype: String(frame?.subtype || ""),
+      isError: frame?.is_error === true,
+    },
+  });
+}
+
+async function executeClaudeCompact({ entry, frames, agentLabel, terminateAfter = false, timeoutMs = 90_000 }) {
+  // Subscribe before writing `/compact`: a local or fast remote process can
+  // publish its boundary/result before the write promise yields back to us.
+  const lines = entry.process.lines(agentLineQueueOptions(entry.agentId));
+  const parsed = parsedFrames(lines);
+  const iterator = parsed[Symbol.asyncIterator]();
+  const queue = claudeTurnQueue(entry);
+  let precedingResults = Math.max(0, queue.submitted - queue.completed);
+  let lastMessage = "";
+  let pendingNext = null;
+  const deadline = Date.now() + timeoutMs;
+  try {
+    for (const frame of frames || []) writeClaudeFrame(entry, frame);
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new ApiError("AGENT_COMPACT_TIMEOUT", `${agentLabel} 上下文压缩等待原生结果超时`, {
+          status: 504,
+          retryable: true,
+          expose: true,
+        });
+      }
+      pendingNext = iterator.next();
+      let timer;
+      const next = await Promise.race([
+        pendingNext,
+        new Promise((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), remaining); }),
+      ]).finally(() => clearTimeout(timer));
+      if (next?.timeout) {
+        throw new ApiError("AGENT_COMPACT_TIMEOUT", `${agentLabel} 上下文压缩等待原生结果超时`, {
+          status: 504,
+          retryable: true,
+          expose: true,
+        });
+      }
+      pendingNext = null;
+      if (next.done) {
+        throw new ApiError("AGENT_COMPACT_INCOMPLETE", `${agentLabel} 原生进程已结束，但没有返回压缩完成边界`, {
+          status: 502,
+          retryable: true,
+          expose: true,
+        });
+      }
+      const frame = next.value;
+      if (frame?.type === "system" && frame?.subtype === "compact_boundary") return frame;
+      const message = claudeFrameText(frame);
+      if (message) lastMessage = message;
+      if (frame?.type === "system" && frame?.subtype === "status" && frame?.compact_result === "failed") {
+        throw compactFailure(agentLabel, frame, lastMessage);
+      }
+      if (frame?.type !== "result") continue;
+      // An active process can still be finishing turns that were submitted
+      // before `/compact`. Their result frames are not the compact outcome.
+      if (precedingResults > 0) {
+        precedingResults -= 1;
+        lastMessage = "";
+        continue;
+      }
+      // A successful native compact always publishes compact_boundary before
+      // its terminal result. A result without that boundary is a native no-op
+      // or failure (too-short context, auth/quota failure, blocked hook, etc.).
+      throw compactFailure(agentLabel, frame, lastMessage);
+    }
+  } finally {
+    // Cancel a pending read before returning the parsed generator. Without
+    // this, an actual timeout can remain blocked in iterator.next().
+    try { await lines.return?.(); } catch { /* best-effort subscription cleanup */ }
+    if (pendingNext) await pendingNext.catch(() => undefined);
+    try { await iterator.return?.(); } catch { /* best-effort parser cleanup */ }
+    entry.process.endInput?.();
+    if (terminateAfter && !entry.process.closed) {
+      await entry.process.signal("SIGTERM").catch(() => undefined);
+    }
+  }
 }
 
 function claudeUnsupportedEffort(frame) {
@@ -1265,6 +1386,10 @@ function agentCacheVersionKey(version) {
   return `${label}-${digest}`;
 }
 
+function codexLocalStorageIdentity(codexHome) {
+  return crypto.createHash("sha256").update(String(codexHome || "")).digest("hex").slice(0, 32);
+}
+
 function commandHelpHasFlag(help, flag) {
   const escaped = String(flag).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?:^|[\\s,])${escaped}(?=[\\s,=]|$)`, "m").test(String(help || ""));
@@ -1357,10 +1482,12 @@ function codexThreadRequestParams(params, bypassHookTrust) {
 function codexTurnRequestParams(params, context) {
   const model = String(context.runtimeApiRoute?.model || context.configuration.model || "").trim();
   const effort = String(context.configuration.reasoningEffort || "").trim();
+  const cwd = String(context.request.workspace?.path || "").trim();
   return {
     ...params,
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
+    ...(cwd ? { cwd } : {}),
   };
 }
 
@@ -1376,8 +1503,9 @@ function codexSteerWindowClosed(error) {
 
 function contextUsageWithConfiguredLimit(usage, configuration) {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
-  const used = Number(usage.used);
+  const reportedUsed = Number(usage.used);
   const nativeLimit = Number(usage.limit);
+  const nativeRatio = Number(usage.ratio);
   const configuredLimit = Number(configuration?.contextLimit);
   // The Agent control displays the auto-compaction calculation window, not
   // the provider/model hard context capacity reported by usage events.
@@ -1386,6 +1514,13 @@ function contextUsageWithConfiguredLimit(usage, configuration) {
     : Number.isFinite(nativeLimit) && nativeLimit > 0
       ? nativeLimit
       : null;
+  const ratio = Number.isFinite(nativeRatio) && nativeRatio >= 0 && nativeRatio <= 1
+    ? nativeRatio
+    : null;
+  const ratioLimit = Number.isFinite(nativeLimit) && nativeLimit > 0 ? nativeLimit : limit;
+  const used = ratio !== null && ratioLimit && (!Number.isFinite(reportedUsed) || reportedUsed < 0 || reportedUsed === 0 && ratio > 0)
+    ? Math.round(ratio * ratioLimit)
+    : reportedUsed;
   if (!Number.isFinite(used) || used < 0) return structuredClone(usage);
   return {
     ...structuredClone(usage),
@@ -1400,12 +1535,23 @@ function contextUsageWithConfiguredLimit(usage, configuration) {
 
 function verifiedStoredContextUsage(agentId, usage) {
   if (!usage || typeof usage !== "object") return null;
-  if (agentId !== "claude-code") return usage;
-  return ["claude-code-current-request", "claude-code-context-report"].includes(String(usage.source || "")) ? usage : null;
+  if (agentId === "claude-code") return ["claude-code-current-request", "claude-code-context-report"].includes(String(usage.source || "")) ? usage : null;
+  if (agentId === "qoder-cn") return ["qoder-cn-current-request", "qoder-cn-context-report"].includes(String(usage.source || "")) ? usage : null;
+  return usage;
 }
 
 export class AgentRuntimeTransport {
-  constructor({ executor, deploymentService, skillDeployment = null, configurationService = null, clock = () => Date.now(), httpReadyAttempts = 120, httpReadyDelayMs = 250, openCodePollIntervalMs = 500, openCodeDefaultProtocol = "v2" } = {}) {
+  constructor({
+    executor,
+    deploymentService,
+    skillDeployment = null,
+    configurationService = null,
+    clock = () => Date.now(),
+    httpReadyAttempts = 120,
+    httpReadyDelayMs = 250,
+    openCodePollIntervalMs = 500,
+    openCodeDefaultProtocol = "v2",
+  } = {}) {
     invariant(executor && typeof executor.spawn === "function" && typeof executor.exec === "function", "AGENT_RUNTIME_EXECUTOR_REQUIRED", "缺少 Agent runtime executor", {
       status: 500,
       expose: false,
@@ -1432,11 +1578,58 @@ export class AgentRuntimeTransport {
     this.configurationHashes = new Map();
     this.cliCapabilityProfiles = new Map();
     this.claudeEffortFallbacks = new Map();
+    this.codexStorageProfiles = new Map();
+    this.pendingCodexStorageProfiles = new Map();
+    this.nativeProcessActivitySequence = 0;
+    this.releaseSessionChannelPressureHandler = typeof this.executor.setSessionChannelPressureHandler === "function"
+      ? this.executor.setSessionChannelPressureHandler(() => this.#evictLeastRecentlyUsedIdleNativeProcess())
+      : null;
+  }
+
+  #touchNativeProcess(entry) {
+    if (!entry?.process || entry.process.detached) return;
+    entry.lastActiveAt = Number(this.clock());
+    entry.lastActiveOrder = ++this.nativeProcessActivitySequence;
+  }
+
+  async #evictLeastRecentlyUsedIdleNativeProcess() {
+    const candidates = [...this.active.entries()]
+      .filter(([, entry]) => {
+        const process = entry?.process;
+        if (!process || process.closed || process.detached) return false;
+        if (entry.agentId === "codex") return !entry.codexFrameScope && entry.operationActive !== true;
+        return ["claude-code", "qoder-cn"].includes(entry.agentId) && entry.prepared === true;
+      })
+      .sort((left, right) => Number(left[1].lastActiveOrder || 0) - Number(right[1].lastActiveOrder || 0));
+    const candidate = candidates[0];
+    if (!candidate) return false;
+    const [key, entry] = candidate;
+    const process = entry.process;
+    if (this.active.get(key) !== entry) return false;
+    this.active.delete(key);
+    try {
+      if (typeof process.retire === "function") await process.retire();
+      else if (typeof process.endInput === "function") process.endInput();
+      else if (typeof process.signal === "function") await process.signal("SIGTERM");
+      else throw new Error("Agent process cannot be retired");
+      return true;
+    } catch {
+      if (!process.closed && !this.active.has(key)) this.active.set(key, entry);
+      return false;
+    }
   }
 
   async checkReadiness(agentId, { source = null, configScope = "default" } = {}) {
     runtimeAgentDefinition(agentId);
     const installation = await this.deploymentService.resolveRuntime(agentId, { source });
+    if (agentId === "qoder-cn") {
+      const authentication = await this.deploymentService.authenticationStatus(agentId, { force: true });
+      invariant(authentication.authenticated, "QODER_LOGIN_REQUIRED", "请先登录 Qoder CN 账号", {
+        status: 409,
+        details: { agentId, authentication },
+      });
+      return Object.freeze({ ready: true, agentId, version: installation.version, protocol: "qoder-cn-stream-json", authentication });
+    }
     if (agentId !== "codex") {
       return Object.freeze({ ready: true, agentId, version: installation.version, protocol: null });
     }
@@ -1448,19 +1641,25 @@ export class AgentRuntimeTransport {
         : Promise.resolve({}),
     ]);
     const probeHome = `${remoteAgentPaths(home, agentId).easyworkRoot}/runtime/readiness/codex`;
-    const prepared = await this.executor.exec(`mkdir -p -- ${shellQuote(probeHome)}`, { maxOutputBytes: 16 * 1024 });
+    const probeRuntimeHome = `${probeHome}/home`;
+    const prepared = await this.executor.exec(`mkdir -p -- ${shellQuote(probeHome)} ${shellQuote(probeRuntimeHome)}`, { maxOutputBytes: 16 * 1024 });
     invariant(prepared.code === 0, "AGENT_READINESS_PREPARE_FAILED", "无法准备 Codex 就绪检查目录", {
       status: 502,
       retryable: true,
       details: { agentId, exitCode: prepared.code },
     });
+    const storageProfile = await this.#codexStorageProfile(probeHome);
     let process = null;
     try {
       process = await this.executor.spawn({
         executable: installation.binaryPath,
         args: ["app-server", ...codexRuntimeConfigArguments(configuration, null, null)],
-        cwd: home,
-        env: { HOME: home, CODEX_HOME: probeHome },
+        cwd: probeRuntimeHome,
+        env: {
+          HOME: probeRuntimeHome,
+          CODEX_HOME: probeHome,
+          ...(storageProfile.sqliteHome ? { CODEX_SQLITE_HOME: storageProfile.sqliteHome } : {}),
+        },
       });
       await process.requestJsonRpc("initialize", {
         clientInfo: { name: "easywork-readiness", title: "EasyWork", version: "2" },
@@ -1475,6 +1674,8 @@ export class AgentRuntimeTransport {
         agentId,
         version: installation.version,
         protocol: "codex-app-server-jsonrpc",
+        storageMode: storageProfile.mode,
+        filesystemType: storageProfile.filesystemType,
       });
     } catch (error) {
       throw new ApiError("AGENT_CODEX_PROTOCOL_UNAVAILABLE", `Codex ${String(installation.version || "unknown")} 没有提供 EasyWork 所需的 app-server 初始化协议`, {
@@ -1498,6 +1699,13 @@ export class AgentRuntimeTransport {
     invariant(request && request.descriptor && request.binding, "AGENT_TRANSPORT_REQUEST_INVALID", "Agent transport 请求不完整", { status: 400 });
     const agentId = String(request.adapterId || "");
     runtimeAgentDefinition(agentId);
+    if (agentId === "qoder-cn" && !["event-cache", "native-deferred"].includes(request.descriptor.transport)) {
+      const authentication = await this.deploymentService.authenticationStatus(agentId, { force: true });
+      invariant(authentication.authenticated, "QODER_LOGIN_REQUIRED", "请先登录 Qoder CN 账号", {
+        status: 409,
+        details: { agentId, authentication },
+      });
+    }
     invariant(request.descriptor.adapter === agentId && request.descriptor.operation === request.operation, "AGENT_TRANSPORT_DESCRIPTOR_MISMATCH", "Agent operation descriptor 与请求不一致", {
       status: 400,
     });
@@ -1610,9 +1818,11 @@ export class AgentRuntimeTransport {
     // as authoritative before caching or execution so that logical-only probe
     // environment can never move a forked thread to branch-local CODEX_HOME.
     if (agentId === "codex") {
+      const storageProfile = await this.#codexStorageProfile(`${nativeStorePaths.runtimeData}/codex`);
       environment = Object.freeze({
         ...environment,
         CODEX_HOME: `${nativeStorePaths.runtimeData}/codex`,
+        ...(storageProfile.sqliteHome ? { CODEX_SQLITE_HOME: storageProfile.sqliteHome } : {}),
       });
     } else if (agentId === "opencode") {
       environment = Object.freeze({
@@ -1637,7 +1847,7 @@ export class AgentRuntimeTransport {
       paths.skillsRoot,
     );
     const skillPins = [...new Map([...currentView.skills, ...recoveredSkills, ...skills].map((skill) => [skill.skillId, skill])).values()];
-    const nativeSkillCommand = ["claude-code", "opencode"].includes(agentId) && ["start", "resume"].includes(request.operation)
+    const nativeSkillCommand = ["claude-code", "qoder-cn", "opencode"].includes(agentId) && ["start", "resume"].includes(request.operation)
       ? await selectedSkillCommand(this.executor, paths, skills) : null;
     runtimeFingerprint = isolatedRuntimeFingerprint(agentId, configuration, runtimeApiRoute, installation, agentProfile, skillPins);
     if (nativeSkillCommand) runtimeFingerprint = crypto.createHash("sha256").update(runtimeFingerprint).update(nativeSkillCommand.sha256).digest("hex");
@@ -1661,7 +1871,8 @@ export class AgentRuntimeTransport {
       effortAdjustments: [],
       releaseEffortAdaptationHandler: null,
     };
-    if (["start", "resume"].includes(request.operation)
+    if (agentId !== "qoder-cn"
+      && ["start", "resume"].includes(request.operation)
       && (request.task?.route?.providerId || request.task?.route?.modelId)) {
       invariant(runtimeApiRoute, "AGENT_API_ROUTE_REQUIRED", "当前 Agent 会话没有可用的模型 API 配置", {
         status: 409,
@@ -1700,11 +1911,11 @@ export class AgentRuntimeTransport {
           contextUsageReason: cachedUsage ? null : "当前原生会话尚未返回可验证的上下文用量；运行一次 Agent 后再读取。",
         };
       } else if (request.descriptor.transport === "native-deferred") {
-        invariant(agentId === "claude-code", "AGENT_NATIVE_DEFERRED_UNSUPPORTED", `${agentId} 不支持 deferred native operation`, { status: 409 });
+        invariant(["claude-code", "qoder-cn"].includes(agentId), "AGENT_NATIVE_DEFERRED_UNSUPPORTED", `${agentId} 不支持 deferred native operation`, { status: 409 });
         const sourceSessionId = String(request.descriptor.sourceSessionId || "");
         const targetSessionId = String(request.descriptor.targetSessionId || "");
         const resumeSessionAt = String(request.descriptor.resumeSessionAt || "");
-        invariant(sourceSessionId && targetSessionId && resumeSessionAt, "AGENT_NATIVE_FORK_BOUNDARY_MISSING", "Claude Code 原生分支缺少会话边界", { status: 409 });
+        invariant(sourceSessionId && targetSessionId && resumeSessionAt, "AGENT_NATIVE_FORK_BOUNDARY_MISSING", `${agentId === "qoder-cn" ? "Qoder CN" : "Claude Code"} 原生分支缺少会话边界`, { status: 409 });
         await this.#recordRuntime(context, {
           runId: nativeRunId(request.binding),
           status: "idle",
@@ -1733,11 +1944,18 @@ export class AgentRuntimeTransport {
         result = await this.#executeCodex(context);
       } else if (agentId === "claude-code") {
         result = await this.#executeClaudeCode(context);
+      } else if (agentId === "qoder-cn") {
+        result = await this.#executeClaudeCode(context);
       } else {
         context.releaseEffortAdaptationHandler?.();
         return unsupportedCapability(agentId, request.operation, "no_transport");
       }
     } catch (error) {
+      const failedEntry = this.active.get(activeEntryKey(request.binding));
+      if (failedEntry?.agentId === "codex" && failedEntry.operationActive === true) {
+        failedEntry.operationActive = false;
+        this.#touchNativeProcess(failedEntry);
+      }
       context.releaseEffortAdaptationHandler?.();
       throw error;
     }
@@ -1863,6 +2081,13 @@ export class AgentRuntimeTransport {
     invariant(request?.task?.route && request?.binding, "AGENT_PREPARE_REQUEST_INVALID", "Agent 预备请求不完整", { status: 400 });
     const agentId = String(request.adapterId || request.task.route.agentId || "");
     runtimeAgentDefinition(agentId);
+    if (agentId === "qoder-cn") {
+      const authentication = await this.deploymentService.authenticationStatus(agentId, { force: true });
+      invariant(authentication.authenticated, "QODER_LOGIN_REQUIRED", "请先登录 Qoder CN 账号", {
+        status: 409,
+        details: { agentId, authentication },
+      });
+    }
     const bindingId = String(request.binding.agentBindingId || "");
     invariant(bindingId, "AGENT_BINDING_REQUIRED", "Agent 预备请求缺少 binding", { status: 400 });
     const requestedNativeStoreBindingId = String(request.binding.native?.runtimeBindingId || bindingId);
@@ -1898,14 +2123,22 @@ export class AgentRuntimeTransport {
     const configuration = apiRoute?.model && !storedConfiguration.model
       ? { ...storedConfiguration, model: apiRoute.model }
       : storedConfiguration;
-    const [environment, discoveredAgentProfile] = await Promise.all([
+    let [environment, discoveredAgentProfile] = await Promise.all([
       this.#runtimeEnvironment(request, paths, installation, configuration, apiRoute, nativeStorePaths),
       agentId === "opencode"
         ? this.#openCodeCliProfile(installation, request.binding)
         : agentId === "codex"
           ? this.#codexCliProfile(installation, configuration)
-          : Promise.resolve(null),
+        : Promise.resolve(null),
     ]);
+    if (agentId === "codex") {
+      const storageProfile = await this.#codexStorageProfile(`${nativeStorePaths.runtimeData}/codex`);
+      environment = Object.freeze({
+        ...environment,
+        CODEX_HOME: `${nativeStorePaths.runtimeData}/codex`,
+        ...(storageProfile.sqliteHome ? { CODEX_SQLITE_HOME: storageProfile.sqliteHome } : {}),
+      });
+    }
     const runtimeApiRoute = apiRoute
       ? {
           ...apiRoute,
@@ -1924,12 +2157,13 @@ export class AgentRuntimeTransport {
     const runtimeFingerprint = isolatedRuntimeFingerprint(agentId, configuration, runtimeApiRoute, installation, agentProfile, request.binding.native?.skillPins || []);
     const sessionId = request.binding.native?.sessionId || request.binding.state?.sessionId || null;
     const descriptor = {
-      transport: agentId === "claude-code" ? "process-jsonl" : agentId === "codex" ? "json-rpc" : "http",
+      transport: ["claude-code", "qoder-cn"].includes(agentId) ? "process-jsonl" : agentId === "codex" ? "json-rpc" : "http",
       cwd: request.workspace?.path,
-      ...(agentId === "claude-code" ? {
+      ...(["claude-code", "qoder-cn"].includes(agentId) ? {
         executable: installation.binaryPath,
         args: [
-          "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompt-tool", "stdio",
+          agentId === "qoder-cn" ? "--print" : "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+          ...(agentId === "claude-code" ? ["--verbose"] : []), "--include-partial-messages", "--permission-prompt-tool", "stdio",
           ...(sessionId ? ["--resume", String(sessionId)] : []),
         ],
         stdin: [],
@@ -1958,7 +2192,7 @@ export class AgentRuntimeTransport {
     // case, but never start a native process without the exact API route that
     // its first real turn will use.  Otherwise the later turn can inherit a
     // process whose generated config names an API key that was never exported.
-    const warmNativeProcess = runtimeApiRoute && !request.task.skillPins?.length;
+    const warmNativeProcess = (runtimeApiRoute || agentId === "qoder-cn") && !request.task.skillPins?.length;
     if (warmNativeProcess && agentId === "opencode") entry = await this.#openCodeService(context);
     else if (warmNativeProcess && agentId === "codex") entry = await this.#codexProcess(context);
     else if (warmNativeProcess && !request.binding.native?.pendingFork) {
@@ -2026,6 +2260,8 @@ export class AgentRuntimeTransport {
   }
 
   async close() {
+    this.releaseSessionChannelPressureHandler?.();
+    this.releaseSessionChannelPressureHandler = null;
     const processes = [...this.active.values()].map((entry) => entry?.process).filter((process) => process && !process.closed);
     this.active.clear();
     await Promise.allSettled(processes.map(async (process) => {
@@ -2036,6 +2272,8 @@ export class AgentRuntimeTransport {
     this.configurationHashes.clear();
     this.pendingProcessStarts.clear();
     this.claudeEffortFallbacks.clear();
+    this.codexStorageProfiles.clear();
+    this.pendingCodexStorageProfiles.clear();
   }
 
   async refreshManagedConfiguration(agentId, { configScope = "default" } = {}) {
@@ -2176,6 +2414,131 @@ export class AgentRuntimeTransport {
     return results;
   }
 
+  async #codexStorageProfile(codexHome) {
+    const normalizedHome = path.posix.normalize(String(codexHome || ""));
+    invariant(normalizedHome.startsWith("/") && normalizedHome !== "/", "AGENT_CODEX_HOME_INVALID", "Codex runtime 目录无效", {
+      status: 500,
+      expose: false,
+    });
+    const cached = this.codexStorageProfiles.get(normalizedHome);
+    if (cached) return cached;
+    const pending = this.pendingCodexStorageProfiles.get(normalizedHome);
+    if (pending) return pending;
+    const run = this.#resolveCodexStorageProfile(normalizedHome);
+    this.pendingCodexStorageProfiles.set(normalizedHome, run);
+    try {
+      const profile = await run;
+      this.codexStorageProfiles.set(normalizedHome, profile);
+      return profile;
+    } finally {
+      if (this.pendingCodexStorageProfiles.get(normalizedHome) === run) {
+        this.pendingCodexStorageProfiles.delete(normalizedHome);
+      }
+    }
+  }
+
+  async #resolveCodexStorageProfile(codexHome) {
+    const identity = codexLocalStorageIdentity(codexHome);
+    const command = `
+set -eu
+codex_home=${shellQuote(codexHome)}
+mkdir -p -- "$codex_home/tmp"
+fs_type="$(stat -f -c %T -- "$codex_home" 2>/dev/null || printf '%s' unknown)"
+case "$fs_type" in
+  ext2/ext3|ext4|xfs|btrfs|tmpfs|overlayfs|zfs|f2fs|jfs|reiserfs|ufs|ramfs)
+    printf '%s\\tpersistent\\t\\t%s\\n' '${CODEX_STORAGE_PROBE_MARKER}' "$fs_type"
+    ;;
+  *)
+    tmp_type="$(stat -f -c %T -- /tmp 2>/dev/null || printf '%s' unknown)"
+    case "$tmp_type" in
+      ext2/ext3|ext4|xfs|btrfs|tmpfs|overlayfs|zfs|f2fs|jfs|reiserfs|ufs|ramfs) ;;
+      *)
+        printf '%s\\tpersistent\\t\\t%s\\n' '${CODEX_STORAGE_PROBE_MARKER}' "$fs_type"
+        exit 0
+        ;;
+    esac
+    uid="$(id -u)"
+    user_root="/tmp/easywork-$uid"
+    family_root="$user_root/codex"
+    local_root="$family_root/${identity}"
+    sqlite_home="$local_root/sqlite"
+    arg0_home="$local_root/arg0"
+    for target in "$user_root" "$family_root" "$local_root" "$sqlite_home" "$arg0_home"; do
+      [ ! -L "$target" ] || exit 73
+    done
+    mkdir -p -- "$sqlite_home" "$arg0_home"
+    for target in "$user_root" "$family_root" "$local_root" "$sqlite_home" "$arg0_home"; do
+      [ "$(stat -c %u -- "$target")" = "$uid" ] || exit 73
+      chmod 0700 -- "$target"
+    done
+    arg0_link="$codex_home/tmp/arg0"
+    arg0_local=1
+    if [ -L "$arg0_link" ]; then
+      [ "$(readlink -- "$arg0_link")" = "$arg0_home" ] || exit 73
+    elif [ -e "$arg0_link" ]; then
+      [ -d "$arg0_link" ] || exit 73
+      if [ -z "$(find "$arg0_link" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+        rmdir -- "$arg0_link"
+      else
+        active=0
+        for candidate in $(ps -u "$uid" -o pid= 2>/dev/null); do
+          [ -r "/proc/$candidate/environ" ] || continue
+          if tr '\\0' '\\n' < "/proc/$candidate/environ" | grep -Fqx -- "CODEX_HOME=$codex_home"; then
+            active=1
+            break
+          fi
+        done
+        if [ "$active" -eq 0 ]; then
+          backup="$codex_home/tmp/arg0.pre-local-$(date +%s)-$$"
+          mv -- "$arg0_link" "$backup"
+        else
+          arg0_local=0
+        fi
+      fi
+      if [ "$arg0_local" -eq 1 ]; then
+        ln -s -- "$arg0_home" "$arg0_link"
+      fi
+    else
+      ln -s -- "$arg0_home" "$arg0_link"
+    fi
+    if [ "$arg0_local" -eq 1 ]; then
+      mode=local
+    else
+      mode=local-sqlite
+    fi
+    printf '%s\\t%s\\t%s\\t%s\\n' '${CODEX_STORAGE_PROBE_MARKER}' "$mode" "$sqlite_home" "$fs_type"
+    ;;
+esac
+`.trim();
+    const result = await this.executor.exec(command, { maxOutputBytes: 16 * 1024 });
+    invariant(result.code === 0, "AGENT_CODEX_LOCAL_RUNTIME_PREPARE_FAILED", "无法为 Codex 准备节点本地运行存储", {
+      status: 502,
+      retryable: true,
+      details: { exitCode: result.code },
+    });
+    const marker = `${CODEX_STORAGE_PROBE_MARKER}\t`;
+    const line = String(result.stdout || "").split(/\r?\n/).find((entry) => entry.startsWith(marker));
+    if (!line) return Object.freeze({ mode: "persistent", filesystemType: "unknown", sqliteHome: null });
+    const [, mode, sqliteHome, filesystemType] = line.split("\t");
+    invariant(["persistent", "local", "local-sqlite"].includes(mode), "AGENT_CODEX_LOCAL_RUNTIME_RESPONSE_INVALID", "Codex 节点本地运行存储响应无效", {
+      status: 502,
+      retryable: true,
+    });
+    if (mode === "persistent") {
+      return Object.freeze({ mode, filesystemType: String(filesystemType || "unknown"), sqliteHome: null });
+    }
+    const normalizedSqliteHome = path.posix.normalize(String(sqliteHome || ""));
+    invariant(normalizedSqliteHome.startsWith("/tmp/easywork-") && normalizedSqliteHome.endsWith("/sqlite"), "AGENT_CODEX_LOCAL_RUNTIME_PATH_INVALID", "Codex 节点本地 SQLite 路径无效", {
+      status: 502,
+      retryable: true,
+    });
+    return Object.freeze({
+      mode,
+      filesystemType: String(filesystemType || "unknown"),
+      sqliteHome: normalizedSqliteHome,
+    });
+  }
+
   async #prepareRuntime(paths, agentId, nativeStorePaths = paths) {
     const runtimeKey = `${String(paths.runtimeRoot)}\0${String(nativeStorePaths.runtimeRoot)}`;
     if (this.preparedRuntimeRoots.has(runtimeKey)) return;
@@ -2207,18 +2570,29 @@ export class AgentRuntimeTransport {
     ])];
     const quote = (value) => `'${String(value).replace(/'/g, `'"'"'`)}'`;
     const codexSkillView = `${paths.runtimeData}/codex/skills`;
+    const qoderSkillView = `${paths.runtimeData}/qoder-cn/skills`;
     const skillViews = [
       `${paths.runtimeData}/claude/skills`,
+      qoderSkillView,
       `${paths.runtimeConfig}/opencode/skills`,
     ];
     const claudeProjects = `${paths.runtimeData}/claude/projects`;
     const nativeClaudeProjects = `${nativeStorePaths.runtimeData}/claude/projects`;
+    const qoderProjects = `${paths.runtimeData}/qoder-cn/projects`;
+    const nativeQoderProjects = `${nativeStorePaths.runtimeData}/qoder-cn/projects`;
+    const qoderAuth = `${paths.runtimeData}/qoder-cn/.auth`;
     if (agentId === "claude-code") directories.push(nativeClaudeProjects);
+    if (agentId === "qoder-cn") {
+      directories.push(paths.accountsRoot, paths.accountRoot, paths.accountAuthRoot, nativeQoderProjects);
+      guarded.push(paths.accountsRoot, paths.accountRoot, paths.accountAuthRoot, nativeQoderProjects);
+    }
     const parents = [codexSkillView, ...skillViews].map((entry) => entry.slice(0, entry.lastIndexOf("/")));
     const interactiveMarker = agentId === "codex"
       ? `CODEX_HOME=${nativeStorePaths.runtimeData}/codex`
       : agentId === "claude-code"
         ? `CLAUDE_CONFIG_DIR=${paths.runtimeData}/claude`
+        : agentId === "qoder-cn"
+          ? `QODERCN_CONFIG_DIR=${paths.runtimeData}/qoder-cn`
         : null;
     // Codex and Claude Code run on the SSH exec channel and cannot be
     // reattached by a new Gateway process.  If the host process was killed
@@ -2250,6 +2624,14 @@ export class AgentRuntimeTransport {
         `if [ -e ${quote(claudeProjects)} ] && [ ! -L ${quote(claudeProjects)} ]; then [ -d ${quote(claudeProjects)} ] && [ -z "$(ls -A -- ${quote(claudeProjects)})" ] || exit 73; rmdir -- ${quote(claudeProjects)}; fi`,
         `ln -sfn -- ${quote(nativeClaudeProjects)} ${quote(claudeProjects)}`,
       ] : agentId === "claude-code" ? [`mkdir -p -- ${quote(claudeProjects)}`] : []),
+      ...(agentId === "qoder-cn" ? [
+        `if [ -e ${quote(qoderAuth)} ] && [ ! -L ${quote(qoderAuth)} ]; then [ -d ${quote(qoderAuth)} ] && [ -z "$(ls -A -- ${quote(qoderAuth)})" ] || exit 73; rmdir -- ${quote(qoderAuth)}; fi`,
+        `ln -sfn -- ${quote(paths.accountAuthRoot)} ${quote(qoderAuth)}`,
+        ...(qoderProjects !== nativeQoderProjects ? [
+          `if [ -e ${quote(qoderProjects)} ] && [ ! -L ${quote(qoderProjects)} ]; then [ -d ${quote(qoderProjects)} ] && [ -z "$(ls -A -- ${quote(qoderProjects)})" ] || exit 73; rmdir -- ${quote(qoderProjects)}; fi`,
+          `ln -sfn -- ${quote(nativeQoderProjects)} ${quote(qoderProjects)}`,
+        ] : [`mkdir -p -- ${quote(qoderProjects)}`]),
+      ] : []),
     ].join(" && ");
     const result = await this.executor.exec(command);
     invariant(result.code === 0, "AGENT_RUNTIME_PREPARE_FAILED", "无法创建远端 Agent runtime 或 Skill 视图", { status: 502 });
@@ -2313,7 +2695,25 @@ export class AgentRuntimeTransport {
       Object.assign(extra, providerEnvironment, { EASYWORK_PROVIDER_ENV_FILE: paths.providerEnvironment });
     }
     if (configuration.effortLevel) extra.CLAUDE_CODE_EFFORT_LEVEL = configuration.effortLevel;
-    if (agentId === "claude-code") extra.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+    if (agentId === "claude-code") {
+      extra.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+      // EasyWork owns both provider routing and verified binary updates. Tell
+      // Claude about that host boundary explicitly, and keep claude.ai account,
+      // connector, telemetry and updater traffic from delaying the first
+      // stream-json frame on restricted HPC login nodes.
+      extra.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = "1";
+      extra.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+      extra.ENABLE_CLAUDEAI_MCP_SERVERS = "false";
+      extra.DISABLE_TELEMETRY = "1";
+      extra.DISABLE_AUTOUPDATER = "1";
+      extra.DISABLE_UPDATES = "1";
+    }
+    if (agentId === "qoder-cn") {
+      extra.QODERCN_CONFIG_DIR = `${paths.runtimeData}/qoder-cn`;
+      extra.DISABLE_TELEMETRY = "1";
+      extra.DISABLE_AUTOUPDATER = "1";
+      extra.DISABLE_UPDATES = "1";
+    }
     if (Number.isSafeInteger(Number(configuration.contextLimit))) {
       extra.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(Number(configuration.contextLimit));
     }
@@ -2674,6 +3074,34 @@ export class AgentRuntimeTransport {
         },
       };
       await Promise.all([hookWrite, this.#writeConfigurationIfChanged(`${paths.runtimeData}/claude/settings.json`, `${JSON.stringify(settings, null, 2)}\n`)]);
+      return agentProfile;
+    }
+    if (agentId === "qoder-cn") {
+      const contextWindow = Number(configuration.contextLimit);
+      const settings = {
+        general: {
+          ...(configuration.permissionMode ? { defaultPermissionMode: configuration.permissionMode } : {}),
+          enableAutoUpdate: false,
+          fileCheckpointing: { enabled: true },
+        },
+        model: {
+          ...(configuration.model ? { name: configuration.model } : {}),
+          ...(Number.isSafeInteger(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
+        },
+        skills: { loadFromAgentsDirectory: true },
+        hooks: {
+          PreToolUse: [{
+            matcher: ".*",
+            hooks: [{
+              type: "command",
+              command: versionHookCommand(paths),
+              timeout: 120,
+              statusMessage: INTERNAL_VERSION_HOOK_STATUS,
+            }],
+          }],
+        },
+      };
+      await Promise.all([hookWrite, this.#writeConfigurationIfChanged(`${paths.runtimeData}/qoder-cn/settings.json`, `${JSON.stringify(settings, null, 2)}\n`)]);
       return agentProfile;
     }
     await hookWrite;
@@ -3145,6 +3573,51 @@ export class AgentRuntimeTransport {
     });
   }
 
+  async #moveOpenCodeSessionWorkspace(context, entry, sessionId) {
+    // The Web route is updated as soon as the user confirms the workspace
+    // switch, before this native request starts.  It therefore cannot tell us
+    // where the persisted OpenCode session still lives.  Track the last
+    // successfully used native location instead; legacy bindings without this
+    // metadata deliberately probe move-session once so they cannot silently
+    // keep running in their old directory.
+    const sourceWorkspaceId = String(context.request.binding.native?.workspaceId || "");
+    const sourceDirectory = String(context.request.binding.native?.workspacePath || "").trim();
+    const targetWorkspaceId = String(context.request.task?.route?.workspaceId || "");
+    const targetDirectory = String(context.request.workspace?.path || "").trim();
+    if (!targetDirectory) return false;
+    if ((sourceDirectory && sourceDirectory === targetDirectory)
+      || (sourceWorkspaceId && targetWorkspaceId && sourceWorkspaceId === targetWorkspaceId)) return false;
+    try {
+      await this.executor.requestHttp({
+        host: "127.0.0.1",
+        port: entry.servicePort,
+        method: "POST",
+        path: "/experimental/control-plane/move-session",
+        body: {
+          sessionID: String(sessionId),
+          destination: { directory: targetDirectory },
+          moveChanges: false,
+        },
+      });
+      return true;
+    } catch (error) {
+      throw new ApiError("AGENT_NATIVE_WORKSPACE_MOVE_UNAVAILABLE", `OpenCode ${String(context.installation.version || "unknown")} 无法把当前原生会话切换到所选工作区`, {
+        status: statusCode(error) || 409,
+        retryable: false,
+        expose: true,
+        details: {
+          agentId: "opencode",
+          sessionId: String(sessionId),
+          sourceWorkspaceId,
+          targetWorkspaceId,
+          targetDirectory,
+          reason: String(error?.code || error?.message || "move_session_failed"),
+        },
+        cause: error,
+      });
+    }
+  }
+
   async #executeOpenCode(context) {
     invariant(["http"].includes(context.request.descriptor.transport), "AGENT_TRANSPORT_UNSUPPORTED", "OpenCode operation 需要 HTTP transport", {
       status: 409,
@@ -3166,6 +3639,9 @@ export class AgentRuntimeTransport {
         || descriptorSessionId
         || "",
     );
+    if (sessionId && ["start", "resume"].includes(operation)) {
+      await this.#moveOpenCodeSessionWorkspace(context, entry, sessionId);
+    }
     if (entry.protocol === "v1" && sessionId && ["start", "append", "resume"].includes(operation)) {
       baselineMessageIds = new Set((await openCodeV1Messages(this.executor, entry.servicePort, sessionId)).map(openCodeV1MessageId).filter(Boolean));
     }
@@ -3366,6 +3842,12 @@ export class AgentRuntimeTransport {
           runtimeStoreRoot: context.nativeStorePaths.runtimeRoot,
           skillsRoot: context.paths.skillsRoot,
           ...(sessionId ? { sessionId } : {}),
+          ...(context.request.task?.route?.workspaceId
+            ? { workspaceId: String(context.request.task.route.workspaceId) }
+            : {}),
+          ...(context.request.workspace?.path
+            ? { workspacePath: String(context.request.workspace.path) }
+            : {}),
           ...(["fork", "revert"].includes(operation) ? { turnId: nativeTurnId } : {}),
           ...(context.runtimeFingerprint ? { runtimeFingerprint: context.runtimeFingerprint } : {}),
           ...(context.request.__runtimeProxy ? { apiProxy: context.request.__runtimeProxy } : {}),
@@ -3424,7 +3906,10 @@ export class AgentRuntimeTransport {
       // when app-server starts, so never reuse a process across that boundary.
       const staleNativeStore = requiresExactRuntime
         && String(entry.nativeStorePaths?.runtimeRoot || "") !== String(context.nativeStorePaths?.runtimeRoot || "");
-      if (!stalePreparation && !staleNativeStore) return entry;
+      if (!stalePreparation && !staleNativeStore) {
+        this.#touchNativeProcess(entry);
+        return entry;
+      }
       await entry.process.signal("SIGTERM").catch(() => undefined);
       if (this.active.get(key) === entry) this.active.delete(key);
       entry = null;
@@ -3496,7 +3981,9 @@ export class AgentRuntimeTransport {
     })();
     this.pendingProcessStarts.set(pendingKey, start);
     try {
-      return await start;
+      const started = await start;
+      this.#touchNativeProcess(started);
+      return started;
     } finally {
       if (this.pendingProcessStarts.get(pendingKey) === start) this.pendingProcessStarts.delete(pendingKey);
     }
@@ -3608,6 +4095,8 @@ export class AgentRuntimeTransport {
       });
     }
     const entry = await this.#codexProcess(context);
+    entry.operationActive = true;
+    this.#touchNativeProcess(entry);
     const processChanged = entry.process !== previous?.process;
     if (processChanged && typeof entry.process.discardBufferedLines === "function") entry.process.discardBufferedLines();
     if (context.request.descriptor.transport === "json-rpc-response") {
@@ -3619,6 +4108,8 @@ export class AgentRuntimeTransport {
         processId: entry.process.processId,
         threadId: context.request.binding.native?.threadId || context.request.binding.state?.sessionId || null,
       });
+      entry.operationActive = false;
+      this.#touchNativeProcess(entry);
       return {
         runId: nativeRunId(context.request.binding),
         bindingPatch: {
@@ -3649,7 +4140,11 @@ export class AgentRuntimeTransport {
       && !loadedThreadIds.has(String(nativeThreadId))
       && operation !== "resume"
       && calls[0]?.method !== "thread/resume") {
-      const resumed = await entry.process.requestJsonRpc("thread/resume", codexThreadRequestParams({ threadId: nativeThreadId }, entry.bypassHookTrust));
+      const cwd = String(context.request.workspace?.path || "").trim();
+      const resumed = await entry.process.requestJsonRpc("thread/resume", codexThreadRequestParams({
+        threadId: nativeThreadId,
+        ...(cwd ? { cwd } : {}),
+      }, entry.bypassHookTrust));
       variables["$thread.id"] = String(resumed?.thread?.id || nativeThreadId);
       loadedThreadIds.add(variables["$thread.id"]);
       if (resumed?.thread?.path) variables["$thread.path"] = String(resumed.thread.path);
@@ -3783,6 +4278,8 @@ export class AgentRuntimeTransport {
       ? (entry.compatibilityIssues || []).map((issue) => ({ method: "easywork/compatibilityIssue", params: issue }))
       : [];
     if (compatibilityFrames.length) entry.compatibilityIssuesAnnounced = true;
+    entry.operationActive = false;
+    if (!lines) this.#touchNativeProcess(entry);
     return {
       runId,
       bindingPatch: {
@@ -3814,7 +4311,9 @@ export class AgentRuntimeTransport {
           scope: frameScope,
           process: entry.process,
           onClose: () => {
-            if (entry.codexFrameScope === frameScope) entry.codexFrameScope = null;
+            if (entry.codexFrameScope !== frameScope) return;
+            entry.codexFrameScope = null;
+            this.#touchNativeProcess(entry);
           },
         }), "codex"), runtimePersistence, context.installation.version),
       } : {}),
@@ -3823,7 +4322,9 @@ export class AgentRuntimeTransport {
 
   async #claudeCliProfile(context) {
     if (context.installation.source === "managed") return { help: null, issues: [] };
-    const key = `claude-code\0${context.installation.binaryPath}\0${context.installation.version}`;
+    const isQoder = context.agentId === "qoder-cn";
+    const agentLabel = isQoder ? "Qoder CN" : "Claude Code";
+    const key = `${context.agentId}\0${context.installation.binaryPath}\0${context.installation.version}`;
     if (this.cliCapabilityProfiles.has(key)) return this.cliCapabilityProfiles.get(key);
     const pending = (async () => {
       const result = await this.executor.exec(`${shellQuote(context.installation.binaryPath)} --help`, { maxOutputBytes: 512 * 1024 });
@@ -3837,7 +4338,7 @@ export class AgentRuntimeTransport {
             agentVersion,
             blocking: false,
             eventType: "--help",
-            message: `Claude Code ${agentVersion} 无法返回参数清单；EasyWork 将按标准 stream-json 参数尝试运行。`,
+            message: `${agentLabel} ${agentVersion} 无法返回参数清单；EasyWork 将按标准 stream-json 参数尝试运行。`,
           }],
         };
       }
@@ -3848,7 +4349,7 @@ export class AgentRuntimeTransport {
         ...(!commandHelpHasFlag(help, "--output-format") ? ["--output-format"] : []),
       ];
       if (missingRequired.length) {
-        throw new ApiError("AGENT_CLAUDE_STREAM_PROTOCOL_UNAVAILABLE", `Claude Code ${agentVersion} 不支持 EasyWork 所需的 stream-json 协议`, {
+        throw new ApiError(isQoder ? "AGENT_QODER_STREAM_PROTOCOL_UNAVAILABLE" : "AGENT_CLAUDE_STREAM_PROTOCOL_UNAVAILABLE", `${agentLabel} ${agentVersion} 不支持 EasyWork 所需的 stream-json 协议`, {
           status: 409,
           details: { actualVersion: agentVersion, missingCapabilities: missingRequired },
         });
@@ -3871,6 +4372,8 @@ export class AgentRuntimeTransport {
     if (!profile.help) return { args: [...originalArgs], issues: [...profile.issues] };
     const help = profile.help;
     const agentVersion = String(context.installation.version || "unknown");
+    const isQoder = context.agentId === "qoder-cn";
+    const agentLabel = isQoder ? "Qoder CN" : "Claude Code";
     const issues = [...profile.issues];
     const optional = new Map([
       ["--include-partial-messages", false],
@@ -3879,6 +4382,8 @@ export class AgentRuntimeTransport {
       ["--settings", true],
       ["--model", true],
       ["--effort", true],
+      ["--reasoning-effort", true],
+      ["--disallowed-tools", true],
       ["--permission-mode", true],
     ]);
     const args = [];
@@ -3886,7 +4391,7 @@ export class AgentRuntimeTransport {
       let value = originalArgs[index];
       if (value === "-p" && !commandHelpHasFlag(help, "-p") && commandHelpHasFlag(help, "--print")) value = "--print";
       if (value === "--resume" && !commandHelpHasFlag(help, value)) {
-        throw new ApiError("AGENT_CLAUDE_RESUME_UNAVAILABLE", `Claude Code ${agentVersion} 不支持恢复原生会话`, {
+        throw new ApiError(isQoder ? "AGENT_QODER_RESUME_UNAVAILABLE" : "AGENT_CLAUDE_RESUME_UNAVAILABLE", `${agentLabel} ${agentVersion} 不支持恢复原生会话`, {
           status: 409,
           details: { actualVersion: agentVersion, missingCapability: value },
         });
@@ -3899,7 +4404,7 @@ export class AgentRuntimeTransport {
           agentVersion,
           blocking: false,
           eventType: value,
-          message: `Claude Code ${agentVersion} 不支持参数 ${value}；EasyWork 已使用该版本可用的原生能力继续运行。`,
+          message: `${agentLabel} ${agentVersion} 不支持参数 ${value}；EasyWork 已使用该版本可用的原生能力继续运行。`,
         });
         continue;
       }
@@ -3910,13 +4415,15 @@ export class AgentRuntimeTransport {
 
   async #claudeProcess(context) {
     const key = activeEntryKey(context.request.binding);
-    const pendingKey = `claude-code\0${key}`;
+    const pendingKey = `${context.agentId}\0${key}`;
     const pending = this.pendingProcessStarts.get(pendingKey);
     if (pending) await pending.catch(() => undefined);
     const start = this.#claudeProcessCurrent(context);
     this.pendingProcessStarts.set(pendingKey, start);
     try {
-      return await start;
+      const entry = await start;
+      this.#touchNativeProcess(entry);
+      return entry;
     } finally {
       if (this.pendingProcessStarts.get(pendingKey) === start) this.pendingProcessStarts.delete(pendingKey);
     }
@@ -3928,11 +4435,16 @@ export class AgentRuntimeTransport {
   }
 
   #effectiveClaudeEffort(context) {
+    if (context.agentId === "qoder-cn") {
+      const requested = String(context.configuration.reasoningEffort || "").trim();
+      return requested === "default" ? "" : requested;
+    }
     const requested = String(context.configuration.effortLevel || "").trim();
     return this.claudeEffortFallbacks.get(this.#claudeEffortCacheKey(context, requested)) || requested;
   }
 
   #rememberClaudeEffortFallback(context, fallback) {
+    if (context.agentId === "qoder-cn") return false;
     const requested = String(context.configuration.effortLevel || "").trim();
     const normalized = String(fallback || "").trim();
     if (!requested || !normalized || requested === normalized) return false;
@@ -3940,19 +4452,95 @@ export class AgentRuntimeTransport {
     return true;
   }
 
+  async #prepareQoderSessionWorkspace(context, sessionId, workspacePath) {
+    const nativeSessionId = String(sessionId || "").trim();
+    invariant(CLAUDE_NATIVE_UUID.test(nativeSessionId), "AGENT_NATIVE_SESSION_INVALID", "Qoder CN 原生会话 id 无效", {
+      status: 409,
+      details: { sessionId: nativeSessionId },
+    });
+    const projectsRoot = `${context.nativeStorePaths.runtimeData}/qoder-cn/projects`;
+    const targetProjectKey = qoderProjectKey(workspacePath);
+    const preferredProjectKey = String(context.request.binding.native?.sessionProjectKey || "").trim();
+    const script = [
+      `projects_root=${shellQuote(projectsRoot)}`,
+      `session_id=${shellQuote(nativeSessionId)}`,
+      `target_key=${shellQuote(targetProjectKey)}`,
+      `preferred_key=${shellQuote(preferredProjectKey)}`,
+      "source_file=''",
+      "fallback_file=''",
+      "if [ -n \"$preferred_key\" ] && [ -f \"$projects_root/$preferred_key/$session_id.jsonl\" ]; then source_file=\"$projects_root/$preferred_key/$session_id.jsonl\"; fi",
+      "if [ -z \"$source_file\" ]; then",
+      "  for candidate in \"$projects_root\"/*/\"$session_id.jsonl\"; do",
+      "    [ -f \"$candidate\" ] || continue",
+      "    if [ ! -L \"$candidate\" ]; then source_file=\"$candidate\"; break; fi",
+      "    [ -n \"$fallback_file\" ] || fallback_file=\"$candidate\"",
+      "  done",
+      "fi",
+      "[ -n \"$source_file\" ] || source_file=\"$fallback_file\"",
+      "[ -n \"$source_file\" ] || exit 74",
+      "source_file=\"$(readlink -f -- \"$source_file\")\"",
+      "[ -f \"$source_file\" ] || exit 74",
+      "case \"$source_file\" in \"$projects_root\"/*/\"$session_id.jsonl\") ;; *) exit 73 ;; esac",
+      "source_project=\"${source_file%/*}\"",
+      "target_project=\"$projects_root/$target_key\"",
+      "[ ! -L \"$target_project\" ] || exit 73",
+      "mkdir -p -- \"$target_project\"",
+      "chmod 0700 -- \"$target_project\"",
+      "if [ \"$source_project\" != \"$target_project\" ]; then",
+      "  target_file=\"$target_project/$session_id.jsonl\"",
+      "  if [ -L \"$target_file\" ]; then",
+      "    [ \"$(readlink -f -- \"$target_file\")\" = \"$source_file\" ] || exit 73",
+      "  elif [ -e \"$target_file\" ]; then",
+      "    [ \"$target_file\" -ef \"$source_file\" ] || exit 73",
+      "  else",
+      "    ln -s -- \"$source_file\" \"$target_file\" || { [ -L \"$target_file\" ] && [ \"$(readlink -f -- \"$target_file\")\" = \"$source_file\" ]; } || exit 73",
+      "  fi",
+      "  source_sidecar=\"${source_file%.jsonl}\"",
+      "  target_sidecar=\"$target_project/$session_id\"",
+      "  if [ -d \"$source_sidecar\" ]; then",
+      "    if [ -L \"$target_sidecar\" ]; then",
+      "      [ \"$(readlink -f -- \"$target_sidecar\")\" = \"$(readlink -f -- \"$source_sidecar\")\" ] || exit 73",
+      "    elif [ -e \"$target_sidecar\" ]; then",
+      "      [ \"$target_sidecar\" -ef \"$source_sidecar\" ] || exit 73",
+      "    else",
+      "      ln -s -- \"$source_sidecar\" \"$target_sidecar\" || { [ -L \"$target_sidecar\" ] && [ \"$(readlink -f -- \"$target_sidecar\")\" = \"$(readlink -f -- \"$source_sidecar\")\" ]; } || exit 73",
+      "    fi",
+      "  fi",
+      "fi",
+      "printf '%s\\n' \"${source_project##*/}\"",
+    ].join("\n");
+    const result = await this.executor.exec(`sh -c ${shellQuote(script)}`, { maxOutputBytes: 512 });
+    invariant(result.code !== 74, "AGENT_NATIVE_SESSION_MISSING", "Qoder CN 原生会话记录不存在，无法在新工作区继续", {
+      status: 409,
+      details: { sessionId: nativeSessionId, workspacePath },
+    });
+    invariant(result.code === 0, "AGENT_NATIVE_WORKSPACE_MOVE_FAILED", "Qoder CN 无法把原生会话切换到新工作区", {
+      status: 502,
+      retryable: true,
+      details: { sessionId: nativeSessionId, workspacePath, exitCode: result.code },
+    });
+    return String(result.stdout || "").trim().split(/\s+/)[0] || preferredProjectKey || targetProjectKey;
+  }
+
   async #claudeProcessCurrent(context) {
     const descriptor = context.request.descriptor;
     const key = activeEntryKey(context.request.binding);
     const prepared = this.active.get(key);
-    if (context.request.operation === "prepare" && prepared?.agentId === "claude-code" && prepared.prepared === true && prepared.process && !prepared.process.closed) {
-      if (prepared.runtimeFingerprint === context.runtimeFingerprint) return prepared;
+    const isQoder = context.agentId === "qoder-cn";
+    const streamAgentIds = ["claude-code", "qoder-cn"];
+    const workspacePath = String(descriptor.cwd || context.request.workspace?.path || context.paths.runtimeHome);
+    const preparedMatchesRuntime = prepared?.runtimeFingerprint === context.runtimeFingerprint
+      && prepared?.workspacePath === workspacePath
+      && prepared?.nativeStoreBindingId === context.nativeStoreBindingId;
+    if (context.request.operation === "prepare" && streamAgentIds.includes(prepared?.agentId) && prepared?.agentId === context.agentId && prepared.prepared === true && prepared.process && !prepared.process.closed) {
+      if (preparedMatchesRuntime) return prepared;
       await prepared.process.signal("SIGTERM").catch(() => undefined);
       if (this.active.get(key) === prepared) this.active.delete(key);
     }
     if (context.request.operation === "start"
       && !(Array.isArray(descriptor.args) && descriptor.args.includes("--fork-session"))
-      && prepared?.agentId === "claude-code" && prepared.prepared === true && prepared.process && !prepared.process.closed) {
-      if (prepared.runtimeFingerprint === context.runtimeFingerprint) {
+      && streamAgentIds.includes(prepared?.agentId) && prepared?.agentId === context.agentId && prepared.prepared === true && prepared.process && !prepared.process.closed) {
+      if (preparedMatchesRuntime) {
         prepared.prepared = false;
         return prepared;
       }
@@ -3961,7 +4549,7 @@ export class AgentRuntimeTransport {
     }
     const requestedArgs = [...(descriptor.args || [])];
     const effectiveEffort = this.#effectiveClaudeEffort(context);
-    const configuredEffort = String(context.configuration.effortLevel || "").trim();
+    const configuredEffort = String((isQoder ? context.configuration.reasoningEffort : context.configuration.effortLevel) || "").trim();
     if (effectiveEffort && configuredEffort && effectiveEffort !== configuredEffort) {
       this.#queueEffortAdjustment(context, {
         requestedEffort: configuredEffort,
@@ -3970,14 +4558,28 @@ export class AgentRuntimeTransport {
         cached: true,
       });
     }
-    if (!requestedArgs.includes("--settings")) requestedArgs.push("--settings", `${context.paths.runtimeData}/claude/settings.json`);
-    requestedArgs.push("--disallowedTools", "CronCreate,CronDelete,CronList");
+    if (!requestedArgs.includes("--settings")) requestedArgs.push("--settings", `${context.paths.runtimeData}/${isQoder ? "qoder-cn" : "claude"}/settings.json`);
+    if (isQoder) {
+      for (const tool of ["CronCreate", "CronDelete", "CronList"]) requestedArgs.push("--disallowed-tools", tool);
+    } else requestedArgs.push("--disallowedTools", "CronCreate,CronDelete,CronList");
     if (context.configuration.model) requestedArgs.push("--model", context.configuration.model);
-    if (effectiveEffort) requestedArgs.push("--effort", effectiveEffort);
+    if (isQoder && Number.isSafeInteger(Number(context.configuration.contextLimit)) && Number(context.configuration.contextLimit) > 0) {
+      requestedArgs.push("--context-window", String(context.configuration.contextLimit));
+    }
+    if (effectiveEffort) requestedArgs.push(isQoder ? "--reasoning-effort" : "--effort", effectiveEffort);
     if (context.configuration.permissionMode) requestedArgs.push("--permission-mode", context.configuration.permissionMode);
     const existingSessionId = context.request.binding.native?.sessionId || context.request.binding.state?.sessionId;
     if (context.request.operation === "start" && existingSessionId && !requestedArgs.includes("--resume")) {
       requestedArgs.push("--resume", String(existingSessionId));
+    }
+    const resumeArgumentIndex = requestedArgs.lastIndexOf("--resume");
+    const resumedSessionId = resumeArgumentIndex >= 0 ? requestedArgs[resumeArgumentIndex + 1] : existingSessionId;
+    let sessionProjectKey = null;
+    if (isQoder) {
+      sessionProjectKey = resumedSessionId
+        ? await this.#prepareQoderSessionWorkspace(context, resumedSessionId, workspacePath)
+        : qoderProjectKey(workspacePath);
+      if (requestedArgs.includes("--fork-session")) sessionProjectKey = qoderProjectKey(workspacePath);
     }
     const versionProfile = await this.#claudeArgsForVersion(context, requestedArgs);
     const args = versionProfile.args;
@@ -3985,21 +4587,24 @@ export class AgentRuntimeTransport {
     // Claude Code gives CLAUDE_CODE_EFFORT_LEVEL precedence over settings and
     // CLI flags. A remembered provider compatibility choice is applied to this
     // process immediately and conditionally persisted by the adjustment queue.
-    if (effectiveEffort) processEnv.CLAUDE_CODE_EFFORT_LEVEL = effectiveEffort;
+    if (!isQoder && effectiveEffort) processEnv.CLAUDE_CODE_EFFORT_LEVEL = effectiveEffort;
     const process = await this.executor.spawn({
       executable: context.installation.binaryPath,
       args,
-      cwd: descriptor.cwd || context.request.workspace?.path || context.paths.runtimeHome,
+      cwd: workspacePath,
       env: processEnv,
       envFile: context.runtimeApiRoute ? context.paths.providerEnvironment : null,
     });
     const entry = {
-      agentId: "claude-code",
+      agentId: context.agentId,
       configScope: context.configScope,
       process,
       paths: context.paths,
       runtimeApiRoute: context.runtimeApiRoute,
       runtimeFingerprint: context.runtimeFingerprint,
+      nativeStoreBindingId: context.nativeStoreBindingId,
+      workspacePath,
+      sessionProjectKey,
       effortLevel: effectiveEffort,
       prepared: false,
       compatibilityIssues: versionProfile.issues,
@@ -4019,20 +4624,23 @@ export class AgentRuntimeTransport {
   async #executeClaudeCode(context) {
     const descriptor = context.request.descriptor;
     const operation = context.request.operation;
+    const isQoder = context.agentId === "qoder-cn";
+    const agentLabel = isQoder ? "Qoder CN" : "Claude Code";
+    const configDirectory = isQoder ? "qoder-cn" : "claude";
     const key = activeEntryKey(context.request.binding);
     let entry = this.active.get(key);
-    if (operation === "compact" && (!entry?.process || entry.process.closed)) {
+    if (operation === "compact" && (!entry?.process || entry.process.closed || entry.process.inputEnded)) {
       // Claude's streaming process normally exits after a completed turn. A
       // later compact request must therefore resume the persisted native
       // session in a fresh process instead of requiring the completed process to
       // remain alive indefinitely.
       const sessionId = context.request.binding.native?.sessionId || context.request.binding.state?.sessionId;
-      invariant(sessionId, "AGENT_NATIVE_SESSION_MISSING", "Claude Code compact 缺少 native session", { status: 409 });
+      invariant(sessionId, "AGENT_NATIVE_SESSION_MISSING", `${agentLabel} compact 缺少 native session`, { status: 409 });
       const resumed = {
         ...descriptor,
         transport: "process-jsonl",
-        executable: "claude",
-        args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--resume", String(sessionId)],
+        executable: isQoder ? "qoderclicn" : "claude",
+        args: [isQoder ? "--print" : "-p", "--input-format", "stream-json", "--output-format", "stream-json", ...(isQoder ? [] : ["--verbose"]), "--include-partial-messages", "--resume", String(sessionId)],
         cwd: descriptor.cwd || context.request.workspace?.path,
         stdin: descriptor.frames || [],
       };
@@ -4041,6 +4649,7 @@ export class AgentRuntimeTransport {
       entry = null;
     }
     const effectiveDescriptor = structuredClone(context.request.descriptor);
+    const oneShotCompact = operation === "compact" && effectiveDescriptor.transport === "process-jsonl";
     if (context.nativeSkillCommand && ["start", "resume"].includes(operation)) {
       for (const frame of effectiveDescriptor.stdin || []) {
         if (frame.type === "user" && typeof frame.message?.content === "string") frame.message.content = `/${context.nativeSkillCommand.name} ${frame.message.content}`;
@@ -4066,42 +4675,22 @@ export class AgentRuntimeTransport {
           executor: this.executor,
           runtimeData: context.nativeStorePaths.runtimeData,
           sessionId: sessionBeforeTurn,
+          configDirectory,
         });
       }
-      for (const frame of effectiveDescriptor.stdin || []) writeClaudeFrame(entry, frame);
-      const runId = createRuntimeRunId(context.agentId, context.bindingId, this.clock);
-      const runtimePersistence = this.#recordRuntime(context, {
-        runId,
-        status: "running",
-        processId: entry.process.processId,
-        sessionId: context.request.binding.native?.sessionId || context.request.binding.state?.sessionId || null,
-      }).then(() => null, (error) => error);
       if (operation === "compact") {
-        const persistenceError = await runtimePersistence;
-        if (persistenceError) throw persistenceError;
-        // `/compact` emits a native compact_boundary on stdout but Claude's
-        // stream-json process deliberately stays alive for more stdin. Consume
-        // until that boundary, then close only this one-shot resumed process.
-        const frames = scopedClaudeFrames(entry.process.lines(agentLineQueueOptions("claude-code")), entry);
-        const iterator = frames[Symbol.asyncIterator]();
-        let compacted = false;
-        const deadline = Date.now() + 90_000;
-        while (!compacted) {
-          const remaining = Math.max(1, deadline - Date.now());
-          const next = await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => resolve({ timeout: true }), remaining);
-            iterator.next().then(
-              (value) => { clearTimeout(timer); resolve(value); },
-              (error) => { clearTimeout(timer); reject(error); },
-            );
-          });
-          if (next?.timeout) break;
-          if (next.done) break;
-          compacted = next.value?.type === "system" && next.value?.subtype === "compact_boundary";
-        }
-        await iterator.return?.();
-        await entry.process.signal("SIGTERM").catch(() => undefined);
-        invariant(compacted, "AGENT_COMPACT_TIMEOUT", "Claude Code 上下文压缩未返回完成边界", { status: 504, retryable: true, expose: true });
+        await executeClaudeCompact({
+          entry,
+          frames: effectiveDescriptor.stdin,
+          agentLabel,
+          terminateAfter: oneShotCompact,
+        });
+        await this.#recordRuntime(context, {
+          runId: nativeRunId(context.request.binding),
+          status: "idle",
+          processId: entry.process.processId,
+          sessionId: context.request.binding.native?.sessionId || context.request.binding.state?.sessionId || null,
+        });
         return {
           runId: nativeRunId(context.request.binding),
           bindingPatch: {
@@ -4112,11 +4701,20 @@ export class AgentRuntimeTransport {
               runtimeBindingId: context.nativeStoreBindingId,
               runtimeStoreRoot: context.nativeStorePaths.runtimeRoot,
               skillsRoot: context.paths.skillsRoot,
+              ...(isQoder ? { sessionProjectKey: entry.sessionProjectKey, workspacePath: entry.workspacePath } : {}),
             },
           },
         };
       }
-      const lines = entry.process.lines(agentLineQueueOptions("claude-code"));
+      for (const frame of effectiveDescriptor.stdin || []) writeClaudeFrame(entry, frame);
+      const runId = createRuntimeRunId(context.agentId, context.bindingId, this.clock);
+      const runtimePersistence = this.#recordRuntime(context, {
+        runId,
+        status: "running",
+        processId: entry.process.processId,
+        sessionId: context.request.binding.native?.sessionId || context.request.binding.state?.sessionId || null,
+      }).then(() => null, (error) => error);
+      const lines = entry.process.lines(agentLineQueueOptions(context.agentId));
       const compatibilityFrames = !entry.compatibilityIssuesAnnounced
         ? (entry.compatibilityIssues || []).map((issue) => ({ type: "easywork_compatibility_issue", issue }))
         : [];
@@ -4124,7 +4722,7 @@ export class AgentRuntimeTransport {
       const submittedBeforeRecovery = claudeTurnQueue(entry).submitted;
       const firstEntry = entry;
       const scopedFrames = scopedClaudeFrames(prefixedFrames(lines, compatibilityFrames), entry);
-      const effortFrames = adaptiveClaudeEffortFrames(scopedFrames, {
+      const effortFrames = isQoder ? scopedFrames : adaptiveClaudeEffortFrames(scopedFrames, {
         requestedEffort: entry.effortLevel || context.configuration.effortLevel,
         retry: async (fallback) => {
           // Replaying is safe only before any mid-run user append joined this
@@ -4144,7 +4742,7 @@ export class AgentRuntimeTransport {
             processId: retryEntry.process.processId,
             sessionId: context.request.binding.native?.sessionId || context.request.binding.state?.sessionId || null,
           });
-          return scopedClaudeFrames(retryEntry.process.lines(agentLineQueueOptions("claude-code")), retryEntry);
+          return scopedClaudeFrames(retryEntry.process.lines(agentLineQueueOptions(context.agentId)), retryEntry);
         },
       });
       return {
@@ -4158,6 +4756,7 @@ export class AgentRuntimeTransport {
             runtimeBindingId: context.nativeStoreBindingId,
             runtimeStoreRoot: context.nativeStorePaths.runtimeRoot,
             skillsRoot: context.paths.skillsRoot,
+            ...(isQoder ? { sessionProjectKey: entry.sessionProjectKey, workspacePath: entry.workspacePath } : {}),
             ...(context.request.__runtimeProxy ? { apiProxy: context.request.__runtimeProxy } : {}),
           },
         },
@@ -4168,11 +4767,12 @@ export class AgentRuntimeTransport {
             runtimeData: context.nativeStorePaths.runtimeData,
             sessionId: context.request.binding.native?.sessionId || context.request.binding.state?.sessionId || null,
             previousTurnId,
+            configDirectory,
           },
-        ), "claude-code"), runtimePersistence, context.installation.version),
+        ), context.agentId), runtimePersistence, context.installation.version),
       };
     }
-    invariant(entry?.agentId === "claude-code" && entry.process && !entry.process.closed, "AGENT_NATIVE_PROCESS_UNAVAILABLE", "Claude Code 原生进程已不可用", {
+    invariant(entry?.agentId === context.agentId && entry.process && !entry.process.closed && !entry.process.inputEnded, "AGENT_NATIVE_PROCESS_UNAVAILABLE", `${agentLabel} 原生进程已不可用`, {
       status: 409,
       details: { operation },
     });
@@ -4191,14 +4791,20 @@ export class AgentRuntimeTransport {
         if (!entry.process.closed) await entry.process.signal("SIGTERM");
         if (!await confirmProcessExit(entry.process, 4_000)) {
           await entry.process.signal("SIGKILL");
-          invariant(await confirmProcessExit(entry.process, 2_000), "AGENT_INTERRUPT_TIMEOUT", "Claude Code 中断后仍未退出，可重试停止", { status: 504, retryable: true });
+          invariant(await confirmProcessExit(entry.process, 2_000), "AGENT_INTERRUPT_TIMEOUT", `${agentLabel} 中断后仍未退出，可重试停止`, { status: 504, retryable: true });
         }
         if (this.active.get(key)?.process === entry.process) this.active.delete(key);
+      } else if (operation === "compact") {
+        await executeClaudeCompact({
+          entry,
+          frames: effectiveDescriptor.frames,
+          agentLabel,
+        });
       } else {
         for (const frame of effectiveDescriptor.frames || []) writeClaudeFrame(entry, frame);
       }
     } else if (effectiveDescriptor.transport === "process-signal") {
-      invariant(String(effectiveDescriptor.processId) === String(entry.process.processId), "AGENT_NATIVE_PROCESS_MISMATCH", "interrupt 未命中当前 Claude Code 进程", {
+      invariant(String(effectiveDescriptor.processId) === String(entry.process.processId), "AGENT_NATIVE_PROCESS_MISMATCH", `interrupt 未命中当前 ${agentLabel} 进程`, {
         status: 409,
       });
       await entry.process.signal(effectiveDescriptor.signal || "SIGINT");
@@ -4214,7 +4820,7 @@ export class AgentRuntimeTransport {
           await entry.process.signal("SIGTERM");
           if (await waitForExit(4_000) === null && !entry.process.closed) {
             await entry.process.signal("SIGKILL");
-            invariant(await waitForExit(2_000) !== null || entry.process.closed, "AGENT_INTERRUPT_TIMEOUT", "Claude Code 未在中断后及时退出", { status: 504, retryable: true });
+            invariant(await waitForExit(2_000) !== null || entry.process.closed, "AGENT_INTERRUPT_TIMEOUT", `${agentLabel} 未在中断后及时退出`, { status: 504, retryable: true });
           }
         }
       }
@@ -4223,7 +4829,7 @@ export class AgentRuntimeTransport {
     }
     await this.#recordRuntime(context, {
       runId: nativeRunId(context.request.binding),
-      status: operation === "interrupt" || effectiveDescriptor.transport === "process-signal" ? "interrupted" : "running",
+      status: operation === "interrupt" || effectiveDescriptor.transport === "process-signal" ? "interrupted" : operation === "compact" ? "idle" : "running",
       processId: entry.process.processId,
       sessionId: context.request.binding.native?.sessionId || context.request.binding.state?.sessionId || null,
     });
@@ -4238,6 +4844,7 @@ export class AgentRuntimeTransport {
           runtimeBindingId: context.nativeStoreBindingId,
           runtimeStoreRoot: context.nativeStorePaths.runtimeRoot,
           skillsRoot: context.paths.skillsRoot,
+          ...(isQoder ? { sessionProjectKey: entry.sessionProjectKey, workspacePath: entry.workspacePath } : {}),
         },
       },
     };

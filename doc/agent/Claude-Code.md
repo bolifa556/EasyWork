@@ -6,7 +6,8 @@
 
 - EasyWork Agent ID：`claude-code`
 - 托管包 ID：`claudecode`
-- Manifest 基线：`2.1.245`
+- Manifest 基线：`2.1.269`
+- CentOS/RHEL 7（glibc 2.17）兼容基线：`2.1.170`
 - 进程入口：`claude`
 - 统一协议名：`claude-code-stream-json`
 - 适配器：`gateway/core/agents/claude-code.mjs`
@@ -14,7 +15,7 @@
 - 配置：`gateway/core/agent-runtime/configuration.mjs`
 - 托管制品：`agent-app/manifest.json`
 
-Claude Code 托管制品是按平台下载的 raw binary，不是 tar archive。版本、大小和 SHA-256 仍只以 Manifest 为准。
+Claude Code 托管制品是按平台下载的 raw binary，不是 tar archive。版本、大小和 SHA-256 仍只以 Manifest 为准。主版本 `2.1.269` 覆盖 Linux x64/arm64 的 glibc 与 musl；清单另外固定[官方 `2.1.170` 制品](https://downloads.claude.ai/claude-code-releases/2.1.170/manifest.json)，专供 glibc 不高于 2.17 的旧 x64 主机。[上游 issue #69980](https://github.com/anthropics/claude-code/issues/69980) 已记录 `2.1.176` 在 RHEL/CentOS 7、glibc 2.17 上触发 SIGILL 的运行时回归，并确认同一主机上的 `2.1.170` 可运行；本次 scnet 实测中 `2.1.269` 还会在第一条 stream-json 事件前持续占用 CPU，而 `2.1.170` 能正常进入模型请求。部署器实际探测远端 OS、架构和 libc 后选择制品，并把兼容选择写入托管状态；主机升级到较新 glibc 后会自动回到清单主版本。更新器的 `--locked`、`--check` 和 `--latest` 都保留并处理这份兼容条目，因此它仍是完整可复现的清单内容，而不是远端运行时自行降级。
 
 ## 2. 进程与 stream-json 合同
 
@@ -33,6 +34,8 @@ Claude Code 托管制品是按平台下载的 raw binary，不是 tar archive。
 EasyWork 通过 stdin 连续发送 JSON frame，从 stdout 接收 JSONL。工作区是进程 cwd，环境和 settings 来自当前 binding。预热可以提前启动一个等待输入的进程，但不能发送占位 user frame、创建占位 session 或产生原生回合。
 
 新会话直接发送第一条 user frame；已有 session 在进程参数中加入 `--resume <session-id>`。运行中的追问写入同一进程；自然完成后的后续 Task 可以启动新进程并 resume 同一 session。进程 PID、session、原生 turn 边界和运行指纹记录在 binding runtime 中。
+
+Claude Code 没有修改一个活动进程 cwd 的控制帧。同一服务器和网页分支内切换工作区时，EasyWork 结束或丢弃旧工作区的空闲预热进程，在目标目录作为 cwd 启动新进程，并使用 `--resume <同一 session-id>` 继续原生会话。预热进程只有运行指纹、cwd 和 native store 都一致时才复用；工作区变化不会产生新 session，也不会复制 transcript。
 
 用户安装会按“二进制路径 + 实际版本”缓存一次 `claude --help` 能力探测：
 
@@ -58,24 +61,28 @@ EasyWork 通过 stdin 连续发送 JSON frame，从 stdout 接收 JSONL。工作
 
 绑定目录中的 `claude/settings.json` 写入 model、effort、默认权限、`autoMemoryEnabled: false` 和 EasyWork `PreToolUse` Hook。进程同时显式传相应 CLI 参数，并设置 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`：EasyWork 的长期记忆由网页层统一提取和隔离，Claude Code 原生 auto memory 不应跨网页项目另建第二套记忆，也不应尝试写入 binding 控制目录。`CLAUDE_CODE_EFFORT_LEVEL` 的原生优先级最高，所以 EasyWork 将当前实际 effort 同步写入环境，避免旧 settings 覆盖本轮适配值。自动压缩窗口由环境变量提供。
 
+托管二进制只由经过 SHA-256 校验的 Agent 更新器升级。运行进程设置 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`、`DISABLE_AUTOUPDATER=1` 和 `DISABLE_UPDATES=1`，避免 Claude 自更新绕过 Manifest，也避免遥测、错误上报或后台更新在受限 HPC 登录节点阻塞第一条 stream-json 事件。模型请求仍通过当前 Binding 的 API route；用户主动要求的 WebFetch 等工具流量不由这组开关伪装成模型路由。
+
+网页二级菜单保留 Claude Code 的“打开配置”和“选择模型”。模型仍来自 EasyWork 已配置的 provider 目录。配置快照按 Actor、服务器、网页对话配置域和 Agent 隔离，内存与浏览器缓存最多保留 30 天并优先用于首屏；服务器返回更高 revision 时覆盖旧值，保存遇到 revision 冲突时重读权威配置并只重放用户本次修改。该缓存不改变 `settings.json`、CLI 参数和环境变量的原生优先级。
+
 Skill 包按用户和内容摘要进入不可变缓存，当前 binding 复制出自己的文件代次；`skills/` 中的指针只指向自有副本。`<runtime-data>/claude/skills` 指向这棵独立视图。本轮选中的技能正文从当前自有副本读取，组合为 `skills/easywork-selected/SKILL.md`，为每个技能保留其资源基准目录，并通过 `$ARGUMENTS` 接收本轮交接正文。包装声明 `disable-model-invocation: true`，由 EasyWork 在 stream-json user frame 中显式调用 `/easywork-selected <本轮交接正文>`，让原生命令展开技能，而不只依赖自动匹配。用户原话仍保留在交接正文中，普通补充 prompt 不另行复制 Skill 正文。即使网页分支共享来源 session 的 transcript，技能仍从分叉 Task 的文件快照复制到目标 binding，之后互不影响。
 
-个人包固定、SSH 上传校验、远端缓存与自有副本的完整目录关系，见[远端文件版本与 Agent 机制](../远端文件版本与Agent机制.md)第 7.1 节；历史技能快照与分支继承见第 9.1 节。生成的 `easywork-selected` 是本轮调用包装，不作为用户技能加入历史快照。
+个人包固定、SSH 上传校验、远端缓存与自有副本的完整目录关系，见[远端文件版本与 Agent 机制](../远端文件版本与Agent机制.md)第 7 节；历史技能快照与分支继承见第 10 节。生成的 `easywork-selected` 是本轮调用包装，不作为用户技能加入历史快照。
 
-筛选包括对话模式和 Work 服务器范围。网页 Agent 选择、用户显式附加、Work 强制启用最终共用同一部署及版本收据；后两类不要求网页模型再次读取或批准。同版包复用当前 binding 的副本；强制项仅在切换绑定后的首次提问检查并补齐，连续提问不重复交付。用户显式或网页按需选中的项仍执行本轮原生调用。启动指纹覆盖 Skill pin、视图和调用正文；技能变更后不能复用未加载新内容的预热进程。模型 relay 属于 binding，旧进程退出不能关闭替代进程正在使用的 relay。
+筛选包括对话模式和 Work 服务器范围。网页 Agent 选择、用户显式附加、Work 强制启用最终共用同一部署及版本收据；后两类不要求网页模型再次读取或批准。同版包复用当前 binding 的副本；强制项仅在切换 Agent、服务器、网页分支或上下文代次后的首次提问检查并补齐，普通工作区切换不重复检查。用户显式或网页按需选中的项仍执行本轮原生调用。启动指纹覆盖 Skill pin、视图和调用正文；技能变更后不能复用未加载新内容的预热进程。模型 relay 属于 binding，旧进程退出不能关闭替代进程正在使用的 relay。
 
 ## 4. 原生操作映射
 
 | EasyWork 操作 | Claude Code 行为 |
 | --- | --- |
-| start | 启动 stream-json 进程并写入 user frame；已有 session 时加 `--resume` |
-| resume | `--resume <session>` 启动进程并写入 user frame |
+| start | 在本轮工作区 cwd 启动 stream-json 进程并写入 user frame；已有 session 时加 `--resume` |
+| resume | 在目标工作区 cwd 以 `--resume <session>` 启动进程并写入 user frame |
 | append | 在活动 stdin 先写 control interrupt，再写新的 user frame |
 | interrupt | 发送 `control_request {subtype:"interrupt"}` |
 | approval | 对 `can_use_tool` 等请求写 `control_response` |
 | input | 对 AskUserQuestion、elicitation 或 dialog 写 `control_response` |
 | compact | 在活动进程发送 user `/compact`；无活动进程时 resume 一个一次性进程 |
-| contextUsage | 从当前 streaming message usage 推导 |
+| contextUsage | 从当前请求的 streaming usage 或原生 context report 读取 |
 | fork/revert | 保存 native-deferred 描述，在下一条真实消息启动时完成 |
 
 标准 user frame 为：
@@ -96,9 +103,11 @@ Claude Code 的 append 通过同一 stream-json stdin 完成：先发原生 cont
 
 ## 6. 压缩与上下文用量
 
-Claude Code 把压缩暴露为原生 `/compact` 命令，而不是独立 RPC。活动进程直接接收该 user frame；已完成进程不存在时，EasyWork 用 `--resume` 启动一次性 stream-json 进程，等待原生 `compact_boundary`，然后停止该进程。超时或缺少边界不会标记为压缩成功。
+Claude Code 把压缩暴露为原生 `/compact` 命令，而不是独立 RPC。活动进程直接接收该 user frame；已完成进程不存在时，EasyWork 用 `--resume` 启动一次性 stream-json 进程。两条路径都先订阅输出再发送命令，并只在收到原生 `system/compact_boundary` 后确认成功。活动进程中属于此前排队回合的 `result` 会按队列计数略过；轮到压缩后若先收到无边界的终态 `result`，则立即返回原生拒绝、失败或未执行原因。流提前关闭返回不完整，90 秒内既没有边界也没有终态才返回超时；任何一种情况都不会伪装成成功。
 
-当前 context-window 用量只取 streaming `message.usage` 与 `message_delta.usage`。终端 `result.usage` 是整个 Agent run 的累计计费用量，可能包含多次模型/工具循环，单独保存为 billing 信息，不覆盖当前请求上下文占用。
+当前 context-window 用量只接受当前请求的 streaming `message.usage`、`message_delta.usage`，或 assistant frame 的原生 `context_usage` report。终端 `result.usage` 是整个 Agent run 的累计计费用量，可能包含多次模型/工具循环，单独保存为 billing 信息；`modelUsage.contextWindow` 最多用于补齐当前请求的原生上限，不能把累计 token 冒充窗口占用。配置页显示的上限优先使用 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 对应的 `contextLimit`，因此表示自动压缩计算窗口，不保证等于模型硬上限。
+
+Claude Code 没有独立的只读 context RPC。EasyWork 读取 Binding 中最近一次经过来源校验的事件快照，不向会话注入测试消息或 `/context`。网页按 Actor、服务器、配置域、Binding 和 Agent 缓存该值，在原生 context revision 前进、菜单重新打开或压缩完成后刷新；原生会话尚未返回可验证用量时明确显示不可用。
 
 ## 7. 事件归一化
 
@@ -118,7 +127,7 @@ Claude Code 把压缩暴露为原生 `/compact` 命令，而不是独立 RPC。�
 
 partial message 与快照可能重复描述同一 block；reducer 按 message/content/tool ID 合并，避免正文、thinking 或 tool result 重复。未知非交互 frame 形成兼容性信息；未知交互 frame 明确失败。
 
-作业提交记录使用 Bash `tool_use` 的输入与 `user.tool_result` 的真实输出，通过 `tool_use_id` 关联。只有流式参数时，在 `content_block_stop` 将完整 JSON 输入保存到对应 `tool_use_id`，不依赖下一轮可能复用的内容块索引；已有原生完整工具输入时保留该输入。终态结果进入统一提交检测器，仅直接 `sbatch` 与对应成功回执形成持久提交记录，查询结果、读取到的文件和 Claude 的文字总结不补录历史。成功回执写入账本后，由三种 Agent 共用的后台跟踪器直接查询调度器并持久化终态，不依赖 Claude 后续查询或用户打开算力面板；断线、重连和查询失败边界统一处理。不向 Claude 添加记账提示词或调用其记忆能力。识别与跟踪边界见《SSH机制》的提交历史章节。
+作业提交记录使用 Bash `tool_use` 的输入与 `user.tool_result` 的真实输出，通过 `tool_use_id` 关联。只有流式参数时，在 `content_block_stop` 将完整 JSON 输入保存到对应 `tool_use_id`，不依赖下一轮可能复用的内容块索引；已有原生完整工具输入时保留该输入。终态结果进入统一提交检测器，仅直接 `sbatch` 与对应成功回执形成持久提交记录，查询结果、读取到的文件和 Claude 的文字总结不补录历史。成功回执写入账本后，由四种 Agent 共用的后台跟踪器直接查询调度器并持久化终态，不依赖 Claude 后续查询或用户打开算力面板；断线、重连和查询失败边界统一处理。不向 Claude 添加记账提示词或调用其记忆能力。识别与跟踪边界见《SSH机制》的提交历史章节。
 
 接收队列只合并同一通道相邻的增量，允许淘汰已被新事件替代的累计 `thinking_tokens` 计数；不能用 `assistant` 帧与 `stream_event` 相互替换。当前 SDK 的 `assistant` 是已完成内容块，多个不同块可以共用 `message.id`，并非整条消息的累计快照。完整工具输入、流结束和 usage 都必须保留。无独立 ID 的正文/思考完成块按该原生消息的内容块顺序关联已有流式块，不能直接把完成帧数组的 `0` 当作原流式索引，否则会重复正文或覆盖前面的思考块。此合同已对照官方 SDK `0.3.245` 的 `SDKAssistantMessage`、`SDKPartialAssistantMessage` 类型定义及[官方流式输出说明](https://code.claude.com/docs/en/agent-sdk/streaming-output)核查。
 
@@ -171,6 +180,6 @@ EasyWork 先按网页配置启动 Claude Code。只有原生模型明确拒绝 e
 
 ## 11. 兼容性与升级敏感面
 
-当前实现依赖的易变协议面包括：stream-json 必需参数、长期 stdin 多 user frame 行为、control interrupt/approval/input 请求形状、partial/snapshot/result 事件关系、result 是否保持进程存活、`compact_boundary`、当前请求 usage 字段、Todo/Task 工具结果、settings Hook schema、`last-prompt.leafUuid` 与 `--resume-session-at` 契约、fork-session/session-id 参数。
+当前实现依赖的易变协议面包括：stream-json 必需参数、长期 stdin 多 user frame 行为、跨进程从新 cwd `--resume` 同一 session、control interrupt/approval/input 请求形状、partial/snapshot/result 事件关系、result 是否保持进程存活、`compact_boundary` 必须先于压缩 result、当前请求 usage 与 assistant `context_usage` 字段、Todo/Task 工具结果、settings Hook schema、`last-prompt.leafUuid` 与 `--resume-session-at` 契约、fork-session/session-id 参数。
 
 可选 CLI flag 缺失可以显式降级；stream-json、resume、精确 final 或原生分支边界缺失时不能用 transcript 文本拼接来模拟原生能力。托管基线必须满足完整合同。

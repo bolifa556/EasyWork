@@ -82,7 +82,7 @@ for (const entry of ["dist", "gateway", "shared", "prompts", "help", "public", "
   await copyRelative(entry, common);
 }
 // The host may be Windows or Linux; managed agents run on remote Linux servers.
-// Include only the verified x64 catalog, never the whole local agent-app folder.
+// Include the verified remote-Linux catalog, never the whole local agent-app folder.
 const agentRoot = await realpath(path.join(root, "agent-app"));
 const sourceCatalog = JSON.parse(await readFile(path.join(agentRoot, "manifest.json"), "utf8"));
 if (sourceCatalog.schemaVersion !== 1) throw new Error("Unsupported agent catalog schema");
@@ -106,7 +106,7 @@ for (const agentId of agentIds) {
   }
 }
 await writeFile(path.join(common, "agent-app", "manifest.json"), JSON.stringify(agentCatalog, null, 2) + "\n");
-console.log("[release] Bundling " + includedAgents.size + " verified Linux x64 agent files in every host archive");
+console.log("[release] Bundling " + includedAgents.size + " verified Linux agent files in every host archive");
 for (const entry of ["serve-easywork.mjs", "start-renderer.mjs", "static-assets.mjs", "download-agent-app.mjs", "artifact-download.mjs"]) {
   await copyRelative(`scripts/${entry}`, common);
 }

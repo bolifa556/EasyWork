@@ -218,6 +218,14 @@ export type AgentSummary = {
   version?: string | null;
   configured?: boolean;
   model?: string | null;
+  authentication?: {
+    required: boolean;
+    authenticated: boolean;
+    status: "authenticated" | "unauthenticated" | "pending" | "unavailable" | "error";
+    loginAvailable: boolean;
+    message?: string;
+    version?: string;
+  } | null;
   configuration?: {
     agentId: string;
     configScope?: string;

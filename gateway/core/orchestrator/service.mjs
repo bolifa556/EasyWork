@@ -89,8 +89,13 @@ function nativeSessionWasRemoved(error, adapterId) {
     return /\b(?:thread\s+not\s+found|no\s+rollout\s+found\s+for\s+(?:thread|conversation)\s+id)\b/i.test(message);
   }
   if (adapterId === "opencode") return /\bsession\s+not\s+found\b/i.test(message);
-  if (adapterId === "claude-code") return /\b(?:session|conversation)\s+(?:was\s+)?not\s+found\b/i.test(message);
+  if (["claude-code", "qoder-cn"].includes(adapterId)) return /\b(?:session|conversation)\s+(?:was\s+)?not\s+found\b/i.test(message);
   return false;
+}
+
+function nativeSessionNeedsRebinding(error, adapterId) {
+  return nativeSessionWasRemoved(error, adapterId)
+    || (adapterId === "opencode" && error?.code === "AGENT_NATIVE_WORKSPACE_MOVE_UNAVAILABLE");
 }
 
 function operationInput(binding, input = {}) {
@@ -613,12 +618,12 @@ export class TaskOrchestrator {
       });
       run = await this.#executeTransport({ task, adapter, binding, descriptor, operation: "start", workspace, version, skills, delivery });
     } catch (error) {
-      if (nativeSessionId(binding) && nativeSessionWasRemoved(error, adapter.id)) {
+      if (nativeSessionId(binding) && nativeSessionNeedsRebinding(error, adapter.id)) {
         // The webpage binding can outlive an Agent's native history (for
-        // example after a remote cleanup or an Agent data reset).  Retry once
-        // with a fresh native conversation and a full ContextHub delivery.
-        // This is recovery from verified absence, not a generic retry: other
-        // protocol and transport failures still surface unchanged.
+        // example after a remote cleanup or when OpenCode rejects a move
+        // across incompatible projects). Retry once with a fresh native
+        // conversation and a full ContextHub delivery. This is recovery from
+        // a verified unusable session, not a generic transport retry.
         delivery = await this.contextHub.deliveryForRebinding(task.agentBindingId, assembled.delivery);
         prompt = await this.prompts.remoteDelivery(delivery, task.goal);
         startInput = { prompt, ...(workspace?.path ? { cwd: workspace.path } : {}) };
@@ -1074,11 +1079,11 @@ export class TaskOrchestrator {
       const events = reduced.events.filter((event) => !(liveTask.status === "waiting_append"
         && (event.kind === "error" || (event.kind === "status" && event.phase === "cancelled"))));
       const pendingFork = binding.native?.pendingFork || null;
-      const observedSessionId = adapter.id === "claude-code" && rawFrame?.session_id
+      const observedSessionId = ["claude-code", "qoder-cn"].includes(adapter.id) && rawFrame?.session_id
         ? String(rawFrame.session_id)
         : null;
       if (pendingFork && observedSessionId) {
-        invariant(observedSessionId === String(pendingFork.targetSessionId), "AGENT_CLAUDE_FORK_SESSION_MISMATCH", "Claude Code 原生分支返回了错误的 session id", {
+        invariant(observedSessionId === String(pendingFork.targetSessionId), "AGENT_NATIVE_FORK_SESSION_MISMATCH", `${adapter.id === "qoder-cn" ? "Qoder CN" : "Claude Code"} 原生分支返回了错误的 session id`, {
           status: 502,
           details: { expected: pendingFork.targetSessionId, actual: observedSessionId },
         });
@@ -1092,7 +1097,7 @@ export class TaskOrchestrator {
           ...(binding.native || {}),
           ...(reduced.state.sessionId ? { sessionId: reduced.state.sessionId } : {}),
            ...(adapter.id === "codex" && reduced.state.sessionId ? { threadId: reduced.state.sessionId } : {}),
-           ...(adapter.id === "claude-code" && rawFrame?.type === "easywork_native_boundary"
+           ...(["claude-code", "qoder-cn"].includes(adapter.id) && rawFrame?.type === "easywork_native_boundary"
              ? { turnId: reduced.state.turnId || null }
              : reduced.state.turnId ? { turnId: reduced.state.turnId } : {}),
            ...(pendingFork && observedSessionId ? { pendingFork: null } : {}),

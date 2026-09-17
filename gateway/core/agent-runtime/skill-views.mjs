@@ -10,10 +10,14 @@ const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeo
 
 function verifyDescriptor(descriptor, root, digest) {
   const { sha256, ...content } = descriptor;
-  invariant(sha256 === digest && hash(canonical(content)) === digest && descriptor.root === root
+  const computedDigest = hash(canonical(content));
+  invariant(sha256 === digest && computedDigest === digest && descriptor.root === root
     && Array.isArray(descriptor.files) && Array.isArray(descriptor.skillPins)
     && descriptor.files.length <= 10000 && descriptor.files.reduce((size, file) => size + file.size, 0) <= 64 * 1024 * 1024,
-  "AGENT_SKILL_SNAPSHOT_CHANGED", "分支技能快照已变化", { status: 409 });
+  "AGENT_SKILL_SNAPSHOT_CHANGED", "分支技能快照已变化", {
+    status: 409,
+    details: { expectedDigest: digest, storedDigest: sha256, computedDigest, expectedRoot: root, storedRoot: descriptor.root },
+  });
 }
 
 export async function readSkillView(executor, paths) {
@@ -38,14 +42,29 @@ export async function selectedSkillCommand(executor, paths, skills) {
 }
 
 const SNAPSHOT_SCRIPT = String.raw`
-import os,sys,json,hashlib,shutil,uuid,stat
-p=json.loads(sys.argv[1]); root=os.path.realpath(p['runtimeRoot']); target=p['target']
-def inside(path,base): return os.path.commonpath([os.path.realpath(path),base])==base
+from __future__ import print_function
+import os,sys,json,hashlib,shutil,uuid,stat,io,errno
+try: text_type=unicode
+except NameError: text_type=str
+raw=sys.argv[1]
+if not isinstance(raw,text_type): raw=raw.decode('utf-8')
+p=json.loads(raw); root=os.path.realpath(p['runtimeRoot']); target=p['target']
+def inside(path,base):
+ path=os.path.realpath(path); base=os.path.realpath(base)
+ return path==base or path.startswith(base+os.sep)
+def makedirs(path,mode=0o777):
+ try: os.makedirs(path,mode)
+ except OSError as error:
+  if error.errno!=errno.EEXIST or not os.path.isdir(path): raise
+def emit(value):
+ if not isinstance(value,text_type): value=value.decode('utf-8')
+ output=getattr(sys.stdout,'buffer',sys.stdout)
+ output.write(value.encode('utf-8')+b'\n'); output.flush()
 assert inside(target,root) and target!=root
 manifestfile=os.path.join(target,'snapshot.json')
 if os.path.isfile(manifestfile):
- print(open(manifestfile,encoding='utf-8').read()); sys.exit(0)
-stage=target+'.stage-'+str(uuid.uuid4()); os.makedirs(stage,mode=0o700)
+ emit(io.open(manifestfile,encoding='utf-8').read()); sys.exit(0)
+stage=target+'.stage-'+str(uuid.uuid4()); os.makedirs(stage,0o700)
 files=[]; total=0
 try:
  for name in sorted(os.listdir(p['skillsRoot'])):
@@ -61,24 +80,31 @@ try:
     total+=attrs.st_size
     assert total<=67108864 and len(files)<10000, 'skill snapshot too large'
     rel=name+'/'+os.path.relpath(sourcefile,source).replace(os.sep,'/'); destination=os.path.join(stage,'files',rel)
-    os.makedirs(os.path.dirname(destination),exist_ok=True); shutil.copyfile(sourcefile,destination)
-    data=open(destination,'rb').read(); files.append({'path':rel,'size':len(data),'sha256':hashlib.sha256(data).hexdigest(),'mode':stat.S_IMODE(attrs.st_mode)})
+    makedirs(os.path.dirname(destination)); shutil.copyfile(sourcefile,destination)
+    data=io.open(destination,'rb').read(); files.append({'path':rel,'size':len(data),'sha256':hashlib.sha256(data).hexdigest(),'mode':stat.S_IMODE(attrs.st_mode)})
  pins=p.get('pins',[]); names={f['path'].split('/')[0] for f in files}; pins=[x for x in pins if x['skillId'] in names]
  descriptor={'schemaVersion':1,'root':target,'skillPins':pins,'files':files}
  digest=hashlib.sha256(json.dumps(descriptor,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
  descriptor['sha256']=digest
- open(os.path.join(stage,'snapshot.json'),'w',encoding='utf-8').write(json.dumps(descriptor))
- os.makedirs(os.path.dirname(target),exist_ok=True); os.rename(stage,target)
- print(json.dumps(descriptor))
+ io.open(os.path.join(stage,'snapshot.json'),'w',encoding='utf-8').write(json.dumps(descriptor,ensure_ascii=False))
+ makedirs(os.path.dirname(target)); os.rename(stage,target)
+ emit(json.dumps(descriptor,ensure_ascii=True))
 except:
- shutil.rmtree(stage); raise
+ if os.path.isdir(stage): shutil.rmtree(stage)
+ raise
 `;
 
 export async function captureSkillSnapshot(executor, paths, taskId, pins) {
   invariant(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(String(taskId)), "AGENT_SKILL_CHECKPOINT_INVALID", "技能快照边界无效", { status: 400 });
   const target = `${paths.runtimeRoot}/skill-snapshots/${taskId}`;
-  const result = await executor.exec(`python3 -c ${quote(SNAPSHOT_SCRIPT)} ${quote(JSON.stringify({ runtimeRoot: paths.runtimeRoot, skillsRoot: paths.skillsRoot, target, pins }))}`, { maxOutputBytes: 4 * 1024 * 1024 });
-  invariant(result.code === 0, "AGENT_SKILL_SNAPSHOT_FAILED", "无法保存当前回合的技能文件快照", { status: 502 });
+  const probe = await executor.exec("if command -v python3 >/dev/null 2>&1; then printf '%s\\n' python3; elif command -v python >/dev/null 2>&1; then printf '%s\\n' python; fi", { maxOutputBytes: 1024 });
+  const interpreter = String(probe.stdout || "").trim();
+  invariant(probe.code === 0 && ["python3", "python"].includes(interpreter), "AGENT_SKILL_SNAPSHOT_RUNTIME_MISSING", "远端缺少保存技能快照所需的 Python", { status: 502 });
+  const result = await executor.exec(`${interpreter} -c ${quote(SNAPSHOT_SCRIPT)} ${quote(JSON.stringify({ runtimeRoot: paths.runtimeRoot, skillsRoot: paths.skillsRoot, target, pins }))}`, { maxOutputBytes: 4 * 1024 * 1024 });
+  invariant(result.code === 0, "AGENT_SKILL_SNAPSHOT_FAILED", "无法保存当前回合的技能文件快照", {
+    status: 502,
+    details: { exitCode: result.code, stderr: String(result.stderr || "").slice(-2048) },
+  });
   const snapshot = JSON.parse(result.stdout);
   verifyDescriptor(snapshot, target, snapshot.sha256);
   return { schemaVersion: 1, root: target, sha256: snapshot.sha256, skillPins: snapshot.skillPins };

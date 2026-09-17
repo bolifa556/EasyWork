@@ -19,15 +19,57 @@ async function sha256File(filePath) {
   return hash.digest("hex");
 }
 
-function manifestEntry(manifest, agentId, platform) {
+function numericParts(value) {
+  const match = String(value || "").match(/\d+(?:\.\d+)*/);
+  return match ? match[0].split(".").map((part) => Number(part)) : [];
+}
+
+function compareNumericVersions(left, right) {
+  const a = numericParts(left);
+  const b = numericParts(right);
+  const length = Math.max(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const delta = (a[index] || 0) - (b[index] || 0);
+    if (delta) return delta;
+  }
+  return 0;
+}
+
+function matchesCompatibility(selector, hostProfile, platform) {
+  if (!selector || typeof selector !== "object" || !hostProfile) return false;
+  if (Array.isArray(selector.platforms) && !selector.platforms.includes(platform)) return false;
+  if (selector.libcFamily && String(hostProfile.libcFamily || "") !== String(selector.libcFamily)) return false;
+  if (selector.libcMax && (!hostProfile.libcVersion || compareNumericVersions(hostProfile.libcVersion, selector.libcMax) > 0)) return false;
+  if (selector.kernelMajorMax !== undefined) {
+    const major = numericParts(hostProfile.kernel)[0];
+    if (!Number.isSafeInteger(major) || major > Number(selector.kernelMajorMax)) return false;
+  }
+  const cpuFlags = new Set(Array.isArray(hostProfile.cpuFlags) ? hostProfile.cpuFlags.map((flag) => String(flag).toLowerCase()) : []);
+  if (Array.isArray(selector.requiredCpuFlags) && selector.requiredCpuFlags.some((flag) => !cpuFlags.has(String(flag).toLowerCase()))) return false;
+  if (Array.isArray(selector.missingCpuFlags) && selector.missingCpuFlags.every((flag) => cpuFlags.has(String(flag).toLowerCase()))) return false;
+  return true;
+}
+
+function compatibilityReleases(agent) {
+  if (!agent?.compatibility) return [];
+  if (Array.isArray(agent.compatibility)) return agent.compatibility;
+  return Object.entries(agent.compatibility).map(([id, release]) => ({ id, ...release }));
+}
+
+function manifestEntry(manifest, agentId, platform, { hostProfile = null } = {}) {
   const definition = runtimeAgentDefinition(agentId);
   const agent = manifest.agents?.[definition.packageId];
-  const artifact = agent?.artifacts?.[platform];
+  const compatibility = compatibilityReleases(agent).find((release) => (
+    release?.artifacts?.[platform]
+    && matchesCompatibility(release.selector, hostProfile, platform)
+  ));
+  const release = compatibility || agent;
+  const artifact = release?.artifacts?.[platform];
   invariant(agent && artifact, "AGENT_ARTIFACT_UNAVAILABLE", `主机没有 ${definition.displayName} 的 ${platform} 安装包`, {
     status: 409,
     details: { agentId, platform },
   });
-  return { definition, agent, artifact };
+  return { definition, agent, release, artifact, compatibilityId: compatibility?.id || null };
 }
 
 export class HostAgentArtifactCatalog {
@@ -59,10 +101,19 @@ export class HostAgentArtifactCatalog {
   }
 
   async resolve(agentId, platform, { verify = true } = {}) {
+    return this.#resolve(agentId, platform, { verify });
+  }
+
+  async resolveForHost(agentId, hostProfile, { verify = true } = {}) {
+    const platform = assertLinuxPlatform(hostProfile?.platform);
+    return this.#resolve(agentId, platform, { verify, hostProfile });
+  }
+
+  async #resolve(agentId, platform, { verify = true, hostProfile = null } = {}) {
     const normalizedPlatform = assertLinuxPlatform(platform);
     const manifest = await this.load({ refresh: true });
-    const { definition, agent, artifact } = manifestEntry(manifest, agentId, normalizedPlatform);
-    invariant(typeof agent.version === "string" && agent.version.trim(), "AGENT_ARTIFACT_VERSION_INVALID", "Agent 安装包清单缺少版本号", {
+    const { definition, agent, release, artifact, compatibilityId } = manifestEntry(manifest, agentId, normalizedPlatform, { hostProfile });
+    invariant(typeof release.version === "string" && release.version.trim(), "AGENT_ARTIFACT_VERSION_INVALID", "Agent 安装包清单缺少版本号", {
       status: 500,
       expose: false,
     });
@@ -112,14 +163,15 @@ export class HostAgentArtifactCatalog {
       packageId: definition.packageId,
       displayName: definition.displayName,
       binary: definition.binary,
-      version: String(agent.version || ""),
+      version: String(release.version || ""),
       platform: normalizedPlatform,
+      compatibilityId,
       archive: String(artifact.archive),
       archiveBinary: archiveBinary || definition.binary,
       sha256: expectedHash,
       size: fileStat.size,
       localPath,
-      source: String(artifact.source || agent.source || ""),
+      source: String(artifact.source || release.source || agent.source || ""),
     });
   }
 }

@@ -80,17 +80,31 @@ export function createEffectiveContextScope(input) {
   });
 }
 
-export function createAgentBindingKey(scope, agentId) {
+function agentBindingKey(scope, agentId, includeWorkspace) {
   const value = [
     scope?.actorType,
     scope?.actorId,
     scope?.serverIdentity,
-    scope?.workspaceId,
+    ...(includeWorkspace ? [scope?.workspaceId] : []),
     agentId,
     scope?.conversationId,
     scope?.branchId,
     scope?.contextEpoch,
   ];
-  invariant(value.every((entry) => entry !== null && entry !== undefined && entry !== ""), "AGENT_BINDING_SCOPE_INCOMPLETE", "Agent binding 缺少服务器、工作区或对话 Scope", { status: 400 });
+  invariant(value.every((entry) => entry !== null && entry !== undefined && entry !== ""), "AGENT_BINDING_SCOPE_INCOMPLETE", "Agent binding 缺少服务器、Agent 或对话 Scope", { status: 400 });
   return `abk_${crypto.createHash("sha256").update(JSON.stringify(value)).digest("base64url")}`;
+}
+
+// A native Agent conversation belongs to one Web conversation, branch,
+// server and Agent. Its working directory is mutable native state, so changing
+// workspace on the same server must keep this identity stable.
+export function createAgentBindingKey(scope, agentId) {
+  return agentBindingKey(scope, agentId, false);
+}
+
+// Releases before workspace-native switching included workspaceId in the
+// digest. Keep the exact historical formula so an existing native conversation
+// can be adopted once instead of being silently abandoned after an upgrade.
+export function createLegacyAgentBindingKey(scope, agentId) {
+  return agentBindingKey(scope, agentId, true);
 }

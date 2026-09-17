@@ -8,6 +8,7 @@ import {
   createClaudeCodeAdapter,
   createCodexAdapter,
   createOpenCodeAdapter,
+  createQoderCnAdapter,
 } from "../gateway/core/agents/index.mjs";
 
 function consume(adapter, frames) {
@@ -36,9 +37,9 @@ function assertCanonical(adapter, events) {
   }
 }
 
-test("三 Agent adapter 声明同一 clean-break contract 与显式 capability", () => {
+test("四种 Agent adapter 声明同一 clean-break contract 与显式 capability", () => {
   const adapters = createAgentAdapters();
-  assert.deepEqual(Object.keys(adapters), ["opencode", "codex", "claude-code"]);
+  assert.deepEqual(Object.keys(adapters), ["opencode", "codex", "claude-code", "qoder-cn"]);
   assert.deepEqual(AGENT_EVENT_KINDS, [
     "message", "reasoning", "plan", "tool_call", "tool_result", "approval_request", "approval_response",
     "input_request", "input_response", "file_change", "job_status", "artifact", "usage", "status", "error", "final",
@@ -58,9 +59,12 @@ test("三 Agent adapter 声明同一 clean-break contract 与显式 capability",
   assert.equal(adapters.opencode.capabilities.revert.availability, "available");
   assert.equal(adapters["claude-code"].capabilities.fork.availability, "available");
   assert.equal(adapters["claude-code"].capabilities.revert.availability, "available");
+  assert.equal(adapters["qoder-cn"].capabilities.append.mode, "native");
+  assert.equal(adapters["qoder-cn"].capabilities.fork.availability, "available");
+  assert.equal(adapters["qoder-cn"].capabilities.revert.availability, "available");
 });
 
-test("三种 Agent 把思考档位自动适配归一为同一种可见配置事件", () => {
+test("四种 Agent 把思考档位自动适配归一为同一种可见配置事件", () => {
   const configuration = {
     agentId: "codex",
     source: "system",
@@ -82,6 +86,7 @@ test("三种 Agent 把思考档位自动适配归一为同一种可见配置事�
     [createOpenCodeAdapter(), { type: "easywork.effort.adjusted", data: adjustment }],
     [createCodexAdapter(), { method: "easywork/effortAdjusted", params: adjustment }],
     [createClaudeCodeAdapter(), { type: "easywork_effort_adjusted", adjustment }],
+    [createQoderCnAdapter(), { type: "easywork_effort_adjusted", adjustment }],
   ];
 
   for (const [adapter, frame] of cases) {
@@ -115,6 +120,7 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
   const openCode = createOpenCodeAdapter();
   const codex = createCodexAdapter();
   const claude = createClaudeCodeAdapter();
+  const qoder = createQoderCnAdapter();
 
   const descriptors = [
     openCode.operation("start", { prompt: "inspect files" }),
@@ -126,7 +132,7 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
     codex.operation("start", { prompt: "inspect files", cwd: "/work" }),
     codex.operation("append", { threadId: "t-1", turnId: "v-1", prompt: "continue" }),
     codex.operation("interrupt", { threadId: "t-1", turnId: "v-1" }),
-    codex.operation("resume", { threadId: "t-1", prompt: "resume" }),
+    codex.operation("resume", { threadId: "t-1", prompt: "resume", cwd: "/work/next" }),
     codex.operation("compact", { threadId: "t-1" }),
     codex.operation("contextUsage", { threadId: "t-1" }),
     claude.operation("start", { prompt: "inspect files", cwd: "/work", sessionId: "s-existing" }),
@@ -140,6 +146,11 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
     openCode.operation("fork", { sessionId: "s-source", retainedMessageId: "msg-7" }),
     openCode.operation("revert", { sessionId: "s-source", retainedMessageId: "msg-7" }),
     claude.operation("fork", { sourceSessionId: "11111111-1111-4111-8111-111111111111", targetSessionId: "22222222-2222-4222-8222-222222222222", resumeSessionAt: "33333333-3333-4333-8333-333333333333" }),
+    qoder.operation("start", { prompt: "inspect files", cwd: "/work", sessionId: "q-session" }),
+    qoder.operation("append", { prompt: "continue" }),
+    qoder.operation("resume", { sessionId: "q-session", prompt: "continue", cwd: "/work/next" }),
+    qoder.operation("compact", { sessionId: "q-session", cwd: "/work/next" }),
+    qoder.operation("fork", { sourceSessionId: "q-source", targetSessionId: "q-target", resumeSessionAt: "q-message" }),
   ];
   const json = JSON.stringify(descriptors);
   assert.equal(/apiKey|password|privateKey|authorization/i.test(json), false);
@@ -149,6 +160,8 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
     params: { cwd: "/work", historyMode: "paginated" },
   });
   assert.equal(descriptors[7].calls[0].method, "turn/steer");
+  assert.equal(descriptors[9].calls[0].params.cwd, "/work/next");
+  assert.equal(descriptors[9].calls[1].params.cwd, "/work/next");
   assert.equal(descriptors[12].executable, "claude");
   assert.deepEqual(descriptors[12].args.slice(-2), ["--resume", "s-existing"]);
   assert.deepEqual(descriptors[13], {
@@ -279,18 +292,44 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
       },
     }],
   });
+  const qoderStart = descriptors.find((descriptor) => descriptor.adapter === "qoder-cn" && descriptor.operation === "start");
+  const qoderAppend = descriptors.find((descriptor) => descriptor.adapter === "qoder-cn" && descriptor.operation === "append");
+  const qoderResume = descriptors.find((descriptor) => descriptor.adapter === "qoder-cn" && descriptor.operation === "resume");
+  const qoderFork = descriptors.find((descriptor) => descriptor.adapter === "qoder-cn" && descriptor.operation === "fork");
+  assert.equal(qoderStart.executable, "qoderclicn");
+  assert.deepEqual(qoderStart.args.slice(-2), ["--resume", "q-session"]);
+  assert.equal(qoderStart.cwd, "/work");
+  assert.deepEqual(qoderAppend.frames, [{
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text: "continue" }] },
+    parent_tool_use_id: null,
+    priority: "now",
+  }]);
+  assert.equal(qoderResume.cwd, "/work/next");
+  assert.deepEqual(qoderResume.args.slice(-2), ["--resume", "q-session"]);
+  assert.deepEqual(qoderFork, {
+    adapter: "qoder-cn",
+    operation: "fork",
+    transport: "native-deferred",
+    sourceSessionId: "q-source",
+    targetSessionId: "q-target",
+    resumeSessionAt: "q-message",
+  });
 });
 
-test("三个 Agent 的新 EasyWork Task 都在已有原生会话中启动下一轮", () => {
+test("四个 Agent 的新 EasyWork Task 都在已有原生会话中启动下一轮", () => {
   const openCode = createOpenCodeAdapter().operation("start", { sessionId: "session-existing", prompt: "next task" });
-  const codex = createCodexAdapter().operation("start", { threadId: "thread-existing", prompt: "next task" });
+  const codex = createCodexAdapter().operation("start", { threadId: "thread-existing", prompt: "next task", cwd: "/work/next" });
   const claude = createClaudeCodeAdapter().operation("start", { sessionId: "session-existing", prompt: "next task" });
+  const qoder = createQoderCnAdapter().operation("start", { sessionId: "session-existing", prompt: "next task" });
 
   assert.equal(openCode.request.path, "/api/session/session-existing/prompt");
   assert.equal(openCode.transaction, undefined);
   assert.deepEqual(codex.calls.map((call) => call.method), ["turn/start"]);
   assert.equal(codex.calls[0].params.threadId, "thread-existing");
+  assert.equal(codex.calls[0].params.cwd, "/work/next");
   assert.deepEqual(claude.args.slice(-2), ["--resume", "session-existing"]);
+  assert.deepEqual(qoder.args.slice(-2), ["--resume", "session-existing"]);
 });
 
 test("OpenCode 当前 SSE 协议保留 step、文本、工具、权限与 Todo 顺序", () => {
@@ -422,6 +461,85 @@ test("Codex app-server JSON-RPC fixtures 归一化 turn、item、delta、approva
   assert.equal(result.state.contextUsage.limit, 200000);
 });
 
+test("Codex 0.154 新增输出、写入审批、认证恢复与用户验证协议均可消费", () => {
+  const adapter = createCodexAdapter();
+  const result = consume(adapter, [
+    {
+      method: "item/completed",
+      params: {
+        threadId: "thread-154",
+        turnId: "turn-154",
+        item: {
+          id: "function-output-1",
+          type: "functionCallOutput",
+          namespace: "weather",
+          name: "lookup",
+          output: [{ type: "input_text", text: "sunny" }],
+        },
+      },
+    },
+    {
+      id: 91,
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-154",
+        turnId: "turn-154",
+        itemId: "command-154",
+        kind: "writeStdin",
+        approvalId: "approval-154",
+        command: "python interactive.py",
+        cwd: "/work/next",
+      },
+    },
+    { method: "modelProvider/authRecoveryStarted", params: { provider: "reta", message: "refreshing credentials" } },
+    { method: "modelProvider/authRecoveryCompleted", params: { provider: "reta", message: "credentials refreshed" } },
+    { method: "mcpServer/event/stream/notification", params: { serverName: "files", event: { type: "progress" } } },
+    { method: "thread/realtime/item/started", params: { threadId: "thread-154", item: { id: "realtime-1" } } },
+    {
+      id: 92,
+      method: "mcpServer/elicitation/request",
+      params: {
+        mode: "openai/userVerification",
+        title: "Verify device",
+        description: "Paste the verification proof",
+        challenge: "challenge-154",
+        serverName: "accounts",
+      },
+    },
+  ]);
+
+  assertCanonical(adapter, result.events);
+  assert.equal(result.events.some((event) => event.kind === "error"), false);
+  assert.equal(result.events.some((event) => event.payload?.eventType), false);
+  const output = result.events.find((event) => event.kind === "tool_result");
+  assert.equal(output.payload.name, "weather.lookup");
+  assert.equal(output.payload.text, "sunny");
+  const approval = result.events.find((event) => event.kind === "approval_request");
+  assert.equal(approval.payload.action, "write_stdin");
+  assert.equal(approval.payload.details.approvalId, "approval-154");
+  assert.deepEqual(
+    result.events.filter((event) => event.payload?.operation === "provider_auth_recovery").map((event) => event.phase),
+    ["started", "completed"],
+  );
+  const request = result.events.find((event) => event.kind === "input_request");
+  assert.equal(request.payload.input.mode, "openai/userVerification");
+  assert.equal(request.payload.input.questions[0].id, "proof");
+  assert.equal(request.payload.input.questions[0].isSecret, true);
+
+  const response = adapter.operation("respondInput", {
+    requestId: "92",
+    answers: { proof: "proof-token" },
+    pendingInput: result.state.pendingInputs["92"],
+  });
+  assert.deepEqual(response, {
+    adapter: "codex",
+    operation: "respondInput",
+    transport: "json-rpc-response",
+    requestId: 92,
+    result: { action: "accept", content: { proof: "proof-token" }, _meta: null },
+  });
+});
+
 test("EasyWork 执行前版本 Hook 只进入内部版本链路", () => {
   const codex = consume(createCodexAdapter(), [{
     method: "hook/completed",
@@ -487,6 +605,99 @@ test("Claude Code stream-json fixtures 归一化 streaming、tool、plan、contr
   const completedUsage = result.events.findLast((event) => event.kind === "usage");
   assert.equal(completedUsage.payload.input, 72, "result 的累计用量仍供 Task 报告使用");
   assert.equal(completedUsage.payload.context.used, 116, "result 不得用累计用量覆盖当前窗口");
+});
+
+test("Qoder CN 原生 stream-json 保留思考、权限、正文、会话与当前上下文", () => {
+  const adapter = createQoderCnAdapter();
+  const frames = [
+    { type: "system", subtype: "init", session_id: "q-session-1", model: "qoder-model", permissionMode: "acceptEdits" },
+    { type: "stream_event", session_id: "q-session-1", event: { type: "message_start", message: { id: "q-message-1", usage: { input_tokens: 8 } } } },
+    { type: "stream_event", session_id: "q-session-1", event: { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } } },
+    { type: "stream_event", session_id: "q-session-1", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "先查看文件" } } },
+    { type: "control_request", session_id: "q-session-1", request_id: "q-permission-1", request: { subtype: "can_use_tool", tool_name: "Bash", tool_use_id: "q-tool-1", input: { command: "pwd" }, permission_suggestions: [{ type: "addRules", rules: [{ toolName: "Bash" }] }] } },
+    { type: "control_response", session_id: "q-session-1", response: { subtype: "success", request_id: "q-permission-1", response: { behavior: "allow" } } },
+    { type: "stream_event", session_id: "q-session-1", event: { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } } },
+    { type: "stream_event", session_id: "q-session-1", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "已完成" } } },
+    { type: "stream_event", session_id: "q-session-1", event: { type: "message_delta", usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 3 } } },
+    { type: "result", subtype: "success", session_id: "q-session-1", result: "已完成", usage: { input_tokens: 50, output_tokens: 12 }, modelUsage: { "qoder-model": { inputTokens: 50, contextWindow: 100000 } } },
+  ];
+  const result = consume(adapter, frames);
+  assertCanonical(adapter, result.events);
+  assert.equal(result.state.sessionId, "q-session-1");
+  assert.equal(result.state.finalText, "已完成");
+  assert.equal(result.state.finalSeen, true);
+  for (const kind of ["reasoning", "approval_request", "approval_response", "message", "usage", "status", "final"]) {
+    assert.equal(result.events.some((event) => event.kind === kind), true, `missing Qoder CN ${kind}`);
+  }
+  assert.equal(result.events.find((event) => event.kind === "reasoning").payload.text, "先查看文件");
+  assert.equal(result.state.contextUsage.used, 12, "当前上下文只累计 prompt、cache-read 与 cache-write token");
+  assert.equal(result.state.contextUsage.limit, 100000);
+  assert.equal(result.state.contextUsage.source, "qoder-cn-current-request");
+  const approval = result.events.find((event) => event.kind === "approval_request");
+  const response = adapter.operation("respondApproval", {
+    requestId: approval.payload.requestId,
+    decision: "approve_session",
+    pendingApproval: { suggestions: [{ type: "addRules", rules: [{ toolName: "Bash" }] }] },
+  });
+  assert.equal(response.frames[0].response.response.updatedPermissions[0].destination, "session");
+});
+
+test("Qoder CN 在 token 计数为零时用原生 context_usage_ratio 还原当前上下文", () => {
+  const adapter = createQoderCnAdapter();
+  const result = consume(adapter, [
+    { type: "system", subtype: "init", session_id: "q-session-ratio", model: "qoder-model" },
+    { type: "result", subtype: "success", session_id: "q-session-ratio", result: "完成", usage: { input_tokens: 0, output_tokens: 0, context_usage_ratio: 0.375 }, modelUsage: { "qoder-model": { inputTokens: 0, contextWindow: 200000 } } },
+  ]);
+  assertCanonical(adapter, result.events);
+  assert.deepEqual(result.state.contextUsage, {
+    used: 75_000,
+    limit: 200_000,
+    remaining: 125_000,
+    ratio: 0.375,
+    source: "qoder-cn-current-request",
+  });
+  const completedUsage = result.events.findLast((event) => event.kind === "usage");
+  assert.equal(completedUsage.payload.context.used, 75_000);
+  assert.equal(completedUsage.payload.input, 0, "累计 result token 仍保留在任务用量中");
+});
+
+test("Qoder CN 最新 SDK 的队列、目标、产物和后台状态都有确定事件映射", () => {
+  const result = consume(createQoderCnAdapter(), [
+    { type: "system", subtype: "model_queue_status", status: "queued", request_id: "request-1", request_set_id: "set-1", model_key: "qwen", queue_count: 2, wait_time_ms: 1200, session_id: "q-session" },
+    { type: "system", subtype: "model_queue_status", status: "ready", request_id: "request-1", request_set_id: "set-1", model_key: "qwen", session_id: "q-session" },
+    { type: "command_lifecycle", command_uuid: "command-1", state: "queued", session_id: "q-session" },
+    { type: "command_lifecycle", command_uuid: "command-1", state: "completed", session_id: "q-session" },
+    { type: "system", subtype: "plan_mode_changed", plan_mode: { active: true }, session_id: "q-session" },
+    { type: "system", subtype: "goal_updated", goal: { id: "goal-1", objective: "完成验收", status: "blocked", turns_used: 3, max_turns: 12, time_used_seconds: 45, credits_budget: 10, credits_used: 2 }, reason: "waiting-user", session_id: "q-session" },
+    { type: "system", subtype: "artifacts_update", artifacts: [
+      { kind: "changed", path: "/work/output.txt", display_path: "output.txt", name: "output.txt", additions: 4, deletions: 1, is_new: false },
+      { kind: "presented", path: "/work/report.pdf", display_path: "report.pdf", name: "report.pdf" },
+    ], session_id: "q-session" },
+    { type: "system", subtype: "memory_generation", result: { status: "partial", attemptId: "memory-1", origin: "turn_complete", writtenFiles: [{ rootId: "root", path: "MEMORY.md" }], failedFiles: [], durationMs: 20 }, session_id: "q-session" },
+    { type: "system", subtype: "memory_consumption", result: { status: "partial", files: [{ id: "memory", path: "MEMORY.md", status: "truncated" }] }, session_id: "q-session" },
+    { type: "system", subtype: "skill_evolution", result: { status: "suggested", attemptId: "skill-1", origin: "turn_complete", suggestions: [{ skillName: "review", action: "update", summary: "补充验收", confidence: 0.9 }], durationMs: 30 }, session_id: "q-session" },
+    { type: "system", subtype: "session_title_changed", title: "原生标题", source: "ai", revision: 2, session_id: "q-session" },
+    { type: "system", subtype: "available_models_update", models: [{ value: "qwen" }], currentModel: "qwen", session_id: "q-session" },
+    { type: "system", subtype: "commands_changed", commands: [{ name: "review" }], session_id: "q-session" },
+    { type: "cloud_agent_event", event: "task.updated", id: "cloud-1", data: { status: "running", summary: "远端任务运行中" }, session_id: "q-session" },
+    { type: "system", subtype: "goal_cleared", goal_id: "goal-1", reason: "done", session_id: "q-session" },
+  ]);
+
+  assertCanonical(createQoderCnAdapter(), result.events);
+  assert.equal(result.events.some((event) => event.payload.operation === "unmapped_agent_event"), false);
+  assert.equal(result.events.find((event) => event.payload.operation === "model_queue")?.phase, "waiting");
+  assert.equal(result.events.find((event) => event.payload.operation === "command_lifecycle")?.phase, "waiting");
+  assert.equal(result.events.find((event) => event.payload.operation === "goal" && event.payload.status === "blocked")?.phase, "waiting");
+  assert.equal(result.events.find((event) => event.kind === "file_change")?.payload.visibility, "internal");
+  assert.deepEqual(result.events.find((event) => event.kind === "artifact")?.payload, {
+    source: "remote",
+    path: "/work/report.pdf",
+    name: "report.pdf",
+    kind: "file",
+  });
+  for (const operation of ["plan_mode", "memory_generation", "memory_consumption", "skill_evolution", "session_title", "available_models", "available_commands", "cloud_agent"]) {
+    assert.equal(result.events.some((event) => event.payload.operation === operation), true, `missing Qoder CN ${operation}`);
+  }
 });
 
 test("Claude Code 原生 transcript 边界只更新会话状态且不产生前端事件", () => {

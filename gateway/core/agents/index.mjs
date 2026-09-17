@@ -10,8 +10,10 @@ export {
 export { createOpenCodeAdapter } from "./opencode.mjs";
 export { createCodexAdapter } from "./codex.mjs";
 export { createClaudeCodeAdapter } from "./claude-code.mjs";
+export { createQoderCnAdapter } from "./qoder-cn.mjs";
 
 import { createClaudeCodeAdapter } from "./claude-code.mjs";
+import { createQoderCnAdapter } from "./qoder-cn.mjs";
 import { createCodexAdapter } from "./codex.mjs";
 import { createOpenCodeAdapter } from "./opencode.mjs";
 
@@ -20,5 +22,6 @@ export function createAgentAdapters(options = {}) {
     opencode: createOpenCodeAdapter(options.opencode),
     codex: createCodexAdapter(options.codex),
     "claude-code": createClaudeCodeAdapter(options["claude-code"]),
+    "qoder-cn": createQoderCnAdapter(options["qoder-cn"]),
   });
 }

@@ -8,11 +8,11 @@ import { createHostApiRelay } from "./api-reverse-proxy.mjs";
 
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
 const MAX_PTY_INPUT_BYTES = 64 * 1024;
-// OpenSSH defaults MaxSessions to 10. Keep two server-side slots in reserve,
-// while leaving enough room for a retained PTY, resource sampling, downloads,
-// Agent discovery and one foreground Agent turn to coexist on the shared SSH
-// connection. A limit of four let background reads starve the user turn.
-const MAX_CONCURRENT_SESSION_CHANNELS = 8;
+// OpenSSH defaults MaxSessions to 10. Background channels may occupy eight;
+// exec channels can use the two reserved slots so a retained terminal/SFTP
+// stream cannot make a healthy SSH connection reject the next user command.
+const MAX_BACKGROUND_SESSION_CHANNELS = 8;
+const MAX_CONCURRENT_SESSION_CHANNELS = 10;
 const SESSION_CHANNEL_WAIT_TIMEOUT_MS = 15_000;
 const SESSION_CHANNEL_OPEN_TIMEOUT_MS = 15_000;
 const CHANNEL_OPEN_RETRY_DELAYS_MS = Object.freeze([0, 120, 320, 750, 1_500]);
@@ -170,6 +170,8 @@ class Ssh2Session {
     this.apiProxies = new Map();
     this.activeSessionChannels = 0;
     this.sessionChannelWaiters = [];
+    this.sessionChannelPressureHandler = null;
+    this.sessionChannelPressureRelief = null;
     client.on("tcp connection", (details, accept, reject) => this.#acceptReverseConnection(details, accept, reject));
     client.once("close", () => {
       this.closed = true;
@@ -186,6 +188,14 @@ class Ssh2Session {
   onClose(listener) {
     if (typeof listener === "function") this.closeListeners.add(listener);
     return () => this.closeListeners.delete(listener);
+  }
+
+  setSessionChannelPressureHandler(handler) {
+    invariant(handler === null || handler === undefined || typeof handler === "function", "SSH_CHANNEL_PRESSURE_HANDLER_INVALID", "SSH 通道回收处理器无效", { status: 500, expose: false });
+    this.sessionChannelPressureHandler = typeof handler === "function" ? handler : null;
+    return () => {
+      if (this.sessionChannelPressureHandler === handler) this.sessionChannelPressureHandler = null;
+    };
   }
 
   async isAlive() {
@@ -208,7 +218,17 @@ class Ssh2Session {
       released = true;
       this.activeSessionChannels = Math.max(0, this.activeSessionChannels - 1);
       while (this.sessionChannelWaiters.length) {
-        const waiter = this.sessionChannelWaiters.shift();
+        // Foreground execs get the reserved capacity first. Background PTY or
+        // SFTP work remains capped at eight even when the server has room for
+        // two more command channels.
+        let index = this.activeSessionChannels < MAX_CONCURRENT_SESSION_CHANNELS
+          ? this.sessionChannelWaiters.findIndex((waiter) => waiter.priority)
+          : -1;
+        if (index < 0 && this.activeSessionChannels < MAX_BACKGROUND_SESSION_CHANNELS) {
+          index = this.sessionChannelWaiters.findIndex((waiter) => !waiter.priority);
+        }
+        if (index < 0) break;
+        const [waiter] = this.sessionChannelWaiters.splice(index, 1);
         clearTimeout(waiter.timer);
         waiter.signal?.removeEventListener?.("abort", waiter.abort);
         if (waiter.signal?.aborted) continue;
@@ -219,15 +239,35 @@ class Ssh2Session {
     };
   }
 
-  async #acquireSessionSlot(signal) {
+  async #relieveSessionChannelPressure(limit, reason) {
+    if (!this.sessionChannelPressureHandler) return false;
+    if (!this.sessionChannelPressureRelief) {
+      const relief = Promise.resolve()
+        .then(() => this.sessionChannelPressureHandler?.({ active: this.activeSessionChannels, limit, reason }))
+        .then(Boolean, () => false)
+        .finally(() => {
+          if (this.sessionChannelPressureRelief === relief) this.sessionChannelPressureRelief = null;
+        });
+      this.sessionChannelPressureRelief = relief;
+    }
+    return this.sessionChannelPressureRelief;
+  }
+
+  async #acquireSessionSlot(signal, priority = false) {
     invariant(!this.closed, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
     if (signal?.aborted) throw Object.assign(new Error("SSH 命令已中断"), { code: "SSH_COMMAND_ABORTED", status: 409 });
-    if (this.activeSessionChannels < MAX_CONCURRENT_SESSION_CHANNELS) {
+    const limit = priority ? MAX_CONCURRENT_SESSION_CHANNELS : MAX_BACKGROUND_SESSION_CHANNELS;
+    if (priority && this.activeSessionChannels >= limit && this.sessionChannelPressureHandler) {
+      await this.#relieveSessionChannelPressure(limit, "local-limit");
+      invariant(!this.closed, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
+      if (signal?.aborted) throw Object.assign(new Error("SSH 命令已中断"), { code: "SSH_COMMAND_ABORTED", status: 409 });
+    }
+    if (this.activeSessionChannels < limit) {
       this.activeSessionChannels += 1;
       return this.#sessionSlotRelease();
     }
     return new Promise((resolve, reject) => {
-      const waiter = { resolve, reject, signal, abort: null, timer: null };
+      const waiter = { resolve, reject, signal, priority, abort: null, timer: null };
       const fail = (error) => {
         const index = this.sessionChannelWaiters.indexOf(waiter);
         if (index >= 0) this.sessionChannelWaiters.splice(index, 1);
@@ -238,10 +278,10 @@ class Ssh2Session {
       waiter.abort = () => {
         fail(Object.assign(new Error("SSH 命令已中断"), { code: "SSH_COMMAND_ABORTED", status: 409 }));
       };
-      waiter.timer = setTimeout(() => fail(new ApiError("SSH_CHANNEL_SLOT_TIMEOUT", "SSH 会话通道等待超时", {
+      waiter.timer = setTimeout(() => fail(new ApiError("SSH_CHANNEL_SLOT_TIMEOUT", "SSH 已连接，但可用执行通道暂时占满，请稍后重试", {
         status: 504,
         retryable: true,
-        details: { limit: MAX_CONCURRENT_SESSION_CHANNELS, timeoutMs: SESSION_CHANNEL_WAIT_TIMEOUT_MS },
+        details: { limit, timeoutMs: SESSION_CHANNEL_WAIT_TIMEOUT_MS },
       })), SESSION_CHANNEL_WAIT_TIMEOUT_MS);
       signal?.addEventListener?.("abort", waiter.abort, { once: true });
       this.sessionChannelWaiters.push(waiter);
@@ -250,9 +290,10 @@ class Ssh2Session {
 
   async #openSessionChannel(open, options = {}) {
     let lastError = null;
+    let pressureReliefAttempted = false;
     for (let attempt = 0; attempt < CHANNEL_OPEN_RETRY_DELAYS_MS.length; attempt += 1) {
       await wait(CHANNEL_OPEN_RETRY_DELAYS_MS[attempt], options.signal);
-      const release = await this.#acquireSessionSlot(options.signal);
+      const release = await this.#acquireSessionSlot(options.signal, options.priority === true);
       try {
         const channel = await new Promise((resolve, reject) => {
           let settled = false;
@@ -288,6 +329,14 @@ class Ssh2Session {
       } catch (error) {
         release();
         lastError = error;
+        if (!pressureReliefAttempted
+          && options.priority === true
+          && this.activeSessionChannels > 0
+          && channelOpenWasRefused(error)
+          && this.sessionChannelPressureHandler) {
+          pressureReliefAttempted = true;
+          await this.#relieveSessionChannelPressure(MAX_CONCURRENT_SESSION_CHANNELS, "server-refused");
+        }
         if (!channelOpenWasRefused(error) || attempt === CHANNEL_OPEN_RETRY_DELAYS_MS.length - 1) throw error;
       }
     }
@@ -299,7 +348,7 @@ class Ssh2Session {
     try {
       return await this.#openSessionChannel(
         (callback) => this.client.exec(command, { env: options.env, pty: options.pty || false }, callback),
-        options,
+        { ...options, priority: options.priority !== false },
       );
     } catch (error) {
       throw safeError(error, "SSH_COMMAND_FAILED");
@@ -358,10 +407,10 @@ class Ssh2Session {
     });
   }
 
-  async sftp() {
+  async sftp(options = {}) {
     invariant(!this.closed, "SSH_CONNECTION_CLOSED", "SSH 连接已关闭", { status: 409 });
     try {
-      return await this.#openSessionChannel((callback) => this.client.sftp(callback));
+      return await this.#openSessionChannel((callback) => this.client.sftp(callback), { ...options, priority: options.priority === true });
     } catch (error) {
       throw safeError(error, "SFTP_OPEN_FAILED");
     }
@@ -502,12 +551,13 @@ class Ssh2Session {
   }
 
   async keepAlive() {
-    const result = await this.exec("true", { maxOutputBytes: 1024 });
+    const result = await this.exec("true", { maxOutputBytes: 1024, priority: false });
     invariant(result.code === 0, "SSH_KEEPALIVE_FAILED", "SSH keepalive 失败", { status: 502 });
   }
 
   async close() {
     if (this.closed) return;
+    this.sessionChannelPressureHandler = null;
     await this.#closeApiProxies();
     this.closed = true;
     this.client.end();

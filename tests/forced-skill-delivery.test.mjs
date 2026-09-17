@@ -76,14 +76,15 @@ test("强制技能仍不阻止手动重选或按需下载 Skill 的本轮调用"
   assert.deepEqual(await f.lifecycle.filterHandoff({ scope: f.scope, fragments }), fragments);
 });
 
-test("首次检查按精确版本和哈希判断，其他对话或工作区的安装不能混用", async () => {
+test("首次检查按精确版本和哈希判断，稳定 Binding 跨工作区复用但不跨对话或代次", async () => {
   const f = fixture();
   f.binding.native.skillPins = [pin];
   const newer = { ...pin, version: "2.0.0", sha256: "b".repeat(64) };
   assert.equal((await f.select([catalogSkill(newer)])).length, 1);
   f.deployed([newer]);
   assert.equal((await f.select([catalogSkill(newer)])).length, 0);
-  for (const change of [{ conversationId: "other" }, { workspaceId: "other" }, { contextEpoch: 1 }]) {
+  assert.equal((await f.select([catalogSkill()], { ...f.scope, workspaceId: "other" })).length, 0);
+  for (const change of [{ conversationId: "other" }, { contextEpoch: 1 }]) {
     assert.equal((await f.select([catalogSkill()], { ...f.scope, ...change })).length, 1);
   }
   const changedHash = fixture();

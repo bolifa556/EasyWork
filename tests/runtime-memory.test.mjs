@@ -437,12 +437,14 @@ test("全部模式强制 Skill 在 Chat 按需读取，下一轮复用正文且�
   const skillName = "通用核验说明";
   const skillBody = "核验时保留蓝色签收记录。";
   const modelInputs = [];
+  let discoveryLimits;
   let skillReads = 0;
   const { services } = await fixture(t, ({ runId }) => {
     let iteration = 0;
     return {
-      async complete({ messages, tools = [] }) {
+      async complete({ messages, tools = [], limits }) {
         if (String(messages[0]?.content || "").includes("你为一个已安装 Skill 生成发现简介")) {
+          discoveryLimits = limits;
           return { content: "当用户需要核验签收记录或沿用核验规则时使用，要求保留蓝色签收记录。", reasoning: "", toolCalls: [], usage: null };
         }
         if (!tools.some((tool) => tool.name === "skill_search")) {
@@ -474,6 +476,7 @@ test("全部模式强制 Skill 在 Chat 按需读取，下一轮复用正文且�
   });
   await services.interactions.waitFor(first.response.runId);
   await services.waitForIdle();
+  assert.equal(discoveryLimits.maxOutputTokens, null);
   assert.equal(skillReads, 1);
   assert.ok(modelInputs.some((messages) => messages.some((entry) => String(entry.content).includes(skillBody))));
   const current = await services.baseConversations.getConversation(first.conversation.id);
@@ -572,6 +575,25 @@ test("辅助模型入口拒绝对象序列化输入", async (t) => {
     assert.equal(error.code, "AUXILIARY_MODEL_INPUT_TEXT_REQUIRED");
     return true;
   });
+});
+
+test("文件发现简介不给推理模型设置会截断正文的输出上限", async (t) => {
+  let summaryLimits;
+  const { services } = await fixture(t, () => ({
+    async complete({ limits }) {
+      summaryLimits = limits;
+      return { content: "一份介绍蓝绿发布步骤的文档。", reasoning: "先阅读文件。", toolCalls: [], usage: null };
+    },
+  }));
+  const summary = await services.resources.summaryGenerator({
+    filename: "deploy.md",
+    sha256: "a".repeat(64),
+    parsed: { text: "先发布绿色版本，再验证健康检查。" },
+    providerId: "platform-web",
+    modelId: "reasoning-model",
+  });
+  assert.equal(summary, "一份介绍蓝绿发布步骤的文档。");
+  assert.equal(summaryLimits.maxOutputTokens, null);
 });
 
 test("独立记忆提取失败不影响网页最终回复落盘", async (t) => {

@@ -36,6 +36,7 @@ export { AtomicJsonRepository } from "./repository.mjs";
 export {
   computeServerIdentity,
   createAgentBindingKey,
+  createLegacyAgentBindingKey,
   createEffectiveContextScope,
   normalizeSshHost,
 } from "./scope.mjs";

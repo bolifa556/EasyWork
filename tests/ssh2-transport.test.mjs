@@ -84,12 +84,98 @@ test("ssh2 transport leaves room for terminal, monitoring, downloads and a foreg
       this.channels.push(channel);
       callback(null, channel);
     }
+    sftp(callback) {
+      const channel = new FakeChannel();
+      this.channels.push(channel);
+      callback(null, channel);
+    }
   }
   const factory = new Ssh2TransportFactory({ ClientClass: ConcurrentClient });
   const session = await factory.connect(request);
-  const channels = await Promise.all(Array.from({ length: 8 }, (_, index) => session.openExec(`operation-${index}`)));
-  assert.equal(session.client.channels.length, 8);
-  for (const channel of channels) channel.emit("close", 0, null);
+  const background = await Promise.all(Array.from({ length: 8 }, () => session.sftp()));
+  const foreground = await Promise.all([
+    session.openExec("foreground-agent-1"),
+    session.openExec("foreground-agent-2"),
+  ]);
+  assert.equal(session.client.channels.length, 10, "two reserved channels remain available to user commands");
+
+  let overflowOpened = false;
+  const overflow = session.openExec("foreground-agent-3").then((channel) => {
+    overflowOpened = true;
+    return channel;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(overflowOpened, false, "an eleventh server-side session still waits for capacity");
+  background[0].emit("close", 0, null);
+  const admitted = await overflow;
+  assert.equal(overflowOpened, true);
+
+  for (const channel of [...background.slice(1), ...foreground, admitted]) channel.emit("close", 0, null);
+  await session.close();
+});
+
+test("ssh2 transport asks the runtime to reclaim one idle channel only when the server limit is full", async () => {
+  class ConcurrentClient extends FakeClient {
+    constructor() {
+      super();
+      this.channels = [];
+    }
+    exec(_command, _options, callback) {
+      const channel = new FakeChannel();
+      this.channels.push(channel);
+      callback(null, channel);
+    }
+  }
+  const factory = new Ssh2TransportFactory({ ClientClass: ConcurrentClient });
+  const session = await factory.connect(request);
+  const occupied = await Promise.all(Array.from({ length: 10 }, (_, index) => session.openExec(`agent-${index}`)));
+  let reclaimed = 0;
+  session.setSessionChannelPressureHandler(() => {
+    reclaimed += 1;
+    occupied[0].emit("close", 0, null);
+    return true;
+  });
+
+  const replacement = await session.openExec("foreground-command");
+  assert.equal(reclaimed, 1);
+  assert.equal(session.client.channels.length, 11);
+
+  for (const channel of [...occupied.slice(1), replacement]) channel.emit("close", 0, null);
+  await session.close();
+});
+
+test("ssh2 transport also reclaims one idle Agent when the server reports a lower session limit", async () => {
+  class LowerLimitClient extends FakeClient {
+    constructor() {
+      super();
+      this.channels = [];
+      this.execCalls = 0;
+    }
+    exec(_command, _options, callback) {
+      this.execCalls += 1;
+      if (this.execCalls === 2) {
+        callback(new Error("Channel open failure: resource shortage"));
+        return;
+      }
+      const channel = new FakeChannel();
+      this.channels.push(channel);
+      callback(null, channel);
+    }
+  }
+  const factory = new Ssh2TransportFactory({ ClientClass: LowerLimitClient });
+  const session = await factory.connect(request);
+  const idle = await session.openExec("idle-agent");
+  let reclaimed = 0;
+  session.setSessionChannelPressureHandler(() => {
+    reclaimed += 1;
+    idle.emit("close", 0, null);
+    return true;
+  });
+
+  const replacement = await session.openExec("foreground-command");
+  assert.equal(reclaimed, 1);
+  assert.equal(session.client.execCalls, 3);
+  replacement.emit("close", 0, null);
   await session.close();
 });
 

@@ -14,7 +14,7 @@ class FakeSocket extends EventEmitter {
 
 const actor = { actorType: "user", actorId: "user_a", deviceId: "device_a", sessionId: "session_a", roles: [] };
 
-test("summary subscriptions replay headings but preserve full live reasoning", async () => {
+test("summary subscriptions inline small replay reasoning and preserve full live reasoning", async () => {
   const events = [{ eventId: "old", topic: "task:one", sequence: 1, producer: "agent:codex", kind: "reasoning", payload: { event: { text: "旧思考正文" } } }];
   const broker = new RealtimeBroker({ journal: {
     async append(topic, event) { const envelope = { ...event, topic, sequence: events.length + 1 }; events.push(envelope); return envelope; },
@@ -27,7 +27,7 @@ test("summary subscriptions replay headings but preserve full live reasoning", a
     socket.message({ type: "authenticate", token: "token" });
     socket.message({ type: "subscribe", topics: ["task:one"], resume: {}, replayView: "summary" });
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(socket.sent.find((v) => v.type === "event").event.payload.event.text, "");
+    assert.equal(socket.sent.find((v) => v.type === "event").event.payload.event.text, "旧思考正文");
     assert.equal(socket.sent.find((v) => v.type === "event").replay, true);
     await broker.append("task:one", { eventId: "new", producer: "agent:codex", kind: "reasoning", payload: { event: { text: "正在产生的思考" } } });
     assert.equal(socket.sent.filter((v) => v.type === "event").at(-1).event.payload.event.text, "正在产生的思考");

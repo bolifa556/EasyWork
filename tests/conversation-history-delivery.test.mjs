@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createActorContext } from "../gateway/core/actor.mjs";
 import { ContextHub } from "../gateway/core/context-hub/index.mjs";
 import { PromptRepository } from "../gateway/core/prompts/index.mjs";
-import { createAgentBindingKey, createEffectiveContextScope, computeServerIdentity } from "../gateway/core/scope.mjs";
+import { createAgentBindingKey, createEffectiveContextScope, createLegacyAgentBindingKey, computeServerIdentity } from "../gateway/core/scope.mjs";
 import { RemoteTaskLifecycle, workConversationTranscriptFragments } from "../gateway/core/runtime/services.mjs";
 
 const prompts = new PromptRepository({ promptRoot: fileURLToPath(new URL("../prompts", import.meta.url)) });
@@ -104,6 +104,94 @@ for (const agentId of ["codex", "claude-code", "opencode"]) {
     assert.doesNotMatch(retriedB.prompt, /提问8/);
   });
 }
+
+test("旧工作区 binding 首次使用新版本时迁移原生会话与回执", async (t) => {
+  const dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "easywork-binding-migration-"));
+  t.after(async () => {
+    assert.equal(path.dirname(path.resolve(dataRoot)), path.resolve(os.tmpdir()));
+    await fs.rm(dataRoot, { recursive: true, force: true });
+  });
+  const actor = createActorContext({ actorType: "user", actorId: "migration-user", userId: "migration-user", deviceId: "migration-device", sessionId: "migration-session", roles: [] });
+  const scope = {
+    actorType: "user",
+    actorId: actor.actorId,
+    conversationId: "migration-conversation",
+    branchId: "migration-branch",
+    contextEpoch: 0,
+    serverId: "migration-server",
+    serverIdentity: computeServerIdentity({ host: "migration.example", port: 22, hostKeyFingerprint: "SHA256:migrationfingerprint" }).serverIdentity,
+    workspaceId: "workspace-b",
+    agentId: "claude-code",
+  };
+  const stableBindingId = createAgentBindingKey(scope, scope.agentId);
+  const legacyBindingId = createLegacyAgentBindingKey({ ...scope, workspaceId: "workspace-a" }, scope.agentId);
+  assert.notEqual(stableBindingId, legacyBindingId);
+
+  const bindings = new Map([[legacyBindingId, {
+    agentBindingId: legacyBindingId,
+    adapterId: scope.agentId,
+    native: { sessionId: "native-existing", runtimeBindingId: legacyBindingId },
+  }]]);
+  const oldTask = {
+    id: "old-task",
+    conversationId: scope.conversationId,
+    branchId: scope.branchId,
+    agentBindingId: legacyBindingId,
+    route: { serverId: scope.serverId, serverIdentity: scope.serverIdentity, workspaceId: "workspace-a", agentId: scope.agentId },
+    status: "completed",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z",
+  };
+  const tasks = new Map([[oldTask.id, oldTask]]);
+  const contextHub = new ContextHub({ dataRoot, actor });
+  const deliveredUnit = { key: "conversation:already-sent", version: "1", content: "already sent" };
+  await contextHub.acknowledgeKnowledge({ bindingKey: legacyBindingId, nativeSessionId: "native-existing", units: [deliveredUnit] });
+
+  const container = {
+    actor,
+    runtime: { prompts },
+    contextHub,
+    baseConversations: {
+      async getConversation() { return { summary: { id: scope.conversationId, mode: "work", projectId: null, activeBranchId: scope.branchId } }; },
+      async listMessages() { return { items: [], nextCursor: null }; },
+    },
+    taskRuntime: {
+      async loadBinding(id) { return bindings.get(id) || null; },
+      async saveBinding(id, value) { bindings.set(id, structuredClone(value)); },
+    },
+    taskStore: {
+      async getTask(id) { return tasks.get(id) || null; },
+      async scanTasks() { return [...tasks.values()]; },
+      async listTasks({ statuses } = {}) { return [...tasks.values()].filter((task) => !statuses || statuses.includes(task.status)); },
+    },
+    memoryCoordinator: { async registerTask() {} },
+    orchestrator: {
+      async create(input) {
+        const task = { ...input, status: "queued", createdAt: "2026-01-02T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z" };
+        tasks.set(task.id, task);
+        return { task };
+      },
+      async start(id) {
+        const task = tasks.get(id);
+        task.status = "running";
+        task.startedAt = "2026-01-02T00:00:01.000Z";
+        return { taskId: id, status: "running" };
+      },
+    },
+  };
+  const lifecycle = new RemoteTaskLifecycle(container, { messageId: "new-message", providerId: "provider", modelId: "model" });
+  const result = await lifecycle.create({ scope, userMessage: "continue", handoffFragments: [], idempotencyKey: "migrate-binding" });
+
+  assert.equal(result.task.agentBindingId, stableBindingId);
+  assert.equal(bindings.get(stableBindingId).native.sessionId, "native-existing");
+  assert.equal(bindings.get(stableBindingId).native.runtimeBindingId, legacyBindingId);
+  assert.equal(bindings.get(stableBindingId).native.migratedFromBindingId, legacyBindingId);
+  assert.deepEqual(await contextHub.unacknowledgedKnowledge({
+    bindingKey: stableBindingId,
+    nativeSessionId: "native-existing",
+    units: [deliveredUnit],
+  }), []);
+});
 
 test("历史正文不因检索预算变小而丢失末尾，当前提问相同文字仍各归其位", async (t) => {
   const dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "easywork-history-budget-"));

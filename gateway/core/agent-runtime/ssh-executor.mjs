@@ -9,6 +9,7 @@ const JSON_RPC_TIMEOUT_MS = 60_000;
 const CONTROL_REQUEST_TIMEOUT_MS = 3_000;
 const SFTP_OPERATION_TIMEOUT_MS = 60_000;
 const SFTP_UPLOAD_TIMEOUT_MS = 10 * 60_000;
+const IDLE_PROCESS_RETIRE_GRACE_MS = 750;
 const AGENT_STREAM_QUEUE_MAX_ITEMS = 4_096;
 const AGENT_STREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
 const AGENT_STREAM_BACKLOG_MAX_BYTES = 8 * 1024 * 1024;
@@ -264,12 +265,14 @@ class LineHub {
 }
 
 class SshProcessHandle {
-  constructor({ channel, processId, onStderr, session }) {
+  constructor({ channel, processId, onStderr, session, specification = {} }) {
     this.channel = channel;
     this.session = session;
+    this.specification = specification;
     this.detached = false;
     this.processId = processId;
     this.remotePidObserved = false;
+    this.startupStderr = "";
     this.hub = new LineHub();
     this.pendingRpc = new Map();
     this.pendingControls = new Map();
@@ -286,7 +289,11 @@ class SshProcessHandle {
       this.rejectReady = reject;
     });
     channel.on("data", (chunk) => this.#consume(chunk));
-    channel.stderr?.on("data", (chunk) => onStderr?.(Buffer.from(chunk)));
+    channel.stderr?.on("data", (chunk) => {
+      const bytes = Buffer.from(chunk);
+      if (!this.remotePidObserved) this.startupStderr = `${this.startupStderr}${bytes.toString("utf8")}`.slice(-4_096);
+      onStderr?.(bytes);
+    });
     channel.once("error", (error) => this.#finish(error));
     channel.once("close", (code, signal) => this.#finish(null, { code: Number.isInteger(code) ? code : null, signal: signal || null }));
   }
@@ -366,7 +373,26 @@ class SshProcessHandle {
       pending.reject(error || new Error("Agent process exited"));
     }
     this.pendingControls.clear();
-    if (error || !this.remotePidObserved) this.rejectReady(error || new Error("Agent process exited before reporting its remote PID"));
+    if (error || !this.remotePidObserved) {
+      let startupError = error;
+      if (!startupError) {
+        const cwd = String(this.specification?.cwd || "").trim();
+        const stderr = this.startupStderr.trim();
+        const workingDirectoryFailure = cwd && /(?:^|\n)(?:bash|sh):[^\n]*\bcd:\s+[^\n]*(?:No such file or directory|Permission denied|Not a directory)/i.test(stderr);
+        startupError = workingDirectoryFailure
+          ? new ApiError("AGENT_WORKSPACE_UNAVAILABLE", `远端工作区不存在或不可访问：${cwd}`, {
+              status: 409,
+              details: { cwd, exitCode: result?.code ?? null },
+            })
+          : new ApiError("AGENT_PROCESS_START_FAILED", "远端 Agent 进程启动失败", {
+              status: 502,
+              expose: true,
+              retryable: true,
+              details: { exitCode: result?.code ?? null, signal: result?.signal ?? null },
+            });
+      }
+      this.rejectReady(startupError);
+    }
     this.hub.close(error);
     if (error) this.rejectExit(error);
     else this.resolveExit(result);
@@ -395,6 +421,23 @@ class SshProcessHandle {
     if (this.closed || this.inputEnded) return;
     this.inputEnded = true;
     this.channel.end();
+  }
+
+  async retire() {
+    if (this.closed) return;
+    // Reclaiming an idle process must not need another SSH session channel:
+    // channel pressure is exactly the condition in which a fallback `kill`
+    // exec cannot be opened. Ask the existing channel to terminate, close its
+    // stdin, then force-close only if the remote process ignores both.
+    try { this.channel.signal?.("TERM"); } catch { /* channel close below is authoritative */ }
+    this.endInput();
+    const exited = await Promise.race([
+      this.exit.then(() => true, () => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), IDLE_PROCESS_RETIRE_GRACE_MS)),
+    ]);
+    if (exited || this.closed) return;
+    this.channel.close?.();
+    this.channel.destroy?.();
   }
 
   requestControl(frame, timeoutMs = CONTROL_REQUEST_TIMEOUT_MS) {
@@ -605,6 +648,10 @@ export class SshAgentExecutor {
     this.pendingHome = null;
   }
 
+  setSessionChannelPressureHandler(handler) {
+    return this.session.setSessionChannelPressureHandler?.(handler) || (() => {});
+  }
+
   async home() {
     if (this.cachedHome) return this.cachedHome;
     if (this.pendingHome) return this.pendingHome;
@@ -685,7 +732,7 @@ export class SshAgentExecutor {
     const channel = typeof this.session.openExec === "function"
       ? await this.session.openExec(commandLine(specification), { pty: false })
       : await new Promise((resolve, reject) => client.exec(commandLine(specification), { pty: false }, (error, opened) => error ? reject(error) : resolve(opened)));
-    const process = new SshProcessHandle({ channel, processId, onStderr: specification.onStderr, session: this.session });
+    const process = new SshProcessHandle({ channel, processId, onStderr: specification.onStderr, session: this.session, specification });
     await process.ready();
     return process;
   }

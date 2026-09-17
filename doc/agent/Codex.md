@@ -6,7 +6,7 @@
 
 - EasyWork Agent ID：`codex`
 - 托管包 ID：`codex`
-- Manifest 基线：`0.149.1`
+- Manifest 基线：`0.154.0`
 - 进程入口：`codex app-server`
 - 统一协议名：`codex-app-server-jsonrpc`
 - 适配器：`gateway/core/agents/codex.mjs`
@@ -39,6 +39,12 @@ Codex thread 持久在 `CODEX_HOME` 原生 store 中，但“磁盘上有 thread
 - 这个集合随进程销毁，不跨进程臆测；
 - 只有 native store、运行指纹和 binding 都匹配时才复用进程。
 
+`CODEX_HOME` 可能位于 NFS、Parastor 等共享家目录。Codex 的状态数据库使用 SQLite WAL，当前版本还会在 `$CODEX_HOME/tmp/arg0` 建立辅助入口；这两类运行时文件直接落在共享文件系统时，app-server 可能长时间停在初始化。EasyWork 在启动前读取文件系统类型：本地文件系统继续使用原目录；共享或无法识别的文件系统则保留 `CODEX_HOME` 中的 thread、rollout 和配置，只把数据库通过原生 `CODEX_SQLITE_HOME` 指到该用户专属、权限为 `0700` 的本机临时目录，并把 `tmp/arg0` 安全链接到同一类本机目录。非空且正在使用的旧 `arg0` 目录不会被直接覆盖。app-server 的初始化 RPC 最多等待 60 秒，以容纳老旧登录节点上的首次装载。
+
+这一处理使用 Codex 自己公开的配置边界，不搬运或改写原生会话内容；对应上游实现见 [`CODEX_SQLITE_HOME` 配置](https://github.com/openai/codex/blob/main/codex-rs/config/src/config_toml.rs)与 [`arg0` 目录实现](https://github.com/openai/codex/blob/main/codex-rs/arg0/src/lib.rs)。
+
+同一服务器和网页分支内切换工作区不会更换 thread。EasyWork 在 `thread/resume` 和随后的 `turn/start` 中都发送目标 `cwd`；进程没有重建时，也在下一次 `turn/start` 发送目标 `cwd`。因此工作目录以本轮原生参数为准，thread 历史、压缩状态和原生 session ID 连续保留。活动 turn 结束前页面不会变更路由。
+
 网页分支可以让父子 binding 的 app-server 指向同一 Codex 原生 store，因为 thread 本身彼此独立。模型、权限、沙箱和 provider 路由通过进程级 `-c` 高优先级配置提供，避免两个网页分支竞争修改共享 `config.toml`。
 
 ## 3. 配置与运行参数
@@ -59,12 +65,14 @@ Codex 会把上一个 model 和 reasoning effort 持久到 native thread。因�
 
 思考强度遭原生模型明确拒绝时，统一适配器至多在无正文、无工具副作用、无 append 的前提下重试一次，并以 compare-and-set 更新该网页对话的 `reasoningEffort`。
 
+网页二级菜单保留 Codex 的“打开配置”，模型从 EasyWork 已配置的 provider 目录选择。配置快照按 Actor、服务器、网页对话配置域和 Agent 隔离，优先显示最近缓存；服务器提供更高 revision 时覆盖旧值，保存遇到 revision 冲突时重读权威配置并只重放用户本次修改。配置缓存不会替代 app-server 的进程级参数或每轮 `turn/start` 覆盖。
+
 ## 4. 原生操作映射
 
 | EasyWork 操作 | Codex app-server 调用 |
 | --- | --- |
 | 新建会话 | `thread/start {cwd, historyMode:"paginated"}`，随后 `turn/start` |
-| 已有会话继续 | 必要时 `thread/resume`，随后 `turn/start` |
+| 已有会话继续 | 必要时 `thread/resume {threadId,cwd}`，随后 `turn/start {threadId,cwd,...}` |
 | 运行中追加 | `turn/steer {threadId, expectedTurnId, input}` |
 | 终止 | `turn/interrupt {threadId, turnId}` |
 | 压缩 | `thread/compact/start {threadId}` |
@@ -90,11 +98,17 @@ Codex 会把上一个 model 和 reasoning effort 持久到 native thread。因�
 
 终止必须命中当前 app-server 进程、thread 和 turn。进程不存在时，append、interrupt、approval 和 input 都返回原生进程不可用，不能另起 app-server 后向不确定的活动 turn 发控制命令。
 
-## 6. Skill 适配
+## 6. 压缩与上下文用量
+
+网页“压缩”调用 `thread/compact/start {threadId}`，并等待 app-server 对该 JSON-RPC 请求返回。RPC error 直接失败；成功响应表示 Codex 已接受并完成这次原生操作，后续 `thread/compacted` notification 仍作为内部生命周期事件记录，但页面不会自行拼接摘要或靠轮询 rollout 猜测结果。压缩返回后只强制刷新当前 Binding 的上下文用量，不清空模型/provider 目录。
+
+`contextUsage` 来自 `thread/tokenUsage/updated` 的原生事件缓存，当前窗口占用与累计 billing 分开保存。配置页显示的上限优先采用当前 `model_auto_compact_token_limit`，因此它表示自动压缩计算窗口，不保证等于模型的硬 context capacity。读取用量不会向 thread 注入测试消息；当前 thread 尚未返回可验证 usage 时明确显示不可用。网页缓存按 Actor、服务器、配置域、Binding 和 Agent 隔离，并在 usage revision 变化后刷新。
+
+## 7. Skill 适配
 
 Codex 不通过共享 `CODEX_HOME` 自动发现 EasyWork Skill。原因是网页父子分支可能共享原生 store，如果把 Skill 放入全局发现目录，会把一个 binding 的 Skill 泄漏给另一个 binding。
 
-个人包固定、SSH 上传校验、远端缓存与对话自有副本的完整目录关系，见[远端文件版本与 Agent 机制](../远端文件版本与Agent机制.md)第 7.1 节。Codex 不生成 `easywork-selected` 组合命令，直接使用各技能的原生入口。
+个人包固定、SSH 上传校验、远端缓存与对话自有副本的完整目录关系，见[远端文件版本与 Agent 机制](../远端文件版本与Agent机制.md)第 7 节。Codex 不生成 `easywork-selected` 组合命令，直接使用各技能的原生入口。
 
 app-server 初始化后调用 `skills/extraRoots/set`，以 `extraRoots: [<binding-skills-root>]` 注册当前 binding 的 Skill 根。每次选用技能的 `turn/start` 前，调用 `skills/list`，传入 `cwds: [<当前工作区>]` 和 `forceReload: true`，确认入口已经被原生发现且解析路径仍位于当前 binding 内；没有发现时明确失败，不把“目录已部署”当成“技能已加载”。本轮选中的 Skill 使用发现结果返回的名称与路径作为原生 input item 加入；路径可以是当前视图入口，也可以是其解析后的自有文件代次：
 
@@ -106,7 +120,7 @@ app-server 初始化后调用 `skills/extraRoots/set`，以 `extraRoots: [<bindi
 
 上游选择有三种来源：网页 Agent 选择、用户显式附加、Work 设置中的强制启用。模式和服务器范围先由 EasyWork 过滤；强制项在切换远端绑定后的首次提问由后端检查安装记录，只补齐缺少的版本，后续连续提问复用检查结果；不交给网页模型读取或批准。实际补发项与其他本轮选中项共用上述原生 input item 和版本收据。
 
-## 7. 文件写前 Hook
+## 8. 文件写前 Hook
 
 Codex 使用 app-server 暴露的 Hook 发现与信任接口验证 EasyWork pre-tool hook。
 
@@ -134,7 +148,7 @@ config/batchWrite
 
 托管基线缺失或无法信任这条 Hook 会阻止运行。用户显式选择的 Codex 版本若 app-server 早于 Hook discovery，可以继续执行 Agent 功能，但会产生可见兼容性提示，明确该版本的文件修改无法保证完整回溯。
 
-## 8. 事件归一化
+## 9. 事件归一化
 
 Codex app-server 的 thread、turn、item、usage 和 server request 都经过 `codex.mjs` reducer。主要投影包括：
 
@@ -146,15 +160,19 @@ Codex app-server 的 thread、turn、item、usage 和 server request 都经过 `
 - `turn/plan/updated`：唯一的 Todo/计划来源；
 - token usage：当前请求上下文用量和累计 billing 分开保存；
 - approval、permissions、requestUserInput、MCP elicitation：统一交互请求；
-- model reroute、safety、verification、Hook 或兼容性通知：状态/错误信息。
+- `functionCallOutput`：归一化为对应函数调用的工具结果；
+- `writeStdin` command approval：保留为终端写入审批，不误标成普通命令执行；
+- `openai/userVerification` 与 `openai/form`：形成可见用户输入并按原生 JSON-RPC 形状响应；
+- provider auth recovery、model reroute、safety、verification、Hook 或兼容性通知：状态/错误信息；
+- realtime item/transcript 与 MCP stream notification：当前编码任务界面不投影，但按已知 `0.154.0` 通知显式消费，避免误报未知协议。
 
 相邻 message、reasoning、plan 和 command output delta 在原始 JSONL 队列前合并。除已适配的交互请求和 `currentTime/read` 外，未知 server request 返回 JSON-RPC `-32601`，不能自动批准；未知 notification 则形成兼容性事件，避免协议新增字段被静默吞掉。
 
-作业提交记录消费同一执行的原生 `item/completed` → `commandExecution`：归一化结果携带 `command` 与 `aggregatedOutput`，终态 `tool_result` 的命令及输出进入统一提交检测器。仅直接 `sbatch` 执行和对应成功回执形成持久提交记录，不扫描旧对话、不采纳 Agent 的查询结果或自然语言总结。成功回执写入账本后，由三种 Agent 共用的后台跟踪器直接查询调度器并持久化终态，不依赖 Codex 后续查询或用户打开算力面板；断线、重连和查询失败边界统一处理。该能力不向 Codex 添加提示词，也不更改原生工具参数。具体识别与跟踪边界见《SSH机制》的提交历史章节。
+作业提交记录消费同一执行的原生 `item/completed` → `commandExecution`：归一化结果携带 `command` 与 `aggregatedOutput`，终态 `tool_result` 的命令及输出进入统一提交检测器。仅直接 `sbatch` 执行和对应成功回执形成持久提交记录，不扫描旧对话、不采纳 Agent 的查询结果或自然语言总结。成功回执写入账本后，由四种 Agent 共用的后台跟踪器直接查询调度器并持久化终态，不依赖 Codex 后续查询或用户打开算力面板；断线、重连和查询失败边界统一处理。该能力不向 Codex 添加提示词，也不更改原生工具参数。具体识别与跟踪边界见《SSH机制》的提交历史章节。
 
 EasyWork 的 Todo 完全跟随 `turn/plan/updated`，不从普通 assistant Markdown 中解析。`result.usage` 一类累计计费值不覆盖当前 context-window 占用。
 
-## 9. 原生分支、回退与重新生成
+## 10. 原生分支、回退与重新生成
 
 Context checkpoint 保存 Codex `threadId`、精确 `turnId` 和 rollout `path`。只有来源 Task 已完成且边界齐全时，上层才调用 `thread/fork`。返回的新 thread ID 和 path 写入目标 binding；原生 thread 已继承的消息前缀在目标 Context receipt 中登记为别名，因此网页历史不重发。
 
@@ -162,8 +180,8 @@ Context checkpoint 保存 Codex `threadId`、精确 `turnId` 和 rollout `path`�
 
 重新生成沿用同一机制：先恢复目标用户消息之前的原生和文件边界，再用原始用户消息创建新 Task。原生 thread 分支和 EasyWork 文件 checkpoint 是两个独立结果，必须都成功或明确进入降级路径。
 
-## 10. 兼容性与升级敏感面
+## 11. 兼容性与升级敏感面
 
-当前实现依赖的易变协议面包括：app-server initialize handshake、`thread/*` 与 `turn/*` 请求参数、paginated history 的 revert 能力、fork 返回的 thread/path、turn steer 的关闭错误、item 类型和 final phase、token usage 形状、approval/input server request、Skill input item、Hook list/trust schema 及 pre-tool event 名称。
+当前实现依赖的易变协议面包括：app-server initialize handshake、`thread/*` 与 `turn/*` 请求参数及其 `cwd`、`thread/compact/start` 的响应与 `thread/compacted` 通知、paginated history 的 revert 能力、fork 返回的 thread/path、turn steer 的关闭错误、item 类型和 final phase、`thread/tokenUsage/updated` 形状、approval/input server request（包括 `writeStdin` 和 `openai/userVerification`）、Skill input item、Hook list/trust schema 及 pre-tool event 名称。
 
 用户版本允许对非核心 Hook 能力给出显式降级；托管基线必须满足完整合同。任何升级都不能通过读取或改写 Codex rollout 私有 JSONL 来模拟 thread 操作，原生接口不可用时应保留真实失败并由 EasyWork 上层换绑。

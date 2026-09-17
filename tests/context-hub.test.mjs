@@ -660,3 +660,40 @@ test("待确认知识只回执预算和原生会话筛选后实际交付的语�
     await rm(dataRoot, { recursive: true, force: true });
   }
 });
+
+test("旧工作区级 binding 的回执可迁移到稳定 Agent binding 而不重复上下文", async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-context-binding-migration-"));
+  try {
+    const hub = new ContextHub({
+      dataRoot,
+      actor,
+      sources: {
+        conversation: async () => ({
+          id: "message_migrated",
+          kind: "message",
+          content: "已经交付的网页消息",
+          source: { type: "conversation", id: "message_migrated", version: "1" },
+        }),
+      },
+    });
+    const session = await hub.createSession({
+      consumer: "remote-agent",
+      consumerId: "task_migrated",
+      scope,
+      budget: { maxTokens: 100, reservedOutputTokens: 10 },
+    });
+    const delivery = (await hub.assemble(session.id)).delivery;
+    await hub.acknowledge({ bindingKey: "binding_legacy", nativeSessionId: "native_same", delivery });
+
+    const inherited = await hub.inheritBindingReceipt({
+      sourceBindingKey: "binding_legacy",
+      targetBindingKey: "binding_stable",
+      nativeSessionId: "native_same",
+    });
+    assert.equal(inherited.inherited, true);
+    assert.equal((await hub.deliveryForBinding("binding_stable", delivery, "native_same")).entries.length, 0);
+    assert.equal((await hub.deliveryForBinding("binding_legacy", delivery, "native_same")).entries.length, 0);
+  } finally {
+    await rm(dataRoot, { recursive: true, force: true });
+  }
+});

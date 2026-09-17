@@ -9,6 +9,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createClaudeCodeAdapter } from "../gateway/core/agents/claude-code.mjs";
 import { createCodexAdapter } from "../gateway/core/agents/codex.mjs";
 import { createOpenCodeAdapter } from "../gateway/core/agents/opencode.mjs";
+import { createQoderCnAdapter } from "../gateway/core/agents/qoder-cn.mjs";
 import { ApiError } from "../gateway/core/errors.mjs";
 import {
   AgentDeploymentService,
@@ -49,6 +50,35 @@ it("native process replacement and late exit cannot close the binding's active A
     await transport.close();
     assert.equal(executor.proxyClosed, 1);
   }
+});
+
+it("evicts only the least recently active idle Agent when its SSH channel is needed", async () => {
+  let now = 1;
+  const executor = new FakeExecutor();
+  const adapter = createCodexAdapter();
+  const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver(), clock: () => now });
+  const preparedRequest = (suffix) => requestFor(adapter, "start", { prompt: `prepare ${suffix}`, cwd: "/work/demo" }, {
+    binding: binding(adapter, { agentBindingId: `binding:conversation-${suffix}:workspace-1` }),
+    task: { id: `task-${suffix}`, conversationId: `conversation-${suffix}`, route: { agentId: adapter.id } },
+    apiRoute: { baseUrl: "https://api.internal/v1", apiKey: "fixture", model: "model-agent-1", remoteReachable: false },
+  });
+
+  await transport.prepare(preparedRequest("old"));
+  now += 1;
+  await transport.prepare(preparedRequest("new"));
+  assert.equal(transport.active.size, 2);
+
+  assert.equal(await executor.channelPressureHandler(), true);
+  assert.deepEqual(executor.processes[0].signals, ["RETIRED"]);
+  assert.deepEqual(executor.processes[1].signals, []);
+  assert.equal(transport.active.has("binding:conversation-old:workspace-1"), false);
+  assert.equal(transport.active.has("binding:conversation-new:workspace-1"), true);
+
+  const remaining = transport.active.get("binding:conversation-new:workspace-1");
+  remaining.codexFrameScope = { threadId: "thread-running", turnId: "turn-running" };
+  assert.equal(await executor.channelPressureHandler(), false);
+  assert.deepEqual(executor.processes[1].signals, []);
+  await transport.close();
 });
 
 afterEach(async () => {
@@ -120,12 +150,80 @@ async function artifactFixture({ hashOverride = null, archive = "raw", archiveBi
   return { root, sha256 };
 }
 
+async function compatibilityArtifactFixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), "easywork-agent-compatibility-"));
+  temporaryDirectories.push(root);
+  await mkdir(path.join(root, "claudecode"), { recursive: true });
+  const latest = Buffer.from("fixture-claude-latest");
+  const legacy = Buffer.from("fixture-claude-legacy");
+  const latestFile = "claudecode/claude-linux-x64-latest";
+  const legacyFile = "claudecode/claude-linux-x64-legacy";
+  await Promise.all([
+    writeFile(path.join(root, latestFile), latest),
+    writeFile(path.join(root, legacyFile), legacy),
+  ]);
+  const latestHash = crypto.createHash("sha256").update(latest).digest("hex");
+  const legacyHash = crypto.createHash("sha256").update(legacy).digest("hex");
+  await writeFile(path.join(root, "manifest.json"), JSON.stringify({
+    schemaVersion: 1,
+    agents: {
+      claudecode: {
+        version: "2.1.269",
+        artifacts: {
+          "linux-x64": { file: latestFile, archive: "raw", sha256: latestHash, size: latest.length },
+        },
+        compatibility: [{
+          id: "legacy-glibc-2.17",
+          version: "2.1.170",
+          selector: { platforms: ["linux-x64"], libcFamily: "glibc", libcMax: "2.17" },
+          artifacts: {
+            "linux-x64": { file: legacyFile, archive: "raw", sha256: legacyHash, size: legacy.length },
+          },
+        }],
+      },
+    },
+  }));
+  return { root, latestFile, legacyFile, latestHash, legacyHash };
+}
+
+class FakeLineHub {
+  constructor() {
+    this.backlog = [];
+    this.subscribers = new Set();
+    this.closed = false;
+    this.error = null;
+  }
+
+  push(value) {
+    if (this.closed) return;
+    if (!this.subscribers.size) this.backlog.push(value);
+    for (const subscriber of this.subscribers) subscriber.push(value);
+  }
+
+  subscribe(options = {}) {
+    const queue = new AsyncQueue(() => this.subscribers.delete(queue), options);
+    for (const value of this.backlog) queue.push(value);
+    this.backlog = [];
+    if (this.closed) queue.end(this.error);
+    else this.subscribers.add(queue);
+    return queue;
+  }
+
+  end(error = null) {
+    if (this.closed) return;
+    this.closed = true;
+    this.error = error;
+    for (const subscriber of this.subscribers) subscriber.end(error);
+    this.subscribers.clear();
+  }
+}
+
 class FakeProcess {
   constructor(id, { codexHook = null, skillCatalog = null } = {}) {
     this.skillCatalog = skillCatalog;
     this.processId = id;
     this.closed = false;
-    this.queue = new AsyncQueue();
+    this.queue = new FakeLineHub();
     this.writes = [];
     this.rpc = [];
     this.signals = [];
@@ -137,7 +235,7 @@ class FakeProcess {
     this.exitPromise = new Promise((resolve) => { this.resolveExit = resolve; });
   }
 
-  lines() { return this.queue; }
+  lines(options = {}) { return this.queue.subscribe(options); }
 
   discardBufferedLines() {}
 
@@ -192,6 +290,11 @@ class FakeProcess {
     if (["SIGTERM", "SIGKILL"].includes(value) && this.writes.at(-1)?.request?.subtype === "interrupt") this.close();
   }
 
+  async retire() {
+    this.signals.push("RETIRED");
+    this.close();
+  }
+
   wait() { return this.exitPromise; }
 
   close() {
@@ -215,6 +318,7 @@ class FakeExecutor {
     this.proxyRequests = [];
     this.proxyClosed = 0;
     this.proxyEffortHandler = null;
+    this.channelPressureHandler = null;
     this.remoteReachable = false;
     this.scanOutput = "";
     this.claudeBoundaryOutput = "";
@@ -222,6 +326,13 @@ class FakeExecutor {
   }
 
   async home() { return "/home/tester"; }
+
+  setSessionChannelPressureHandler(handler) {
+    this.channelPressureHandler = handler;
+    return () => {
+      if (this.channelPressureHandler === handler) this.channelPressureHandler = null;
+    };
+  }
 
   async exec(command) {
     this.commands.push(command);
@@ -309,6 +420,17 @@ class FakeExecutor {
         { providerID: "easywork", id: "model-agent-2" },
       ] };
     }
+    if (request.path === "/provider") {
+      return {
+        all: [{
+          id: "easywork",
+          models: {
+            "model-agent-1": { id: "model-agent-1" },
+            "model-agent-2": { id: "model-agent-2" },
+          },
+        }],
+      };
+    }
     if (request.method === "POST" && request.path === "/api/session") return { data: { id: "session-native-1" } };
     if (request.method === "POST" && /^\/api\/session\/[^/]+\/prompt$/.test(request.path)) return { data: { admittedSeq: 1 } };
     if (request.path === "/api/session/active") return {};
@@ -347,14 +469,19 @@ class FakeExecutor {
 
 function deploymentResolver(source = "managed") {
   return {
+    async authenticationStatus(agentId) {
+      assert.equal(agentId, "qoder-cn");
+      return { required: true, authenticated: true, status: "authenticated", loginAvailable: true };
+    },
     async resolveRuntime(agentId) {
-      const binary = agentId === "claude-code" ? "claude" : agentId;
+      const packageId = agentId === "claude-code" ? "claudecode" : agentId === "qoder-cn" ? "qodercncli" : agentId;
+      const binary = agentId === "claude-code" ? "claude" : agentId === "qoder-cn" ? "qoderclicn" : agentId;
       return {
         installed: true,
         source,
         managed: source === "managed",
         binaryPath: source === "managed"
-          ? `/home/tester/.easywork/agents/${agentId === "claude-code" ? "claudecode" : agentId}/current/bin/${binary}`
+          ? `/home/tester/.easywork/agents/${packageId}/current/bin/${binary}`
           : `/opt/user-agent/${binary}`,
         version: "1.0.0",
       };
@@ -414,6 +541,30 @@ describe("host Agent artifact catalog", () => {
       artifact,
       paths: remoteAgentPaths("/home/tester", "opencode"),
     }).archiveBinary, "opencode-linux-x64");
+  });
+
+  it("selects a pinned compatibility release only for the matching remote host", async () => {
+    const fixture = await compatibilityArtifactFixture();
+    const catalog = new HostAgentArtifactCatalog({ root: fixture.root });
+    const legacy = await catalog.resolveForHost("claude-code", {
+      platform: "linux-x64",
+      libcFamily: "glibc",
+      libcVersion: "2.17",
+      kernel: "3.10.0-957.el7.x86_64",
+    });
+    assert.equal(legacy.version, "2.1.170");
+    assert.equal(legacy.compatibilityId, "legacy-glibc-2.17");
+    assert.equal(legacy.sha256, fixture.legacyHash);
+
+    const current = await catalog.resolveForHost("claude-code", {
+      platform: "linux-x64",
+      libcFamily: "glibc",
+      libcVersion: "2.28",
+      kernel: "4.18.0",
+    });
+    assert.equal(current.version, "2.1.269");
+    assert.equal(current.compatibilityId, null);
+    assert.equal(current.sha256, fixture.latestHash);
   });
 });
 
@@ -549,6 +700,29 @@ describe("SSH process protocol", () => {
     assert.equal(first.done, false);
     assert.equal(JSON.parse(first.value).event.delta.partial_json.length, 10_000);
     assert.deepEqual(await lines.next(), { value: undefined, done: true });
+  });
+
+  it("reports a missing remote workspace before an Agent process can publish its PID", async () => {
+    const channel = new EventEmitter();
+    channel.stderr = new EventEmitter();
+    channel.write = () => {};
+    channel.end = () => {};
+    const cwd = "/home/tester/missing-workspace";
+    const process = new SshProcessHandle({
+      channel,
+      processId: "missing-workspace",
+      specification: { cwd },
+    });
+    const ready = process.ready();
+    channel.stderr.emit("data", Buffer.from(`bash: line 0: cd: ${cwd}: No such file or directory\n`));
+    channel.emit("close", 1, null);
+    await assert.rejects(ready, (error) => {
+      assert.equal(error?.code, "AGENT_WORKSPACE_UNAVAILABLE");
+      assert.equal(error?.status, 409);
+      assert.equal(error?.details?.cwd, cwd);
+      assert.match(error?.message || "", /远端工作区不存在或不可访问/);
+      return true;
+    });
   });
 
   it("preserves Claude completed content blocks and lifecycle events under a queued stream burst", async () => {
@@ -1074,6 +1248,151 @@ describe("SSH process protocol", () => {
 });
 
 describe("managed and user Agent deployment", () => {
+  it("checks Qoder CN account state and returns the native device-login URL without launching a browser on the server", async () => {
+    class QoderLoginExecutor extends FakeExecutor {
+      constructor() {
+        super();
+        this.loggedIn = false;
+      }
+
+      async exec(command, options) {
+        if (command.includes(" status -o json")) {
+          this.commands.push(command);
+          return { code: 0, stdout: JSON.stringify({ logged_in: this.loggedIn, version: "1.1.53", allow_byok: 0 }), stderr: "" };
+        }
+        return super.exec(command, options);
+      }
+
+      async spawn(specification) {
+        const process = await super.spawn({ ...specification, onStderr: undefined });
+        process.queue.push("Open https://account.qoder.com/device?code=test-code to continue");
+        return process;
+      }
+    }
+    const executor = new QoderLoginExecutor();
+    const service = new AgentDeploymentService({ catalog: { async resolve() { return {}; } }, executor });
+    service.status = async () => ({ installed: true, status: "ready", version: "1.1.53", binaryPath: "/home/tester/.easywork/agents/qodercncli/current/bin/qoderclicn" });
+    service.resolveRuntime = async () => ({ installed: true, status: "ready", version: "1.1.53", binaryPath: "/home/tester/.easywork/agents/qodercncli/current/bin/qoderclicn" });
+
+    const before = await service.authenticationStatus("qoder-cn", { force: true });
+    assert.equal(before.authenticated, false);
+    assert.equal(before.loginAvailable, true);
+    const login = await service.beginLogin("qoder-cn");
+    assert.equal(login.url, "https://account.qoder.com/device?code=test-code");
+    assert.deepEqual(executor.spawns[0].args, ["login"]);
+    assert.equal(executor.spawns[0].env.BROWSER, "www-browser");
+    assert.equal(executor.spawns[0].env.NO_BROWSER, "1");
+    assert.equal(executor.spawns[0].env.QODERCN_CONFIG_DIR, "/home/tester/.easywork/accounts/qodercncli");
+    assert.ok(executor.commands.some((command) => command.includes("QODERCN_CONFIG_DIR='/home/tester/.easywork/accounts/qodercncli'") && command.includes("status -o json")));
+
+    executor.loggedIn = true;
+    const after = await service.authenticationStatus("qoder-cn", { force: true });
+    assert.equal(after.authenticated, true);
+    assert.equal(after.status, "authenticated");
+    executor.processes[0].close();
+  });
+
+  it("reads the signed-in Qoder model catalog, native context tiers, Credits multipliers and account quota through the SDK control protocol", async () => {
+    class QoderCatalogExecutor extends FakeExecutor {
+      async exec(command, options) {
+        if (command.includes(" status -o json")) {
+          this.commands.push(command);
+          return { code: 0, stdout: JSON.stringify({ logged_in: true, version: "1.1.53" }), stderr: "" };
+        }
+        return super.exec(command, options);
+      }
+
+      async spawn(specification) {
+        const process = await super.spawn({ ...specification, onStderr: undefined });
+        process.requestControl = async (frame) => {
+          process.writeJson(frame);
+          if (frame.request.type === "initialize") {
+            return { type: "control_response", response: { subtype: "success", request_id: frame.request_id, response: { models: [] } } };
+          }
+          if (frame.request.subtype === "get_models") {
+            return { type: "control_response", response: { subtype: "success", request_id: frame.request_id, response: { models: [{
+              value: "qwen-coder-plus",
+              displayName: "Qwen Coder Plus",
+              description: "Coding model",
+              isDefault: true,
+              isEnabled: true,
+              priceFactor: 1.6,
+              originalPriceFactor: 2,
+              context_config: {
+                "200K": { token_count: 200_000, is_default: true },
+                "1M": { token_count: 1_000_000 },
+              },
+              thinking_config: { enabled: { efforts: { low: {}, high: { is_default: true } } } },
+              promotion: { active: true, badge: { zh: "限时优惠" }, discount_factor: 1.6, before_promotion_price_factor: 2 },
+            }] } } };
+          }
+          if (frame.request.type === "get_usage_info") {
+            return { type: "control_response", response: { subtype: "success", request_id: frame.request_id, response: { usage: {
+              userQuota: { total: 1_000, used: 320, remaining: 680, percentage: 32, unit: "Credits" },
+              orgResourcePackage: { available: false, cap: -1, used: 0, remaining: 0, percentage: 0, unit: "Credits" },
+              totalUsagePercentage: 32,
+              isQuotaExceeded: false,
+            } } } };
+          }
+          throw new Error(`unexpected Qoder control request: ${JSON.stringify(frame.request)}`);
+        };
+        process.endInput = () => { process.inputEnded = true; process.close(); };
+        return process;
+      }
+    }
+    const executor = new QoderCatalogExecutor();
+    const service = new AgentDeploymentService({
+      catalog: { async resolve() { return {}; } },
+      executor,
+      clock: () => new Date("2026-09-16T08:00:00.000Z"),
+    });
+    service.status = async () => ({ installed: true, status: "ready", version: "1.1.53", binaryPath: "/home/tester/.easywork/agents/qodercncli/current/bin/qoderclicn" });
+
+    const catalog = await service.nativeCatalog("qoder-cn", { force: true });
+    assert.equal(catalog.models.length, 1);
+    assert.equal(catalog.models[0].id, "qwen-coder-plus");
+    assert.equal(catalog.models[0].priceFactor, 1.6);
+    assert.equal(catalog.models[0].originalPriceFactor, 2);
+    assert.equal(catalog.models[0].defaultContextWindow, 200_000);
+    assert.deepEqual(catalog.models[0].contextTiers.map((tier) => tier.tokens), [200_000, 1_000_000]);
+    assert.equal(catalog.models[0].defaultEffort, "high");
+    assert.equal(catalog.models[0].promotion.badge.zh, "限时优惠");
+    assert.equal(catalog.usage.userQuota.remaining, 680);
+    assert.equal(catalog.usage.orgResourcePackage, null, "Qoder 的 available=false/cap=-1 是无组织资源包标记，不是额度");
+    assert.equal(catalog.fetchedAt, "2026-09-16T08:00:00.000Z");
+    assert.deepEqual(executor.spawns[0].args, ["--print", "--output-format", "stream-json", "--input-format", "stream-json", "--no-session-persistence", "--tools", "", "--disable-builtin-skills"]);
+    assert.equal(executor.spawns[0].env.QODER_AGENT_SDK_ENTRYPOINT, "sdk-ts");
+    assert.equal(executor.spawns[0].env.QODER_AGENT_SDK_VERSION, "1.0.41");
+    assert.ok(executor.spawns[0].env.QODER_SDK_AUTH_PAYLOAD_FILE.startsWith("/home/tester/.easywork/accounts/qodercncli/.easywork-sdk-auth-"));
+    assert.equal(JSON.parse(executor.writes.find((entry) => entry.remotePath.includes(".easywork-sdk-auth-"))?.content || "null").type, "qodercli");
+    assert.equal(executor.processes[0].writes[0].request.type, "initialize");
+    assert.equal(executor.processes[0].writes[1].request.subtype, "get_models");
+    assert.equal(executor.processes[0].writes[2].request.type, "get_usage_info");
+    assert.ok(executor.commands.some((command) => command.startsWith("rm -f -- ") && command.includes(".easywork-sdk-auth-")));
+  });
+
+  it("deploys the manifest compatibility release on a matching legacy Linux host", async () => {
+    const fixture = await compatibilityArtifactFixture();
+    class LegacyLinuxExecutor extends FakeExecutor {
+      async exec(command, options) {
+        if (command.startsWith("uname -s")) {
+          return { code: 0, stdout: "Linux\nx86_64\nldd (GNU libc) 2.17\n3.10.0-957.el7.x86_64\n", stderr: "" };
+        }
+        return super.exec(command, options);
+      }
+    }
+    const executor = new LegacyLinuxExecutor();
+    const service = new AgentDeploymentService({
+      catalog: new HostAgentArtifactCatalog({ root: fixture.root }),
+      executor,
+      clock: () => new Date("2026-09-13T00:00:00.000Z"),
+    });
+    const installed = await service.install("claude-code");
+    assert.equal(installed.state.version, "2.1.170");
+    assert.equal(installed.state.compatibilityId, "legacy-glibc-2.17");
+    assert.equal(installed.descriptor.localArtifact, path.join(fixture.root, fixture.legacyFile));
+  });
+
   it("uploads a verified release, atomically switches current and persists managed state only in .easywork", async () => {
     const fixture = await artifactFixture();
     const executor = new FakeExecutor();
@@ -1172,7 +1491,7 @@ describe("managed and user Agent deployment", () => {
   });
 });
 
-describe("three-Agent executable runtime transport", () => {
+describe("four-Agent executable runtime transport", () => {
   it("probes the Codex app-server initialization protocol before Agent selection", async () => {
     const executor = new FakeExecutor();
     const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
@@ -1185,6 +1504,35 @@ describe("three-Agent executable runtime transport", () => {
     assert.equal(executor.spawns[0].env.CODEX_HOME, "/home/tester/.easywork/runtime/readiness/codex");
     assert.deepEqual(executor.processes[0].rpc.map((entry) => entry.method), ["initialize", "initialized"]);
     assert.deepEqual(executor.processes[0].signals, ["SIGTERM"]);
+  });
+
+  it("moves Codex SQLite and arg0 runtime data off an HPC shared filesystem", async () => {
+    class SharedFilesystemExecutor extends FakeExecutor {
+      async exec(command) {
+        if (command.includes("__EASYWORK_CODEX_STORAGE__")) {
+          this.commands.push(command);
+          return {
+            code: 0,
+            stdout: "__EASYWORK_CODEX_STORAGE__\tlocal\t/tmp/easywork-1000/codex/fixture/sqlite\tUNKNOWN (0x797083)\n",
+            stderr: "",
+          };
+        }
+        return super.exec(command);
+      }
+    }
+    const executor = new SharedFilesystemExecutor();
+    const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+
+    const readiness = await transport.checkReadiness("codex", { configScope: "conversation-1" });
+
+    assert.equal(readiness.storageMode, "local");
+    assert.equal(readiness.filesystemType, "UNKNOWN (0x797083)");
+    assert.equal(executor.spawns[0].env.CODEX_SQLITE_HOME, "/tmp/easywork-1000/codex/fixture/sqlite");
+    assert.equal(executor.spawns[0].env.HOME, "/home/tester/.easywork/runtime/readiness/codex/home");
+    const storageCommand = executor.commands.find((command) => command.includes("__EASYWORK_CODEX_STORAGE__"));
+    assert.match(storageCommand, /stat -f -c %T/);
+    assert.match(storageCommand, /tmp\/arg0/);
+    assert.doesNotMatch(storageCommand, /rm -rf/);
   });
 
   it("rejects Codex selection when the installed app-server cannot initialize", async () => {
@@ -1363,6 +1711,12 @@ describe("three-Agent executable runtime transport", () => {
     assert.ok(claudeExecutor.spawns[0].args.includes("stdio"));
     assert.equal(claudeExecutor.spawns[0].env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "180000");
     assert.equal(claudeExecutor.spawns[0].env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1");
+    assert.equal(claudeExecutor.spawns[0].env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, "1");
+    assert.equal(claudeExecutor.spawns[0].env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
+    assert.equal(claudeExecutor.spawns[0].env.ENABLE_CLAUDEAI_MCP_SERVERS, "false");
+    assert.equal(claudeExecutor.spawns[0].env.DISABLE_TELEMETRY, "1");
+    assert.equal(claudeExecutor.spawns[0].env.DISABLE_AUTOUPDATER, "1");
+    assert.equal(claudeExecutor.spawns[0].env.DISABLE_UPDATES, "1");
     await claudeTransport.close();
   });
 
@@ -1814,6 +2168,46 @@ describe("three-Agent executable runtime transport", () => {
     assert.equal(executor.proxyClosed, 1);
   });
 
+  it("moves an existing OpenCode session to the selected workspace before the next prompt", async () => {
+    const executor = new FakeExecutor();
+    const adapter = createOpenCodeAdapter();
+    const transport = new AgentRuntimeTransport({
+      executor,
+      deploymentService: deploymentResolver(),
+      configurationService: { async runtimeValues() { return { contextLimit: "262144", permissionMode: "allow" }; } },
+    });
+    const current = binding(adapter, {
+      // The browser route has already been committed to the target by the
+      // time transport starts. A legacy native binding has no location
+      // metadata, so transport must still probe the native move endpoint.
+      route: { workspaceId: "workspace-target" },
+      native: { sessionId: "session-native-1", protocol: "v2" },
+      state: adapter.createState({ sessionId: "session-native-1" }),
+    });
+    const resumed = await transport.execute(requestFor(adapter, "start", {
+      sessionId: "session-native-1",
+      prompt: "inspect the new workspace",
+    }, {
+      binding: current,
+      task: { id: "task-workspace-move", route: { workspaceId: "workspace-target" } },
+      workspace: { path: "/work/target" },
+    }));
+
+    const moveIndex = executor.http.findIndex((entry) => entry.path === "/experimental/control-plane/move-session");
+    const streamIndex = executor.http.findIndex((entry) => entry.stream === true && entry.path === "/api/event");
+    const promptIndex = executor.http.findIndex((entry) => entry.path === "/api/session/session-native-1/prompt");
+    assert.ok(moveIndex >= 0 && moveIndex < streamIndex && streamIndex < promptIndex, JSON.stringify(executor.http.map((entry) => entry.path)));
+    assert.deepEqual(executor.http[moveIndex].body, {
+      sessionID: "session-native-1",
+      destination: { directory: "/work/target" },
+      moveChanges: false,
+    });
+    assert.equal(resumed.bindingPatch.native.sessionId, "session-native-1");
+    assert.equal(resumed.bindingPatch.native.workspaceId, "workspace-target");
+    assert.equal(resumed.bindingPatch.native.workspacePath, "/work/target");
+    await transport.close();
+  });
+
   it("uses OpenCode's source-backed V1 fork boundary, then isolates the branch native store", async () => {
     class NativeHistoryExecutor extends FakeExecutor {
       constructor() {
@@ -2137,6 +2531,7 @@ describe("three-Agent executable runtime transport", () => {
     ]);
     assert.equal(process.rpc.find((entry) => entry.method === "thread/start").params.config, undefined);
     assert.equal(process.rpc.find((entry) => entry.method === "turn/start").params.threadId, "thread-native-1");
+    assert.equal(process.rpc.find((entry) => entry.method === "turn/start").params.cwd, "/work/demo");
     process.queue.push(JSON.stringify({ method: "turn/started", params: { threadId: "thread-native-1", turn: { id: "turn-native-1" } } }));
     assert.equal((await started.frames[Symbol.asyncIterator]().next()).value.method, "turn/started");
 
@@ -2161,8 +2556,10 @@ describe("three-Agent executable runtime transport", () => {
     await restartedTransport.execute(requestFor(adapter, "start", {
       threadId: "thread-native-1",
       prompt: "new task on the same binding",
+      cwd: "/work/target",
     }, {
       binding: binding(adapter, { native: { threadId: "thread-native-1" } }),
+      workspace: { path: "/work/target" },
     }));
     assert.deepEqual(restartedExecutor.processes[0].rpc.map((entry) => entry.method), [
       "initialize",
@@ -2175,6 +2572,8 @@ describe("three-Agent executable runtime transport", () => {
       "turn/start",
     ]);
     assert.equal(restartedExecutor.processes[0].rpc.find((entry) => entry.method === "thread/resume").params.config, undefined);
+    assert.equal(restartedExecutor.processes[0].rpc.find((entry) => entry.method === "thread/resume").params.cwd, "/work/target");
+    assert.equal(restartedExecutor.processes[0].rpc.find((entry) => entry.method === "turn/start").params.cwd, "/work/target");
   });
 
   it("continues on the same Codex thread when the native steer window closes during UI drain", async () => {
@@ -2617,12 +3016,17 @@ describe("three-Agent executable runtime transport", () => {
       native: { ...first.bindingPatch.native, sessionId: "claude-session-1" },
       state: adapter.createState({ sessionId: "claude-session-1" }),
     });
-    await transport.execute(requestFor(adapter, "start", { prompt: "second", cwd: "/work/demo" }, { apiRoute, binding: resumedBinding }));
+    await transport.execute(requestFor(adapter, "start", { prompt: "second", cwd: "/work/target" }, {
+      apiRoute,
+      binding: resumedBinding,
+      workspace: { path: "/work/target" },
+    }));
     assert.equal(executor.spawns.length, 2);
     assert.equal(executor.spawns[1].envFile, executor.spawns[0].envFile);
     assert.ok(executor.spawns[1].args.includes("--resume"));
     assert.ok(executor.spawns[1].args.includes("claude-session-1"));
     assert.ok(executor.spawns[1].args.includes("--settings"));
+    assert.equal(executor.spawns[1].cwd, "/work/target");
     assert.equal(executor.writes.filter((entry) => entry.remotePath === providerEnvironment.remotePath).length, 1);
     await transport.close();
   });
@@ -2739,6 +3143,83 @@ describe("three-Agent executable runtime transport", () => {
     assert.equal(nextTaskStart.bindingPatch.native.processId, "process-3");
   });
 
+  it("runs Qoder CN with account auth, isolated settings and the same native session after switching workspace", async () => {
+    const executor = new FakeExecutor();
+    const adapter = createQoderCnAdapter();
+    const qoderSessionId = "77777777-7777-4777-8777-777777777777";
+    const transport = new AgentRuntimeTransport({
+      executor,
+      deploymentService: deploymentResolver(),
+      configurationService: { async runtimeValues() { return { model: "qwen-coder-plus", contextLimit: "1000000", reasoningEffort: "high", permissionMode: "accept_edits" }; } },
+      clock: () => 5,
+    });
+    const sourceBindingId = "binding:conversation-1:workspace-1";
+    const started = await transport.execute(requestFor(adapter, "start", { prompt: "inspect", cwd: "/work/source" }, {
+      binding: binding(adapter, { agentBindingId: sourceBindingId }),
+      // Work Task routes still carry the webpage model route. Qoder must ignore
+      // it because its native account and selected native model own inference.
+      task: { id: "task-qoder-1", route: { agentId: "qoder-cn", providerId: "web-provider", modelId: "web-model" } },
+      workspace: { path: "/work/source" },
+      apiRoute: null,
+    }));
+    const first = executor.spawns[0];
+    assert.equal(first.executable, "/home/tester/.easywork/agents/qodercncli/current/bin/qoderclicn");
+    assert.equal(first.cwd, "/work/source");
+    assert.equal(first.envFile, null);
+    assert.equal(first.env.QODERCN_CONFIG_DIR, `${remoteAgentPaths("/home/tester", "qoder-cn", sourceBindingId).runtimeData}/qoder-cn`);
+    assert.ok(first.args.includes("--reasoning-effort"));
+    assert.ok(first.args.includes("high"));
+    assert.ok(first.args.includes("--permission-mode"));
+    assert.ok(first.args.includes("accept_edits"));
+    assert.ok(first.args.includes("--model"));
+    assert.ok(first.args.includes("qwen-coder-plus"));
+    assert.ok(first.args.includes("--context-window"));
+    assert.ok(first.args.includes("1000000"));
+    assert.equal(first.args.includes("--verbose"), false);
+    const settingsWrite = executor.writes.find((entry) => entry.remotePath.endsWith("/qoder-cn/settings.json"));
+    const settings = JSON.parse(settingsWrite.content);
+    assert.equal(settings.general.defaultPermissionMode, "accept_edits");
+    assert.equal(settings.general.fileCheckpointing.enabled, true);
+    assert.equal(settings.model.name, "qwen-coder-plus");
+    assert.equal(settings.model.contextWindow, 1_000_000);
+    assert.equal(settings.skills.loadFromAgentsDirectory, true);
+    assert.equal(settings.hooks.PreToolUse[0].matcher, ".*");
+    assert.ok(executor.commands.some((command) => command.includes("/accounts/qodercncli/.auth") && command.includes("/qoder-cn/.auth")));
+
+    executor.processes[0].queue.push(JSON.stringify({ type: "system", subtype: "init", session_id: qoderSessionId }));
+    assert.equal((await started.frames[Symbol.asyncIterator]().next()).value.session_id, qoderSessionId);
+    assert.equal(started.bindingPatch.native.sessionProjectKey, "-work-source");
+    assert.equal(started.bindingPatch.native.workspacePath, "/work/source");
+    executor.processes[0].close();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const targetBindingId = "binding:conversation-1:workspace-2";
+    await transport.execute(requestFor(adapter, "start", { prompt: "continue here", cwd: "/work/target" }, {
+      binding: binding(adapter, {
+        agentBindingId: targetBindingId,
+        native: { ...started.bindingPatch.native, sessionId: qoderSessionId, runtimeBindingId: sourceBindingId },
+      }),
+      task: { id: "task-qoder-2", route: { agentId: "qoder-cn" } },
+      workspace: { path: "/work/target" },
+      apiRoute: null,
+    }));
+    assert.equal(executor.spawns.length, 2);
+    assert.equal(executor.spawns[1].cwd, "/work/target");
+    assert.ok(executor.spawns[1].args.includes("--resume"));
+    assert.ok(executor.spawns[1].args.includes(qoderSessionId));
+    const sourcePaths = remoteAgentPaths("/home/tester", "qoder-cn", sourceBindingId);
+    const targetPaths = remoteAgentPaths("/home/tester", "qoder-cn", targetBindingId);
+    assert.equal(executor.spawns[1].env.QODERCN_CONFIG_DIR, `${targetPaths.runtimeData}/qoder-cn`);
+    assert.notEqual(executor.spawns[1].env.QODERCN_CONFIG_DIR, first.env.QODERCN_CONFIG_DIR);
+    assert.ok(executor.commands.some((command) => command.includes(`${sourcePaths.runtimeData}/qoder-cn/projects`) && command.includes(`${targetPaths.runtimeData}/qoder-cn/projects`)));
+    const workspaceMove = executor.commands.find((command) => command.includes(qoderSessionId) && command.includes("target_key="));
+    assert.match(workspaceMove, /target_key=.*-work-target/);
+    assert.match(workspaceMove, /preferred_key=.*-work-source/);
+    assert.match(workspaceMove, /ln -s --/);
+    assert.equal(executor.spawns[1].cwd, "/work/target");
+    await transport.close();
+  });
+
   it("executes native compact and returns cached context usage without probing unsupported files", async () => {
     const openExecutor = new FakeExecutor();
     const openAdapter = createOpenCodeAdapter();
@@ -2765,6 +3246,25 @@ describe("three-Agent executable runtime transport", () => {
     const openCompact = openExecutor.http.find((entry) => entry.path === "/api/session/session-native-1/compact");
     assert.equal(openCompact.body, undefined);
 
+    const openV1Executor = new FakeExecutor();
+    const openV1Transport = new AgentRuntimeTransport({ executor: openV1Executor, deploymentService: deploymentResolver() });
+    await openV1Transport.execute(requestFor(openAdapter, "compact", {
+      sessionId: "session-native-v1",
+      providerId: "provider-1",
+      modelId: "model-1",
+    }, {
+      binding: binding(openAdapter, { native: { sessionId: "session-native-v1", protocol: "v1" } }),
+      apiRoute: {
+        remoteReachable: false,
+        baseUrl: "https://api.internal/v1",
+        apiKey: "proxy-upstream-key",
+        model: "model-agent-1",
+        protocol: "auto",
+      },
+    }));
+    const openV1Compact = openV1Executor.http.find((entry) => entry.path.startsWith("/session/session-native-v1/summarize"));
+    assert.deepEqual(openV1Compact.body, { providerID: "easywork", modelID: "model-agent-1" });
+
     const codexExecutor = new FakeExecutor();
     const codexAdapter = createCodexAdapter();
     const codexTransport = new AgentRuntimeTransport({
@@ -2783,6 +3283,66 @@ describe("three-Agent executable runtime transport", () => {
     const contextUsage = await codexTransport.execute(requestFor(codexAdapter, "contextUsage", { threadId: "thread-native-1" }, { binding: codexBinding }));
     assert.deepEqual(contextUsage.contextUsage, { used: 12_000, limit: 150_000, remaining: 138_000, ratio: 0.08 });
 
+    const qoderAdapter = createQoderCnAdapter();
+    const qoderExecutor = new FakeExecutor();
+    const qoderTransport = new AgentRuntimeTransport({
+      executor: qoderExecutor,
+      deploymentService: deploymentResolver(),
+      configurationService: { async runtimeValues() { return { contextLimit: "150000" }; } },
+    });
+    const qoderSessionId = "77777777-7777-4777-8777-777777777777";
+    const qoderStart = await qoderTransport.execute(requestFor(qoderAdapter, "start", { prompt: "x" }));
+    const qoderBinding = binding(qoderAdapter, {
+      activeRunId: qoderStart.runId,
+      native: { ...qoderStart.bindingPatch.native, sessionId: qoderSessionId },
+    });
+    const qoderCompact = qoderTransport.execute(requestFor(qoderAdapter, "compact", {
+      processId: qoderStart.bindingPatch.native.processId,
+      sessionId: qoderSessionId,
+    }, { binding: qoderBinding }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(qoderExecutor.processes[0].writes.at(-1).message.content[0].text, "/compact");
+    qoderExecutor.processes[0].queue.push(JSON.stringify({
+      type: "system",
+      subtype: "compact_boundary",
+      session_id: qoderSessionId,
+      compact_metadata: { trigger: "manual", pre_tokens: 30_000 },
+    }));
+    await qoderCompact;
+
+    const rejectedCompact = qoderTransport.execute(requestFor(qoderAdapter, "compact", {
+      processId: qoderStart.bindingPatch.native.processId,
+      sessionId: qoderSessionId,
+    }, { binding: qoderBinding }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(qoderExecutor.processes.length, 2, "输入已结束的 Qoder 进程必须恢复同一原生会话");
+    qoderExecutor.processes[1].queue.push(JSON.stringify({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "Conversation is too short to compress" }] },
+    }));
+    qoderExecutor.processes[1].queue.push(JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Conversation is too short to compress",
+    }));
+    await assert.rejects(rejectedCompact, (error) => {
+      assert.equal(error.code, "AGENT_COMPACT_NOT_APPLIED");
+      assert.match(error.message, /Conversation is too short to compress/);
+      return true;
+    });
+    assert.deepEqual(qoderExecutor.processes[1].signals, ["SIGTERM"]);
+
+    const qoderUsage = await qoderTransport.execute(requestFor(qoderAdapter, "contextUsage", {
+      sessionId: qoderSessionId,
+    }, {
+      binding: binding(qoderAdapter, {
+        native: { sessionId: qoderSessionId },
+        state: qoderAdapter.createState({ contextUsage: { ratio: 0.25, limit: 200_000, source: "qoder-cn-current-request" } }),
+      }),
+    }));
+    assert.deepEqual(qoderUsage.contextUsage, { used: 50_000, limit: 150_000, remaining: 100_000, ratio: 1 / 3, source: "qoder-cn-current-request" });
+
     const claudeExecutor = new FakeExecutor();
     const claudeAdapter = createClaudeCodeAdapter();
     const claudeTransport = new AgentRuntimeTransport({
@@ -2796,11 +3356,14 @@ describe("three-Agent executable runtime transport", () => {
       native: { ...claudeStart.bindingPatch.native, sessionId: "claude-session-1" },
       state: claudeAdapter.createState({ contextUsage: { used: 42_000, limit: 200_000, ratio: 0.21, source: "claude-code-current-request" } }),
     });
-    await claudeTransport.execute(requestFor(claudeAdapter, "compact", {
+    const activeClaudeCompact = claudeTransport.execute(requestFor(claudeAdapter, "compact", {
       processId: claudeStart.bindingPatch.native.processId,
       sessionId: "claude-session-1",
     }, { binding: claudeBinding }));
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(claudeExecutor.processes[0].writes.at(-1).message.content[0].text, "/compact");
+    claudeExecutor.processes[0].queue.push(JSON.stringify({ type: "system", subtype: "compact_boundary", session_id: "claude-session-1" }));
+    await activeClaudeCompact;
 
     claudeExecutor.processes[0].close();
     const completedCompact = claudeTransport.execute(requestFor(claudeAdapter, "compact", {

@@ -5,7 +5,7 @@ import { ApiError, invariant } from "../errors.mjs";
 
 export const AGENT_RUNTIME_SCHEMA_VERSION = 1;
 
-export const RUNTIME_AGENT_IDS = Object.freeze(["opencode", "codex", "claude-code"]);
+export const RUNTIME_AGENT_IDS = Object.freeze(["opencode", "codex", "claude-code", "qoder-cn"]);
 
 export const MANAGED_AGENT_DEFINITIONS = Object.freeze({
   opencode: Object.freeze({
@@ -27,6 +27,13 @@ export const MANAGED_AGENT_DEFINITIONS = Object.freeze({
     packageId: "claudecode",
     displayName: "Claude Code",
     binary: "claude",
+    launch: Object.freeze([]),
+  }),
+  "qoder-cn": Object.freeze({
+    id: "qoder-cn",
+    packageId: "qodercncli",
+    displayName: "Qoder CN",
+    binary: "qoderclicn",
     launch: Object.freeze([]),
   }),
 });
@@ -117,6 +124,9 @@ export function remoteAgentPaths(home, agentId, bindingId = null) {
     // for one webpage conversation never exposes it to another binding.
     skillCacheRoot: `${easyworkRoot}/skills`,
     skillsRoot: `${easyworkRoot}/skills`,
+    accountsRoot: `${easyworkRoot}/accounts`,
+    accountRoot: `${easyworkRoot}/accounts/${definition.packageId}`,
+    accountAuthRoot: `${easyworkRoot}/accounts/${definition.packageId}/.auth`,
   };
   if (bindingId !== null && bindingId !== undefined) {
     const bindingDirectory = bindingDirectoryName(bindingId);
@@ -191,6 +201,7 @@ export function runtimeEnvironment(paths, extra = {}) {
     XDG_CACHE_HOME: paths.runtimeCache,
     CODEX_HOME: `${paths.runtimeData}/codex`,
     CLAUDE_CONFIG_DIR: `${paths.runtimeData}/claude`,
+    QODERCN_CONFIG_DIR: `${paths.runtimeData}/qoder-cn`,
     OPENCODE_CONFIG_DIR: `${paths.runtimeConfig}/opencode`,
     EASYWORK_SKILLS_DIR: paths.skillsRoot,
     EASYWORK_FILES_DIR: paths.filesRoot,

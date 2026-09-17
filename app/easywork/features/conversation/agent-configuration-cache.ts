@@ -33,7 +33,7 @@ const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
 // Configuration field labels/options are part of the cached payload. Keep the
 // cache namespace versioned so a UI/schema release cannot keep rendering stale
 // option metadata for up to MAX_AGE_MS (for example, pre-bilingual labels).
-const PREFIX = "easywork.agent-configuration:v2:";
+const PREFIX = "easywork.agent-configuration:v3:";
 
 function cacheKey(actorId: string | undefined, serverId: string, configScope: string, agentId: string) {
   if (!actorId || !serverId || !configScope || !agentId) return null;
@@ -90,11 +90,15 @@ export function copyAgentConfigurationCache(actorId: string | undefined, serverI
 
 export function mergeCachedAgentConfigurations(agents: AgentSummary[], actorId: string | undefined, serverId: string, configScope: string) {
   return agents.map((agent) => {
+    const qoderReady = agent.agentId === "qoder-cn"
+      && agent.installed
+      && agent.status === "ready"
+      && agent.authentication?.authenticated === true;
     // Deployment state is server-wide and can be reused immediately across
     // conversations.  Model/config values are conversation-scoped, though, so
     // never leak another scope's values while using that shared inventory.
     const scopedAgent = agent.configuration?.configScope && agent.configuration.configScope !== configScope
-      ? { ...agent, configuration: null, model: null, configured: false }
+      ? { ...agent, configuration: null, model: null, configured: qoderReady }
       : agent;
     const cached = readAgentConfigurationCache(actorId, serverId, configScope, agent.agentId);
     const remote = agent.configuration?.configScope === configScope ? agent.configuration as AgentConfiguration : null;
@@ -111,7 +115,9 @@ export function mergeCachedAgentConfigurations(agents: AgentSummary[], actorId: 
       ...scopedAgent,
       configuration,
       model,
-      configured: Boolean(scopedAgent.installed && scopedAgent.status === "ready" && model),
+      configured: scopedAgent.agentId === "qoder-cn"
+        ? qoderReady
+        : Boolean(scopedAgent.installed && scopedAgent.status === "ready" && model),
     };
   });
 }

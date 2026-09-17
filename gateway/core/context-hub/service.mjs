@@ -415,6 +415,30 @@ export class ContextHub {
     });
   }
 
+  async inheritBindingReceipt({ sourceBindingKey, targetBindingKey, nativeSessionId }) {
+    invariant(sourceBindingKey && targetBindingKey && nativeSessionId, "CONTEXT_RECEIPT_INVALID", "迁移 Context receipt 时缺少 Agent binding 或原生会话", { status: 400 });
+    const sourceKey = String(sourceBindingKey);
+    const targetKey = String(targetBindingKey);
+    const sessionId = String(nativeSessionId);
+    if (sourceKey === targetKey) return { inherited: false, bindingKey: targetKey, nativeSessionId: sessionId };
+    const repository = this.#receipts();
+    let inherited = false;
+    await updateWithLatestRevision(repository, (data) => {
+      const source = data.bindings[sourceKey] || null;
+      if (source?.nativeSessionId !== sessionId) return;
+      const target = data.bindings[targetKey] || null;
+      if (target?.nativeSessionId === sessionId) return;
+      data.bindings[targetKey] = {
+        ...normalizeReceiptForMutation(source),
+        nativeSessionId: sessionId,
+        inheritedFromBindingKey: sourceKey,
+        acknowledgedAt: new Date().toISOString(),
+      };
+      inherited = true;
+    });
+    return { inherited, bindingKey: targetKey, nativeSessionId: sessionId };
+  }
+
   async deliveryForRebinding(bindingKey, delivery) {
     validateContextDelivery(delivery);
     const [receipts, sessions] = await Promise.all([

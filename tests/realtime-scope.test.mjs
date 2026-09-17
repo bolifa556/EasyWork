@@ -9,6 +9,7 @@ import { RealtimeEventJournal } from "../gateway/core/realtime.mjs";
 import {
   computeServerIdentity,
   createAgentBindingKey,
+  createLegacyAgentBindingKey,
   createEffectiveContextScope,
 } from "../gateway/core/scope.mjs";
 
@@ -85,7 +86,11 @@ test("EffectiveContextScope 由服务端身份构建并形成完整 Agent bindin
   assert.equal(key, createAgentBindingKey({ ...scope, taskId: "task-2" }, "codex"));
   assert.notEqual(key, createAgentBindingKey({ ...scope, conversationId: "conversation-2" }, "codex"));
   assert.notEqual(key, createAgentBindingKey({ ...scope, branchId: "branch-2" }, "codex"));
-  assert.notEqual(key, createAgentBindingKey({ ...scope, workspaceId: "workspace-2" }, "codex"));
+  assert.equal(key, createAgentBindingKey({ ...scope, workspaceId: "workspace-2" }, "codex"));
+  assert.notEqual(
+    createLegacyAgentBindingKey(scope, "codex"),
+    createLegacyAgentBindingKey({ ...scope, workspaceId: "workspace-2" }, "codex"),
+  );
   assert.notEqual(key, createAgentBindingKey({ ...scope, serverIdentity: `ssh_${"z".repeat(43)}` }, "codex"));
   assert.notEqual(key, createAgentBindingKey({ ...scope, contextEpoch: 4 }, "codex"));
   assert.notEqual(key, createAgentBindingKey(scope, "claude-code"));

@@ -132,7 +132,7 @@ test("real workspaces register independently and do not touch the lazy version l
   assert.equal(versioning.ledgers.size, 0);
 });
 
-test("agent and workspace combinations own independent native sessions while workspaces may be shared", async (t) => {
+test("workspace routes stay distinct while same-server workspace changes preserve the current Agent session", async (t) => {
   const { service } = await fixture(t);
   const virtual = await service.createVirtual({
     conversationId: "conv-a", serverIdentity: SERVER_IDENTITY, expectedRevision: 0, commandId: "cmd-v-a",
@@ -185,6 +185,8 @@ test("agent and workspace combinations own independent native sessions while wor
   assert.equal(switchDescriptor.requiresConfirmation, true);
   assert.equal(switchDescriptor.effects.preservesWebConversationMemory, true);
   assert.equal(switchDescriptor.effects.contextDelivery, "delta-after-watermark");
+  assert.equal(switchDescriptor.effects.switchesNativeAgentSession, true);
+  assert.equal(switchDescriptor.effects.preservesNativeAgentSession, false);
   const switched = await service.switchBinding({
     ...switchDescriptor,
     descriptorId: switchDescriptor.id,
@@ -205,6 +207,19 @@ test("agent and workspace combinations own independent native sessions while wor
   });
   assert.equal(switched.binding.agentId, "codex");
   assert.equal(replay.idempotentReplay, true);
+
+  const workspaceDescriptor = await service.describeSwitch({
+    conversationId: "conv-a",
+    branchId: "main",
+    workspaceId: real.workspace.id,
+    agentId: "codex",
+    contextEpoch: 0,
+  });
+  assert.equal(workspaceDescriptor.requiresConfirmation, true);
+  assert.equal(workspaceDescriptor.effects.switchesNativeAgentSession, false);
+  assert.equal(workspaceDescriptor.effects.preservesNativeAgentSession, true);
+  assert.equal(workspaceDescriptor.effects.changesNativeWorkspace, true);
+  assert.equal(workspaceDescriptor.targetContextEpoch, switched.binding.contextEpoch);
 
   const nextEpoch = await service.ensureAgentBinding({
     conversationId: "conv-a", branchId: "main", workspaceId: virtual.workspace.id, agentId: "opencode", contextEpoch: 1,

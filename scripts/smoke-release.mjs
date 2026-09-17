@@ -14,16 +14,17 @@ const root = path.resolve(process.argv[2] || ".");
 const metadata = JSON.parse(await readFile(path.join(root, "release.json"), "utf8"));
 assert.equal(process.arch, "x64");
 assert.equal(process.versions.node, metadata.nodeVersion);
-assert.deepEqual(metadata.agentPlatforms, ["linux-x64", "linux-x64-musl"]);
+assert.deepEqual(metadata.agentPlatforms, ["linux-x64", "linux-x64-musl", "linux-arm64", "linux-arm64-musl"]);
 const agentRoot = path.join(root, "agent-app");
 const agentManifest = JSON.parse(await readFile(path.join(agentRoot, "manifest.json"), "utf8"));
-assert.deepEqual(Object.keys(agentManifest.agents).sort(), ["claudecode", "codex", "opencode"]);
+assert.deepEqual(Object.keys(agentManifest.agents).sort(), ["claudecode", "codex", "opencode", "qodercncli"]);
 const { HostAgentArtifactCatalog } = await import(pathToFileURL(path.join(root, "gateway/core/agent-runtime/manifest.mjs")));
 const catalog = new HostAgentArtifactCatalog({ root: agentRoot });
+const runtimeAgentId = (id) => ({ claudecode: "claude-code", qodercncli: "qoder-cn" })[id] || id;
 for (const [id, agent] of Object.entries(agentManifest.agents)) {
   assert.equal(agent.version, metadata.agents[id]);
-  assert.deepEqual(Object.keys(agent.artifacts).sort(), [...metadata.agentPlatforms].sort(), "Only x64 agent platforms");
-  for (const platform of metadata.agentPlatforms) await catalog.resolve(id === "claudecode" ? "claude-code" : id, platform, { verify: false });
+  assert.deepEqual(Object.keys(agent.artifacts).sort(), [...metadata.agentPlatforms].sort(), "All declared remote Linux agent platforms");
+  for (const platform of metadata.agentPlatforms) await catalog.resolve(runtimeAgentId(id), platform, { verify: false });
 }
 async function runUpdater(command, args) {
   const updater = spawn(command, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
@@ -136,7 +137,7 @@ try {
     clearTimeout(timeout);
     socket.close();
   }
-  console.log(JSON.stringify({ target: metadata.target, os: `${os.type()} ${os.release()}`, node: process.versions.node, arch: process.arch, agents: metadata.agents, checks: ["bundled x64 agent catalog", "native updater scripts and SHA-256 verification", "native canvas", "PDF extraction", "Word extraction", "SSH library", "home page", `${assets.length} static assets`, "registration", "clean data", "authenticated API", "WebSocket"] }, null, 2));
+  console.log(JSON.stringify({ target: metadata.target, os: `${os.type()} ${os.release()}`, node: process.versions.node, arch: process.arch, agents: metadata.agents, checks: ["bundled remote Linux agent catalog", "native updater scripts and SHA-256 verification", "native canvas", "PDF extraction", "Word extraction", "SSH library", "home page", `${assets.length} static assets`, "registration", "clean data", "authenticated API", "WebSocket"] }, null, 2));
 } catch (error) {
   console.error(logs);
   throw error;

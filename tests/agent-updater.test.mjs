@@ -17,7 +17,12 @@ async function fixture(t) {
   t.after(() => rm(root, { recursive: true, force: true }));
   const manifest = { schemaVersion: 1, updatedAt: "2026-01-01T00:00:00Z", agents: {} };
   for (const id of ["opencode", "codex", "claudecode"]) {
-    manifest.agents[id] = { version: "1.0.0", artifacts: { "linux-x64": artifact(id), "linux-x64-musl": artifact(id), "linux-arm64": artifact(id) } };
+    manifest.agents[id] = { version: "1.0.0", artifacts: {
+      "linux-x64": artifact(id),
+      "linux-x64-musl": artifact(id),
+      "linux-arm64": artifact(id),
+      "linux-arm64-musl": artifact(id),
+    } };
     await mkdir(path.join(root, id));
     await writeFile(path.join(root, id, "old-agent"), bytes);
   }
@@ -30,7 +35,10 @@ function githubRelease(url) {
   const codex = url.includes("/openai/codex/");
   return {
     tag_name: codex ? "rust-v2.0.0" : "v2.0.0",
-    assets: (codex ? ["codex-x86_64-unknown-linux-musl.tar.gz"] : ["opencode-linux-x64.tar.gz", "opencode-linux-x64-musl.tar.gz"]).map((name) => ({
+    assets: (codex
+      ? ["codex-x86_64-unknown-linux-musl.tar.gz", "codex-aarch64-unknown-linux-musl.tar.gz"]
+      : ["opencode-linux-x64.tar.gz", "opencode-linux-x64-musl.tar.gz", "opencode-linux-arm64.tar.gz", "opencode-linux-arm64-musl.tar.gz"]
+    ).map((name) => ({
       name, digest: "sha256:" + checksum(bytes), size: bytes.length, browser_download_url: "https://example.test/" + name,
     })),
   };
@@ -75,6 +83,37 @@ test("latest update preserves other agents and old binaries, and backs up the ex
   assert.deepEqual(await readFile(path.join(root, next.agents.opencode.artifacts["linux-x64"].file)), bytes);
 });
 
+test("pinned compatibility releases are downloaded, checked and preserved by latest updates", async (t) => {
+  const { root, manifest, options } = await fixture(t);
+  const compatibility = [{
+    id: "legacy-glibc-2.17",
+    version: "0.9.0",
+    selector: { platforms: ["linux-x64"], libcFamily: "glibc", libcMax: "2.17" },
+    artifacts: {
+      "linux-x64": { ...artifact("claudecode"), file: "claudecode/legacy-agent" },
+    },
+  }];
+  manifest.agents.claudecode.compatibility = compatibility;
+  await writeFile(path.join(root, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+  let downloads = 0;
+  await updateCatalog(["--agent", "claudecode", "--platform", "linux-x64"], {
+    ...options,
+    download: async (input) => { downloads += 1; await save(input); },
+  });
+  assert.equal(downloads, 2);
+  assert.deepEqual(await readFile(path.join(root, "claudecode/legacy-agent")), bytes);
+
+  await updateCatalog(["--latest", "--agent", "claudecode", "--platform", "linux-x64"], {
+    ...options,
+    request: async (url) => url.endsWith("/latest")
+      ? "2.0.0"
+      : { platforms: { "linux-x64": { checksum: checksum(bytes), size: bytes.length } } },
+    download: save,
+  });
+  const next = JSON.parse(await readFile(path.join(root, "manifest.json"), "utf8"));
+  assert.deepEqual(next.agents.claudecode.compatibility, compatibility);
+});
+
 test("a late download failure keeps the old catalog and all referenced binaries usable", async (t) => {
   const { root, original, options } = await fixture(t);
   let downloads = 0;
@@ -95,23 +134,27 @@ test("invalid downloads never activate the new catalog", async (t) => {
   assert.equal(await readFile(path.join(root, "manifest.json"), "utf8"), original);
 });
 
-test("both Codex libc variants share one verified archive after an update", async (t) => {
+test("Codex libc variants share one verified archive per architecture after an update", async (t) => {
   const { root, options } = await fixture(t);
   let downloads = 0;
   await updateCatalog(["--latest", "--agent", "codex"], { ...options, request: githubRelease, download: async (input) => { downloads += 1; await save(input); } });
   const next = JSON.parse(await readFile(path.join(root, "manifest.json"), "utf8"));
   const variants = Object.values(next.agents.codex.artifacts);
-  assert.equal(downloads, 1);
-  assert.equal(variants.length, 2);
-  assert.equal(variants[0].file, variants[1].file);
+  assert.equal(downloads, 2);
+  assert.equal(variants.length, 4);
+  assert.equal(next.agents.codex.artifacts["linux-x64"].file, next.agents.codex.artifacts["linux-x64-musl"].file);
+  assert.equal(next.agents.codex.artifacts["linux-arm64"].file, next.agents.codex.artifacts["linux-arm64-musl"].file);
   assert.equal(variants[0].binary, "codex-x86_64-unknown-linux-musl");
+  assert.equal(next.agents.codex.artifacts["linux-arm64"].binary, "codex-aarch64-unknown-linux-musl");
 });
 
 test("Claude metadata without a declared size gets the verified binary size in the catalog", async (t) => {
   const { root, options } = await fixture(t);
   await updateCatalog(["--latest", "--agent", "claudecode"], {
     ...options,
-    request: async (url) => url.endsWith("/latest") ? "2.0.0" : { platforms: { "linux-x64": { checksum: checksum(bytes) }, "linux-x64-musl": { checksum: checksum(bytes) } } },
+    request: async (url) => url.endsWith("/latest") ? "2.0.0" : { platforms: Object.fromEntries([
+      "linux-x64", "linux-x64-musl", "linux-arm64", "linux-arm64-musl",
+    ].map((platform) => [platform, { checksum: checksum(bytes) }])) },
     download: save,
   });
   const next = JSON.parse(await readFile(path.join(root, "manifest.json"), "utf8"));
@@ -120,9 +163,41 @@ test("Claude metadata without a declared size gets the verified binary size in t
 
 test("missing upstream checksum and incompatible CLI options fail before downloading", async () => {
   await assert.rejects(resolveLatest("codex", ["linux-x64"], async () => ({ tag_name: "rust-v2.0.0", assets: [] })), /official SHA-256/);
-  assert.throws(() => parseOptions(["--platform", "linux-arm64"]), /Unsupported/);
+  assert.deepEqual(parseOptions(["--platform", "linux-arm64"]).platforms, ["linux-arm64"]);
+  assert.throws(() => parseOptions(["--platform", "linux-riscv64"]), /Unsupported/);
   assert.throws(() => parseOptions(["--latest", "--check"]), /only one/);
   assert.throws(() => parseOptions(["--agent"]), /Missing value/);
+});
+
+test("Qoder CN 官方清单映射四种 Linux 包并为缺少优化指令集的 x64 主机保留 baseline", async () => {
+  const hashes = {
+    amd64: "1".repeat(64),
+    "amd64-musl": "2".repeat(64),
+    arm64: "3".repeat(64),
+    "arm64-musl": "4".repeat(64),
+    "amd64-baseline": "5".repeat(64),
+  };
+  const release = {
+    latest: "1.2.3",
+    files: Object.entries(hashes).map(([arch, sha256]) => ({
+      os: "linux",
+      arch,
+      sha256,
+      url: `https://static.qoder.com.cn/qoder-cli-cn/1.2.3/qoderclicn-linux-${arch}.tar.gz`,
+    })),
+  };
+  const resolved = await resolveLatest("qodercncli", ["linux-x64", "linux-x64-musl", "linux-arm64", "linux-arm64-musl"], async (url) => {
+    assert.equal(url, "https://static.qoder.com.cn/qoder-cli-cn/channels/manifest.json");
+    return release;
+  });
+  assert.equal(resolved.version, "1.2.3");
+  assert.deepEqual(Object.keys(resolved.artifacts), ["linux-x64", "linux-x64-musl", "linux-arm64", "linux-arm64-musl"]);
+  assert.equal(resolved.artifacts["linux-x64"].binary, "qoderclicn");
+  assert.equal(resolved.artifacts["linux-arm64-musl"].sha256, hashes["arm64-musl"]);
+  const baseline = resolved.compatibility["linux-x64-baseline"];
+  assert.equal(baseline.artifacts["linux-x64"].sha256, hashes["amd64-baseline"]);
+  assert.deepEqual(baseline.selector.platforms, ["linux-x64"]);
+  assert.deepEqual(baseline.selector.missingCpuFlags, ["sse4_2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "fma"]);
 });
 
 test("unsafe paths and malformed manifests are never repaired by overwriting the catalog", async (t) => {

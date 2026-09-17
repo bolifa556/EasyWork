@@ -1,9 +1,9 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("opencode", "codex", "claudecode")]
-  [string[]]$Agent = @("opencode", "codex", "claudecode"),
-  [ValidateSet("linux-x64", "linux-x64-musl")]
-  [string[]]$Platform = @("linux-x64", "linux-x64-musl"),
+  [ValidateSet("opencode", "codex", "claudecode", "qodercncli")]
+  [string[]]$Agent = @("opencode", "codex", "claudecode", "qodercncli"),
+  [ValidateSet("linux-x64", "linux-x64-musl", "linux-arm64", "linux-arm64-musl")]
+  [string[]]$Platform = @(),
   [switch]$Latest,
   [switch]$Locked,
   [switch]$Check,
@@ -19,7 +19,8 @@ if (-not (Test-Path -LiteralPath $taskNode -PathType Leaf)) {
   if (-not $taskNodeCommand) { throw "Node.js 22.13+ is required. Use an EasyWork release with its bundled runtime." }
   $taskNode = $taskNodeCommand.Source
 }
-$taskArguments = @("--agent", ($Agent -join ","), "--platform", ($Platform -join ","))
+$taskArguments = @("--agent", ($Agent -join ","))
+if ($Platform.Count -gt 0) { $taskArguments += @("--platform", ($Platform -join ",")) }
 if ($Latest) { $taskArguments += "--latest" }
 elseif ($Check) { $taskArguments += "--check" }
 else { $taskArguments += "--locked" }

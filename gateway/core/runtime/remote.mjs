@@ -924,6 +924,7 @@ export class RoutingAgentTransport {
     const serverId = request?.task?.route?.serverId;
     invariant(serverId, "AGENT_ROUTE_SERVER_REQUIRED", "Agent 请求缺少 serverId", { status: 400 });
     const transport = await this.resolveTransport(serverId);
+    if (request.adapterId === "qoder-cn") return transport.execute({ ...request, apiRoute: null });
     const route = request?.task?.route;
     if (!this.resolveApiRoute || request.apiRoute || !route?.providerId || !route?.modelId) return transport.execute(request);
     const apiRoute = await this.resolveApiRoute({ request, serverId, providerId: route.providerId, modelId: route.modelId });
@@ -950,6 +951,7 @@ export class RoutingAgentTransport {
     const transport = await this.resolveTransport(serverId);
     invariant(typeof transport.prepare === "function", "AGENT_PREPARE_UNAVAILABLE", "远端 Agent transport 不支持并行预备", { status: 503 });
     const route = request?.task?.route;
+    if (request.adapterId === "qoder-cn") return transport.prepare({ ...request, apiRoute: null });
     if (!this.resolveApiRoute || request.apiRoute || !route?.providerId || !route?.modelId) return transport.prepare(request);
     const apiRoute = await this.resolveApiRoute({ request, serverId, providerId: route.providerId, modelId: route.modelId });
     invariant(apiRoute && typeof apiRoute === "object", "AGENT_API_ROUTE_RESOLUTION_FAILED", "无法解析 Agent 模型 API", { status: 500, expose: false });

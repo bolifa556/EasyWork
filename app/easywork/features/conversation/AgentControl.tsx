@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { Bot, Check, ChevronDown, ChevronLeft, ChevronRight, Code2, Database, Download, FileText, FolderSearch, LoaderCircle, Plus, RefreshCw, Save, Settings2, Trash2, X } from "lucide-react";
+import { Bot, Check, ChevronDown, ChevronLeft, ChevronRight, Database, Download, FileText, FolderSearch, LoaderCircle, LogIn, Plus, RefreshCw, Save, Settings2, Trash2, X } from "lucide-react";
 import type { AgentSummary, ModelProviderSummary } from "@/app/core/contracts";
 import { commandId } from "@/app/core/gateway/client";
 import { useAppRuntime } from "../../runtime/AppRuntime";
@@ -20,7 +20,32 @@ type ContextState =
   | { status: "idle" | "loading"; usage: null; reason: null }
   | { status: "ready"; usage: { used: number; limit: number | null; ratio: number | null }; reason: null }
   | { status: "unavailable"; usage: null; reason: string };
-type ModelSummary = { id: string; name: string };
+type ModelSummary = {
+  id: string;
+  name: string;
+  description?: string;
+  isDefault?: boolean;
+  isNew?: boolean;
+  isFree?: boolean;
+  priceFactor?: number | null;
+  originalPriceFactor?: number | null;
+  contextTiers?: { label: string; tokens: number; isDefault: boolean }[];
+  defaultContextWindow?: number | null;
+  efforts?: string[];
+  defaultEffort?: string | null;
+  promotion?: { active: boolean; badge?: Record<string, string>; discountFactor?: number; originalPriceFactor?: number } | null;
+};
+type QoderQuota = { total: number | null; used: number | null; remaining: number | null; percentage: number | null; unit: string | null };
+type QoderUsage = {
+  userQuota: QoderQuota | null;
+  addOnQuota: QoderQuota | null;
+  orgResourcePackage: (QoderQuota & { available?: boolean }) | null;
+  totalUsagePercentage: number | null;
+  expiresAt: number | null;
+  isQuotaExceeded: boolean;
+};
+type QoderCatalog = { agentId: "qoder-cn"; models: ModelSummary[]; usage: QoderUsage | null; usageError?: string | null; fetchedAt: string };
+type CachedQoderCatalog = { value: QoderCatalog; savedAt: number };
 type AgentUpdate = { agentId: string; installedVersion: string; availableVersion: string; updateAvailable: boolean };
 type MenuPage = "root" | "config" | "models";
 type MenuAnchor = { top: number; right: number; bottom: number; left: number };
@@ -28,9 +53,13 @@ type MenuAnchor = { top: number; right: number; bottom: number; left: number };
 const initialContext: ContextState = { status: "idle", usage: null, reason: null };
 type CachedContext = { state: Extract<ContextState, { status: "ready" }>; contextRevision: number; savedAt: number };
 const agentContextCache = new Map<string, CachedContext>();
-// v3 drops Claude snapshots produced from aggregate result usage rather than
-// the last concrete model request.
-const AGENT_CONTEXT_CACHE_PREFIX = "easywork.agent-context:v3:";
+// v4 also drops Qoder snapshots created before native context_usage_ratio was
+// preserved, so the first open after upgrading reads the corrected binding.
+const AGENT_CONTEXT_CACHE_PREFIX = "easywork.agent-context:v4:";
+const QODER_CATALOG_CACHE_PREFIX = "easywork.qoder-catalog:v1:";
+const QODER_CATALOG_FRESH_MS = 5 * 60_000;
+const QODER_CATALOG_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
+const qoderCatalogCache = new Map<string, CachedQoderCatalog>();
 
 function readCachedContext(key: string | null) {
   if (!key) return null;
@@ -62,6 +91,38 @@ function clearCachedContext(key: string | null) {
   try { localStorage.removeItem(`${AGENT_CONTEXT_CACHE_PREFIX}${key}`); } catch { /* nothing else to clear */ }
 }
 
+function qoderCatalogKey(actorId: string | undefined, serverId: string, agent: AgentSummary | undefined) {
+  if (!actorId || !agent) return null;
+  return `${actorId}:${serverId}:${agent.version || agent.authentication?.version || "unknown"}`;
+}
+
+function readCachedQoderCatalog(key: string | null) {
+  if (!key) return null;
+  const memory = qoderCatalogCache.get(key);
+  if (memory && Date.now() - memory.savedAt <= QODER_CATALOG_MAX_AGE_MS) return memory;
+  if (typeof window === "undefined") return null;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(`${QODER_CATALOG_CACHE_PREFIX}${key}`) || "null") as CachedQoderCatalog | null;
+    if (!parsed || !Array.isArray(parsed.value?.models) || !Number.isFinite(parsed.savedAt) || Date.now() - parsed.savedAt > QODER_CATALOG_MAX_AGE_MS) return null;
+    qoderCatalogCache.set(key, parsed);
+    return parsed;
+  } catch { return null; }
+}
+
+function writeCachedQoderCatalog(key: string | null, value: QoderCatalog) {
+  if (!key) return;
+  const cached = { value, savedAt: Date.now() };
+  qoderCatalogCache.delete(key);
+  qoderCatalogCache.set(key, cached);
+  while (qoderCatalogCache.size > 24) qoderCatalogCache.delete(qoderCatalogCache.keys().next().value as string);
+  if (typeof window === "undefined") return;
+  try { localStorage.setItem(`${QODER_CATALOG_CACHE_PREFIX}${key}`, JSON.stringify(cached)); } catch { /* memory cache remains available */ }
+}
+
+function sameQoderModels(left: ModelSummary[], right: ModelSummary[]) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 function operationAvailable(agent: AgentSummary | undefined, operation: "contextUsage" | "compact") {
   return agent?.runtimeCapabilities?.[operation]?.availability === "available";
 }
@@ -70,6 +131,38 @@ function formatTokens(value: number) {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1)}k`;
   return String(value);
+}
+
+function formatCredits(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  return Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function qoderModelPrice(model: ModelSummary) {
+  const priceFactor = typeof model.priceFactor === "number" ? model.priceFactor : model.promotion?.discountFactor;
+  const originalPriceFactor = typeof model.originalPriceFactor === "number" ? model.originalPriceFactor : model.promotion?.originalPriceFactor;
+  if (model.isFree || priceFactor === 0) return "免费";
+  if (typeof priceFactor !== "number" || !Number.isFinite(priceFactor)) return "";
+  const current = `${Number(priceFactor).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}× Credits`;
+  return typeof originalPriceFactor === "number" && Number.isFinite(originalPriceFactor) && originalPriceFactor !== priceFactor
+    ? `${current}（原 ${Number(originalPriceFactor).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}×）`
+    : current;
+}
+
+function qoderQuotaSummary(quota: QoderQuota | null | undefined) {
+  if (!quota) return null;
+  const unit = quota.unit || "Credits";
+  const valid = (value: number | null | undefined) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+  if (valid(quota.remaining) && valid(quota.total)) return `${formatCredits(quota.remaining)} / ${formatCredits(quota.total)} ${unit}`;
+  if (valid(quota.used) && valid(quota.total)) return `已用 ${formatCredits(quota.used)} / ${formatCredits(quota.total)} ${unit}`;
+  if (valid(quota.percentage)) return `已用 ${formatCredits(quota.percentage)}%`;
+  return null;
+}
+
+function missingConfigurationLabel(agent: AgentSummary, needsLogin: boolean) {
+  if (needsLogin) return "需要登录";
+  if (agent.agentId === "qoder-cn") return agent.model || "自动选择";
+  return agent.managed && !agent.configured ? "需要配置api" : null;
 }
 
 function sourceOf(agent: AgentSummary) {
@@ -104,16 +197,20 @@ export function AgentSelectionList({
   selectedAgentId,
   disabled,
   installingAgentId,
+  loggingInAgentId,
   onSelect,
   onInstall,
+  onLogin,
   onManualAdd,
 }: {
   agents: AgentSummary[];
   selectedAgentId: string | null;
   disabled?: boolean;
   installingAgentId?: string | null;
+  loggingInAgentId?: string | null;
   onSelect: (agentId: string) => Promise<void>;
   onInstall?: (agentId: string) => Promise<void>;
+  onLogin?: (agentId: string) => Promise<void>;
   onManualAdd?: () => void;
 }) {
   const [switching, setSwitching] = useState<string | null>(null);
@@ -126,11 +223,13 @@ export function AgentSelectionList({
   return <div className={styles.selectionPanel}>
     <div className={styles.agentList}>{agents.map((agent) => {
       const ready = agent.installed && agent.status === "ready";
-      return ready ? <button key={agent.agentId} className={agent.agentId === selectedAgentId ? styles.activeAgent : undefined} disabled={Boolean(switching) || disabled} onClick={() => void select(agent.agentId)}>
-        <span>{agent.agentId === "opencode" ? <Code2 size={15} /> : <Bot size={15} />}<span className={styles.agentIdentity}><strong>{agent.displayName}{agent.model ? <small>{agent.model}</small> : agent.managed && !agent.configured ? <small>需要配置api</small> : null}</strong><small>EasyWork已部署</small></span></span>
+      const needsLogin = agent.authentication?.required === true && !agent.authentication.authenticated;
+      const requirement = missingConfigurationLabel(agent, needsLogin);
+      return ready ? <div className={styles.agentReadyRow} key={agent.agentId}><button className={agent.agentId === selectedAgentId ? styles.activeAgent : undefined} disabled={Boolean(switching) || disabled} onClick={() => void select(agent.agentId)}>
+        <span><Bot size={15} /><span className={styles.agentIdentity}><strong>{agent.displayName}{agent.model ? <small>{agent.model}</small> : requirement ? <small>{requirement}</small> : null}</strong><small>EasyWork已部署</small></span></span>
         {switching === agent.agentId ? <LoaderCircle className={styles.spin} size={15} /> : agent.agentId === selectedAgentId ? <Check size={15} /> : null}
-      </button> : <div className={styles.agentUnavailable} key={agent.agentId}>
-        <span><Bot size={15} /><span className={styles.agentIdentity}><strong>{agent.displayName}{agent.installed && agent.model ? <small>{agent.model}</small> : agent.installed && agent.managed && !agent.configured ? <small>需要配置api</small> : null}</strong><small>{agent.installed ? "EasyWork已部署" : "未部署"}</small></span></span>
+      </button>{needsLogin && onLogin ? <button className={styles.installButton} disabled={Boolean(loggingInAgentId) || Boolean(switching) || disabled} onClick={() => void onLogin(agent.agentId)}>{loggingInAgentId === agent.agentId ? <LoaderCircle className={styles.spin} size={14} /> : <LogIn size={14} />}{loggingInAgentId === agent.agentId ? "等待登录" : "登录"}</button> : null}</div> : <div className={styles.agentUnavailable} key={agent.agentId}>
+        <span><Bot size={15} /><span className={styles.agentIdentity}><strong>{agent.displayName}{agent.installed && agent.model ? <small>{agent.model}</small> : agent.installed && requirement ? <small>{requirement}</small> : null}</strong><small>{agent.installed ? "EasyWork已部署" : "未部署"}</small></span></span>
         {agent.capabilities.install === "available" && onInstall ? <button className={styles.installButton} disabled={Boolean(installingAgentId) || disabled} onClick={() => void onInstall(agent.agentId)}>{installingAgentId === agent.agentId ? <LoaderCircle className={styles.spin} size={14} /> : <Download size={14} />}{installingAgentId === agent.agentId ? "安装中" : "安装"}</button> : null}
       </div>;
     })}
@@ -151,10 +250,13 @@ export function AgentControl({
   disabled,
   canConfigure = true,
   installingAgentId = null,
+  loggingInAgentId = null,
+  onBeforeSelect,
   onSelect,
   onInstall,
-  onManualAdd,
+  onLogin,
   onConfigure,
+  onManualAdd,
   onAgentsChanged,
   triggerVariant = "toolbar",
   triggerLabel,
@@ -174,10 +276,13 @@ export function AgentControl({
   disabled?: boolean;
   canConfigure?: boolean;
   installingAgentId?: string | null;
+  loggingInAgentId?: string | null;
+  onBeforeSelect?: (agentId: string) => Promise<boolean>;
   onSelect: (agentId: string) => Promise<void>;
   onInstall?: (agentId: string) => Promise<void>;
+  onLogin?: (agentId: string) => Promise<void>;
+  onConfigure?: (agent: AgentSummary) => void;
   onManualAdd?: () => void;
-  onConfigure: (agent: AgentSummary) => void;
   onAgentsChanged?: () => Promise<void>;
   triggerVariant?: "toolbar" | "setup";
   triggerLabel?: string;
@@ -188,6 +293,8 @@ export function AgentControl({
 }) {
   const runtime = useAppRuntime();
   const actorId = runtime.bootstrap?.actor.id;
+  const qoderAgent = agents.find((agent) => agent.agentId === "qoder-cn");
+  const qoderCatalogCacheKey = qoderCatalogKey(actorId, serverId, qoderAgent);
   const contextCacheKey = actorId && bindingId && selectedAgentId
     ? `${actorId}:${serverId}:${cacheScope}:${bindingId}:${selectedAgentId}`
     : null;
@@ -218,7 +325,11 @@ export function AgentControl({
   const [providers, setProviders] = useState<ModelProviderSummary[]>([]);
   const [providerId, setProviderId] = useState("");
   const [models, setModels] = useState<ModelSummary[]>([]);
+  const [qoderModels, setQoderModels] = useState<ModelSummary[]>(() => readCachedQoderCatalog(qoderCatalogCacheKey)?.value.models ?? []);
   const [modelsBusy, setModelsBusy] = useState(false);
+  const [qoderUsage, setQoderUsage] = useState<QoderUsage | null>(() => readCachedQoderCatalog(qoderCatalogCacheKey)?.value.usage ?? null);
+  const [qoderUsageBusy, setQoderUsageBusy] = useState(false);
+  const [qoderUsageError, setQoderUsageError] = useState<string | null>(null);
   const selected = agents.find((agent) => agent.agentId === selectedAgentId);
   const installingAgent = agents.find((agent) => agent.agentId === installingAgentId);
   const setupConfigured = Boolean(triggerVariant === "setup" && selected?.installed && selected.status === "ready" && (!selected.managed || selected.configured));
@@ -373,6 +484,43 @@ export function AgentControl({
     finally { setCompacting(false); }
   };
 
+  const loadQoderCatalog = async ({ includeModels = false, force = false, notifyError = false } = {}) => {
+    const cached = readCachedQoderCatalog(qoderCatalogCacheKey);
+    if (cached) {
+      setQoderModels((current) => sameQoderModels(current, cached.value.models) ? current : cached.value.models);
+      if (includeModels) setModels((current) => sameQoderModels(current, cached.value.models) ? current : cached.value.models);
+      setQoderUsage(cached.value.usage);
+      setQoderUsageError(cached.value.usageError || (cached.value.usage ? null : "Qoder 当前未返回积分信息"));
+    }
+    if (!force && cached && Date.now() - cached.savedAt <= QODER_CATALOG_FRESH_MS) return cached.value;
+    if (!cached) {
+      setQoderModels([]);
+      if (includeModels) setModels([]);
+      setQoderUsage(null);
+      setQoderUsageBusy(true);
+      setQoderUsageError(null);
+    }
+    try {
+      const query = force ? "?force=1" : "";
+      const result = await runtime.api.get<QoderCatalog>(`/api/servers/${encodeURIComponent(serverId)}/agents/qoder-cn/catalog${query}`);
+      writeCachedQoderCatalog(qoderCatalogCacheKey, result.data);
+      setQoderModels((current) => sameQoderModels(current, result.data.models) ? current : result.data.models);
+      if (includeModels) setModels((current) => sameQoderModels(current, result.data.models) ? current : result.data.models);
+      setQoderUsage(result.data.usage);
+      setQoderUsageError(result.data.usageError || (result.data.usage ? null : "Qoder 当前未返回积分信息"));
+      return result.data;
+    } catch (reason) {
+      const message = errorText(reason, "Qoder 原生模型目录读取失败");
+      if (!cached) {
+        if (includeModels) setModels([]);
+        setQoderUsage(null);
+        setQoderUsageError(message);
+      }
+      if (notifyError) runtime.notify(message, "error");
+      return null;
+    } finally { setQoderUsageBusy(false); }
+  };
+
   const openConfig = async (agent: AgentSummary) => {
     const cachedSnapshot = readAgentConfigurationCache(actorId, serverId, cacheScope, agent.agentId);
     const remoteSnapshot = agent.configuration?.configScope === cacheScope ? agent.configuration as AgentConfiguration : null;
@@ -393,6 +541,12 @@ export function AgentControl({
     setContextLimitDraft(nextConfig?.values.contextLimit || "");
     setPage("config");
     if (canConfigure && !nextConfig) void loadConfig(agent, true);
+    if (agent.agentId === "qoder-cn" && agent.authentication?.authenticated) void loadQoderCatalog({ includeModels: true });
+    else {
+      setQoderUsage(null);
+      setQoderUsageError(null);
+      setQoderUsageBusy(false);
+    }
   };
 
   const changeFields = async (values: Record<string, string>) => {
@@ -451,10 +605,17 @@ export function AgentControl({
   const openModels = async () => {
     setPage("models");
     setProviderId("");
-    setModels([]);
     setProviders([]);
+    if (configAgent?.agentId === "qoder-cn") {
+      const cachedModels = qoderModels.length ? qoderModels : readCachedQoderCatalog(qoderCatalogCacheKey)?.value.models ?? [];
+      setModels(cachedModels);
+    } else setModels([]);
     setModelsBusy(true);
     try {
+      if (configAgent?.agentId === "qoder-cn") {
+        await loadQoderCatalog({ includeModels: true, notifyError: true });
+        return;
+      }
       const result = await runtime.api.get<ModelProviderSummary[]>("/api/providers?purpose=agent");
       setProviders(result.data);
     } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "模型 API 读取失败", "error"); }
@@ -470,6 +631,20 @@ export function AgentControl({
       setModels(result.data.models);
     } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "模型读取失败", "error"); }
     finally { setModelsBusy(false); }
+  };
+
+  const chooseModel = (item: ModelSummary) => {
+    const values: Record<string, string> = { model: item.id };
+    if (configAgent?.agentId === "qoder-cn") {
+      const supportedWindows = (item.contextTiers || []).map((tier) => tier.tokens);
+      const configuredWindow = Number(resolvedConfig?.values.contextLimit);
+      const contextWindow = supportedWindows.includes(configuredWindow)
+        ? configuredWindow
+        : item.defaultContextWindow || supportedWindows[0] || null;
+      if (contextWindow) values.contextLimit = String(contextWindow);
+    }
+    setPage("config");
+    void changeFields(values);
   };
 
   const deploy = async (agent: AgentSummary, action: "update" | "uninstall") => {
@@ -503,15 +678,33 @@ export function AgentControl({
   const contextLimitChanged = Boolean(contextLimitField && contextLimitDraft !== (resolvedConfig?.values.contextLimit || ""));
   const initialConfigLoading = page === "config" && canConfigure && Boolean(configAgent) && resolvedConfig?.agentId !== configAgent?.agentId && !configError;
   const initialConfigFailed = page === "config" && canConfigure && Boolean(configAgent) && resolvedConfig?.agentId !== configAgent?.agentId && Boolean(configError);
-  const visibleModels = providerId ? models : providers;
+  const isQoderConfig = configAgent?.agentId === "qoder-cn";
+  const qoderAuthenticated = configAgent?.authentication?.authenticated === true;
+  const visibleModels = isQoderConfig || providerId ? models : providers;
+  // Configurations cached before Qoder model selection was introduced do not
+  // contain a model key. Qoder itself treats that state as Auto, so keep the
+  // menu label and selected row aligned with the native effective value.
+  const selectedModelId = isQoderConfig
+    ? String(resolvedConfig?.values.model || "auto")
+    : String(resolvedConfig?.values.model || "");
+  const selectedNativeModel = isQoderConfig ? qoderModels.find((model) => model.id === selectedModelId) : null;
+  const selectedModelLabel = isQoderConfig
+    ? selectedNativeModel?.name || (selectedModelId === "auto" ? "Auto" : selectedModelId)
+    : selectedModelId || "尚未选择";
+  const qoderContextTiers = selectedNativeModel?.contextTiers || [];
+  const qoderPlanCredits = qoderQuotaSummary(qoderUsage?.userQuota);
+  const qoderAddOnCredits = qoderQuotaSummary(qoderUsage?.addOnQuota);
+  const qoderOrgCredits = qoderUsage?.orgResourcePackage?.available === true
+    ? qoderQuotaSummary(qoderUsage.orgResourcePackage)
+    : null;
   const rootStateVisible = Boolean(loadError || !agents.length);
-  const modelMenuHeight = modelsBusy || !visibleModels.length
-    ? 122
-    : Math.min(300, 61 + visibleModels.length * 45);
+  // Keep the model page stable while its native catalog is loading. The list
+  // owns the remaining height and scrolls inside it after the response arrives.
+  const modelMenuHeight = 360;
   const calculatedMenuHeight = page === "root"
     ? Math.min(390, 12 + agents.length * 58 + (rootStateVisible ? 62 : 0) + (onManualAdd ? 45 : 0))
     : page === "config"
-      ? initialConfigLoading || initialConfigFailed ? 174 : 18 + 43 + (configAgent ? 108 : 0) + nativeFields.length * 52 + (configAgent?.status === "ready" ? (context.status === "unavailable" ? 139 : 112) + (configMutationError ? 42 : 0) : 0) + (configAgent?.managed && configAgent.status === "ready" ? 38 : 0)
+      ? initialConfigLoading || initialConfigFailed ? 174 : 18 + 43 + (configAgent ? 54 : 0) + (configAgent && ["opencode", "codex", "claude-code"].includes(configAgent.agentId) && onConfigure ? 46 : 0) + nativeFields.length * 52 + (configAgent?.status === "ready" ? (context.status === "unavailable" ? 139 : 112) + (configMutationError ? 42 : 0) : 0) + (configAgent?.status === "ready" && (triggerVariant === "setup" || configAgent.managed) ? 38 : 0) + (isQoderConfig && qoderAuthenticated ? 52 : 0)
       : modelMenuHeight;
   const viewportGap = 14;
   const anchoredOnMobile = triggerVariant === "toolbar" && typeof window !== "undefined" && window.innerWidth <= 719;
@@ -532,10 +725,16 @@ export function AgentControl({
     : viewportGap;
   const portalStyle = { top: menuTop, left: menuLeft, width: menuWidth } as CSSProperties;
   const selectAgent = async (agent: AgentSummary) => {
-    if (selectingAgentId || disabled || agent.agentId === selectedAgentId) return;
-    setSelectingAgentId(agent.agentId);
+    if (selectingAgentId || disabled) return;
+    if (agent.agentId === selectedAgentId) {
+      setOpen(false);
+      setPage("root");
+      return;
+    }
     setSelectionError(null);
     try {
+      if (onBeforeSelect && !await onBeforeSelect(agent.agentId)) return;
+      setSelectingAgentId(agent.agentId);
       await onSelect(agent.agentId);
       setOpen(false);
     } catch (reason) {
@@ -544,10 +743,33 @@ export function AgentControl({
       setSelectingAgentId(null);
     }
   };
+  const completeSetupConfig = async (agent: AgentSummary) => {
+    if (triggerVariant !== "setup" || selectingAgentId || configBusy || configSaving || disabled) return;
+    setConfigMutationError(null);
+    if (agent.agentId === selectedAgentId) {
+      setOpen(false);
+      setPage("root");
+      return;
+    }
+    setSelectingAgentId(agent.agentId);
+    try {
+      await onSelect(agent.agentId);
+      setOpen(false);
+      setPage("root");
+    } catch (reason) {
+      const message = errorText(reason, "Agent 检查失败");
+      setConfigMutationError(message);
+      runtime.notify(message, "error");
+    } finally {
+      setSelectingAgentId(null);
+    }
+  };
   return <div className={styles.root} ref={root}>
     <button ref={trigger} className={`${styles.trigger} ${triggerVariant === "setup" ? styles.setupTrigger : ""} ${setupConfigured ? styles.setupReady : ""} ${installingAgent ? styles.setupInstalling : ""}`} disabled={disabled} aria-label={triggerVariant === "toolbar" ? `Agent 配置${selected ? `：${selected.displayName}` : ""}` : undefined} title={triggerVariant === "toolbar" ? "Agent 配置" : undefined} aria-expanded={open} onClick={() => {
       if (open) { setOpen(false); setPage("root"); return; }
       setOpen(true);
+      const qoder = agents.find((agent) => agent.agentId === "qoder-cn" && agent.authentication?.authenticated);
+      if (qoder) void loadQoderCatalog();
       if (initialPage === "config" && selected) void openConfig(selected);
       else setPage("root");
     }}>
@@ -563,13 +785,22 @@ export function AgentControl({
             {agents.map((agent) => {
             const ready = agent.installed && agent.status === "ready";
             const installing = installingAgentId === agent.agentId;
+            const needsLogin = agent.authentication?.required === true && !agent.authentication.authenticated;
+            const loggingIn = loggingInAgentId === agent.agentId;
+            const requirement = missingConfigurationLabel(agent, needsLogin);
+            const configuredModelId = agent.agentId === resolvedConfig?.agentId
+              ? String(resolvedConfig.values.model || "").trim()
+              : String(agent.model || "").trim();
+            const configuredModelLabel = agent.agentId === "qoder-cn"
+              ? qoderModels.find((model) => model.id === (configuredModelId || "auto"))?.name || ((configuredModelId || "auto") === "auto" ? "Auto" : configuredModelId)
+              : configuredModelId;
             return <div className={`${styles.rootRow} ${ready && agent.agentId === selectedAgentId ? styles.rootActive : ""}`} key={agent.agentId}>
               <button className={styles.rootSelect} disabled={!ready || disabled || Boolean(selectingAgentId)} onClick={() => void selectAgent(agent)}>
-                <span data-ui-icon="" className={styles.rootIcon}>{agent.agentId === "opencode" ? <Code2 size={16} /> : <Bot size={16} />}</span>
-                <span className={styles.rootIdentity}><strong><span>{agent.displayName}</span>{agent.installed && agent.model ? <em>{agent.model}</em> : agent.installed && !agent.configured ? <em>需要配置api</em> : null}</strong><small>{agent.installed ? "EasyWork已部署" : "未部署"}</small></span>
+                <span data-ui-icon="" className={styles.rootIcon}><Bot size={16} /></span>
+                <span className={styles.rootIdentity}><strong><span>{agent.displayName}</span>{agent.installed && configuredModelLabel ? <em>{configuredModelLabel}</em> : agent.installed && requirement ? <em>{requirement}</em> : null}</strong><small>{agent.installed ? "EasyWork已部署" : "未部署"}</small></span>
                 {selectingAgentId === agent.agentId ? <LoaderCircle className={styles.spin} size={14} /> : ready && agent.agentId === selectedAgentId ? <Check size={14} /> : null}
               </button>
-              {!ready && agent.capabilities.install === "available" && onInstall ? <button className={`${styles.inlineAction} ${installing ? styles.installing : ""}`} aria-label={installing ? `正在安装 ${agent.displayName}` : `安装 ${agent.displayName}`} disabled={Boolean(installingAgentId)} onClick={() => void onInstall(agent.agentId)}>{installing ? <LoaderCircle className={styles.spin} size={13} /> : <><Download size={13} /><span>安装</span></>}</button> : ready ? <span className={styles.rowActions}>{agent.managed ? <button aria-label={`检测 ${agent.displayName} 更新`} title="更新" disabled={deploymentBusy === agent.agentId || updateChecking} onClick={() => void checkUpdate(agent)}><RefreshCw className={deploymentBusy === agent.agentId || updateChecking && updateAgent?.agentId === agent.agentId ? styles.spin : ""} size={14} /></button> : null}<button aria-label={`配置 ${agent.displayName}`} onClick={() => void openConfig(agent)}><ChevronRight size={15} /></button></span> : null}
+              {!ready && agent.capabilities.install === "available" && onInstall ? <button className={`${styles.inlineAction} ${installing ? styles.installing : ""}`} aria-label={installing ? `正在安装 ${agent.displayName}` : `安装 ${agent.displayName}`} disabled={Boolean(installingAgentId)} onClick={() => void onInstall(agent.agentId)}>{installing ? <LoaderCircle className={styles.spin} size={13} /> : <><Download size={13} /><span>安装</span></>}</button> : ready ? <span className={styles.rowActions}>{needsLogin && onLogin ? <button className={styles.loginAction} aria-label={loggingIn ? `正在登录 ${agent.displayName}` : `登录 ${agent.displayName}`} disabled={loggingIn || disabled || Boolean(selectingAgentId)} onClick={() => void onLogin(agent.agentId)}>{loggingIn ? <LoaderCircle className={styles.spin} size={13} /> : <LogIn size={13} />}<span>{loggingIn ? "等待登录" : "登录"}</span></button> : agent.managed ? <button aria-label={`检测 ${agent.displayName} 更新`} title="更新" disabled={deploymentBusy === agent.agentId || updateChecking} onClick={() => void checkUpdate(agent)}><RefreshCw className={deploymentBusy === agent.agentId || updateChecking && updateAgent?.agentId === agent.agentId ? styles.spin : ""} size={14} /></button> : null}<button aria-label={`配置 ${agent.displayName}`} onClick={() => void openConfig(agent)}><ChevronRight size={15} /></button></span> : null}
             </div>;
             })}
             {selectionError ? <div className={styles.selectionError} role="alert"><X size={14} /><span><strong>无法选择 {agents.find((agent) => agent.agentId === selectionError.agentId)?.displayName || "Agent"}</strong><small>{selectionError.message}</small></span></div> : null}
@@ -580,24 +811,24 @@ export function AgentControl({
         <section className={`${styles.menuPanel} ${styles.configPanel}`}>
           <button className={styles.back} onClick={() => setPage("root")}><ChevronLeft size={15} />返回</button>
           {initialConfigLoading ? <div className={styles.configLoading} role="status"><LoaderCircle className={styles.spin} size={22} /><span>正在读取 Agent 配置</span></div> : initialConfigFailed ? <div className={styles.configLoading} role="alert"><X size={22} /><span>{configError}</span><button type="button" onClick={() => configAgent && void loadConfig(configAgent, true)}><RefreshCw size={14} />重新读取</button></div> : <>
-          {configAgent ? <button className={styles.option} disabled={!canConfigure} onClick={() => { setOpen(false); onConfigure(configAgent); }}><FileText size={16} /><span>打开配置</span></button> : null}
-          {configAgent && ["opencode", "codex", "claude-code"].includes(configAgent.agentId) ? <button className={styles.option} disabled={Boolean(resolvedConfig && !resolvedConfig.writable)} onClick={() => void openModels()}><Bot size={16} /><span className={styles.optionCopy}><span>选择模型</span><small title={resolvedConfig?.values.model || ""}>{resolvedConfig?.values.model || "尚未选择"}</small></span><ChevronRight size={15} /></button> : null}
+          {configAgent && ["opencode", "codex", "claude-code"].includes(configAgent.agentId) && onConfigure ? <button className={styles.option} disabled={!canConfigure} onClick={() => { setOpen(false); onConfigure(configAgent); }}><FileText size={16} /><span>打开配置</span><ChevronRight size={15} /></button> : null}
+          {configAgent && ["opencode", "codex", "claude-code", "qoder-cn"].includes(configAgent.agentId) ? <button className={styles.option} disabled={Boolean(resolvedConfig && !resolvedConfig.writable) || isQoderConfig && !qoderAuthenticated} onClick={() => void openModels()}><Bot size={16} /><span className={styles.optionCopy}><span>选择模型</span><small title={selectedModelId}>{isQoderConfig && !qoderAuthenticated ? "登录后可选择" : selectedModelLabel}</small></span><ChevronRight size={15} /></button> : null}
           {nativeFields.map((field) => <label className={styles.nativeSetting} key={field.key}><span>{field.label}</span>{field.type === "enum" ? <span className={styles.selectControl}><select disabled={!resolvedConfig?.writable || configBusy} value={resolvedConfig?.values[field.key] || field.options?.[0]?.value || ""} onChange={(event) => void changeField(field.key, event.target.value)}>{field.options?.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select><ChevronDown aria-hidden="true" size={14} /></span> : <input disabled={!resolvedConfig?.writable || configBusy} value={resolvedConfig?.values[field.key] || ""} onChange={(event) => setConfig((current) => current ? { ...current, values: { ...current.values, [field.key]: event.target.value } } : current)} onBlur={(event) => void changeField(field.key, event.target.value)} />}</label>)}
           {configAgent?.status === "ready" ? <div className={styles.contextControls}>
             <div className={styles.usageRow}><i data-ui-icon=""><b style={{ width: `${context.status === "ready" && context.usage.ratio !== null ? context.usage.ratio * 100 : 0}%` }} /></i><strong>{context.status === "ready" ? `${formatTokens(context.usage.used)} / ${context.usage.limit === null ? "上限未知" : formatTokens(context.usage.limit)}` : context.status === "loading" ? "正在读取实时用量" : "暂时没有实时用量"}</strong></div>
             {context.status === "unavailable" ? <p className={styles.contextReason}>{context.reason}</p> : null}
-            <div className={styles.contextActions}><span className={styles.contextLimitGroup}><small>{contextLimitField?.label || "上下文容量"}</small><span className={styles.limitControl}><input type="text" inputMode="numeric" disabled={!contextLimitField || !resolvedConfig?.writable || configBusy} value={contextLimitDraft} aria-label={contextLimitField?.label || "上下文容量"} placeholder={contextLimitField ? "输入 Token 数" : "原生配置自行管理"} onChange={(event) => { setContextLimitDraft(event.target.value); setConfigMutationError(null); }} /><button type="button" aria-label={`保存${contextLimitField?.label || "上下文容量"}`} disabled={!resolvedConfig?.writable || configBusy || !contextLimitChanged} onClick={() => void changeField("contextLimit", contextLimitDraft)}>{configSaving ? <LoaderCircle className={styles.spin} size={13} /> : <Save size={13} />}</button></span></span><button disabled={!contextBindingId || !operationAvailable(configAgent, "compact") || compacting} onClick={() => void compact()}>{compacting ? <LoaderCircle className={styles.spin} size={13} /> : <Database size={13} />}压缩</button></div>
+            <div className={styles.contextActions}><span className={styles.contextLimitGroup}><small>{contextLimitField?.label || "上下文容量"}</small>{isQoderConfig && qoderContextTiers.length ? <span className={styles.selectControl}><select disabled={!contextLimitField || !resolvedConfig?.writable || configBusy} value={contextLimitDraft} aria-label={contextLimitField?.label || "上下文容量"} onChange={(event) => { setContextLimitDraft(event.target.value); void changeField("contextLimit", event.target.value); }}>{!qoderContextTiers.some((tier) => String(tier.tokens) === contextLimitDraft) && contextLimitDraft ? <option value={contextLimitDraft}>{formatTokens(Number(contextLimitDraft))}</option> : null}{qoderContextTiers.map((tier) => <option value={tier.tokens} key={tier.tokens}>{tier.label}{tier.isDefault ? "（默认）" : ""}</option>)}</select><ChevronDown aria-hidden="true" size={14} /></span> : <span className={styles.limitControl}><input type="text" inputMode="numeric" disabled={!contextLimitField || !resolvedConfig?.writable || configBusy} value={contextLimitDraft} aria-label={contextLimitField?.label || "上下文容量"} placeholder={contextLimitField ? "输入 Token 数" : "原生配置自行管理"} onChange={(event) => { setContextLimitDraft(event.target.value); setConfigMutationError(null); }} /><button type="button" aria-label={`保存${contextLimitField?.label || "上下文容量"}`} disabled={!resolvedConfig?.writable || configBusy || !contextLimitChanged} onClick={() => void changeField("contextLimit", contextLimitDraft)}>{configSaving ? <LoaderCircle className={styles.spin} size={13} /> : <Save size={13} />}</button></span>}</span><button disabled={!contextBindingId || !operationAvailable(configAgent, "compact") || compacting} onClick={() => void compact()}>{compacting ? <LoaderCircle className={styles.spin} size={13} /> : <Database size={13} />}压缩</button></div>
             {configMutationError ? <p className={styles.operationError} role="alert">{configMutationError}</p> : null}
             {compactError ? <p className={styles.operationError} role="alert">{compactError}</p> : null}
           </div> : null}
-          {configAgent?.managed && configAgent.status === "ready" ? <div className={styles.configFooter}>{configSaving ? <span className={styles.runtimeConfiguring}><LoaderCircle className={styles.spin} size={14} />配置中</span> : <span aria-hidden="true" />}<button className={styles.uninstall} disabled={deploymentBusy === configAgent.agentId} onClick={() => { setOpen(false); setPendingUninstall(configAgent); }}><Trash2 size={16} /><span>卸载 Agent</span></button></div> : null}
+          {isQoderConfig && qoderAuthenticated ? <div className={styles.qoderCredits}><span>当前积分</span>{qoderUsageBusy ? <strong><LoaderCircle className={styles.spin} size={13} />正在读取</strong> : qoderPlanCredits || qoderAddOnCredits || qoderOrgCredits ? <span className={styles.qoderCreditValues}>{qoderPlanCredits ? <strong title="套餐积分">{qoderPlanCredits}</strong> : null}{qoderAddOnCredits ? <small title="附加积分">附加 {qoderAddOnCredits}</small> : null}{qoderOrgCredits ? <small title="组织资源包">资源包 {qoderOrgCredits}</small> : null}</span> : <strong title={qoderUsageError || undefined}>暂时无法读取</strong>}</div> : null}
+          {configAgent?.status === "ready" && (triggerVariant === "setup" || configAgent.managed) ? <div className={`${styles.configFooter} ${triggerVariant === "setup" ? "" : styles.uninstallFooter}`}>{configSaving ? <span className={styles.runtimeConfiguring}><LoaderCircle className={styles.spin} size={14} />配置中</span> : <span aria-hidden="true" />}{triggerVariant === "setup" ? <button className={styles.complete} disabled={configBusy || configSaving || Boolean(selectingAgentId) || disabled} onClick={() => void completeSetupConfig(configAgent)}>{selectingAgentId === configAgent.agentId ? <LoaderCircle className={styles.spin} size={16} /> : <Check size={16} />}<span>{selectingAgentId === configAgent.agentId ? "完成中" : "完成"}</span></button> : <button className={styles.uninstall} disabled={deploymentBusy === configAgent.agentId} onClick={() => { setOpen(false); setPendingUninstall(configAgent); }}><Trash2 size={16} /><span>卸载 Agent</span></button>}</div> : null}
           </>}
         </section>
 
         <section className={`${styles.menuPanel} ${styles.modelPanel}`}>
-          <button className={styles.back} onClick={() => { if (providerId) { setProviderId(""); setModels([]); } else setPage("config"); }}><ChevronLeft size={15} />返回</button>
-          {modelsBusy ? <div className={styles.menuState}><LoaderCircle className={styles.spin} size={15} />正在检测模型</div> : <div className={styles.modelList}>{providerId ? models.map((item) => <button key={item.id} className={resolvedConfig?.values.model === item.id ? styles.modelSelected : ""} onClick={() => { setPage("config"); void changeFields({ model: item.id }); }}><span title={item.id}>{item.name}</span>{resolvedConfig?.values.model === item.id ? <Check size={14} /> : null}</button>) : providers.map((item) => <button key={item.id} disabled={!item.configured} onClick={() => void chooseProvider(item.id)}><span><strong>{item.name}</strong><small>{item.configured ? item.baseUrl || "已配置" : "未配置"}</small></span><ChevronRight size={14} /></button>)}</div>}
-          {!modelsBusy && !(providerId ? models : providers).length ? <div className={styles.menuState}>{providerId ? "当前 API 没有可用模型" : "请先配置模型 API"}</div> : null}
+          <button className={styles.back} onClick={() => { if (!isQoderConfig && providerId) { setProviderId(""); setModels([]); } else setPage("config"); }}><ChevronLeft size={15} />返回</button>
+          <div className={styles.modelViewport}>{modelsBusy && !visibleModels.length ? <div className={styles.menuState}><LoaderCircle className={styles.spin} size={15} />正在检测模型</div> : visibleModels.length ? <div className={styles.modelList}>{isQoderConfig || providerId ? models.map((item) => { const price = isQoderConfig ? qoderModelPrice(item) : ""; const badge = item.promotion?.active ? item.promotion.badge?.zh || item.promotion.badge?.en : ""; const detail = [badge, price, item.description].filter(Boolean).join(" · "); return <button key={item.id} className={selectedModelId === item.id ? styles.modelSelected : ""} title={item.description || item.id} onClick={() => chooseModel(item)}><span><strong>{item.name}{item.isDefault ? " · 默认" : ""}</strong>{detail ? <small>{detail}</small> : null}</span>{selectedModelId === item.id ? <Check size={14} /> : null}</button>; }) : providers.map((item) => <button key={item.id} disabled={!item.configured} onClick={() => void chooseProvider(item.id)}><span><strong>{item.name}</strong><small>{item.configured ? item.baseUrl || "已配置" : "未配置"}</small></span><ChevronRight size={14} /></button>)}</div> : <div className={styles.menuState}>{isQoderConfig ? "当前 Qoder 账号没有可用模型" : providerId ? "当前 API 没有可用模型" : "请先配置模型 API"}</div>}</div>
         </section>
       </div>
     </div></div>, portalTarget) : null}

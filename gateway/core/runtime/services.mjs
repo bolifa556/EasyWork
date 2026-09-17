@@ -27,7 +27,7 @@ import { cosine } from "../resources/embedding-client.mjs";
 import { SlurmSchedulerAdapter } from "../scheduler/slurm.mjs";
 import { SchedulerService } from "../scheduler/service.mjs";
 import { agentSchedulerActivity, agentSubmissionReceipts, SchedulerSubmissionLedger, SchedulerSubmissionTracker } from "../scheduler/submissions.mjs";
-import { createAgentBindingKey } from "../scope.mjs";
+import { createAgentBindingKey, createLegacyAgentBindingKey } from "../scope.mjs";
 import {
   filterEligibleSkillObservations,
   isAutomaticSkillApplicable,
@@ -1009,7 +1009,7 @@ class ConversationInteractionFacade {
         inPlace = true;
       } else {
         const targetSessionId = crypto.randomUUID();
-        const operation = adapter.id === "claude-code" ? "revert" : "fork";
+        const operation = ["claude-code", "qoder-cn"].includes(adapter.id) ? "revert" : "fork";
         const operationInput = adapter.id === "codex"
           ? {
               threadId: retainedSessionId,
@@ -1667,6 +1667,76 @@ function resourceCoverageKnowledge(fragment) {
   };
 }
 
+function runtimeNativeSessionId(binding) {
+  return binding?.native?.sessionId || binding?.native?.threadId || binding?.state?.sessionId || null;
+}
+
+async function migrateLegacyAgentBinding(container, scope, targetBindingId) {
+  const existing = await container.taskRuntime.loadBinding(targetBindingId);
+  if (existing) return existing;
+
+  const candidateIds = new Set([createLegacyAgentBindingKey(scope, scope.agentId)]);
+  if (typeof container.workspaceFor === "function") {
+    const workspaces = await container.workspaceFor(scope.serverId, scope.serverIdentity);
+    const bindings = await workspaces.listBindings({ conversationId: scope.conversationId, branchId: scope.branchId });
+    for (const binding of bindings) {
+      if (binding.serverIdentity !== scope.serverIdentity
+        || binding.agentId !== scope.agentId
+        || binding.contextEpoch !== scope.contextEpoch) continue;
+      candidateIds.add(createLegacyAgentBindingKey({ ...scope, workspaceId: binding.workspaceId }, scope.agentId));
+    }
+  }
+
+  const tasks = typeof container.taskStore.scanTasks === "function"
+    ? await container.taskStore.scanTasks({ conversationId: scope.conversationId })
+    : await container.taskStore.listTasks({ conversationId: scope.conversationId, limit: 1000 });
+  for (const task of tasks) {
+    if (task.route?.agentId !== scope.agentId
+      || task.route?.serverIdentity !== scope.serverIdentity
+      || (task.branchId && task.branchId !== scope.branchId)
+      || !task.route?.workspaceId) continue;
+    candidateIds.add(createLegacyAgentBindingKey({ ...scope, workspaceId: task.route.workspaceId }, scope.agentId));
+  }
+  const recentCandidateIds = tasks
+    .filter((task) => candidateIds.has(String(task.agentBindingId || ""))
+      && task.route?.agentId === scope.agentId
+      && task.route?.serverIdentity === scope.serverIdentity
+      && (!task.branchId || task.branchId === scope.branchId))
+    .sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")))
+    .map((task) => String(task.agentBindingId));
+  const orderedCandidateIds = [...new Set([...recentCandidateIds, ...candidateIds])];
+
+  for (const sourceBindingId of orderedCandidateIds) {
+    const source = await container.taskRuntime.loadBinding(sourceBindingId);
+    const nativeSessionId = runtimeNativeSessionId(source);
+    if (!source || source.adapterId !== scope.agentId || !nativeSessionId) continue;
+    const raced = await container.taskRuntime.loadBinding(targetBindingId);
+    if (raced) return raced;
+    if (typeof container.agentTransport?.releaseBinding === "function") {
+      await container.agentTransport.releaseBinding(targetBindingId);
+    }
+    const migrated = {
+      ...clone(source),
+      agentBindingId: targetBindingId,
+      native: {
+        ...(source.native || {}),
+        runtimeBindingId: String(source.native?.runtimeBindingId || sourceBindingId),
+        migratedFromBindingId: sourceBindingId,
+      },
+    };
+    await container.taskRuntime.saveBinding(targetBindingId, migrated);
+    if (typeof container.contextHub?.inheritBindingReceipt === "function") {
+      await container.contextHub.inheritBindingReceipt({
+        sourceBindingKey: sourceBindingId,
+        targetBindingKey: targetBindingId,
+        nativeSessionId,
+      });
+    }
+    return migrated;
+  }
+  return null;
+}
+
 export class RemoteTaskLifecycle {
   constructor(container, extraction) {
     this.container = container;
@@ -1692,7 +1762,7 @@ export class RemoteTaskLifecycle {
     const nativeSessionId = binding?.native?.sessionId || binding?.native?.threadId || binding?.state?.sessionId;
     // An existing native conversation owns its history. Even a missing local
     // receipt is not a reason to replay its transcript on an ordinary turn.
-    if (nativeSessionId && previous?.agentBindingId === bindingKey) return [];
+    if (nativeSessionId && [bindingKey, binding?.native?.migratedFromBindingId].filter(Boolean).includes(previous?.agentBindingId)) return [];
     const messages = await allMessages(this.container.baseConversations, scope.conversationId, scope.branchId);
     const fragments = await workConversationTranscriptFragments(messages, this.extraction.messageId, this.container.runtime.prompts, { tasks });
     return this.filterHandoff({ scope, fragments });
@@ -1974,6 +2044,7 @@ export class RemoteTaskLifecycle {
     const detail = await this.container.baseConversations.getConversation(scope.conversationId);
     const taskScope = effectiveScope(this.container.actor, detail.summary, scope.branchId || detail.summary.activeBranchId, scope, taskId, true);
     const agentBindingId = createAgentBindingKey(taskScope, scope.agentId);
+    await migrateLegacyAgentBinding(this.container, { ...taskScope, agentId: scope.agentId }, agentBindingId);
     const fileFragments = await this.#stageSelectedFiles({ ...taskScope, agentId: scope.agentId }, agentBindingId);
     // Re-evaluate delivery against the actual binding immediately before the
     // Task is staged. The Web model's selected set remains provenance for
@@ -2803,7 +2874,11 @@ class WebInteractionService {
           versionDomainId: prepared.preparedRoute.binding.versionDomainId,
         };
         const agentBindingId = createAgentBindingKey(preparedScope, requestedScope.agentId);
-        const existingBinding = await this.container.taskRuntime.loadBinding(agentBindingId);
+        const existingBinding = await migrateLegacyAgentBinding(
+          this.container,
+          { ...preparedScope, agentId: requestedScope.agentId },
+          agentBindingId,
+        );
         const binding = existingBinding || {
           agentBindingId,
           adapterId: String(requestedScope.agentId),
@@ -2873,7 +2948,10 @@ class WebInteractionService {
             runId: `skill_discovery_${crypto.createHash("sha256").update(`${sha256}:${input.providerId}:${input.modelId}`).digest("hex").slice(0, 32)}`,
             system: prompt.system,
             input: prompt.input,
-            maxOutputTokens: 400,
+            // Reasoning models consume the same output allowance before they
+            // emit the requested sentence. Let the provider finish the reply;
+            // the discovery normalizer still enforces the stored shape.
+            maxOutputTokens: null,
           });
         });
         const result = await this.container.skills.listInstalledKnowledge();
@@ -3894,7 +3972,9 @@ export class ActorServiceContainer {
           runId: `resource_summary_${crypto.createHash("sha256").update(`${sha256}:${providerId}:${modelId}`).digest("hex").slice(0, 32)}`,
           system: prompt.system,
           input: prompt.input,
-          maxOutputTokens: 600,
+          // Keep the summary concise through its prompt without cutting off a
+          // reasoning model before it emits the summary text.
+          maxOutputTokens: null,
         });
       },
     });
@@ -4324,7 +4404,7 @@ export class ActorServiceContainer {
     const agentId = String(routing.agentId || "");
     const agentLabel = String(routing.agentLabel || "").normalize("NFKC").trim();
     const agent = fields.has("agent") && (agentId || agentLabel)
-      ? { name: Array.from(agentLabel || ({ opencode: "OpenCode", codex: "Codex", "claude-code": "Claude Code" })[agentId] || agentId).slice(0, 120).join("") }
+      ? { name: Array.from(agentLabel || ({ opencode: "OpenCode", codex: "Codex", "claude-code": "Claude Code", "qoder-cn": "Qoder CN" })[agentId] || agentId).slice(0, 120).join("") }
       : null;
     return { conversation, project, server, workspace, agent, serverCapabilities };
   }
@@ -4850,7 +4930,9 @@ export class ActorServiceContainer {
 
   async connectSsh(serverId, options = {}) {
     const connection = await this.sshWorker.connect(serverId, options);
-    await this.scheduleDeletedAgentConversationCleanup(serverId);
+    // The SSH session is ready at this point. Conversation cleanup discovery
+    // must not keep the connect request (and its UI spinner) open.
+    void this.scheduleDeletedAgentConversationCleanup(serverId).catch(() => undefined);
     // Classify once per connection generation and persist Scheduler detection.
     // The request itself must stay fast; the shared capability cache is warmed
     // in the background for every conversation bound to this server.

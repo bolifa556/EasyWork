@@ -5,6 +5,7 @@ export const CONVERSATIONS_CHANGED_EVENT = "easywork:conversations-changed";
 export type ConversationsChangedDetail = {
   conversationId: string;
   kind: "created" | "updated" | "deleted" | "renamed";
+  optimistic?: boolean;
   conversation?: Omit<ConversationSummary, "runningTaskId"> & { runningTaskId?: string | null };
   title?: string;
   revision?: number;
