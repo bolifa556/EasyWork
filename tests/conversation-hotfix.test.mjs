@@ -114,6 +114,29 @@ test("chat exposes each output delta before the final commit", () => {
   assert.equal(classifyConversationOutput(events).streamingFinal, "你好，世界");
 });
 
+test("expired socket replay recovers its subscription while preserving live delivery", async () => {
+  const source = ts.createSourceFile("client.ts", await readFile(new URL("../app/core/realtime/client.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  const declaration = source.statements.find(ts.isClassDeclaration).getText(source);
+  const { RealtimeClient } = await importTypeScript(`const WebSocket = { OPEN: 1 }; let id = 0; const randomRequestId = () => String(++id); ${declaration}`);
+  const client = new RealtimeClient(() => "ws://localhost", () => "token");
+  const sent = [], received = [];
+  client.state = "open";
+  client.authenticated = true;
+  client.socket = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  client.lastSequence.set("conversation:one", 2);
+  client.subscribe("conversation:one", (item, context) => received.push({ sequence: item.sequence, ...context }));
+  client.receive(JSON.stringify({ type: "error", meta: { requestId: sent[0].requestId }, error: { code: "REALTIME_REPLAY_EXPIRED" } }));
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[1].resume, { "conversation:one": 0 });
+  client.receive(JSON.stringify({ type: "event", replay: true, event: event(50, "run.reasoning.delta", { content: "已有思考" }) }));
+  client.receive(JSON.stringify({ type: "subscribed", requestId: sent[1].requestId, topics: ["conversation:one"] }));
+  client.receive(JSON.stringify({ type: "event", event: event(51, "run.reasoning.delta", { content: "继续输出" }) }));
+  assert.deepEqual(received, [{ sequence: 50, initialReplay: true }, { sequence: 51, initialReplay: false }]);
+  assert.equal(client.pendingSubscriptions.size, 0);
+  client.receive(JSON.stringify({ type: "error", meta: { requestId: sent[0].requestId }, error: { code: "REALTIME_REPLAY_EXPIRED" } }));
+  assert.equal(sent.length, 2, "a stale error cannot create a re-subscription loop");
+});
+
 test("an iteration classified as activity leaves the live answer without losing its text", () => {
   const events = [event(1, "run.started"), event(2, "run.output.delta", { segmentId: "prelude", target: "final", content: "正在查找资料" })];
   assert.equal(classifyConversationOutput(events).streamingFinal, "正在查找资料");

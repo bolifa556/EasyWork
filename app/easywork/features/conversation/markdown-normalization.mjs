@@ -19,9 +19,22 @@ function protectLine(source) {
     }
     if (inlineTicks === 0 && source[index] === "$" && !escapedAt(source, index)) {
       const tail = source.slice(index);
+      // Preserve Markdown's established display-math delimiter. Shell PID
+      // syntax also uses `$$`, but treating the pair as prose is preferable to
+      // corrupting every legitimate formula before remark-math sees it.
+      if (tail.startsWith("$$")) {
+        result += "$$";
+        index += 2;
+        continue;
+      }
       const braced = /^\$\{[A-Za-z_][A-Za-z0-9_]*(?:[^{}\r\n]*)\}/.exec(tail)?.[0] || "";
       const uppercase = /^\$[A-Z_][A-Za-z0-9_]+/.exec(tail)?.[0] || "";
-      const token = braced || uppercase;
+      // Positional/special parameters and command, arithmetic or ANSI-C
+      // substitutions are unambiguous shell syntax. Without escaping their
+      // opening dollar, remark-math can consume everything up to a later `$`
+      // and render prose as space-less mathematical italics.
+      const shellForm = /^\$(?:[0-9]+|[?#@*!_-]|[(["'])/.exec(tail)?.[0] || "";
+      const token = braced || uppercase || shellForm;
       // `$x + y$` remains normal inline math. Shell variables are protected
       // only when their token is not immediately closed by a math delimiter.
       if (token && tail[token.length] !== "$") {

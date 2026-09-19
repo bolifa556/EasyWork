@@ -62,7 +62,9 @@ async function parseSse(response, onPayload) {
   let buffer = "";
   let terminal = false;
   for await (const chunk of response.body) {
-    buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
+    // CRLF may straddle network chunks. Normalize after joining the carry so
+    // a split delimiter cannot buffer or discard otherwise complete events.
+    buffer = (buffer + decoder.decode(chunk, { stream: true })).replace(/\r\n/g, "\n");
     for (;;) {
       const boundary = buffer.indexOf("\n\n");
       if (boundary < 0) break;

@@ -844,7 +844,8 @@ export function AppShell() {
   const renderConversation = (conversation: ConversationSummary, nested = false) => {
     const active = runtime.view.kind === "conversation" && runtime.view.conversationId === conversation.id;
     const editing = conversationRename?.item.id === conversation.id ? conversationRename : null;
-    return <div className={`${styles.conversationRow} ${editing ? styles.renamingConversation : ""}`} key={conversation.id}>
+    const running = Boolean(conversation.runningTaskId);
+    return <div className={`${styles.conversationRow} ${editing ? styles.renamingConversation : ""} ${running ? styles.conversationRunning : ""}`} key={conversation.id}>
       {editing ? <form className={`${styles.treeItem} ${styles.renameItem} ${nested ? styles.nested : ""} ${active ? styles.active : ""}`} onSubmit={(event) => { event.preventDefault(); void saveConversationRename(); }}>
         <input
           ref={renameInput}
@@ -864,7 +865,7 @@ export function AppShell() {
           }}
         />
         {editing.saving ? <LoaderCircle className={styles.spin} size={14} /> : null}
-      </form> : <button className={`${styles.treeItem} ${nested ? styles.nested : ""} ${active ? styles.active : ""}`} onClick={() => runtime.navigate({ kind: "conversation", conversationId: conversation.id })}><ScrollingTitle title={conversation.title} /><span className={styles.kind}>{conversation.mode === "work" ? "工作" : "聊天"}</span></button>}
+      </form> : <button className={`${styles.treeItem} ${nested ? styles.nested : ""} ${active ? styles.active : ""}`} onClick={() => runtime.navigate({ kind: "conversation", conversationId: conversation.id })}><ScrollingTitle title={conversation.title} /><span className={styles.conversationMeta}>{running ? <span className={styles.conversationRunningIndicator} role="status" aria-label="对话正在进行"><LoaderCircle className={styles.spin} data-loading-spinner="" size={14} /></span> : null}<span className={styles.kind}>{conversation.mode === "work" ? "工作" : "聊天"}</span></span></button>}
       {!editing ? <button className={styles.conversationMore} aria-label={`${conversation.title} 更多操作`} aria-haspopup="menu" aria-expanded={menu?.kind === "conversation" && menu.item.id === conversation.id} onClick={(event) => openMenu(event, { kind: "conversation", item: conversation, page: "main" })}><MoreHorizontal size={15} /></button> : null}
     </div>;
   };

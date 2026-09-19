@@ -3,7 +3,7 @@
 import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
 import styles from "./DisclosureMotion.module.css";
 
-type DisclosureGate = { setPending: (id: string, pending: boolean) => void; revealTogether: boolean };
+type DisclosureGate = { setPending: (id: string, pending: boolean) => void; revealTogether: boolean; progressive: boolean };
 const GateContext = createContext<DisclosureGate | null>(null);
 
 export function useDisclosurePending(pending: boolean) {
@@ -22,13 +22,15 @@ const RetainedContent = memo(function RetainedContent({ children }: { open: bool
   return children;
 }, (previous, next) => !next.open || previous.children === next.children);
 
-export function DisclosureMotion({ open, ready = true, className = "", children }: {
+export function DisclosureMotion({ open, ready = true, progressive = false, className = "", children }: {
   open: boolean;
   ready?: boolean;
+  progressive?: boolean;
   className?: string;
   children: ReactNode;
 }) {
   const parent = useContext(GateContext);
+  const revealProgressively = progressive || Boolean(parent?.progressive);
   const [motion, setMotion] = useState({ requestedOpen: open, mounted: open, expanded: false });
   const [pendingChildren, setPendingChildren] = useState<ReadonlySet<string>>(() => new Set());
   const [showPending, setShowPending] = useState(false);
@@ -44,9 +46,11 @@ export function DisclosureMotion({ open, ready = true, className = "", children 
       return next;
     });
   }, []);
-  const waiting = open && (!ready || pendingChildren.size > 0);
+  // Live output must paint as it arrives. A historical detail request in a
+  // sibling must not hold the entire running activity at zero height.
+  const waiting = open && !revealProgressively && (!ready || pendingChildren.size > 0);
   useDisclosurePending(waiting && !expanded);
-  const gate = useMemo(() => ({ setPending, revealTogether: !expanded || Boolean(parent?.revealTogether) }), [expanded, parent?.revealTogether, setPending]);
+  const gate = useMemo(() => ({ setPending, progressive: revealProgressively, revealTogether: !revealProgressively && (!expanded || Boolean(parent?.revealTogether)) }), [expanded, parent?.revealTogether, revealProgressively, setPending]);
   const preparing = waiting && !expanded;
   useEffect(() => {
     if (!preparing) return;

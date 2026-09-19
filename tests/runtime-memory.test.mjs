@@ -155,6 +155,21 @@ async function isolatedContainer(t, actorId) {
   );
 }
 
+test("网页失败但未创建远端任务的工作请求直接重试，不连接 SSH 或变更远端上下文", async (t) => {
+  const { services } = await fixture(t);
+  const created = await services.baseConversations.sendMessage({ mode: "work", role: "user", content: "更新技能", expectedRevision: 0, commandId: "failed-before-handoff" });
+  services.servers.findConversationBinding = async () => { throw new Error("无远端任务时不应连接 SSH 回退"); };
+  const responded = [];
+  services.interactions.respond = async (input) => { responded.push(input); return { runId: "retried-web-run" }; };
+  const result = await services.conversations.retry({ conversationId: created.conversation.id, branchId: created.branchId, messageId: created.messageId,
+    expectedRevision: created.conversation.revision, commandId: "retry-before-handoff",
+    response: { providerId: "platform-web", modelId: "memory-model", scope: {} },
+  });
+  assert.deepEqual(result.nativeConversation, { applied: true, unchanged: true, reason: "no_remote_task" });
+  assert.equal(result.response.runId, "retried-web-run");
+  assert.equal(responded[0].messageId, created.messageId);
+});
+
 test("Web Agent 在每轮冻结快照后跨对话读取同项目记忆", async (t) => {
   const extractionInputs = [];
   const { services } = await fixture(t, (options) => projectMemoryModelFactory(options, (input) => extractionInputs.push(input)));

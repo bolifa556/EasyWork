@@ -1235,6 +1235,11 @@ class ConversationInteractionFacade {
   }
 
   async #rewindWorkAndNative({ conversationId, branchId, removedMessages, retainedMessages, commandId }) {
+    // A Web Agent failure before handoff never touched the native session or
+    // workspace. Retrying it must not connect over SSH or reset that session.
+    if (!(await this.#tasksFromSourceMessages(conversationId, removedMessages)).length) {
+      return { applied: true, unchanged: true, reason: "no_remote_task" };
+    }
     const workRoute = await this.#workRoute(conversationId, branchId);
     const openCode = workRoute?.route?.binding?.agentId === "opencode";
     if (openCode) {

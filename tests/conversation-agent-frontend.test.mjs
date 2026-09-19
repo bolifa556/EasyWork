@@ -529,12 +529,14 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.doesNotMatch(timeline, /previous\?\.iteration !== iteration/);
   assert.match(timeline, /entries\.push\(reasoning\)/);
   assert.match(timeline, /function WebThought[\s\S]+?const hasBody = trace\.entries\.length > 0 \|\| Boolean\(handoff\)/);
-  assert.match(timeline, /const \[open, toggleOpen\] = useTimelineDisclosure\(disclosureId, hasBody, trace\.thinking\)/);
+  assert.match(timeline, /const \[open, toggleOpen\] = useTimelineDisclosure\(disclosureId, hasBody, trace\.thinking, true\)/);
+  assert.match(timeline, /function ReasoningTrace[\s\S]+?useTimelineDisclosure\(disclosureId, true, updating\)/);
+  assert.match(timeline, /const updatingReasoningId = trace\.thinking && trace\.entries\.at\(-1\)\?\.type === "reasoning"[\s\S]+?<ReasoningTrace[^>]+updating=\{entry\.id === updatingReasoningId\}/);
   assert.match(timeline, /className=\{styles\.webThoughtHeading\}[\s\S]+?aria-expanded=\{hasBody \? open : undefined\}/);
   assert.match(timeline, /entry\.type === "reasoning"[\s\S]+?<ReasoningTrace key=\{entry\.id\} entry=\{entry\} disclosureId=/);
   assert.match(timeline, /if \(event\.kind === "run\.output\.delta"\)[\s\S]+?replacement[\s\S]+?type: "reasoning"/);
   assert.doesNotMatch(timeline, /className=\{styles\.activityText\}/);
-  assert.match(timeline, /function AgentCall[\s\S]+?useTimelineDisclosure\(disclosureId, hasDetails, running && !collapseWhen/);
+  assert.match(timeline, /function AgentCall[\s\S]+?useTimelineDisclosure\(disclosureId, hasDetails, running && !collapseWhen, true\)/);
   assert.match(timeline, /trace\.thinking \? "正在思考"/);
   assert.match(timeline, /trace\.aborted \? "思考已停止" : "思考完成"/);
   assert.match(timeline, /rawAbortReason\.trim\(\) === "请求已停止" \? "" : rawAbortReason/);
@@ -562,7 +564,7 @@ test("远端与网页 Work Agent 的原有思考流正常展示，Work 自由文
   assert.match(motionStyles, /\.motion\s*\{[^}]*grid-template-rows:0fr;[^}]*transition:grid-template-rows/s);
   assert.match(motionStyles, /\.motion\[data-expanded="true"\]\s*\{[^}]*grid-template-rows:1fr;/s);
   assert.match(timeline, /<DisclosureMotion open=\{open\} ready=\{detailState\.ready\} className=\{styles\.reasoningMotion\}/);
-  assert.match(timeline, /<DisclosureMotion open=\{hasBody && open\} className=\{styles\.webThoughtMotion\}/);
+  assert.match(timeline, /<DisclosureMotion open=\{hasBody && open\} progressive=\{trace\.running\} className=\{styles\.webThoughtMotion\}/);
   assert.match(styles, /\.webThoughtOpen \.webThoughtChevron[^}]*rotate\(90deg\)/s);
   assert.match(styles, /\.reasoningHeading\s*\{[^}]*grid-template-columns:22px minmax\(0,auto\) 14px;/s);
   assert.match(styles, /\.backgroundHeading\s*\{[^}]*align-items:center;/s);
@@ -995,7 +997,7 @@ test("Agent 调用活动区保留完整命令、文件与事件内容，并采�
   assert.match(timeline, /if \(!TERMINAL_TASK_STATUSES\.has\(status\)\)[\s\S]+?taskById\[taskId\]\?\.status[\s\S]+?TERMINAL_TASK_STATUSES\.has\(taskStatus\)/);
   assert.match(timeline, /event\.producer === "task-orchestrator" && \(event\.kind === "error" \|\| event\.status === "failed"\)/);
   assert.match(view, /<ConversationTimeline events=\{timelineEvents \|\| \[\]\} mode=\{timelineMode\}[\s\S]+?taskById=\{taskById\}/);
-  assert.match(view, /<ConversationTimeline events=\{pendingTimelineEvents\} mode=\{activeMode\} taskById=\{tasks\}/);
+  assert.match(view, /<ConversationTimeline events=\{pendingTimelineEvents \|\| \[\]\} mode=\{activeMode\} pending=\{waitingForReply\}[^>]+taskById=\{tasks\}/);
   assert.match(timeline, /function useTimelineDisclosure/);
   assert.doesNotMatch(timeline.match(/function isRunningEvent[\s\S]+?\n\}/)?.[0] || "", /waiting|null/);
   assert.match(timeline, /cancelled \? <Square size=\{8\} \/>/);
@@ -1263,7 +1265,8 @@ test("破坏性消息操作以同步锁阻止重复提交且不自动重放旧�
 test("消息操作按钮使用应用内悬停提示并以历史图标表达回溯", async () => {
   const [view, styles] = await Promise.all([readFile(viewPath, "utf8"), readFile(viewStylePath, "utf8")]);
   assert.match(view, /function MessageAction/);
-  assert.match(view, /data-tooltip=\{label\}/);
+  assert.match(view, /data-tooltip=\{visibleLabel\}/);
+  assert.match(view, /aria-busy=\{busy\} disabled=\{busy\}/);
   assert.match(view, /label=\{copied \? "已复制" : user \? "复制消息" : "复制回复"\}/);
   assert.doesNotMatch(view, /label="编辑消息"/);
   assert.match(view, /label="重新生成"/);

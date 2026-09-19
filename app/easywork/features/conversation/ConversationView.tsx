@@ -55,6 +55,7 @@ import { ComposerResourceChips, ComposerResources, emptyComposerResources, type 
 import { classifyConversationOutput, ConversationAnswer, ConversationArtifactCards, type ArtifactCardData, ConversationTimeline, isDirectRemoteAppendTimeline, splitRemoteFinalPresentation } from "./ConversationTimeline";
 import { conversationArtifactCards, referencedArtifactsForDownloadReply, stripArtifactPlaceholderLines } from "./artifact-presentation.mjs";
 import { mergeConversationEvents, retainConversationEvents } from "./conversation-event-retention.mjs";
+import { catchUpConversation } from "./conversation-stream-catchup.mjs";
 import { followConversationScroll, type ConversationScrollPosition } from "./conversation-scroll";
 import { PENDING_USER_WORKSPACE_SELECTION, WorkspaceDialog } from "./WorkspaceDialog";
 import { ConversationWorkspacePreview, type WorkspacePreviewHandle } from "../workspace/ConversationWorkspacePreview";
@@ -344,9 +345,10 @@ function agentOperationAvailable(agent: AgentSummary | undefined, operation: "ap
   return agent?.runtimeCapabilities?.[operation]?.availability === "available";
 }
 
-function MessageAction({ label, icon, onClick, showLabel = false }: { label: string; icon: ReactNode; onClick: () => void; showLabel?: boolean }) {
-  return <span className={`${styles.messageAction} ${showLabel ? styles.messageActionLabel : ""}`} data-tooltip={label}>
-    <Button compact iconOnly={!showLabel} variant="ghost" aria-label={label} icon={icon} onClick={onClick}>{showLabel ? label : null}</Button>
+function MessageAction({ label, icon, onClick, showLabel = false, busy = false }: { label: string; icon: ReactNode; onClick: () => void; showLabel?: boolean; busy?: boolean }) {
+  const visibleLabel = busy ? "正在准备重试…" : label;
+  return <span className={`${styles.messageAction} ${showLabel || busy ? styles.messageActionLabel : ""}`} data-tooltip={visibleLabel}>
+    <Button compact iconOnly={!showLabel && !busy} variant="ghost" aria-label={visibleLabel} aria-busy={busy} disabled={busy} icon={busy ? <LoaderCircle className={styles.spin} size={15} /> : icon} onClick={onClick}>{showLabel || busy ? visibleLabel : null}</Button>
   </span>;
 }
 
@@ -359,6 +361,7 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
   const runtime = useAppRuntime();
   const [pendingAction, setPendingAction] = useState<"branch" | "rewind" | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;
@@ -384,12 +387,13 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
     if (actionInFlight.current) return;
     actionInFlight.current = true;
     setActionBusy(true);
-    const actionBody = name === "branch"
-      ? { action: name, sourceBranchId: message.branchId, atMessageId: message.id }
-      : name === "rewind"
-        ? { action: name, branchId: message.branchId, toMessageId: message.id }
-        : { action: name, branchId: message.branchId, messageId: message.id, response: response() };
+    setRetrying(name === "retry");
     try {
+      const actionBody = name === "branch"
+        ? { action: name, sourceBranchId: message.branchId, atMessageId: message.id }
+        : name === "rewind"
+          ? { action: name, branchId: message.branchId, toMessageId: message.id }
+          : { action: name, branchId: message.branchId, messageId: message.id, response: response() };
       const idempotencyKey = commandId(name);
       const submit = (expectedRevision: number) => runtime.api.post<BranchedConversationResult>(
         `/api/conversations/${message.conversationId}/actions`,
@@ -424,6 +428,7 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
     } finally {
       actionInFlight.current = false;
       setActionBusy(false);
+      setRetrying(false);
     }
   };
   return <><article className={`${styles.message} ${user ? styles.user : styles.assistant}`} id={`message-${message.id}`}>
@@ -431,10 +436,10 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
     {!user && (timelineEvents?.length || timelineLoading) ? <ConversationTimeline events={timelineEvents || []} mode={timelineMode} taskIdHint={message.taskId || undefined} finalTextHint={displayedContent} loading={timelineLoading} taskById={taskById} settledTaskIds={settledTaskIds} onApproval={onApproval} onInput={onInput} /> : null}
     {user && message.attachments?.length ? <div className={styles.messageImages}>{message.attachments.filter(isImageFile).map((attachment) => <StoredConversationImage key={attachment.resourceVersionId} name={attachment.name} source={{ kind: "resource", resourceVersionId: attachment.resourceVersionId }} />)}</div> : null}
     {user ? <div className={styles.userBubble}>{message.references?.length ? <span className={styles.messageReferences}>{message.references.map((reference) => <ConversationReferenceLink key={reference.referenceId} reference={reference} />)}</span> : null}{message.content}</div> : <><div className={styles.assistantBody}><ConversationAnswer content={rawDisplayedContent} events={timelineEvents || []} artifacts={artifacts} artifactHistory={artifactHistory} workspaceId={message.taskId ? taskById[message.taskId]?.route.workspaceId : undefined} /></div></>}
-    <div className={styles.messageActions}>
+    <div className={styles.messageActions} data-busy={retrying || undefined}>
       <MessageAction label={copied ? "已复制" : user ? "复制消息" : "复制回复"} showLabel={copied} icon={copied ? <Check size={15} /> : <Copy size={15} />} onClick={copy} />
-      {user && retryableUser ? <MessageAction label="重新生成本轮回复" icon={<RotateCcw size={15} />} onClick={() => void action("retry")} /> : null}
-      {!user ? <>{latestAssistant ? <MessageAction label="重新生成" icon={<RotateCcw size={15} />} onClick={() => void action("retry")} /> : null}<MessageAction label="从这里创建分支对话" icon={<GitBranch size={15} />} onClick={() => void action("branch")} /><MessageAction label="回溯到这里" icon={<History size={16} />} onClick={() => void action("rewind")} /></> : null}
+      {user && retryableUser ? <MessageAction label="重新生成本轮回复" busy={retrying} icon={<RotateCcw size={15} />} onClick={() => void action("retry")} /> : null}
+      {!user ? <>{latestAssistant ? <MessageAction label="重新生成" busy={retrying} icon={<RotateCcw size={15} />} onClick={() => void action("retry")} /> : null}<MessageAction label="从这里创建分支对话" icon={<GitBranch size={15} />} onClick={() => void action("branch")} /><MessageAction label="回溯到这里" icon={<History size={16} />} onClick={() => void action("rewind")} /></> : null}
     </div>
   </article>{pendingAction ? <Modal title={pendingAction === "branch" ? "创建分支对话？" : "回溯到这里？"} size="compact" onClose={() => { if (!actionBusy) setPendingAction(null); }}><div className={styles.modeConfirm}><p>{pendingAction === "branch"
     ? timelineMode === "chat"
@@ -928,6 +933,8 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   const workspacePreviewRef = useRef<WorkspacePreviewHandle>(null);
   const conversationLoadRevision = useRef(0);
   const taskReplayCursors = useRef(new Map<string, number>());
+  const conversationReplayCursor = useRef(0);
+  const lastLiveConversationEventAt = useRef(0);
   const taskReplayRequests = useRef(new Map<string, Promise<RealtimeEnvelope[]>>());
   const taskSummaryRequests = useRef(new Map<string, Promise<TaskSummary>>());
   const messagesRef = useRef(messages);
@@ -1178,8 +1185,11 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   }, [actorId, artifacts, conversationId, detail, events, eventsHydrated, messages, tasks]);
 
   const mergeEvents = useCallback((incoming: RealtimeEnvelope[]) => {
+    for (const event of incoming) if (event.topic === `conversation:${conversationId}`) {
+      conversationReplayCursor.current = Math.max(conversationReplayCursor.current, event.sequence);
+    }
     setEvents((current) => mergeConversationEvents(current, incoming));
-  }, []);
+  }, [conversationId]);
 
   useEffect(() => {
     if (detail && detail.summary.id === conversationId) updateConversationNavigation(detail.summary);
@@ -1313,13 +1323,16 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
 
   const reload = useCallback(async () => {
     const request = ++conversationLoadRevision.current;
-    const [next, nextArtifacts] = await Promise.all([fetchConversation(), fetchConversationArtifacts()]);
+    // File-card refresh must not hold back a newly accepted retry or reply.
+    void fetchConversationArtifacts().then((nextArtifacts) => {
+      if (request === conversationLoadRevision.current) setArtifacts(nextArtifacts);
+    }).catch(() => undefined);
+    const next = await fetchConversation();
     if (request !== conversationLoadRevision.current) return;
     retainEventsForMessages(next.messages);
     mergeEvents(next.events);
     setMessages(next.messages);
     setDetail(next.detail);
-    setArtifacts(nextArtifacts);
     setLoading(false);
     void refreshBootstrap().catch(() => undefined);
   }, [fetchConversation, fetchConversationArtifacts, mergeEvents, refreshBootstrap, retainEventsForMessages]);
@@ -1439,6 +1452,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   useEffect(() => {
     if (!conversationId || !realtime) return;
     return realtime.subscribe(`conversation:${conversationId}`, (event, { initialReplay }) => {
+      lastLiveConversationEventAt.current = Date.now();
       mergeEvents([event]);
       if (initialReplay) return;
       if (event.kind === "run.persisted" || event.kind === "message.created") {
@@ -2358,8 +2372,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   const latestResponseHasActivity = Boolean(pendingTimelineEvents?.length)
     || latestConversationTask?.sourceMessageId === latestResponseUserId;
   const latestResponseCreatedAt = Date.parse(latestResponseUser?.createdAt || "");
-  const latestResponseOrphaned = activeMode === "work"
-    && Boolean(latestResponseUserId)
+  const latestResponseOrphaned = Boolean(latestResponseUserId)
     && !latestResponseHasAssistant
     && !activeTask
     && !latestResponseHasActivity
@@ -2367,8 +2380,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     && responseRecoveryMessageId === latestResponseUserId;
   useEffect(() => {
     if (
-      activeMode !== "work"
-      || !latestResponseUserId
+      !latestResponseUserId
       || latestResponseHasAssistant
       || activeTask
       || latestResponseHasActivity
@@ -2380,17 +2392,38 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     );
     return () => window.clearTimeout(timer);
   }, [activeMode, activeTask, latestResponseCreatedAt, latestResponseHasActivity, latestResponseHasAssistant, latestResponseUserId]);
-  const pendingWorkHandoff = activeMode === "work"
-    && Boolean(latestResponseUserId)
+  const waitingForReply = Boolean(latestResponseUserId)
     && !latestResponseHasAssistant
-    && !activeTask
     && !latestResponseTaskSettled
     && !latestResponseRunSettled
     && !latestResponseOrphaned;
+  const pendingWorkHandoff = activeMode === "work" && waitingForReply && !activeTask;
+  useEffect(() => {
+    if (!conversationId || !waitingForReply) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        if (Date.now() - lastLiveConversationEventAt.current >= 2_000) {
+          const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(5_000)]);
+          await catchUpConversation({ conversationId, after: conversationReplayCursor.current, signal,
+            request: async (url: string, requestSignal: AbortSignal) => (await api.get<{ events: RealtimeEnvelope[]; lastSequence: number; hasMore: boolean; nextAfterSequence: number }>(url, requestSignal)).data,
+            onPage: (page: RealtimeEnvelope[]) => {
+              mergeEvents(page);
+              if (page.some((event) => event.kind === "run.persisted")) void reload().catch(() => undefined);
+            },
+          });
+        }
+      } catch { /* The live subscription and the next bounded read can recover. */ }
+      if (!controller.signal.aborted) timer = setTimeout(() => void poll(), 2_000);
+    };
+    void poll();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [api, conversationId, latestResponseUserId, mergeEvents, reload, waitingForReply]);
   const orphanTimelineByUserMessage = new Map(
     [...timelineByUserMessage].filter(([userMessageId]) => userMessageId !== latestResponseUserId && !usersWithAssistant.has(userMessageId)),
   );
-  const showPendingAssistant = Boolean(visibleStreamingFinal || pendingTimelineEvents?.length);
+  const showPendingAssistant = Boolean(waitingForReply || visibleStreamingFinal || pendingTimelineEvents?.length);
   const retryableAssistantMessageId = latestAssistantPosition > latestUserPosition ? latestAssistant : null;
   const retryableUserMessageId = latestResponseUserId
     && !latestResponseHasAssistant
@@ -2582,7 +2615,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
               {message.role === "user" && orphanTimelineByUserMessage.has(message.id) ? <article className={`${styles.message} ${styles.assistant}`}>{isDirectRemoteAppendTimeline(orphanTimelineByUserMessage.get(message.id) || []) ? null : <div className={styles.messageHead}><span data-ui-icon="" className={styles.dot} /> EasyWork</div>}<ConversationTimeline events={orphanTimelineByUserMessage.get(message.id) || []} mode={activeMode} taskById={tasks} settledTaskIds={settledTaskIds} onApproval={respondApproval} onInput={respondInput} /><ConversationArtifactCards events={orphanTimelineByUserMessage.get(message.id) || []} /></article> : null}
             </div>;
           })}
-          {showPendingAssistant ? <article key={latestResponseUserId || "streaming-response"} className={`${styles.message} ${styles.assistant} ${styles.streamingMessage}`}>{isDirectRemoteAppendTimeline(pendingTimelineEvents || []) ? null : <div className={styles.messageHead}><span data-ui-icon="" className={styles.dot} /> EasyWork</div>}{pendingTimelineEvents?.length ? <ConversationTimeline events={pendingTimelineEvents} mode={activeMode} taskById={tasks} settledTaskIds={settledTaskIds} onApproval={respondApproval} onInput={respondInput} /> : null}<div className={styles.assistantBody}><ConversationAnswer content={visibleStreamingFinal || ""} events={pendingTimelineEvents || []} artifactHistory={artifactHistory} workspaceId={latestConversationTask?.route.workspaceId} /></div></article> : null}
+          {showPendingAssistant ? <article key={latestResponseUserId || "streaming-response"} className={`${styles.message} ${styles.assistant} ${styles.streamingMessage}`}>{isDirectRemoteAppendTimeline(pendingTimelineEvents || []) ? null : <div className={styles.messageHead}><span data-ui-icon="" className={styles.dot} /> EasyWork</div>}<ConversationTimeline events={pendingTimelineEvents || []} mode={activeMode} pending={waitingForReply} taskIdHint={latestConversationTask?.sourceMessageId === latestResponseUserId ? latestConversationTask.id : undefined} taskById={tasks} settledTaskIds={settledTaskIds} onApproval={respondApproval} onInput={respondInput} /><div className={styles.assistantBody}><ConversationAnswer content={visibleStreamingFinal || ""} events={pendingTimelineEvents || []} artifactHistory={artifactHistory} workspaceId={latestConversationTask?.route.workspaceId} /></div></article> : null}
         </div></div>
         <div className={styles.composerWrap}><Composer conversationId={conversationId} referenceMode={activeMode} draftKey={`conversation:${conversationId}`} disabled={activeMode === "work" && (!taskInputAvailable || !conversationWorkConnected)} activeTask={activeMode === "work" ? activeTask : undefined} pendingWebRun={activeMode === "work" && pendingWorkHandoff} interruptFailure={activeMode === "work" ? interruptFailure : null} canInterrupt={pendingWorkHandoff || agentOperationAvailable(selectedAgent, "interrupt")} onInterrupt={interrupt} placeholder={activeMode === "work" ? conversationWorkConnected ? taskPlaceholder : "请先连接远程服务器" : "继续对话"} onSend={send} /></div>
       </>}

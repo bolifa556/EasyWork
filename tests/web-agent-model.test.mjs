@@ -9,6 +9,24 @@ function stream(lines) {
 
 const modelLayout = Object.freeze({ systemMessageSeparator: "\n\n" });
 
+test("SSE 换行和中文字符跨网络分片时，模型结束前仍逐段交付", async () => {
+  let controller;
+  const body = new ReadableStream({ start(value) { controller = value; } });
+  const deltas = [];
+  let received;
+  const firstDelta = new Promise((resolve) => { received = resolve; });
+  const model = new OpenAIChatModel({ ...modelLayout, baseUrl: "https://models.example.test", apiKey: "test-secret", model: "model", fetchImpl: async () => ({ ok: true, body }) });
+  const completed = model.complete({ messages: [{ role: "user", content: "继续" }], onDelta: (delta) => { deltas.push(delta); received(); } });
+  const send = (text) => {
+    for (const byte of new TextEncoder().encode(text)) controller.enqueue(Uint8Array.of(byte));
+  };
+  send('data: {"choices":[{"delta":{"reasoning_content":"正在分析"}}]}\r\n\r\n');
+  await Promise.race([firstDelta, new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error("首段被缓冲到结束")), 1000); timer.unref(); })]);
+  assert.deepEqual(deltas, [{ kind: "reasoning", content: "正在分析" }]);
+  send('data: {"choices":[{"delta":{"content":"完成"}}]}\r\n\r\ndata: [DONE]\r\n\r\n');
+  assert.equal((await completed).content, "完成");
+});
+
 test("OpenAI chat model streams reasoning and final text while assembling tool arguments", async () => {
   const deltas = [];
   let activities = 0;

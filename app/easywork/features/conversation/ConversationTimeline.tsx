@@ -3,7 +3,7 @@
 import { isImageFile } from "../../../../shared/images.mjs";
 import { StoredConversationImage } from "./ConversationImage";
 
-import { useMemo, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { BookOpen, Bot, Box, Brain, Check, ChevronRight, CircleStop, Code2, Copy, Database, Download, File, FileArchive, FileAudio, FileCode2, FileImage, FileSpreadsheet, FileText, FileType2, FileVideo, Gauge, GitBranch, HardDriveDownload, LoaderCircle, MessageCircle, Network, Package, Presentation, Send, ShieldCheck, Square, Terminal, Wrench, X } from "lucide-react";
 import type { ArtifactSummary, RealtimeEnvelope, TaskSummary } from "@/app/core/contracts";
 import { useAppRuntime } from "../../runtime/AppRuntime";
@@ -16,7 +16,7 @@ import { isWorkProtocolReasoning } from "@/shared/timeline-protocol.mjs";
 import { TimelineDetails, TimelineDetailStatus, timelineIntentIds, useTimelineDetails, useTimelineIntent } from "./TimelineDetails";
 import { DisclosureMotion } from "./DisclosureMotion";
 import { markdownFence, markdownLabel, splitRemoteFinalPresentation } from "./conversation-copy.mjs";
-import { hasTimelineDisclosureChoice, readTimelineDisclosure, writeTimelineDisclosure } from "./timeline-disclosure-memory.mjs";
+import { hasTimelineDisclosureChoice, readTimelineDisclosure, subscribeTimelineDisclosure, updateTimelineDisclosureScope, writeTimelineDisclosure } from "./timeline-disclosure-memory.mjs";
 import styles from "./ConversationTimeline.module.css";
 
 type OutputSegment = { id: string; runId: string | null; content: string; target: "final" | "activity" | "handoff" | null; committed: boolean; first: RealtimeEnvelope };
@@ -379,9 +379,9 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
       const iteration = Number(payload.iteration || 0);
       if (discardedReasoningIterations.has(iteration)) continue;
       const content = String(payload.content || "");
-      const streamKey = String(payload.realtimeStreamKey || event.eventId);
+      const streamKey = String(payload.realtimeStreamKey || `delta:${latestStarted?.ids.runId || "web"}:${iteration}`);
       const previousStream = reasoningStreams.get(streamKey) || "";
-      const nextStream = content.startsWith(previousStream) ? content : `${previousStream}${content}`;
+      const nextStream = payload.realtimeStreamKey ? content : `${previousStream}${content}`;
       reasoningStreams.set(streamKey, nextStream);
       if (workMode && isWorkProtocolReasoning(nextStream)) continue;
       const previousVisibleStream = visibleReasoningStreams.get(streamKey) || "";
@@ -400,8 +400,11 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
         entries.push(reasoning);
       }
       else {
-        const separator = previous.text && !previous.text.endsWith("\n") && !addition.startsWith("\n") ? "\n\n" : "";
+        // Token/chunk boundaries are transport details, not paragraphs. Keep
+        // the model's own whitespace, including repeated tokens and line breaks.
+        const separator = previous.iteration !== iteration && previous.text && !previous.text.endsWith("\n") && !addition.startsWith("\n") ? "\n\n" : "";
         previous.text += `${separator}${addition}`;
+        previous.iteration = iteration;
         previous.detailIds.push(...timelineDetailIds(event));
       }
       continue;
@@ -535,8 +538,8 @@ function buildWebTrace(events: RealtimeEnvelope[]) {
   };
 }
 
-function ReasoningTrace({ entry, disclosureId }: { entry: ReasoningEntry; disclosureId: string }) {
-  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true);
+function ReasoningTrace({ entry, disclosureId, updating }: { entry: ReasoningEntry; disclosureId: string; updating: boolean }) {
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true, updating);
   const detailState = useTimelineDetails(entry.detailIds, open);
   const content = entry.text.replace(/\n(?:[ \t]*\n){2,}/g, "\n\n").trim();
   return <section className={`${styles.reasoningTrace} ${open ? styles.reasoningTraceOpen : ""}`}>
@@ -554,7 +557,8 @@ function WebThought({ events, handoff = null }: { events: RealtimeEnvelope[]; ha
   const terminalReason = trace.failure || trace.abortReason;
   const hasBody = trace.entries.length > 0 || Boolean(handoff);
   const disclosureId = `web:${trace.conversationId}:${trace.runId}`;
-  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, hasBody, trace.thinking);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, hasBody, trace.thinking, true);
+  const updatingReasoningId = trace.thinking && trace.entries.at(-1)?.type === "reasoning" ? trace.entries.at(-1)?.id : null;
   const intent = useTimelineIntent(timelineIntentIds(events), open);
   if (!trace.started && !terminalReason) return null;
   const label = trace.thinking ? "正在思考" : trace.failure ? "处理失败" : trace.aborted ? "思考已停止" : "思考完成";
@@ -564,9 +568,9 @@ function WebThought({ events, handoff = null }: { events: RealtimeEnvelope[]; ha
       <span className={styles.activityHeadingLabel}>{label}</span>
       {hasBody ? <ChevronRight className={styles.webThoughtChevron} size={13} /> : null}
     </button>
-    <DisclosureMotion open={hasBody && open} className={styles.webThoughtMotion}><div><div className={styles.webThoughtBody}>
+    <DisclosureMotion open={hasBody && open} progressive={trace.running} className={styles.webThoughtMotion}><div><div className={styles.webThoughtBody}>
       {trace.entries.map((entry) => entry.type === "reasoning"
-        ? <ReasoningTrace key={entry.id} entry={entry} disclosureId={`${disclosureId}:reasoning:${entry.id}`} />
+        ? <ReasoningTrace key={entry.id} entry={entry} disclosureId={`${disclosureId}:reasoning:${entry.id}`} updating={entry.id === updatingReasoningId} />
         : entry.type === "background"
           ? <BackgroundTrace key={entry.id} reads={entry.reads} disclosureId={`${disclosureId}:${entry.id}`} />
           : <CurrentStateTrace key={entry.id} state={entry.state} detailIds={entry.detailIds} disclosureId={`${disclosureId}:${entry.id}`} />)}
@@ -1076,8 +1080,8 @@ function EmbeddedApproval({ event, taskId, taskStatus, onApproval }: { event: Re
   </div>;
 }
 
-function CommandItem({ event, taskId, taskStatus, onApproval }: { event: RealtimeEnvelope; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
-  const [open, toggleOpen] = useTimelineDisclosure(`command:${taskId || "unknown"}:${event.eventId}`, true);
+function CommandItem({ event, disclosureId, taskId, taskStatus, onApproval }: { event: RealtimeEnvelope; disclosureId: string; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true);
   const detailState = useTimelineDetails(timelineDetailIds(event), open);
   const tool = useMemo(() => toolParts(event, open), [event, open]);
   const cancelled = ["cancelled", "interrupted"].includes(String(event.status));
@@ -1142,7 +1146,7 @@ function OperationGroup({ events, disclosureId, taskId, taskStatus, onApproval }
   const waiting = events.some((event) => event.status === "waiting");
   const running = events.some(isRunningEvent);
   const cancelled = events.every((event) => ["cancelled", "interrupted"].includes(String(event.status)));
-  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true, waiting || running);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true, waiting || running, true);
   return <section className={`${styles.activityGroup} ${open ? styles.groupOpen : ""} ${running ? styles.running : ""}`}>
     <button type="button" className={`${styles.groupHeading} ${styles.commandGroupHeading}`} aria-expanded={open} onClick={toggleOpen}>
       <span data-ui-icon="" className={styles.groupGlyph}><Wrench size={14} /></span>
@@ -1150,8 +1154,8 @@ function OperationGroup({ events, disclosureId, taskId, taskStatus, onApproval }
       <ChevronRight className={styles.groupChevron} size={13} />
     </button>
     <DisclosureMotion open={open} className={styles.groupMotion}><div><div className={styles.commandList}>{entries.map((entry) => entry.type === "tool"
-      ? <CommandItem key={entry.id} event={entry.event} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />
-      : <FileItem key={entry.id} file={entry.file} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />)}</div></div></DisclosureMotion>
+      ? <CommandItem key={entry.id} event={entry.event} disclosureId={`${disclosureId}:command:${entry.id}`} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />
+      : <FileItem key={entry.id} file={entry.file} disclosureId={`${disclosureId}:file:${entry.id}`} taskId={taskId} taskStatus={taskStatus} onApproval={onApproval} />)}</div></div></DisclosureMotion>
   </section>;
 }
 
@@ -1195,8 +1199,8 @@ function mergedFileEntries(events: RealtimeEnvelope[]) {
   return [...merged.values()];
 }
 
-function FileItem({ file, taskId, taskStatus, onApproval }: { file: FileEntry; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
-  const [open, toggleOpen] = useTimelineDisclosure(`file:${taskId || "unknown"}:${file.id}`, true);
+function FileItem({ file, disclosureId, taskId, taskStatus, onApproval }: { file: FileEntry; disclosureId: string; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true);
   const detailState = useTimelineDetails(timelineDetailIds(file.event), open);
   const name = file.path?.split(/[\\/]/).filter(Boolean).at(-1) || "未命名文件";
   const running = ["started", "updated", "running"].includes(String(file.status));
@@ -1424,12 +1428,12 @@ export function ConversationAnswer({ content, events = [], artifacts = [], artif
   }} />;
 }
 
-function EventRow({ event, taskId, taskStatus, onApproval }: { event: RealtimeEnvelope; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
+function EventRow({ event, disclosureId, taskId, taskStatus, onApproval }: { event: RealtimeEnvelope; disclosureId: string; taskId?: string; taskStatus?: string; onApproval?: ApprovalResponder }) {
   const record = payloadRecord(nestedPayload(event));
   const detail = event.kind === "approval_request" ? "" : eventDetailLabel(event, record);
   const secondary = detail || (event.kind !== "approval_request" && event.producer.startsWith("agent:") ? event.producer.slice(6) : "");
   const expandable = Boolean(timelineDetailIds(event).length || textFrom(record) || Object.keys(record).length);
-  const [open, toggleOpen] = useTimelineDisclosure(`event:${taskId || "unknown"}:${event.eventId}`, expandable);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, expandable);
   const text = !open ? "" : event.kind === "approval_request"
     ? approvalRequestText(record)
     : textFrom(record) || (event.kind !== "command" && Object.keys(record).length ? safeJson(record) : "");
@@ -1593,18 +1597,22 @@ function settledEvents(events: RealtimeEnvelope[], status: string) {
   });
 }
 
-function useTimelineDisclosure(identity: string, expandable: boolean, updating = false) {
+function useTimelineDisclosure(identity: string, expandable: boolean, updating = false, collapseDescendantsOnSettle = false) {
   // Until the user touches a disclosure, its open state is derived directly
   // from the live phase. This fixes the layout on the first render and avoids
   // a follow-up effect that would visibly move content. Page-scoped choices
   // become authoritative after a click and survive conversation switches.
-  const [, forceRender] = useState(0);
-  const remembered = hasTimelineDisclosureChoice(identity) ? readTimelineDisclosure(identity) : null;
+  useLayoutEffect(() => {
+    if (!collapseDescendantsOnSettle) return;
+    updateTimelineDisclosureScope(identity, updating);
+  }, [collapseDescendantsOnSettle, identity, updating]);
+  const subscribe = useCallback((listener: () => void) => subscribeTimelineDisclosure(identity, listener), [identity]);
+  const readChoice = useCallback(() => hasTimelineDisclosureChoice(identity) ? readTimelineDisclosure(identity) : null, [identity]);
+  const remembered = useSyncExternalStore(subscribe, readChoice, readChoice);
   const open = Boolean(expandable && (remembered ?? updating));
   const toggleOpen = () => {
     const next = expandable ? !open : false;
     writeTimelineDisclosure(identity, next);
-    forceRender((revision) => revision + 1);
   };
   return [open, toggleOpen] as const;
 }
@@ -1641,37 +1649,37 @@ function AgentReasoning({ event }: { event: RealtimeEnvelope }) {
   </section>;
 }
 
-function AgentActivityItem({ segment, taskId, status, onApproval, onInput }: { segment: ActivitySegment; taskId?: string; status: string; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
-  if (segment.type === "operations") return <OperationGroup events={segment.events} disclosureId={`operation:${taskId || "unknown"}:${segment.id}`} taskId={taskId} taskStatus={status} onApproval={onApproval} />;
+function AgentActivityItem({ segment, disclosureRoot, taskId, status, onApproval, onInput }: { segment: ActivitySegment; disclosureRoot: string; taskId?: string; status: string; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+  if (segment.type === "operations") return <OperationGroup events={segment.events} disclosureId={`${disclosureRoot}:operation:${segment.id}`} taskId={taskId} taskStatus={status} onApproval={onApproval} />;
   const event = segment.event;
   if (event.kind === "input_request") return <AgentInputRequest event={event} taskId={taskId} taskStatus={status} onInput={onInput} />;
   if (event.kind === "reasoning") return <AgentReasoning event={event} />;
   if (event.kind === "message") return <AgentThought event={event} />;
-  return <EventRow event={event} taskId={taskId} taskStatus={status} onApproval={onApproval} />;
+  return <EventRow event={event} disclosureId={`${disclosureRoot}:event:${event.eventId}`} taskId={taskId} taskStatus={status} onApproval={onApproval} />;
 }
 
-function AgentThinking({ segments, id, running, taskId, status, onApproval, onInput }: { segments: ActivitySegment[]; id: string; running: boolean; taskId?: string; status: string; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+function AgentThinking({ segments, disclosureId, running, taskId, status, onApproval, onInput }: { segments: ActivitySegment[]; disclosureId: string; running: boolean; taskId?: string; status: string; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
   const activityEvents = segments.flatMap((segment) => segment.type === "event" ? [segment.event] : segment.events);
-  const [open, toggleOpen] = useTimelineDisclosure(`remote-thinking:${taskId}:${id}`, true, running);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, true, running, true);
   const intent = useTimelineIntent(timelineIntentIds(activityEvents), open);
   return <section className={styles.agentThinking}>
     <button {...intent} className={styles.reasoningHeading} type="button" aria-expanded={open} onClick={toggleOpen}>
       <span data-ui-icon="" className={styles.reasoningGlyph}><Brain size={15} /></span>
       <span className={styles.reasoningLabel}>{running ? "Agent思考中" : "Agent已思考"}</span><ChevronRight className={styles.reasoningChevron} size={13} />
     </button>
-    <DisclosureMotion open={open} className={styles.agentThinkingMotion}><div className={styles.agentThinkingBody}>{segments.map((segment) => <AgentActivityItem key={segment.id} segment={segment} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</div></DisclosureMotion>
+    <DisclosureMotion open={open} className={styles.agentThinkingMotion}><div className={styles.agentThinkingBody}>{segments.map((segment) => <AgentActivityItem key={segment.id} segment={segment} disclosureRoot={disclosureId} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</div></DisclosureMotion>
   </section>;
 }
 
-function AgentCallContents({ events, status, taskId, finalTextHint, running, onApproval, onInput }: { events: RealtimeEnvelope[]; status: string; taskId?: string; finalTextHint: string; running: boolean; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+function AgentCallContents({ events, status, disclosureRoot, taskId, finalTextHint, running, onApproval, onInput }: { events: RealtimeEnvelope[]; status: string; disclosureRoot: string; taskId?: string; finalTextHint: string; running: boolean; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
   const segments = useMemo(() => activitySegments(
     settledEvents(events, status),
     TERMINAL_TASK_STATUSES.has(status) && finalTextHint ? [finalTextHint] : [],
   ), [events, finalTextHint, status]);
   const groups = useMemo(() => groupAgentActivity(segments) as Array<ActivitySegment | { type: "thinking"; id: string; segments: ActivitySegment[] }>, [segments]);
   return <>{groups.map((group, index) => group.type === "thinking"
-    ? <AgentThinking key={group.id} segments={group.segments} id={group.id} running={running && index === groups.length - 1} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />
-    : <AgentActivityItem key={group.id} segment={group} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</>;
+    ? <AgentThinking key={group.id} segments={group.segments} disclosureId={`${disclosureRoot}:thinking:${group.id}`} running={running && index === groups.length - 1} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />
+    : <AgentActivityItem key={group.id} segment={group} disclosureRoot={disclosureRoot} taskId={taskId} status={status} onApproval={onApproval} onInput={onInput} />)}</>;
 }
 
 function AgentCall({ events, status, task, taskId, finalTextHint = "", failure = null, detailsLoading = false, collapseWhen = false, onApproval, onInput }: { events: RealtimeEnvelope[]; status: string; task?: TaskSummary; taskId?: string; finalTextHint?: string; failure?: { code: string; message: string } | null; detailsLoading?: boolean; collapseWhen?: boolean; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
@@ -1688,25 +1696,25 @@ function AgentCall({ events, status, task, taskId, finalTextHint = "", failure =
   const stageDetail = taskPreparationDetail(status);
   const hasDetails = detailsLoading || hasActivity || Boolean(stageDetail);
   const running = !TERMINAL_TASK_STATUSES.has(status);
-  // The authoritative Task snapshot still gates live loading while timeline
-  // events are hydrating; disclosure choices are remembered independently.
-  const disclosureRunning = Boolean(task && !TERMINAL_TASK_STATUSES.has(task.status) && running);
+  // Handoff and live events can precede the Task snapshot. Keep loading visible
+  // throughout that gap; disclosure choices are remembered independently.
+  const disclosureRunning = running;
   const failed = status === "failed";
   const interrupted = ["interrupted", "cancelled"].includes(status);
   const conversationId = String(events[0]?.ids.conversationId || task?.conversationId || "unknown");
   const disclosureId = `agent:${conversationId}:${taskId || "unknown"}`;
-  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, hasDetails, running && !collapseWhen);
+  const [open, toggleOpen] = useTimelineDisclosure(disclosureId, hasDetails, running && !collapseWhen, true);
   const intent = useTimelineIntent(timelineIntentIds(events), open);
   if (failed) return <AgentFailureNotice message={agentFailureMessage(events, task, failure)} />;
   return <section className={`${styles.agentCall} ${open ? styles.agentCallOpen : ""} ${running ? styles.agentCallRunning : ""} ${interrupted ? styles.agentCallInterrupted : ""} ${hasDetails ? "" : styles.agentCallNoDetails}`}>
     <button {...intent} type="button" className={styles.agentCallHeading} aria-expanded={hasDetails ? open : undefined} onClick={() => hasDetails && toggleOpen()}>
-      <span data-ui-icon="" className={styles.agentCallGlyph}>{interrupted ? <CircleStop size={17} strokeWidth={1.8} /> : <Bot size={17} />}</span>
+      <span data-ui-icon="" className={styles.agentCallGlyph}>{running ? <LoaderCircle className={styles.spin} size={17} /> : interrupted ? <CircleStop size={17} strokeWidth={1.8} /> : <Bot size={17} />}</span>
       <span className={styles.activityHeadingLabel}>{running ? "Agent调用中" : interrupted ? "Agent调用已停止" : "Agent调用完成"}</span>
       {hasDetails ? <ChevronRight className={styles.agentCallChevron} size={13} /> : null}
     </button>
-    <DisclosureMotion open={hasDetails && open} ready={!detailsLoading || disclosureRunning} className={styles.agentCallMotion}><div><div className={styles.agentActivity}>
+    <DisclosureMotion open={hasDetails && open} ready={!detailsLoading || disclosureRunning} progressive={running} className={styles.agentCallMotion}><div><div className={styles.agentActivity}>
       {stageDetail ? <div className={styles.agentCallStage}><LoaderCircle className={styles.spin} size={15} /><span>{stageDetail}</span></div> : null}
-      <AgentCallContents events={events} status={status} taskId={taskId} finalTextHint={finalTextHint} running={disclosureRunning} onApproval={onApproval} onInput={onInput} />
+      <AgentCallContents events={events} status={status} disclosureRoot={disclosureId} taskId={taskId} finalTextHint={finalTextHint} running={disclosureRunning} onApproval={onApproval} onInput={onInput} />
       {finalActivities.map((content, index) => <AgentFinalActivity key={`final-activity:${index}:${content}`} content={content} />)}
     </div></div></DisclosureMotion>
   </section>;
@@ -1792,7 +1800,7 @@ function remoteTaskStatus(events: RealtimeEnvelope[], taskById: Readonly<Record<
   return status;
 }
 
-function HydratedConversationTimeline({ events, mode = "chat", taskIdHint = "", finalTextHint = "", loading = false, taskById = {}, settledTaskIds = new Set(), onApproval, onInput }: { events: RealtimeEnvelope[]; mode?: "chat" | "work"; taskIdHint?: string; finalTextHint?: string; loading?: boolean; taskById?: Readonly<Record<string, TaskSummary>>; settledTaskIds?: ReadonlySet<string>; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
+function HydratedConversationTimeline({ events, mode = "chat", taskIdHint = "", finalTextHint = "", loading = false, pending = false, taskById = {}, settledTaskIds = new Set(), onApproval, onInput }: { events: RealtimeEnvelope[]; mode?: "chat" | "work"; taskIdHint?: string; finalTextHint?: string; loading?: boolean; pending?: boolean; taskById?: Readonly<Record<string, TaskSummary>>; settledTaskIds?: ReadonlySet<string>; onApproval?: ApprovalResponder; onInput?: InputResponder }) {
   const webTrace = useMemo(() => buildWebTrace(events), [events]);
   const directRemoteAppend = useMemo(() => isDirectRemoteAppendTimeline(events), [events]);
   const remoteAll = useMemo(() => orderedEvents(events.filter((event) => event.producer === "task-orchestrator" || event.producer.startsWith("agent:"))), [events]);
@@ -1830,7 +1838,7 @@ function HydratedConversationTimeline({ events, mode = "chat", taskIdHint = "", 
     || Boolean(webTrace.failure || webTrace.abortReason)
   );
   const showHandoff = mode === "work" && !directRemoteAppend && webTrace.handoff;
-  if (!showThought && !remoteTaskId) return null;
+  if (!showThought && !remoteTaskId) return pending ? <section className={styles.workflow} aria-label="Agent 活动"><div className={`${styles.webThought} ${styles.webThoughtRunning}`}><div className={styles.webThoughtHeading} role="status"><span data-ui-icon="" className={styles.webThoughtGlyph}><LoaderCircle size={17} /></span><span className={styles.activityHeadingLabel}>正在准备回复</span></div></div></section> : null;
   return <section className={styles.workflow} aria-label="Agent 活动">
     {showThought ? <WebThought events={events} handoff={showHandoff ? webTrace.handoff : null} /> : null}
     {mode === "work" && remoteTaskId ? <AgentCall key={remoteTaskId} events={remoteAll} status={status} task={taskById[remoteTaskId]} taskId={remoteTaskId} finalTextHint={finalTextHint} detailsLoading={loading} collapseWhen={finalBodyStarted} onApproval={onApproval} onInput={onInput} /> : null}

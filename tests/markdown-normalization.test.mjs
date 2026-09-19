@@ -27,6 +27,15 @@ test("a dollar-delimited uppercase math identifier remains math", () => {
   assert.equal(protectShellVariablesFromInlineMath("The value is $HOME$ in this formula."), "The value is $HOME$ in this formula.");
 });
 
+test("shell positional parameters and command substitutions cannot turn prose into math italics", () => {
+  const source = "sbatch keeps cwd; use $(dirname \"$0\") with $1, $?, $$, $@, $((STEPS + 1)) and $'literal'. Then keep $x + y$ as math.";
+  assert.equal(
+    protectShellVariablesFromInlineMath(source),
+    "sbatch keeps cwd; use \\$(dirname \"\\$0\") with \\$1, \\$?, $$, \\$@, \\$((STEPS + 1)) and \\$'literal'. Then keep $x + y$ as math.",
+  );
+  assert.equal(protectShellVariablesFromInlineMath('`$(dirname "$0")`'), '`$(dirname "$0")`');
+});
+
 test("a GFM table directly after a label receives a block boundary", () => {
   const source = [
     "**边界换算结果**(`parse_duration(...)`)",

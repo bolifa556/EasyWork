@@ -98,11 +98,16 @@
 .projectMenuButton:hover { background: rgba(55,57,48,.065); color: var(--ew-ink); }
 .conversationRow { position: relative; min-width: 0; }
 .conversationRow > .treeItem { padding-right: 7px; transition:padding-right 150ms ease,background 150ms ease,color 150ms ease; }
+.conversationRunning > .treeItem { padding-right:31px; }
 .conversationMore { position: absolute; top: 3px; right: 3px; display: grid; width: 27px; height: 28px; place-items: center; border: 0; border-radius: 7px; background: transparent; color: var(--ew-ink-muted); opacity: 0; cursor: pointer; transition: opacity 140ms ease, background 140ms ease; }
 .conversationRow:hover .conversationMore,.conversationMore:focus-visible { opacity: 1; }
 .conversationMore:hover { background: rgba(55,57,48,.065); color: var(--ew-ink); }
 .conversationRow:hover > .treeItem,.conversationRow:focus-within > .treeItem,.conversationRow:has(.conversationMore[aria-expanded="true"]) > .treeItem { padding-right:67px; }
-.conversationRow:hover .kind,.conversationRow:focus-within .kind,.conversationRow:has(.conversationMore[aria-expanded="true"]) .kind { right:39px; opacity: 1; }
+.conversationRunning:hover > .treeItem,.conversationRunning:focus-within > .treeItem,.conversationRunning:has(.conversationMore[aria-expanded="true"]) > .treeItem { padding-right:91px; }
+.conversationMeta { position:absolute; top:50%; right:10px; display:flex; align-items:center; gap:5px; pointer-events:none; transform:translateY(-50%); transition:right 150ms ease; }
+.conversationRow:hover .conversationMeta,.conversationRow:focus-within .conversationMeta,.conversationRow:has(.conversationMore[aria-expanded="true"]) .conversationMeta { right:39px; }
+.conversationRunningIndicator { display:grid; width:14px; height:14px; flex:0 0 14px; place-items:center; color:var(--ew-green-deep); }
+.conversationRow:hover .kind,.conversationRow:focus-within .kind,.conversationRow:has(.conversationMore[aria-expanded="true"]) .kind { max-width:30px; opacity:1; }
 .renameItem { gap:7px; margin:0; cursor:text; }
 .renameInput { width:100%; min-width:0; height:28px; padding:3px 7px; border:1px solid rgb(82 107 67 / 32%); border-radius:7px; outline:0; background:rgb(255 254 250 / 78%); color:var(--ew-ink); box-shadow:0 0 0 3px rgb(82 107 67 / 7%); font:inherit; font-size:13.5px; }
 .renameInput:disabled { color:var(--ew-ink-muted); }
@@ -124,7 +129,7 @@
 .projectChatsMotion > div { min-height:0; overflow:hidden; }
 .projectChatsMotion > div > div { display:grid; gap:1px; }
 .projectChatsExpanded { grid-template-rows:1fr; opacity:1; transform:none; pointer-events:auto; }
-.kind { position:absolute; top:50%; right:10px; color:#8a857a; font-size:12px; font-weight:520; line-height:1; opacity: 0; pointer-events:none; transform:translateY(-50%); transition:right 150ms ease,opacity 140ms ease; }
+.kind { max-width:0; overflow:hidden; color:#8a857a; font-size:12px; font-weight:520; line-height:1; opacity:0; white-space:nowrap; transition:max-width 150ms ease,opacity 140ms ease; }
 .menuScrim { position: fixed; z-index: 310; inset: 0; border: 0; background: transparent; }
 .itemMenu { position: fixed; z-index: 311; display: grid; width: 198px; max-height: min(360px,calc(100dvh - 20px)); gap: 2px; padding: 6px; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--ew-line); border-radius: 13px; background: #fffefa; box-shadow: var(--ew-shadow-lg); animation: itemMenuIn 140ms cubic-bezier(.2,.75,.25,1) both; }
 .itemMenu button { display: flex; min-height: 36px; align-items: center; gap: 9px; padding: 7px 10px; border: 0; border-radius: 9px; background: transparent; color: var(--ew-ink-soft); font: inherit; font-size: .87rem; text-align: left; cursor: pointer; }
@@ -250,7 +255,8 @@
   .projectMenuButton,
   .conversationMore { right: 2px; }
   .sidebar .conversationRow:not(.renamingConversation) > .treeItem { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; padding-right:48px; }
-  .sidebar .conversationRow .kind { position:static; opacity:1; transform:none; }
+  .sidebar .conversationRow .conversationMeta { position:static; gap:5px; transform:none; }
+  .sidebar .conversationRow .kind { max-width:none; opacity:1; }
   .sidebar .conversationRow .titleScrollable { mask-image:none; }
   .sidebar .conversationRow .titleScrollable > span { width:100%; min-width:0; overflow:hidden; text-overflow:ellipsis; animation:none; transform:none; }
   .itemMenu button { min-height: var(--ew-mobile-touch); }

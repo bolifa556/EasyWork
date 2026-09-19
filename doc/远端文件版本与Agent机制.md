@@ -204,6 +204,8 @@ EasyWork 的工作区版本账本保存远端 Agent 写入前后的路径状态�
 
 回溯和重新生成同时协调网页消息、原生会话、Context 收据与工作区版本。重新生成不是分支：Codex/OpenCode 调用各自原地 revert；Claude Code/Qoder CN 在当前 session 上以精确 `resume-session-at` 边界继续，并重新提交原用户消息。原生操作成功时不会创建新的 thread/session；“创建分支”才调用原生 fork。恢复点必须属于最新保留的网页 Agent Task；若该 Task 没有可验证 checkpoint，不得向前寻找更老边界。若边界不可验证或原生回退失败，EasyWork 不把 fork 冒充重新生成，而是推进 `contextEpoch`，让下一轮在干净的新原生会话中按收据重建允许的上下文。工作区只恢复账本记录且通过冲突检查的路径。
 
+若被重试或移除的消息尚未创建远端 Task，则没有需要回退的远端执行，后端直接跳过 SSH、工作区和原生会话回退，继续网页响应流程。
+
 Skill 快照以实际 Binding 副本为准。分支继承分叉边界已有技能，之后双方修改互不影响。用户投递文件属于 Binding 私有数据；需要在新分支继续使用时，依据冻结文件版本在新 Binding 重建视图。
 
 ## 11. 删除、恢复与故障收敛

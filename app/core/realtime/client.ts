@@ -19,6 +19,7 @@ export class RealtimeClient {
   private readonly lastSequence = new Map<string, number>();
   private readonly seenEventIds = new Set<string>();
   private readonly initialReplayTopics = new Set<string>();
+  private readonly pendingSubscriptions = new Map<string, { topics: string[]; resume: Record<string, number> }>();
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
   private explicitlyClosed = false;
@@ -53,6 +54,7 @@ export class RealtimeClient {
       if (this.socket !== socket) return;
       this.socket = null;
       this.authenticated = false;
+      this.pendingSubscriptions.clear();
       this.setState("closed");
       if (!this.explicitlyClosed && this.listeners.size) this.scheduleReconnect();
     });
@@ -66,6 +68,7 @@ export class RealtimeClient {
     this.socket = null;
     socket?.close();
     this.authenticated = false;
+    this.pendingSubscriptions.clear();
     this.setState("closed");
   }
 
@@ -120,12 +123,13 @@ export class RealtimeClient {
       resume,
       replayView: "summary",
     };
+    this.pendingSubscriptions.set(message.requestId, { topics, resume });
     this.socket.send(JSON.stringify(message));
   }
 
   private receive(raw: unknown) {
     if (typeof raw !== "string") return;
-    let message: { type?: string; event?: RealtimeEnvelope; replay?: boolean; topics?: string[] };
+    let message: { type?: string; event?: RealtimeEnvelope; replay?: boolean; topics?: string[]; requestId?: string; meta?: { requestId?: string }; error?: { code?: string } };
     try {
       message = JSON.parse(raw) as { type?: string; event?: RealtimeEnvelope };
     } catch {
@@ -138,7 +142,21 @@ export class RealtimeClient {
       return;
     }
     if (message.type === "subscribed") {
+      if (message.requestId) this.pendingSubscriptions.delete(message.requestId);
       for (const topic of message.topics || []) this.initialReplayTopics.delete(topic);
+      return;
+    }
+    if (message.type === "error") {
+      const requestId = message.meta?.requestId || message.requestId || "";
+      const subscription = this.pendingSubscriptions.get(requestId);
+      this.pendingSubscriptions.delete(requestId);
+      if (message.error?.code === "REALTIME_REPLAY_EXPIRED" && subscription && Object.values(subscription.resume).some((cursor) => cursor > 0)) {
+        // The server drops the failed subscription but keeps the socket open.
+        // Start at the retained history so future deltas can arrive again.
+        const topics = subscription.topics.filter((topic) => this.listeners.has(topic));
+        for (const topic of topics) this.lastSequence.delete(topic);
+        this.sendSubscription(topics);
+      }
       return;
     }
     if (message.type !== "event" || !message.event) return;

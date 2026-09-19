@@ -17,18 +17,18 @@ async function freshMemory(name) {
 }
 
 function disclosureFixture(memory) {
-  let state;
-  const hook = new Function("useState", "hasTimelineDisclosureChoice", "readTimelineDisclosure", "writeTimelineDisclosure", `${compiled}; return useTimelineDisclosure;`)(
-    (initialize) => {
-      if (state === undefined) state = typeof initialize === "function" ? initialize() : initialize;
-      return [state, (next) => { state = typeof next === "function" ? next(state) : next; }];
-    },
+  const hook = new Function("useCallback", "useLayoutEffect", "useSyncExternalStore", "hasTimelineDisclosureChoice", "readTimelineDisclosure", "subscribeTimelineDisclosure", "updateTimelineDisclosureScope", "writeTimelineDisclosure", `${compiled}; return useTimelineDisclosure;`)(
+    (callback) => callback,
+    (effect) => { effect(); },
+    (_subscribe, getSnapshot) => getSnapshot(),
     memory.hasTimelineDisclosureChoice,
     memory.readTimelineDisclosure,
+    memory.subscribeTimelineDisclosure,
+    memory.updateTimelineDisclosureScope,
     memory.writeTimelineDisclosure,
   );
-  return { async render(identity, expandable = true, updating = false) {
-    return hook(identity, expandable, updating);
+  return { async render(identity, expandable = true, updating = false, collapseDescendantsOnSettle = false) {
+    return hook(identity, expandable, updating, collapseDescendantsOnSettle);
   } };
 }
 
@@ -52,22 +52,48 @@ test("live activity opens and settles automatically until the user takes control
   const memory = await freshMemory("live-automation");
   const untouched = disclosureFixture(memory);
 
-  assert.equal((await untouched.render("live", true, true, "first"))[0], true, "更新中的汇总栏自动展开");
-  assert.equal((await untouched.render("live", true, true, "delta"))[0], true, "后续更新保持展开");
-  assert.equal((await untouched.render("live", true, false, "done"))[0], false, "更新结束时自动收纳");
+  assert.equal((await untouched.render("live", true, true))[0], true, "更新中的汇总栏自动展开");
+  assert.equal((await untouched.render("live", true, true))[0], true, "后续更新保持展开");
+  assert.equal((await untouched.render("live", true, false))[0], false, "更新结束时自动收纳");
 
   const userCollapsed = disclosureFixture(await freshMemory("user-collapsed"));
-  await userCollapsed.render("live", true, true, "first");
-  const opened = await userCollapsed.render("live", true, true, "delta");
+  await userCollapsed.render("live", true, true);
+  const opened = await userCollapsed.render("live", true, true);
   opened[1]();
-  assert.equal((await userCollapsed.render("live", true, true, "more"))[0], false, "用户收纳后更新不再强制展开");
-  assert.equal((await userCollapsed.render("live", true, false, "done"))[0], false);
+  assert.equal((await userCollapsed.render("live", true, true))[0], false, "用户收纳后更新不再强制展开");
+  assert.equal((await userCollapsed.render("live", true, false))[0], false);
 
   const userExpanded = disclosureFixture(await freshMemory("user-expanded"));
-  const closed = await userExpanded.render("complete", true, false, "done");
+  const closed = await userExpanded.render("complete", true, false);
   closed[1]();
-  assert.equal((await userExpanded.render("complete", true, true, "retry"))[0], true, "用户展开后自动状态不再覆盖");
-  assert.equal((await userExpanded.render("complete", true, false, "settled"))[0], true);
+  assert.equal((await userExpanded.render("complete", true, true))[0], true, "用户展开后自动状态不再覆盖");
+  assert.equal((await userExpanded.render("complete", true, false))[0], true);
+});
+
+test("settling a parent collapses every nested disclosure without overwriting the parent choice", async () => {
+  const memory = await freshMemory("nested-settlement");
+  const parent = disclosureFixture(memory);
+  const root = "agent:conversation-a:task-a";
+  memory.writeTimelineDisclosure(root, true);
+  memory.writeTimelineDisclosure(`${root}:thinking:one`, true);
+  memory.writeTimelineDisclosure(`${root}:thinking:one:operation:one`, true);
+  memory.writeTimelineDisclosure(`${root}:thinking:one:operation:one:command:one`, true);
+  memory.updateTimelineDisclosureScope(`${root}:thinking:auto`, true);
+  memory.writeTimelineDisclosure("agent:conversation-b:task-b:thinking:one", true);
+  let nestedNotifications = 0;
+  const unsubscribe = memory.subscribeTimelineDisclosure(`${root}:thinking:one`, () => { nestedNotifications += 1; });
+
+  await parent.render(root, true, true, true);
+  await parent.render(root, true, false, true);
+  unsubscribe();
+
+  assert.equal(memory.readTimelineDisclosure(root), true, "父栏的用户选择仍由父栏自己管理");
+  assert.equal(memory.readTimelineDisclosure(`${root}:thinking:one`), false);
+  assert.equal(memory.readTimelineDisclosure(`${root}:thinking:one:operation:one`), false);
+  assert.equal(memory.readTimelineDisclosure(`${root}:thinking:one:operation:one:command:one`), false);
+  assert.equal(memory.readTimelineDisclosure(`${root}:thinking:auto`), false, "自动展开但未点过的子栏也会收纳");
+  assert.equal(memory.readTimelineDisclosure("agent:conversation-b:task-b:thinking:one"), true, "其他 Task 不受影响");
+  assert.equal(nestedNotifications, 1, "已挂载的子栏会立即刷新为收纳状态");
 });
 
 test("a refreshed page and another device both start with every activity collapsed", async () => {

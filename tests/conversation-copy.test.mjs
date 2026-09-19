@@ -36,6 +36,27 @@ async function loadProjection() {
 }
 const { conversationTimelineMarkdown: projection, activitySegments, buildWebTrace } = await loadProjection();
 
+test("网页思考逐片输出保留原始连续文字、重复词和换行", () => {
+  const started = event(1, "run.started", { mode: "work" }, "web-agent");
+  const chunks = ["用户", "要求：更新", " skill 文件（", "skills", "/minimax-music", "3.md），然后", "交付给我。", "\n\n", "需要", "需要", "保留的正文。"];
+  let events = [started];
+  for (const [index, content] of chunks.entries()) {
+    events = [...events, event(index + 2, "run.reasoning.delta", { iteration: 0, content }, "web-agent")];
+    const trace = buildWebTrace(events);
+    assert.equal(trace.entries.length, 1);
+    assert.equal(trace.entries[0].text, chunks.slice(0, index + 1).join(""));
+    assert.equal(trace.thinking, true, "未结束的流持续显示思考状态");
+  }
+  const trace = buildWebTrace([...events, event(20, "run.reasoning.delta", { iteration: 1, content: "下一轮分析" }, "web-agent")]);
+  assert.equal(trace.entries[0].text, chunks.join("") + "\n\n下一轮分析");
+});
+
+test("同一思考流收到多个累积快照时只追加新文字", () => {
+  const started = event(1, "run.started", { mode: "chat" }, "web-agent");
+  const events = [started, ...["用户", "用户要求", "用户要求更新技能", "用户要求更新技能"].map((content, index) => event(index + 2, "run.reasoning.delta", { iteration: 0, realtimeStreamKey: "stream:2", content }, "web-agent"))];
+  assert.equal(buildWebTrace(events).entries[0].text, "用户要求更新技能");
+});
+
 test("history already contains every Agent activity heading before any detail is hydrated", () => {
   const outline = entries => groupAgentActivity(activitySegments(entries)).map(group => [group.type, group.id]);
   for (const key of ["text", "content", "message", "summary", "output", "diff"]) {

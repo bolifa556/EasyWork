@@ -69,6 +69,7 @@
 .streamingMessage { padding-bottom: 28px; }
 .messageActions { display: flex; min-height: 31px; gap: 2px; margin-top: 6px; overflow: visible; opacity: 0; transition: opacity 150ms ease; }
 .user:hover .messageActions,.assistant:hover .messageActions,.user:focus-within .messageActions,.assistant:focus-within .messageActions { opacity: 1; }
+.messageActions[data-busy="true"] { opacity:1; }
 .messageAction { position: relative; display: inline-flex; }
 .messageAction::before,.messageAction::after { position: absolute; z-index: 40; left: 50%; pointer-events: none; opacity: 0; transition: opacity 120ms ease, transform 120ms ease; transition-delay: 0ms; }
 .messageAction::before { content: ""; bottom: calc(100% + 3px); width: 7px; height: 7px; border-right: 1px solid rgba(53,50,42,.2); border-bottom: 1px solid rgba(53,50,42,.2); background: #4d4b43; transform: translate(-50%,4px) rotate(45deg); }
