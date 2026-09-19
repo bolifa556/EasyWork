@@ -617,7 +617,7 @@ export class ContextHub {
         const sameBoundarySession = !existingBoundarySession
           || !incomingBoundarySession
           || existingBoundarySession === incomingBoundarySession;
-        existing.nativeBoundary = {
+        const mergedBoundary = {
           ...(existing.nativeBoundary || {}),
           ...(!existing.nativeBoundary?.protocol && nativeBoundary?.protocol ? { protocol: String(nativeBoundary.protocol) } : {}),
           ...(!existing.nativeBoundary?.sessionId && nativeBoundary?.sessionId ? { sessionId: String(nativeBoundary.sessionId) } : {}),
@@ -625,6 +625,10 @@ export class ContextHub {
           ...(sameBoundarySession && nativeBoundary?.rolloutPath ? { rolloutPath: String(nativeBoundary.rolloutPath) } : {}),
           ...(!existing.nativeBoundary?.skillSnapshot && nativeBoundary?.skillSnapshot ? { skillSnapshot: structuredClone(nativeBoundary.skillSnapshot) } : {}),
         };
+        if (sameBoundarySession && Object.prototype.hasOwnProperty.call(nativeBoundary || {}, "turnId") && !nativeBoundary?.turnId) {
+          delete mergedBoundary.turnId;
+        }
+        existing.nativeBoundary = mergedBoundary;
         data.bindings[String(bindingKey)] = receipt;
         saved = structuredClone(existing);
         return;
@@ -672,6 +676,35 @@ export class ContextHub {
     const stored = state.data.bindings[String(bindingKey)] || null;
     if (stored?.nativeSessionId !== String(nativeSessionId)) return [];
     return normalizeReceiptForMutation(stored).checkpoints.map((entry) => String(entry.checkpointId));
+  }
+
+  async rebindBindingNativeSession({ bindingKey, sourceNativeSessionId, targetNativeSessionId }) {
+    invariant(bindingKey && sourceNativeSessionId && targetNativeSessionId, "CONTEXT_RECEIPT_INVALID", "迁移 Context receipt 缺少 Agent binding 或原生会话", { status: 400 });
+    const repository = this.#receipts();
+    let rebound = false;
+    await updateWithLatestRevision(repository, (data) => {
+      const stored = data.bindings[String(bindingKey)] || null;
+      if (!stored || String(stored.nativeSessionId || "") === String(targetNativeSessionId)) return;
+      invariant(String(stored.nativeSessionId || "") === String(sourceNativeSessionId), "CONTEXT_CHECKPOINT_SESSION_MISMATCH", "待迁移 Context receipt 不属于旧原生会话", {
+        status: 409,
+        details: { bindingKey, expected: sourceNativeSessionId, actual: stored.nativeSessionId || null },
+      });
+      const receipt = normalizeReceiptForMutation(stored);
+      for (const checkpoint of receipt.checkpoints) {
+        if (String(checkpoint?.nativeBoundary?.sessionId || sourceNativeSessionId) !== String(sourceNativeSessionId)) continue;
+        checkpoint.nativeBoundary = {
+          ...(checkpoint.nativeBoundary || {}),
+          sessionId: String(targetNativeSessionId),
+        };
+      }
+      data.bindings[String(bindingKey)] = {
+        ...receipt,
+        nativeSessionId: String(targetNativeSessionId),
+        reboundAt: new Date().toISOString(),
+      };
+      rebound = true;
+    });
+    return { bindingKey: String(bindingKey), nativeSessionId: String(targetNativeSessionId), rebound };
   }
 
   async restoreBindingCheckpoint({ bindingKey, nativeSessionId, checkpointId = null }) {

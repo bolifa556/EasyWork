@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { invariant, redactSensitive } from "../errors.mjs";
+import { migrateLegacyRegenerationFork } from "../agent-runtime/native-session.mjs";
 import {
   canTransitionTask,
   createTask,
@@ -107,6 +108,7 @@ function operationInput(binding, input = {}) {
     ...(native.turnId || binding?.state?.turnId ? { turnId: native.turnId || binding.state.turnId } : {}),
     ...(native.processId ? { processId: native.processId } : {}),
     ...(native.pendingFork ? { pendingFork: clone(native.pendingFork) } : {}),
+    ...(native.pendingRewind ? { pendingRewind: clone(native.pendingRewind) } : {}),
   };
 }
 
@@ -967,7 +969,7 @@ export class TaskOrchestrator {
 
   async #loadBinding(task, adapter) {
     const existing = await this.runtime.loadBinding(task.agentBindingId);
-    const binding = existing || {
+    let binding = existing || {
       schemaVersion: 1,
       agentBindingId: task.agentBindingId,
       adapterId: adapter.id,
@@ -977,6 +979,18 @@ export class TaskOrchestrator {
       activeRunId: null,
       activeCommandId: null,
     };
+    const migration = migrateLegacyRegenerationFork(binding);
+    if (migration) {
+      if (typeof this.contextHub.rebindBindingNativeSession === "function") {
+        await this.contextHub.rebindBindingNativeSession({
+          bindingKey: task.agentBindingId,
+          sourceNativeSessionId: migration.receiptSourceSessionId,
+          targetNativeSessionId: migration.receiptTargetSessionId,
+        });
+      }
+      binding = migration.binding;
+      await this.runtime.saveBinding(task.agentBindingId, clone(binding));
+    }
     invariant(binding.agentBindingId === task.agentBindingId && binding.adapterId === adapter.id, "TASK_AGENT_BINDING_MISMATCH", "Task 与 Agent binding 不一致", { status: 409 });
     invariant(binding.state?.adapterId === adapter.id, "TASK_AGENT_STATE_MISMATCH", "Agent binding state 不属于当前 adapter", { status: 409 });
     return clone(binding);
@@ -1079,6 +1093,7 @@ export class TaskOrchestrator {
       const events = reduced.events.filter((event) => !(liveTask.status === "waiting_append"
         && (event.kind === "error" || (event.kind === "status" && event.phase === "cancelled"))));
       const pendingFork = binding.native?.pendingFork || null;
+      const pendingRewind = binding.native?.pendingRewind || null;
       const observedSessionId = ["claude-code", "qoder-cn"].includes(adapter.id) && rawFrame?.session_id
         ? String(rawFrame.session_id)
         : null;
@@ -1086,6 +1101,12 @@ export class TaskOrchestrator {
         invariant(observedSessionId === String(pendingFork.targetSessionId), "AGENT_NATIVE_FORK_SESSION_MISMATCH", `${adapter.id === "qoder-cn" ? "Qoder CN" : "Claude Code"} 原生分支返回了错误的 session id`, {
           status: 502,
           details: { expected: pendingFork.targetSessionId, actual: observedSessionId },
+        });
+      }
+      if (pendingRewind && observedSessionId) {
+        invariant(observedSessionId === String(pendingRewind.sessionId), "AGENT_NATIVE_REWIND_SESSION_MISMATCH", `${adapter.id === "qoder-cn" ? "Qoder CN" : "Claude Code"} 原生回退返回了错误的 session id`, {
+          status: 502,
+          details: { expected: pendingRewind.sessionId, actual: observedSessionId },
         });
       }
       const nextBinding = {
@@ -1101,6 +1122,7 @@ export class TaskOrchestrator {
              ? { turnId: reduced.state.turnId || null }
              : reduced.state.turnId ? { turnId: reduced.state.turnId } : {}),
            ...(pendingFork && observedSessionId ? { pendingFork: null } : {}),
+           ...(pendingRewind && observedSessionId ? { pendingRewind: null } : {}),
         },
       };
       // Native plan/Todo notifications update Task state, but are not Agent

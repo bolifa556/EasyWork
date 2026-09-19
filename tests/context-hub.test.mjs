@@ -89,6 +89,17 @@ test("Context Hub assembles a sealed budgeted delivery and only redelivers unkno
       nativeSessionId: "native_a",
       checkpointId: "task_a",
     })).nativeBoundary.turnId, "turn_a_final", "同一 Task 的早期边界必须推进到终态边界");
+    await hub.checkpointBinding({
+      bindingKey: "binding_a",
+      nativeSessionId: "native_a",
+      checkpointId: "task_a",
+      nativeBoundary: { protocol: "codex", sessionId: "native_a", turnId: null },
+    });
+    assert.equal(Object.hasOwn((await hub.getBindingCheckpoint({
+      bindingKey: "binding_a",
+      nativeSessionId: "native_a",
+      checkpointId: "task_a",
+    })).nativeBoundary, "turnId"), false, "终态验证失败时必须清除早期的不可恢复边界");
   } finally {
     await rm(dataRoot, { recursive: true, force: true });
   }
@@ -536,6 +547,51 @@ test("原生对话回执按 Task 检查点回退，并把分支前缀复制到�
       nativeSessionId: "native_source",
       units: [firstKnowledge, secondKnowledge],
     }), [secondKnowledge]);
+  } finally {
+    await rm(dataRoot, { recursive: true, force: true });
+  }
+});
+
+test("旧版重新生成误建的待分支回执可迁回原生会话", async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-context-rebind-"));
+  try {
+    const hub = new ContextHub({ dataRoot, actor });
+    await hub.acknowledgeSemanticContent({
+      bindingKey: "binding_regenerate",
+      nativeSessionId: "mistaken_branch_session",
+      values: ["用户：保留的问题", "助手：保留的回答"],
+    });
+    await hub.checkpointBinding({
+      bindingKey: "binding_regenerate",
+      nativeSessionId: "mistaken_branch_session",
+      checkpointId: "task_retained",
+      nativeBoundary: {
+        protocol: "qoder-cn-stream-json",
+        sessionId: "mistaken_branch_session",
+        turnId: "retained_assistant_uuid",
+      },
+    });
+
+    const rebound = await hub.rebindBindingNativeSession({
+      bindingKey: "binding_regenerate",
+      sourceNativeSessionId: "mistaken_branch_session",
+      targetNativeSessionId: "original_session",
+    });
+    assert.equal(rebound.rebound, true);
+    assert.deepEqual(await hub.listBindingCheckpointIds({
+      bindingKey: "binding_regenerate",
+      nativeSessionId: "original_session",
+    }), ["task_retained"]);
+    assert.equal((await hub.getBindingCheckpoint({
+      bindingKey: "binding_regenerate",
+      nativeSessionId: "original_session",
+      checkpointId: "task_retained",
+    })).nativeBoundary.sessionId, "original_session");
+    assert.deepEqual(await hub.unacknowledgedSemanticContent({
+      bindingKey: "binding_regenerate",
+      nativeSessionId: "original_session",
+      values: ["助手：保留的回答"],
+    }), []);
   } finally {
     await rm(dataRoot, { recursive: true, force: true });
   }

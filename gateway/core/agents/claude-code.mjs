@@ -30,7 +30,7 @@ const CAPABILITIES = Object.freeze({
   compact: { availability: "available", mode: "native" },
   contextUsage: { availability: "available", mode: "native" },
   fork: { availability: "available", mode: "native-deferred" },
-  revert: { availability: "available", mode: "native-deferred" },
+  revert: { availability: "available", mode: "native-rewind-deferred" },
 });
 
 // Claude Code exposes compaction as a native slash command on its stream-json
@@ -1254,22 +1254,37 @@ function baseArgs() {
   return ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompt-tool", "stdio"];
 }
 
+function resumedArgs(input) {
+  const pendingRewind = object(input.pendingRewind);
+  if (pendingRewind.sessionId && pendingRewind.resumeSessionAt) {
+    return [
+      ...baseArgs(),
+      "--resume", String(pendingRewind.sessionId),
+      "--resume-session-at", String(pendingRewind.resumeSessionAt),
+      ...(pendingRewind.resumeDropsTurn
+        ? ["--resume-drops-turn", String(pendingRewind.resumeDropsTurn)]
+        : []),
+    ];
+  }
+  const pendingFork = object(input.pendingFork);
+  if (pendingFork.sourceSessionId && pendingFork.targetSessionId && pendingFork.resumeSessionAt) {
+    return [
+      ...baseArgs(),
+      "--resume", String(pendingFork.sourceSessionId),
+      "--fork-session",
+      "--session-id", String(pendingFork.targetSessionId),
+      "--resume-session-at", String(pendingFork.resumeSessionAt),
+    ];
+  }
+  return input.sessionId
+    ? [...baseArgs(), "--resume", String(input.sessionId)]
+    : baseArgs();
+}
+
 function buildClaudeCodeOperation(operation, input) {
   if (operation === "start") {
     const prompt = requireString(input, "prompt", operation);
-    const pendingFork = object(input.pendingFork);
-    const args = pendingFork.sourceSessionId && pendingFork.targetSessionId && pendingFork.resumeSessionAt
-      ? [
-          ...baseArgs(),
-          "--resume", String(pendingFork.sourceSessionId),
-          "--fork-session",
-          "--session-id", String(pendingFork.targetSessionId),
-          "--resume-session-at", String(pendingFork.resumeSessionAt),
-        ]
-      : input.sessionId
-        ? [...baseArgs(), "--resume", String(input.sessionId)]
-        : baseArgs();
-    return processDescriptor(args, [userFrame(prompt)], input.cwd);
+    return processDescriptor(resumedArgs(input), [userFrame(prompt)], input.cwd);
   }
   if (operation === "append") {
     const commandId = text(input.commandId).trim() || "append";
@@ -1389,16 +1404,8 @@ function buildClaudeCodeOperation(operation, input) {
     };
   }
   if (operation === "resume") {
-    const pendingFork = object(input.pendingFork);
-    const args = pendingFork.sourceSessionId && pendingFork.targetSessionId && pendingFork.resumeSessionAt
-      ? [
-          ...baseArgs(),
-          "--resume", String(pendingFork.sourceSessionId),
-          "--fork-session",
-          "--session-id", String(pendingFork.targetSessionId),
-          "--resume-session-at", String(pendingFork.resumeSessionAt),
-        ]
-      : [...baseArgs(), "--resume", requireString(input, "sessionId", operation)];
+    requireString(input, "sessionId", operation);
+    const args = resumedArgs(input);
     return processDescriptor(args, [userFrame(requireString(input, "prompt", operation))], input.cwd);
   }
   if (operation === "compact") {
@@ -1406,12 +1413,20 @@ function buildClaudeCodeOperation(operation, input) {
     const args = [...baseArgs(), "--resume", requireString(input, "sessionId", operation)];
     return processDescriptor(args, [userFrame(COMPACT_COMMAND)], input.cwd);
   }
-  if (["fork", "revert"].includes(operation)) {
+  if (operation === "fork") {
     return {
       transport: "native-deferred",
       sourceSessionId: requireString(input, "sourceSessionId", operation),
       targetSessionId: requireString(input, "targetSessionId", operation),
       resumeSessionAt: requireString(input, "resumeSessionAt", operation),
+    };
+  }
+  if (operation === "revert") {
+    return {
+      transport: "native-rewind-deferred",
+      sessionId: requireString(input, "sessionId", operation),
+      resumeSessionAt: requireString(input, "resumeSessionAt", operation),
+      ...(input.resumeDropsTurn ? { resumeDropsTurn: String(input.resumeDropsTurn) } : {}),
     };
   }
   return { transport: "event-cache", action: "result-usage.snapshot", sessionId: idOf(input.sessionId) };

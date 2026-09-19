@@ -273,6 +273,7 @@ class SshProcessHandle {
     this.processId = processId;
     this.remotePidObserved = false;
     this.startupStderr = "";
+    this.diagnosticStderr = "";
     this.hub = new LineHub();
     this.pendingRpc = new Map();
     this.pendingControls = new Map();
@@ -291,6 +292,7 @@ class SshProcessHandle {
     channel.on("data", (chunk) => this.#consume(chunk));
     channel.stderr?.on("data", (chunk) => {
       const bytes = Buffer.from(chunk);
+      this.diagnosticStderr = `${this.diagnosticStderr}${bytes.toString("utf8")}`.slice(-16_384);
       if (!this.remotePidObserved) this.startupStderr = `${this.startupStderr}${bytes.toString("utf8")}`.slice(-4_096);
       onStderr?.(bytes);
     });

@@ -30,7 +30,7 @@ const CAPABILITIES = Object.freeze({
   compact: { availability: "available", mode: "native" },
   contextUsage: { availability: "available", mode: "native" },
   fork: { availability: "available", mode: "native-deferred" },
-  revert: { availability: "available", mode: "native-deferred" },
+  revert: { availability: "available", mode: "native-rewind-deferred" },
 });
 
 // Qoder CN exposes compaction as a native slash command on its stream-json
@@ -1293,7 +1293,9 @@ function reduceQoderCn(previousState, frame, producer) {
   } else if (type === "stream_event") {
     emitStreamEvent(context, frame);
   } else if (type === "assistant") {
-    if (frame.uuid) context.state.turnId = idOf(frame.uuid);
+    // Qoder's stream-json assistant UUID is an SDK event identifier and is not
+    // guaranteed to exist in the native transcript. Only the transport's
+    // verified active-leaf boundary may advance the resumable turn.
     const retractedMessageIds = array(frame.supersedes).map(String);
     if (retractedMessageIds.length) context.emit("job_status", "updated", {
       operation: "message_retracted",
@@ -1473,22 +1475,37 @@ function baseArgs() {
   return ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--permission-prompt-tool", "stdio"];
 }
 
+function resumedArgs(input) {
+  const pendingRewind = object(input.pendingRewind);
+  if (pendingRewind.sessionId && pendingRewind.resumeSessionAt) {
+    return [
+      ...baseArgs(),
+      "--resume", String(pendingRewind.sessionId),
+      "--resume-session-at", String(pendingRewind.resumeSessionAt),
+      ...(pendingRewind.resumeDropsTurn
+        ? ["--resume-drops-turn", String(pendingRewind.resumeDropsTurn)]
+        : []),
+    ];
+  }
+  const pendingFork = object(input.pendingFork);
+  if (pendingFork.sourceSessionId && pendingFork.targetSessionId && pendingFork.resumeSessionAt) {
+    return [
+      ...baseArgs(),
+      "--resume", String(pendingFork.sourceSessionId),
+      "--fork-session",
+      "--session-id", String(pendingFork.targetSessionId),
+      "--resume-session-at", String(pendingFork.resumeSessionAt),
+    ];
+  }
+  return input.sessionId
+    ? [...baseArgs(), "--resume", String(input.sessionId)]
+    : baseArgs();
+}
+
 function buildQoderCnOperation(operation, input) {
   if (operation === "start") {
     const prompt = requireString(input, "prompt", operation);
-    const pendingFork = object(input.pendingFork);
-    const args = pendingFork.sourceSessionId && pendingFork.targetSessionId && pendingFork.resumeSessionAt
-      ? [
-          ...baseArgs(),
-          "--resume", String(pendingFork.sourceSessionId),
-          "--fork-session",
-          "--session-id", String(pendingFork.targetSessionId),
-          "--resume-session-at", String(pendingFork.resumeSessionAt),
-        ]
-      : input.sessionId
-        ? [...baseArgs(), "--resume", String(input.sessionId)]
-        : baseArgs();
-    return processDescriptor(args, [userFrame(prompt)], input.cwd);
+    return processDescriptor(resumedArgs(input), [userFrame(prompt)], input.cwd);
   }
   if (operation === "append") {
     return {
@@ -1603,16 +1620,8 @@ function buildQoderCnOperation(operation, input) {
     };
   }
   if (operation === "resume") {
-    const pendingFork = object(input.pendingFork);
-    const args = pendingFork.sourceSessionId && pendingFork.targetSessionId && pendingFork.resumeSessionAt
-      ? [
-          ...baseArgs(),
-          "--resume", String(pendingFork.sourceSessionId),
-          "--fork-session",
-          "--session-id", String(pendingFork.targetSessionId),
-          "--resume-session-at", String(pendingFork.resumeSessionAt),
-        ]
-      : [...baseArgs(), "--resume", requireString(input, "sessionId", operation)];
+    requireString(input, "sessionId", operation);
+    const args = resumedArgs(input);
     return processDescriptor(args, [userFrame(requireString(input, "prompt", operation))], input.cwd);
   }
   if (operation === "compact") {
@@ -1620,12 +1629,20 @@ function buildQoderCnOperation(operation, input) {
     const args = [...baseArgs(), "--resume", requireString(input, "sessionId", operation)];
     return processDescriptor(args, [userFrame(COMPACT_COMMAND)], input.cwd);
   }
-  if (["fork", "revert"].includes(operation)) {
+  if (operation === "fork") {
     return {
       transport: "native-deferred",
       sourceSessionId: requireString(input, "sourceSessionId", operation),
       targetSessionId: requireString(input, "targetSessionId", operation),
       resumeSessionAt: requireString(input, "resumeSessionAt", operation),
+    };
+  }
+  if (operation === "revert") {
+    return {
+      transport: "native-rewind-deferred",
+      sessionId: requireString(input, "sessionId", operation),
+      resumeSessionAt: requireString(input, "resumeSessionAt", operation),
+      ...(input.resumeDropsTurn ? { resumeDropsTurn: String(input.resumeDropsTurn) } : {}),
     };
   }
   return { transport: "event-cache", action: "result-usage.snapshot", sessionId: idOf(input.sessionId) };

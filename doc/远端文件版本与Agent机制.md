@@ -113,7 +113,7 @@ Codex 由每个 Binding 独立的 `codex app-server` 进程控制。后端建立
 
 ### 5.3 Claude Code 控制
 
-Claude Code 以 `--input-format stream-json --output-format stream-json` 的长 stdin/stdout 进程运行，工作区作为 cwd，HOME、settings 和环境来自当前 Binding。新 session 写入第一条 user frame；继续会话以 `--resume <session-id>` 启动进程后写入新 frame。工作区改变时，在目标 cwd 启动新进程并 resume 同一个 session；旧 cwd 的空闲预热进程不复用。运行中追加先向同一进程写原生 control interrupt，再写下一条 user frame，并用排队回合计数确保中间 `result` 不会提前结束整个 Task。终止先发送 control interrupt，失败时只对保存的受管 PID 依次使用有界的 `SIGINT`、`SIGTERM` 和 `SIGKILL`，每一步都确认进程是否退出。stream event、assistant 快照、tool result、control request 和 terminal result 共同决定事件及终态。
+Claude Code 以 `--input-format stream-json --output-format stream-json` 的长 stdin/stdout 进程运行，工作区作为 cwd，HOME、settings 和环境来自当前 Binding。新 session 写入第一条 user frame；继续会话以 `--resume <session-id>` 启动进程后写入新 frame。工作区改变时，在目标 cwd 启动新进程并 resume 同一个 session；旧 cwd 的空闲预热进程不复用。运行中追加先向同一进程写原生 control interrupt，再写下一条 user frame，并用排队回合计数确保中间 `result` 不会提前结束整个 Task。终止先发送 control interrupt，失败时只对保存的受管 PID 依次使用有界的 `SIGINT`、`SIGTERM` 和 `SIGKILL`，每一步都确认进程是否退出。stream event、assistant 快照、tool result、control request 和 terminal result 共同决定事件及终态。若进程在 terminal result 前退出，运行层返回带退出码、信号和已脱敏 stderr 的 `AGENT_PROCESS_EXITED_WITHOUT_RESULT`，不再用无诊断的通用流结束错误代替原生失败原因。
 
 ### 5.4 OpenCode 控制
 
@@ -125,7 +125,7 @@ Qoder CN 使用官方 `qoderclicn` 可执行文件和 `QODERCN_CONFIG_DIR`。它
 
 部署完成后，后端用 `qoderclicn status -o json` 读取 `logged_in`。未登录时 Agent 仍可被选中和配置，但输入框禁用，Agent 一级菜单原部署位置显示“登录”；已登录时按钮消失。用户点击登录后，浏览器先同步建立空白新标签页，后端在该服务器的账号目录执行原生 `qoderclicn login`，禁止远端自行打开浏览器，捕获 CLI 输出的官方 HTTP(S) 授权地址并把新标签页导航过去。页面轮询原生 status；授权完成后刷新 Agent 状态。EasyWork 不接收账号密码、令牌或 API Key，也不代理 Qoder 登录表单。
 
-对话运行使用 `--print --input-format stream-json --output-format stream-json --include-partial-messages --permission-prompt-tool stdio`。新会话写入原生 user frame；已有会话以 `--resume <session-id>` 恢复。运行中追加向同一 stdin 发送带 `priority:"now"` 的 user frame，原生协议自行处理即时追问，不制造额外中断回合。工作区改变时，在目标 cwd 启动新进程并 resume 同一个 session；稳定 Binding 的 Qoder project store 继续指向原 native-store owner，因此会话身份和 transcript 连续，配置与 Skill 视图仍属于该 Binding。分支和回退使用 `--fork-session --session-id --resume-session-at` 的精确原生边界，边界不可验证时由上层进入新上下文代次。
+对话运行使用 `--print --input-format stream-json --output-format stream-json --include-partial-messages --permission-prompt-tool stdio`。新会话写入原生 user frame；已有会话以 `--resume <session-id>` 恢复。运行中追加向同一 stdin 发送带 `priority:"now"` 的 user frame，原生协议自行处理即时追问，不制造额外中断回合。工作区改变时，在目标 cwd 启动新进程并 resume 同一个 session；稳定 Binding 的 Qoder project store 继续指向原 native-store owner，因此会话身份和 transcript 连续，配置与 Skill 视图仍属于该 Binding。显式网页分支使用 `--fork-session --session-id --resume-session-at`；回溯和重新生成使用 `--resume <当前 session> --resume-session-at <保留边界>`，不创建新 Qoder session。该边界读取 Qoder transcript 的最新 `active-leaf.leafUuid`，并验证它对应同文件中的 assistant 记录；`last-prompt` 和 stream-json `assistant.uuid` 均不能替代。Qoder 进程在 terminal result 前退出时使用与 Claude Code 相同的带退出码、信号和脱敏 stderr 的明确诊断。
 
 Qoder 原生模型目录使用 SDK `1.0.41` 的 `initialize`、`get_models` 和 `get_usage_info`。后端合并并发探测并缓存 30 秒；前端以 Actor、服务器和 Qoder 版本为键先显示最近目录，5 分钟内直接复用，超过后在打开菜单时刷新，缓存最长保留 30 天。目录项带模型 ID、显示名、Credits 倍率、上下文档位和可选促销信息；旧配置缺少 model 时统一解释为原生 `auto`。套餐、附加和组织资源配额分栏显示，不自行求和；组织资源包仅在 `available: true` 时显示，`cap: -1` 等负数哨兵不作为额度。
 
@@ -194,7 +194,7 @@ EasyWork 的工作区版本账本保存远端 Agent 写入前后的路径状态�
 
 若原生 Agent 提供可验证的 fork，EasyWork 在精确 turn 边界调用它；已由原生 fork 继承的消息不重复发送。缺少可靠边界时建立新上下文代次，并按允许范围重新交付网页正文和语义资料。
 
-回溯和重新生成同时协调网页消息、原生会话、Context 收据与工作区版本。原生回退不可用或失败时不伪造旧会话，而是建立新代次。工作区只恢复账本记录且通过冲突检查的路径。
+回溯和重新生成同时协调网页消息、原生会话、Context 收据与工作区版本。重新生成不是分支：Codex/OpenCode 调用各自原地 revert；Claude Code/Qoder CN 在当前 session 上以精确 `resume-session-at` 边界继续，并重新提交原用户消息。原生操作成功时不会创建新的 thread/session；“创建分支”才调用原生 fork。恢复点必须属于最新保留的网页 Agent Task；若该 Task 没有可验证 checkpoint，不得向前寻找更老边界。若边界不可验证或原生回退失败，EasyWork 不把 fork 冒充重新生成，而是推进 `contextEpoch`，让下一轮在干净的新原生会话中按收据重建允许的上下文。工作区只恢复账本记录且通过冲突检查的路径。
 
 Skill 快照以实际 Binding 副本为准。分支继承分叉边界已有技能，之后双方修改互不影响。用户投递文件属于 Binding 私有数据；需要在新分支继续使用时，依据冻结文件版本在新 Binding 重建视图。
 

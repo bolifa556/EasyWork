@@ -10,6 +10,7 @@ import {
   createOpenCodeAdapter,
   createQoderCnAdapter,
 } from "../gateway/core/agents/index.mjs";
+import { migrateLegacyRegenerationFork } from "../gateway/core/agent-runtime/native-session.mjs";
 
 function consume(adapter, frames) {
   let state = adapter.createState();
@@ -146,11 +147,13 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
     openCode.operation("fork", { sessionId: "s-source", retainedMessageId: "msg-7" }),
     openCode.operation("revert", { sessionId: "s-source", retainedMessageId: "msg-7" }),
     claude.operation("fork", { sourceSessionId: "11111111-1111-4111-8111-111111111111", targetSessionId: "22222222-2222-4222-8222-222222222222", resumeSessionAt: "33333333-3333-4333-8333-333333333333" }),
+    claude.operation("revert", { sessionId: "11111111-1111-4111-8111-111111111111", resumeSessionAt: "33333333-3333-4333-8333-333333333333" }),
     qoder.operation("start", { prompt: "inspect files", cwd: "/work", sessionId: "q-session" }),
     qoder.operation("append", { prompt: "continue" }),
     qoder.operation("resume", { sessionId: "q-session", prompt: "continue", cwd: "/work/next" }),
     qoder.operation("compact", { sessionId: "q-session", cwd: "/work/next" }),
     qoder.operation("fork", { sourceSessionId: "q-source", targetSessionId: "q-target", resumeSessionAt: "q-message" }),
+    qoder.operation("revert", { sessionId: "q-source", resumeSessionAt: "q-message" }),
   ];
   const json = JSON.stringify(descriptors);
   assert.equal(/apiKey|password|privateKey|authorization/i.test(json), false);
@@ -193,6 +196,7 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
   const openCodeFork = descriptors.find((descriptor) => descriptor.adapter === "opencode" && descriptor.operation === "fork");
   const openCodeRevert = descriptors.find((descriptor) => descriptor.adapter === "opencode" && descriptor.operation === "revert");
   const claudeFork = descriptors.find((descriptor) => descriptor.adapter === "claude-code" && descriptor.operation === "fork");
+  const claudeRevert = descriptors.find((descriptor) => descriptor.adapter === "claude-code" && descriptor.operation === "revert");
   assert.deepEqual(codexFork.calls, [{
     method: "thread/fork",
     params: {
@@ -227,6 +231,13 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
     transport: "native-deferred",
     sourceSessionId: "11111111-1111-4111-8111-111111111111",
     targetSessionId: "22222222-2222-4222-8222-222222222222",
+    resumeSessionAt: "33333333-3333-4333-8333-333333333333",
+  });
+  assert.deepEqual(claudeRevert, {
+    adapter: "claude-code",
+    operation: "revert",
+    transport: "native-rewind-deferred",
+    sessionId: "11111111-1111-4111-8111-111111111111",
     resumeSessionAt: "33333333-3333-4333-8333-333333333333",
   });
 
@@ -296,6 +307,7 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
   const qoderAppend = descriptors.find((descriptor) => descriptor.adapter === "qoder-cn" && descriptor.operation === "append");
   const qoderResume = descriptors.find((descriptor) => descriptor.adapter === "qoder-cn" && descriptor.operation === "resume");
   const qoderFork = descriptors.find((descriptor) => descriptor.adapter === "qoder-cn" && descriptor.operation === "fork");
+  const qoderRevert = descriptors.find((descriptor) => descriptor.adapter === "qoder-cn" && descriptor.operation === "revert");
   assert.equal(qoderStart.executable, "qoderclicn");
   assert.deepEqual(qoderStart.args.slice(-2), ["--resume", "q-session"]);
   assert.equal(qoderStart.cwd, "/work");
@@ -315,6 +327,64 @@ test("operation descriptors 只描述官方 transport，不携带认证字段", 
     targetSessionId: "q-target",
     resumeSessionAt: "q-message",
   });
+  assert.deepEqual(qoderRevert, {
+    adapter: "qoder-cn",
+    operation: "revert",
+    transport: "native-rewind-deferred",
+    sessionId: "q-source",
+    resumeSessionAt: "q-message",
+  });
+});
+
+test("Claude Code 与 Qoder CN 重新生成在当前原生会话内回退，不创建分支", () => {
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const resumeSessionAt = "22222222-2222-4222-8222-222222222222";
+  for (const adapter of [createClaudeCodeAdapter(), createQoderCnAdapter()]) {
+    const descriptor = adapter.operation("start", {
+      sessionId,
+      prompt: "regenerate",
+      pendingRewind: { sessionId, resumeSessionAt },
+    });
+    assert.deepEqual(
+      descriptor.args.slice(descriptor.args.indexOf("--resume"), descriptor.args.indexOf("--resume-session-at") + 2),
+      ["--resume", sessionId, "--resume-session-at", resumeSessionAt],
+    );
+    assert.equal(descriptor.args.includes("--fork-session"), false);
+    assert.equal(descriptor.args.includes("--session-id"), false);
+  }
+});
+
+test("只迁移旧版重新生成留下的同 binding 待分支，不改动显式网页分支", () => {
+  const base = {
+    schemaVersion: 1,
+    agentBindingId: "binding-current",
+    adapterId: "qoder-cn",
+    state: { adapterId: "qoder-cn", sessionId: "mistaken-target", turnId: null, status: "idle" },
+    native: {
+      runtimeBindingId: "binding-current",
+      sessionId: "mistaken-target",
+      pendingFork: {
+        sourceSessionId: "original-session",
+        targetSessionId: "mistaken-target",
+        resumeSessionAt: "retained-boundary",
+      },
+    },
+  };
+  const migrated = migrateLegacyRegenerationFork(base);
+  assert.equal(migrated.binding.native.sessionId, "original-session");
+  assert.equal(migrated.binding.native.pendingFork, null);
+  assert.deepEqual(migrated.binding.native.pendingRewind, {
+    sessionId: "original-session",
+    resumeSessionAt: "retained-boundary",
+  });
+  assert.equal(migrated.receiptSourceSessionId, "mistaken-target");
+  assert.equal(migrated.receiptTargetSessionId, "original-session");
+
+  assert.equal(migrateLegacyRegenerationFork({
+    ...base,
+    agentBindingId: "binding-branch",
+    native: { ...base.native, runtimeBindingId: "binding-source" },
+  }), null);
 });
 
 test("四个 Agent 的新 EasyWork Task 都在已有原生会话中启动下一轮", () => {
@@ -717,6 +787,24 @@ test("Claude Code 原生 transcript 边界只更新会话状态且不产生前�
   });
   assert.equal(cleared.state.turnId, null);
   assert.deepEqual(cleared.events, []);
+});
+
+test("Qoder CN 只用验证后的 active-leaf 更新可恢复边界", () => {
+  const adapter = createQoderCnAdapter();
+  const initial = adapter.createState({ sessionId: "q-session", turnId: "verified-old-leaf" });
+  const streamed = adapter.reduce(initial, {
+    type: "assistant",
+    session_id: "q-session",
+    uuid: "sdk-event-not-in-transcript",
+    message: { content: [{ type: "text", text: "完成" }] },
+  });
+  assert.equal(streamed.state.turnId, "verified-old-leaf");
+  const verified = adapter.reduce(streamed.state, {
+    type: "easywork_native_boundary",
+    session_id: "q-session",
+    turn_id: "verified-active-leaf",
+  });
+  assert.equal(verified.state.turnId, "verified-active-leaf");
 });
 
 test("Claude Code 长任务 heartbeat 归并到原工具且不会留下伪运行卡片", () => {

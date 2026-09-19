@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 
-import { ApiError, invariant } from "../errors.mjs";
+import { ApiError, invariant, redactSensitive } from "../errors.mjs";
 import {
   assertEasyWorkSkillPaths,
   assertRuntimeIdentifier,
@@ -147,14 +147,57 @@ async function* prefixedFrames(frames, prefix = []) {
 
 const CLAUDE_NATIVE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function transcriptLocatorScript(projectsRoot, sessionId) {
+  return [
+    `projects_root=${shellQuote(projectsRoot)}`,
+    `session_id=${shellQuote(sessionId)}`,
+    "transcript=''",
+    "fallback_transcript=''",
+    "for candidate in \"$projects_root\"/*/\"$session_id.jsonl\"; do",
+    "  [ -f \"$candidate\" ] || continue",
+    "  if [ ! -L \"$candidate\" ]; then transcript=\"$candidate\"; break; fi",
+    "  [ -n \"$fallback_transcript\" ] || fallback_transcript=\"$candidate\"",
+    "done",
+    "[ -n \"$transcript\" ] || transcript=\"$fallback_transcript\"",
+  ];
+}
+
+function transcriptLeafCommand(configDirectory) {
+  if (configDirectory === "qoder-cn") {
+    // Qoder CLI 1.1.53 writes the selected transcript leaf as a standalone
+    // `active-leaf` record. Its `last-prompt` record contains only lastPrompt
+    // and sessionId, so treating it like Claude produces an empty boundary.
+    return "tail -n 256 -- \"$transcript\" 2>/dev/null | grep -F '\"type\":\"active-leaf\"' | tail -n 1 | sed -n 's/.*\"leafUuid\":\"\\([^\"]*\\)\".*/\\1/p'";
+  }
+  return "tail -n 32 -- \"$transcript\" 2>/dev/null | grep -F '\"type\":\"last-prompt\"' | tail -n 1 | sed -n 's/.*\"leafUuid\":\"\\([^\"]*\\)\".*/\\1/p'";
+}
+
+async function nativeTranscriptHasAssistantBoundary({ executor, runtimeData, sessionId, turnId, configDirectory = "claude" }) {
+  const normalizedSessionId = String(sessionId || "");
+  const normalizedTurnId = String(turnId || "");
+  if (!CLAUDE_NATIVE_UUID.test(normalizedSessionId)
+    || !CLAUDE_NATIVE_UUID.test(normalizedTurnId)
+    || !String(runtimeData || "")) return false;
+  const projectsRoot = `${String(runtimeData)}/${String(configDirectory)}/projects`;
+  const script = [
+    ...transcriptLocatorScript(projectsRoot, normalizedSessionId),
+    `turn_id=${shellQuote(normalizedTurnId)}`,
+    "# easywork_boundary_check",
+    "[ -n \"$transcript\" ] || exit 74",
+    "grep -F \"\\\"uuid\\\":\\\"$turn_id\\\"\" \"$transcript\" 2>/dev/null | grep -Fq '\"type\":\"assistant\"'",
+  ].join("\n");
+  const result = await executor.exec(`sh -c ${shellQuote(script)}`, { maxOutputBytes: 512 }).catch(() => null);
+  return Boolean(result && result.code === 0);
+}
+
 async function claudeTranscriptCurrentLeafUuid({ executor, runtimeData, sessionId, configDirectory = "claude" }) {
   const normalizedSessionId = String(sessionId || "");
   if (!CLAUDE_NATIVE_UUID.test(normalizedSessionId) || !String(runtimeData || "")) return null;
   const projectsRoot = `${String(runtimeData)}/${String(configDirectory)}/projects`;
   const script = [
-    `transcript="$(find ${shellQuote(projectsRoot)} -type f -name ${shellQuote(`${normalizedSessionId}.jsonl`)} -print -quit 2>/dev/null)"`,
+    ...transcriptLocatorScript(projectsRoot, normalizedSessionId),
     "leaf=''",
-    "if [ -n \"$transcript\" ]; then leaf=\"$(tail -n 32 -- \"$transcript\" 2>/dev/null | grep -F '\"type\":\"last-prompt\"' | tail -n 1 | sed -n 's/.*\"leafUuid\":\"\\([^\"]*\\)\".*/\\1/p')\"; fi",
+    `if [ -n "$transcript" ]; then leaf="$(${transcriptLeafCommand(configDirectory)})"; fi`,
     "if [ -n \"$leaf\" ] && grep -F \"\\\"uuid\\\":\\\"$leaf\\\"\" \"$transcript\" 2>/dev/null | grep -Fq '\"type\":\"assistant\"'; then printf '%s\\n' \"$leaf\"; fi",
   ].join("\n");
   const result = await executor.exec(`sh -c ${shellQuote(script)}`, { maxOutputBytes: 512 }).catch(() => null);
@@ -169,17 +212,28 @@ async function claudeTranscriptLeafUuid({ executor, runtimeData, sessionId, prev
   const projectsRoot = `${String(runtimeData || "")}/${String(configDirectory)}/projects`;
   if (!String(runtimeData || "")) return null;
   const prior = CLAUDE_NATIVE_UUID.test(String(previousTurnId || "")) ? String(previousTurnId) : "";
-  // Claude's terminal stream-json `result` does not expose the final transcript
-  // message UUID. `last-prompt.leafUuid` in the native JSONL is the boundary
-  // consumed by `--resume-session-at`; read only that compact field after the
-  // turn instead of copying or reconstructing Claude's conversation.
+  // Neither terminal stream-json `result` exposes the final transcript message
+  // UUID. Claude records it in `last-prompt.leafUuid`; Qoder records it in
+  // `active-leaf.leafUuid`. Read the Agent-owned pointer after the turn instead
+  // of copying, sorting or reconstructing its conversation.
   const script = [
+    `projects_root=${shellQuote(projectsRoot)}`,
+    `session_id=${shellQuote(normalizedSessionId)}`,
     "transcript=''",
+    "fallback_transcript=''",
     "leaf=''",
     "assistant_leaf=''",
     "for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100; do",
-    `  if [ -z "$transcript" ]; then transcript="$(find ${shellQuote(projectsRoot)} -type f -name ${shellQuote(`${normalizedSessionId}.jsonl`)} -print -quit 2>/dev/null)"; fi`,
-    "  if [ -n \"$transcript\" ]; then leaf=\"$(tail -n 32 -- \"$transcript\" 2>/dev/null | grep -F '\"type\":\"last-prompt\"' | tail -n 1 | sed -n 's/.*\"leafUuid\":\"\\([^\"]*\\)\".*/\\1/p')\"; fi",
+    "  if [ -z \"$transcript\" ]; then",
+    "    fallback_transcript=''",
+    "    for candidate in \"$projects_root\"/*/\"$session_id.jsonl\"; do",
+    "      [ -f \"$candidate\" ] || continue",
+    "      if [ ! -L \"$candidate\" ]; then transcript=\"$candidate\"; break; fi",
+    "      [ -n \"$fallback_transcript\" ] || fallback_transcript=\"$candidate\"",
+    "    done",
+    "    [ -n \"$transcript\" ] || transcript=\"$fallback_transcript\"",
+    "  fi",
+    `  if [ -n "$transcript" ]; then leaf="$(${transcriptLeafCommand(configDirectory)})"; fi`,
     `  if [ -n "$leaf" ] && { [ -z ${shellQuote(prior)} ] || [ "$leaf" != ${shellQuote(prior)} ]; } && grep -F \"\\\"uuid\\\":\\\"$leaf\\\"\" \"$transcript\" 2>/dev/null | grep -Fq '\"type\":\"assistant\"'; then assistant_leaf="$leaf"; break; fi`,
     "  sleep 0.05",
     "done",
@@ -483,6 +537,7 @@ function claudeResultWithTurnBoundary(entry, frame) {
 
 async function* scopedClaudeFrames(lines, entry) {
   const process = entry.process;
+  let terminalResult = false;
   try {
     for await (const frame of parsedFrames(lines)) {
       if (frame?.type === "control_request") {
@@ -505,10 +560,37 @@ async function* scopedClaudeFrames(lines, entry) {
         // releases stdin and the scoped SSH channel.
         if (result.easywork.terminalResult) process.endInput?.();
         yield result;
-        if (result.easywork.terminalResult) return;
+        if (result.easywork.terminalResult) {
+          terminalResult = true;
+          return;
+        }
         continue;
       }
       yield frame;
+    }
+    if (!terminalResult) {
+      let exit = null;
+      try { exit = typeof process.wait === "function" ? await process.wait() : null; }
+      catch (error) {
+        throw new ApiError("AGENT_PROCESS_EXITED_WITHOUT_RESULT", `${entry.agentId === "qoder-cn" ? "Qoder CN" : "Claude Code"} 进程在返回最终结果前异常退出`, {
+          status: 502,
+          expose: true,
+          retryable: true,
+          details: { reason: String(error?.message || error || "process_wait_failed") },
+          cause: error,
+        });
+      }
+      const stderr = String(process.diagnosticStderr || process.stderr || "")
+        .replace(/\x1b\[[0-9;]*m/g, "")
+        .trim()
+        .slice(-4_096);
+      const detail = stderr ? `：${stderr.split(/\r?\n/).filter(Boolean).at(-1)}` : "";
+      throw new ApiError("AGENT_PROCESS_EXITED_WITHOUT_RESULT", `${entry.agentId === "qoder-cn" ? "Qoder CN" : "Claude Code"} 进程在返回最终结果前退出${detail}`, {
+        status: 502,
+        expose: true,
+        retryable: true,
+        details: redactSensitive({ exitCode: exit?.code ?? null, signal: exit?.signal ?? null, stderr: stderr || null }),
+      });
     }
   } finally {
     // Also release the process when parsing, persistence, or the downstream
@@ -1699,7 +1781,7 @@ export class AgentRuntimeTransport {
     invariant(request && request.descriptor && request.binding, "AGENT_TRANSPORT_REQUEST_INVALID", "Agent transport 请求不完整", { status: 400 });
     const agentId = String(request.adapterId || "");
     runtimeAgentDefinition(agentId);
-    if (agentId === "qoder-cn" && !["event-cache", "native-deferred"].includes(request.descriptor.transport)) {
+    if (agentId === "qoder-cn" && !["event-cache", "native-deferred", "native-rewind-deferred"].includes(request.descriptor.transport)) {
       const authentication = await this.deploymentService.authenticationStatus(agentId, { force: true });
       invariant(authentication.authenticated, "QODER_LOGIN_REQUIRED", "请先登录 Qoder CN 账号", {
         status: 409,
@@ -1916,6 +1998,16 @@ export class AgentRuntimeTransport {
         const targetSessionId = String(request.descriptor.targetSessionId || "");
         const resumeSessionAt = String(request.descriptor.resumeSessionAt || "");
         invariant(sourceSessionId && targetSessionId && resumeSessionAt, "AGENT_NATIVE_FORK_BOUNDARY_MISSING", `${agentId === "qoder-cn" ? "Qoder CN" : "Claude Code"} 原生分支缺少会话边界`, { status: 409 });
+        invariant(await nativeTranscriptHasAssistantBoundary({
+          executor: this.executor,
+          runtimeData: nativeStorePaths.runtimeData,
+          sessionId: sourceSessionId,
+          turnId: resumeSessionAt,
+          configDirectory: agentId === "qoder-cn" ? "qoder-cn" : "claude",
+        }), "AGENT_NATIVE_FORK_BOUNDARY_INVALID", `${agentId === "qoder-cn" ? "Qoder CN" : "Claude Code"} 原生分支边界已失效`, {
+          status: 409,
+          details: { sessionId: sourceSessionId, resumeSessionAt },
+        });
         await this.#recordRuntime(context, {
           runId: nativeRunId(request.binding),
           status: "idle",
@@ -1935,6 +2027,49 @@ export class AgentRuntimeTransport {
               sessionId: targetSessionId,
               turnId: null,
               pendingFork: { sourceSessionId, targetSessionId, resumeSessionAt },
+            },
+          },
+        };
+      } else if (request.descriptor.transport === "native-rewind-deferred") {
+        invariant(["claude-code", "qoder-cn"].includes(agentId), "AGENT_NATIVE_REWIND_DEFERRED_UNSUPPORTED", `${agentId} 不支持 deferred native rewind`, { status: 409 });
+        const sessionId = String(request.descriptor.sessionId || "");
+        const resumeSessionAt = String(request.descriptor.resumeSessionAt || "");
+        const resumeDropsTurn = String(request.descriptor.resumeDropsTurn || "");
+        invariant(sessionId && resumeSessionAt, "AGENT_NATIVE_REWIND_BOUNDARY_MISSING", `${agentId === "qoder-cn" ? "Qoder CN" : "Claude Code"} 原生回退缺少会话边界`, { status: 409 });
+        invariant(await nativeTranscriptHasAssistantBoundary({
+          executor: this.executor,
+          runtimeData: nativeStorePaths.runtimeData,
+          sessionId,
+          turnId: resumeSessionAt,
+          configDirectory: agentId === "qoder-cn" ? "qoder-cn" : "claude",
+        }), "AGENT_NATIVE_REWIND_BOUNDARY_INVALID", `${agentId === "qoder-cn" ? "Qoder CN" : "Claude Code"} 原生回退边界已失效`, {
+          status: 409,
+          details: { sessionId, resumeSessionAt },
+        });
+        await this.#recordRuntime(context, {
+          runId: nativeRunId(request.binding),
+          status: "idle",
+          sessionId,
+        });
+        result = {
+          runId: nativeRunId(request.binding),
+          bindingPatch: {
+            state: { sessionId, turnId: resumeSessionAt, status: "idle" },
+            native: {
+              agentSource: installation.source,
+              binaryPath: installation.binaryPath,
+              runtimeRoot: paths.runtimeRoot,
+              runtimeBindingId: nativeStoreBindingId,
+              runtimeStoreRoot: nativeStorePaths.runtimeRoot,
+              skillsRoot: paths.skillsRoot,
+              sessionId,
+              turnId: resumeSessionAt,
+              pendingFork: null,
+              pendingRewind: {
+                sessionId,
+                resumeSessionAt,
+                ...(resumeDropsTurn ? { resumeDropsTurn } : {}),
+              },
             },
           },
         };
@@ -2195,7 +2330,7 @@ export class AgentRuntimeTransport {
     const warmNativeProcess = (runtimeApiRoute || agentId === "qoder-cn") && !request.task.skillPins?.length;
     if (warmNativeProcess && agentId === "opencode") entry = await this.#openCodeService(context);
     else if (warmNativeProcess && agentId === "codex") entry = await this.#codexProcess(context);
-    else if (warmNativeProcess && !request.binding.native?.pendingFork) {
+    else if (warmNativeProcess && !request.binding.native?.pendingFork && !request.binding.native?.pendingRewind) {
       entry = await this.#claudeProcess(context);
       entry.prepared = true;
     }
@@ -4539,6 +4674,7 @@ esac
     }
     if (context.request.operation === "start"
       && !(Array.isArray(descriptor.args) && descriptor.args.includes("--fork-session"))
+      && !(Array.isArray(descriptor.args) && descriptor.args.includes("--resume-session-at"))
       && streamAgentIds.includes(prepared?.agentId) && prepared?.agentId === context.agentId && prepared.prepared === true && prepared.process && !prepared.process.closed) {
       if (preparedMatchesRuntime) {
         prepared.prepared = false;
@@ -4664,6 +4800,7 @@ esac
       const sessionBeforeTurn = context.request.binding.native?.sessionId || context.request.binding.state?.sessionId || null;
       let previousTurnId = context.request.binding.native?.turnId
         || context.request.binding.state?.turnId
+        || context.request.binding.native?.pendingRewind?.resumeSessionAt
         || context.request.binding.native?.pendingFork?.resumeSessionAt
         || null;
       // Bindings created before native leaf capture was introduced can have a

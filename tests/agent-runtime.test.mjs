@@ -297,10 +297,10 @@ class FakeProcess {
 
   wait() { return this.exitPromise; }
 
-  close() {
+  close(result = { code: 0, signal: null }) {
     this.closed = true;
     this.queue.end();
-    this.resolveExit({ code: 0, signal: null });
+    this.resolveExit(result);
   }
 }
 
@@ -323,6 +323,7 @@ class FakeExecutor {
     this.scanOutput = "";
     this.claudeBoundaryOutput = "";
     this.claudeBoundaryOutputs = [];
+    this.nativeBoundaryValid = true;
   }
 
   async home() { return "/home/tester"; }
@@ -342,6 +343,11 @@ class FakeExecutor {
     if (linked) this.links.set(linked[2], linked[1]);
     const moved = /mv -Tf -- '([^']+)' '([^']+)'/.exec(command);
     if (moved && this.links.has(moved[1])) { this.links.set(moved[2], this.links.get(moved[1])); this.links.delete(moved[1]); }
+    if (command.includes("easywork_boundary_check")) return {
+      code: this.nativeBoundaryValid ? 0 : 1,
+      stdout: "",
+      stderr: "",
+    };
     if (command.includes("leafUuid")) return {
       code: 0,
       stdout: this.claudeBoundaryOutputs.length ? this.claudeBoundaryOutputs.shift() : this.claudeBoundaryOutput,
@@ -1038,17 +1044,43 @@ describe("SSH process protocol", () => {
     assert.deepEqual(frames.map((frame) => frame.type), ["easywork_native_boundary", "result"]);
     assert.equal(frames[0].session_id, sessionId);
     assert.equal(frames[0].turn_id, leafUuid);
-    assert.equal(executor.commands.some((command) => command.includes(`${sessionId}.jsonl`)
+    assert.equal(executor.commands.some((command) => command.includes(sessionId)
+      && command.includes("$session_id.jsonl")
       && command.includes("leafUuid")
       && command.includes("type")
       && command.includes("assistant")
-      && command.includes('if [ -z "$transcript" ]; then transcript=')), true,
+      && command.includes('if [ -z "$transcript" ]; then')), true,
     "fresh Claude forks must rediscover a transcript that appears after the terminal result");
     let state = adapter.createState();
     for (const frame of frames) state = adapter.reduce(state, frame).state;
     assert.equal(state.sessionId, sessionId);
     assert.equal(state.turnId, leafUuid);
     assert.equal(state.finalSeen, true);
+    await transport.close();
+  });
+
+  it("reads Qoder's resumable boundary from active-leaf instead of last-prompt", async () => {
+    const executor = new FakeExecutor();
+    const adapter = createQoderCnAdapter();
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const leafUuid = "22222222-2222-4222-8222-222222222222";
+    executor.claudeBoundaryOutput = `${leafUuid}\n`;
+    const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+    const started = await transport.execute(requestFor(adapter, "start", { prompt: "inspect", cwd: "/work/demo" }));
+    executor.processes[0].queue.push(JSON.stringify({
+      type: "result",
+      subtype: "success",
+      session_id: sessionId,
+      result: "done",
+    }));
+
+    const frames = [];
+    for await (const frame of started.frames) frames.push(frame);
+    assert.equal(frames[0].type, "easywork_native_boundary");
+    assert.equal(frames[0].turn_id, leafUuid);
+    const boundaryCommand = executor.commands.findLast((command) => command.includes("leafUuid"));
+    assert.match(boundaryCommand, /active-leaf/);
+    assert.doesNotMatch(boundaryCommand, /last-prompt/);
     await transport.close();
   });
 
@@ -3100,6 +3132,92 @@ describe("four-Agent executable runtime transport", () => {
     const boundaryCommand = executor.commands.findLast((command) => command.includes("leafUuid"));
     assert.match(boundaryCommand, new RegExp(boundaryMessageId));
     assert.equal(nativeFrames[0].turn_id, leafUuid);
+    await transport.close();
+  });
+
+  it("defers Claude and Qoder regeneration as an in-place native rewind", async () => {
+    for (const adapter of [createClaudeCodeAdapter(), createQoderCnAdapter()]) {
+      const executor = new FakeExecutor();
+      const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+      const sessionId = "11111111-1111-4111-8111-111111111111";
+      const boundaryMessageId = "22222222-2222-4222-8222-222222222222";
+      const current = binding(adapter, {
+        state: adapter.createState({ sessionId, turnId: "33333333-3333-4333-8333-333333333333" }),
+        native: { sessionId, turnId: "33333333-3333-4333-8333-333333333333" },
+      });
+      const deferred = await transport.execute(requestFor(adapter, "revert", {
+        sessionId,
+        resumeSessionAt: boundaryMessageId,
+      }, { binding: current }));
+
+      assert.equal(executor.spawns.length, 0);
+      assert.equal(deferred.bindingPatch.state.sessionId, sessionId);
+      assert.deepEqual(deferred.bindingPatch.native.pendingRewind, {
+        sessionId,
+        resumeSessionAt: boundaryMessageId,
+      });
+      assert.equal(deferred.bindingPatch.native.pendingFork, null);
+
+      const pendingBinding = binding(adapter, {
+        state: deferred.bindingPatch.state,
+        native: deferred.bindingPatch.native,
+      });
+      const turn = await transport.execute(requestFor(adapter, "start", {
+        sessionId,
+        prompt: "regenerate this answer",
+        cwd: "/work/demo",
+        pendingRewind: deferred.bindingPatch.native.pendingRewind,
+      }, { binding: pendingBinding }));
+      const args = executor.spawns[0].args;
+      assert.deepEqual(
+        args.slice(args.indexOf("--resume"), args.indexOf("--resume-session-at") + 2),
+        ["--resume", sessionId, "--resume-session-at", boundaryMessageId],
+      );
+      assert.equal(args.includes("--fork-session"), false);
+      assert.equal(args.includes("--session-id"), false);
+      executor.claudeBoundaryOutput = "44444444-4444-4444-8444-444444444444\n";
+      executor.processes[0].queue.push(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }));
+      executor.processes[0].queue.push(JSON.stringify({ type: "result", subtype: "success", session_id: sessionId, result: "done" }));
+      const frames = [];
+      for await (const frame of turn.frames) frames.push(frame);
+      assert.equal(frames.some((frame) => frame.type === "result"), true);
+      await transport.close();
+    }
+  });
+
+  it("rejects a deferred Qoder rewind whose assistant boundary is absent from the native transcript", async () => {
+    const executor = new FakeExecutor();
+    executor.nativeBoundaryValid = false;
+    const adapter = createQoderCnAdapter();
+    const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const invalidBoundary = "22222222-2222-4222-8222-222222222222";
+    await assert.rejects(() => transport.execute(requestFor(adapter, "revert", {
+      sessionId,
+      resumeSessionAt: invalidBoundary,
+    }, {
+      binding: binding(adapter, {
+        state: adapter.createState({ sessionId, turnId: invalidBoundary }),
+        native: { sessionId, turnId: invalidBoundary },
+      }),
+    })), (error) => error?.code === "AGENT_NATIVE_REWIND_BOUNDARY_INVALID"
+      && error?.details?.resumeSessionAt === invalidBoundary);
+    assert.equal(executor.spawns.length, 0);
+    await transport.close();
+  });
+
+  it("reports native process stderr when a stream exits without a final result", async () => {
+    const executor = new FakeExecutor();
+    const adapter = createQoderCnAdapter();
+    const transport = new AgentRuntimeTransport({ executor, deploymentService: deploymentResolver() });
+    const run = await transport.execute(requestFor(adapter, "start", { prompt: "inspect", cwd: "/work/demo" }));
+    executor.processes[0].diagnosticStderr = "Error resuming session: Resume point was not found.";
+    executor.processes[0].close({ code: 42, signal: null });
+    await assert.rejects(async () => {
+      for await (const frame of run.frames) void frame;
+    }, (error) => error?.code === "AGENT_PROCESS_EXITED_WITHOUT_RESULT"
+      && error?.details?.exitCode === 42
+      && /Resume point was not found/.test(error.message));
     await transport.close();
   });
 

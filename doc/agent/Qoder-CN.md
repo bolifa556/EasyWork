@@ -156,6 +156,8 @@ Agent 一级菜单的状态为：
 
 这是 Qoder 原生即时输入能力。它不会像 Claude Code 适配那样先制造一条 interrupt frame。显式终止仍使用原生 `control_request {subtype:"interrupt"}`，随后有界确认进程退出。
 
+若 stdout 在 terminal `result` 前结束，SSH 进程层保留最近 16 KiB stderr，transport 清除终端颜色、截取并脱敏后返回 `AGENT_PROCESS_EXITED_WITHOUT_RESULT`，同时携带退出码和信号。页面因此显示可定位的 Qoder 原生退出原因，而不是无上下文的 “stream ended without final event”。
+
 ## 5. 工作区切换
 
 Qoder CLI 提供 `--cwd`/进程 cwd 和 `--resume`，没有修改一个已经启动的 CLI 进程 cwd 的独立控制 RPC。EasyWork 因而按原生方式切换：
@@ -180,7 +182,8 @@ Qoder CLI 提供 `--cwd`/进程 cwd 和 `--resume`，没有修改一个已经启
 | input | 按 AskUserQuestion、elicitation 或 dialog 的原生形状回答 |
 | compact | 活动进程发送 `/compact`；无活动进程时恢复一次性进程 |
 | contextUsage | 使用当前请求的 streaming usage、原生 context report 或可验证 ratio |
-| fork/revert | 持久化精确 native-deferred 边界，下次真实输入用原生 fork-at-boundary 参数完成 |
+| fork | 持久化精确 native-deferred 边界；目标网页分支下一条真实输入使用原生 fork-at-boundary 参数 |
+| revert / 重新生成 | 保留当前 `session_id`，持久化 native-rewind-deferred 边界；下一条真实输入在同一 session 内恢复到该边界 |
 
 Qoder 的原生分支参数为：
 
@@ -191,7 +194,18 @@ Qoder 的原生分支参数为：
 --resume-session-at <assistant-leaf-uuid>
 ```
 
-边界来自 Qoder `projects` transcript 中可验证的 assistant UUID。缺少边界时不能从回答文本猜测。
+回溯和重新生成不带 `--fork-session`，也不生成 `--session-id`：
+
+```text
+--resume <current-session>
+--resume-session-at <retained-assistant-leaf-uuid>
+```
+
+网页先把消息、Context receipt 和工作区版本恢复到同一保留边界，再以原用户消息创建新 Task。Qoder 会在同一个 session 的原生 transcript DAG 上继续生成，因此重新生成不是网页分支，也不会创建新的 Qoder session。`--resume-drops-turn <prompt-uuid>` 只在已取得并验证被丢弃用户回合 UUID 时作为防误删 guard；不能用 assistant UUID 或网页消息 ID 代替。
+
+边界来自 Qoder `projects` transcript 的最新 `active-leaf.leafUuid`，并且该 UUID 必须在同一 JSONL 中对应一条 `type:"assistant"` 记录。Qoder CLI `1.1.53` 的 `last-prompt` 只有 `lastPrompt`、`sessionId` 和 `type`，不能按 Claude 的 `last-prompt.leafUuid` 读取。stream-json 的顶层 `assistant.uuid` 是 SDK 事件标识，不作为 `--resume-session-at` 边界。EasyWork 在 Task 终态读取并验证 `active-leaf`，在保存 deferred fork/revert 前再次验证；缺少边界时不能从回答文本猜测。
+
+原生同会话回退不能安全执行时，上层推进 `contextEpoch`，下一轮在干净的新 session 中按 Context receipt 重建允许的上下文；不会改用 `--fork-session` 冒充重新生成。恢复点必须属于最新保留的网页 Agent Task，不能因为该 Task 缺少 checkpoint 就退回更早的原生边界，否则网页与原生历史会错位。旧版 EasyWork 曾把重新生成错误保存成同 Binding 的 `pendingFork`；当前启动时会把这种状态连同 Context receipt 迁回来源 session，而显式网页分支因使用独立 Binding/native-store owner，不参与该迁移。
 
 ## 7. 事件、Skill 与文件版本
 
@@ -215,7 +229,7 @@ Binding 的 `skills/` 链接到 `QODERCN_CONFIG_DIR/skills`。本轮明确选择
 4. `login` 是否仍输出可打开的 device-login HTTP(S) URL；
 5. stream-json 参数、user `priority:"now"`、control request/response 和 result 终态；
 6. `QODERCN_CONFIG_DIR`、`.auth`、`projects`、settings 和 Skill 目录规则；
-7. `--resume` 跨 cwd、`--resume-session-at` 与 `--fork-session`；
+7. `--resume` 跨 cwd、同 session 的 `--resume-session-at`、可选 `--resume-drops-turn` guard，以及独立分支的 `--fork-session`；
 8. 权限枚举、reasoning effort、当前请求 usage、`context_usage_ratio` 和文件 checkpoint Hook；
 9. SDK `1.0.41` control 的 `initialize`、`get_models`、`get_usage_info`，以及模型倍率、上下文档位、配额哨兵和积分结构；
 10. `/compact` 是否仍以 `system/compact_boundary` 先于终态证明成功，以及无边界 result 的失败/未执行语义；

@@ -4,6 +4,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 
 import { createAgentAdapters } from "../agents/index.mjs";
+import { migrateLegacyRegenerationFork } from "../agent-runtime/native-session.mjs";
 import { ArtifactService } from "../artifacts/service.mjs";
 import { AuditService } from "../audit/service.mjs";
 import { CatalogConsistencyService } from "../catalog/consistency.mjs";
@@ -923,14 +924,31 @@ class ConversationInteractionFacade {
     const workRoute = await this.#workRoute(conversationId, branchId);
     if (!workRoute) return { applied: false, reason: "work_route_unavailable" };
     const bindingId = this.#agentBindingKey(workRoute, conversationId, branchId);
-    const binding = await this.container.taskRuntime.loadBinding(bindingId);
+    let binding = await this.container.taskRuntime.loadBinding(bindingId);
     const adapter = this.container.agentAdapters[String(binding?.adapterId || "")];
     if (!binding || !adapter || adapter.capabilities.revert?.availability !== "available") return { applied: false, reason: "adapter_without_native_revert" };
+    const migration = migrateLegacyRegenerationFork(binding);
+    if (migration) {
+      await this.container.contextHub.rebindBindingNativeSession({
+        bindingKey: bindingId,
+        sourceNativeSessionId: migration.receiptSourceSessionId,
+        targetNativeSessionId: migration.receiptTargetSessionId,
+      });
+      binding = migration.binding;
+      await this.container.taskRuntime.saveBinding(bindingId, binding);
+    }
     const nativeSessionId = binding.native?.threadId || binding.native?.sessionId || binding.state?.sessionId || null;
     if (!nativeSessionId) return { applied: false, reason: "native_session_unavailable" };
     const removedTasks = (await this.#tasksFromSourceMessages(conversationId, removedMessages))
       .filter((task) => task.agentBindingId === bindingId);
     if (!removedTasks.length) return { applied: true, bindingId, nativeSessionId, unchanged: true };
+    // A webpage branch whose first native turn failed still has an intentional
+    // pending fork. Regenerating that failed turn retries the same branch
+    // creation; it must not reinterpret the source transcript as this
+    // conversation's in-place session.
+    if (binding.native?.pendingFork) {
+      return { applied: true, bindingId, nativeSessionId, unchanged: true, pendingFork: true };
+    }
     const removedTaskIds = new Set(removedTasks.map((task) => task.id));
     const retainedTasks = (await this.#tasksFromSourceMessages(conversationId, retainedMessages || []))
       // A native webpage branch copies its source receipt checkpoint into the
@@ -940,21 +958,19 @@ class ConversationInteractionFacade {
       // regenerated through the native Agent instead of starting a new epoch.
       .filter((task) => !removedTaskIds.has(task.id))
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
-    let retainedTask = null;
-    let retainedCheckpoint = null;
-    for (const task of [...retainedTasks].reverse()) {
-      const checkpoint = await this.container.contextHub.getBindingCheckpoint({
-        bindingKey: bindingId,
-        nativeSessionId,
-        checkpointId: task.id,
-      });
-      if (checkpoint?.nativeBoundary?.turnId) {
-        retainedTask = task;
-        retainedCheckpoint = checkpoint;
-        break;
-      }
-    }
-    if (!retainedTask || !retainedCheckpoint) return { applied: false, reason: "retained_receipt_boundary_unavailable" };
+    // The native restore point must describe the latest retained Agent task.
+    // Falling back to an older checkpoint rewinds farther than the webpage and
+    // makes the two histories disagree. A missing latest boundary therefore
+    // starts a fresh context epoch through the caller's normal fallback.
+    const retainedTask = retainedTasks.at(-1) || null;
+    const retainedCheckpoint = retainedTask
+      ? await this.container.contextHub.getBindingCheckpoint({
+          bindingKey: bindingId,
+          nativeSessionId,
+          checkpointId: retainedTask.id,
+        })
+      : null;
+    if (!retainedCheckpoint?.nativeBoundary?.turnId) return { applied: false, reason: "latest_retained_receipt_boundary_unavailable" };
     const retainedBoundary = retainedCheckpoint.nativeBoundary;
     const retainedSessionId = retainedBoundary.sessionId || nativeSessionId;
     const retainedTurnId = retainedBoundary.turnId;
@@ -1007,9 +1023,20 @@ class ConversationInteractionFacade {
           workspacePath: workRoute.route.workspace.canonicalPath,
         });
         inPlace = true;
+      } else if (["claude-code", "qoder-cn"].includes(adapter.id)) {
+        reverted = await this.#executeNativeBindingOperation({
+          binding,
+          operation: "revert",
+          operationInput: {
+            sessionId: nativeSessionId,
+            resumeSessionAt: retainedTurnId,
+          },
+          configScope: conversationId,
+          workspacePath: workRoute.route.workspace.canonicalPath,
+        });
+        inPlace = true;
       } else {
-        const targetSessionId = crypto.randomUUID();
-        const operation = ["claude-code", "qoder-cn"].includes(adapter.id) ? "revert" : "fork";
+        const operation = "fork";
         const operationInput = adapter.id === "codex"
           ? {
               threadId: retainedSessionId,
@@ -1017,9 +1044,7 @@ class ConversationInteractionFacade {
               lastTurnId: retainedTurnId,
               cwd: workRoute.route.workspace.canonicalPath,
             }
-          : adapter.id === "opencode"
-            ? { sessionId: retainedSessionId, retainedMessageId: retainedTurnId }
-            : { sourceSessionId: retainedSessionId, targetSessionId, resumeSessionAt: retainedTurnId };
+          : { sessionId: retainedSessionId, retainedMessageId: retainedTurnId };
         if (adapter.id === "codex" && !operationInput.path) return { applied: false, reason: "source_rollout_unavailable" };
         reverted = await this.#executeNativeBindingOperation({
           binding,
@@ -3602,6 +3627,13 @@ class WebInteractionService {
     const reportTurnId = [...(report?.evidence || [])].reverse().find((entry) => (
       String(entry?.source?.sessionId || "") === String(nativeSession) && entry?.source?.turnId
     ))?.source?.turnId;
+    const storedTurnId = binding.native?.turnId || binding.state?.turnId || null;
+    // Claude/Qoder stream events can carry message/event UUIDs that precede the
+    // verified transcript leaf. Their transport boundary in the saved binding
+    // is authoritative for --resume-session-at.
+    const checkpointTurnId = ["claude-code", "qoder-cn"].includes(String(binding.adapterId || ""))
+      ? storedTurnId
+      : reportTurnId || storedTurnId;
     if (checkpoint) {
       await this.container.contextHub.checkpointBinding({
         bindingKey: task.agentBindingId,
@@ -3610,7 +3642,7 @@ class WebInteractionService {
         nativeBoundary: {
           protocol: binding.adapterId,
           sessionId: nativeSession,
-          turnId: reportTurnId || binding.native?.turnId || binding.state?.turnId || null,
+          turnId: checkpointTurnId,
           rolloutPath: binding.native?.rolloutPath || null,
           skillSnapshot: binding.native?.skillCheckpoints?.[task.id] || null,
         },

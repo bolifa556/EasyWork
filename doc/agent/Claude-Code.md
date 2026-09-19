@@ -83,7 +83,8 @@ Skill 包按用户和内容摘要进入不可变缓存，当前 binding 复制�
 | input | 对 AskUserQuestion、elicitation 或 dialog 写 `control_response` |
 | compact | 在活动进程发送 user `/compact`；无活动进程时 resume 一个一次性进程 |
 | contextUsage | 从当前请求的 streaming usage 或原生 context report 读取 |
-| fork/revert | 保存 native-deferred 描述，在下一条真实消息启动时完成 |
+| fork | 保存 native-deferred 描述，在网页分支的下一条真实消息以新 session 完成 |
+| revert / 重新生成 | 保存 native-rewind-deferred 描述，在当前 session 的下一条真实消息回到保留边界 |
 
 标准 user frame 为：
 
@@ -100,6 +101,8 @@ Claude Code 的 append 通过同一 stream-json stdin 完成：先发原生 cont
 终止先发原生 control interrupt，控制失败时对当前受管进程补发 `SIGINT`；随后对同一进程发送 `SIGTERM` 并等待最多 4 秒，仍未退出才升级 `SIGKILL` 并再确认最多 2 秒。信号式兼容路径同样有界确认退出。未确认退出时报可重试错误并保留活动状态，不能提前标记停止。不会按进程名批量终止。原生 Cron 工具被禁用，因为当前网页 Task 的结果流不负责完成后定时通知。
 
 收到控制请求的成功回执只证明命令已接收；Task 终态仍以原生结果/进程退出和文件版本收尾为准。
+
+若 stdout 在 terminal `result` 前结束，SSH 进程层保留最近 16 KiB stderr，transport 清除终端颜色、截取并脱敏后返回 `AGENT_PROCESS_EXITED_WITHOUT_RESULT`，同时携带退出码和信号。页面因此显示可定位的原生退出原因，而不是无上下文的 “stream ended without final event”。
 
 ## 6. 压缩与上下文用量
 
@@ -155,9 +158,11 @@ Hook command 指向该 binding 的受控 launcher；launcher 调用 Python 3 写
 
 Claude 原生权限请求仍通过 stdio 交给用户；Hook 是独立的版本正确性屏障。两者不能合并为一个“默认允许”提示词。
 
-## 9. Native-deferred 分支与回退
+## 9. 原生分支与同会话回退
 
-Claude Code 没有在活动进程外提供一个等价的“立刻 fork/revert session”RPC。适配器把 `fork` 和 `revert` 声明为 `native-deferred`：网页操作时持久保存来源 session、目标 session 和精确 `resumeSessionAt`；目标对话下一条真实用户消息到来时，以以下参数启动：
+Claude Code 没有在活动进程外提供一个等价的“立刻修改 session”RPC，因此分支与回退都延迟到下一条真实用户消息，但两者的会话语义不同。
+
+显式网页分支保存来源 session、目标 session 和精确 `resumeSessionAt`，目标对话下一条真实用户消息到来时使用：
 
 ```text
 --resume <source-session>
@@ -166,11 +171,20 @@ Claude Code 没有在活动进程外提供一个等价的“立刻 fork/revert s
 --resume-session-at <assistant-leaf-uuid>
 ```
 
+回溯和重新生成保存当前 session 与保留边界，下一条真实用户消息使用：
+
+```text
+--resume <current-session>
+--resume-session-at <assistant-leaf-uuid>
+```
+
+此路径不带 `--fork-session` 和 `--session-id`。网页重新生成先恢复消息、Context receipt 与工作区文件边界，再把原用户消息交给同一个 Claude session，新的回答成为该原生 transcript DAG 上的续接。`--resume-drops-turn <prompt-uuid>` 仅可在已验证被裁剪用户回合 UUID 时作为 guard。
+
 原生边界来自 Claude transcript 中的 `last-prompt.leafUuid`。EasyWork 只读取这个紧凑字段，并验证对应 UUID 确实是一条 assistant 记录；不复制、排序或重写 JSONL transcript。内部 `easywork_native_boundary` 必须在 terminal `result` 之前进入 reducer，因为 result 后 orchestrator 会停止消费该 Task 的 frame。
 
-边界读不到、不是合法 UUID、没有对应 assistant 或仍是上一 turn 的 UUID 时，边界置空，让上层使用新 `contextEpoch`。绝不从“最后一条看起来像回答的文本”猜一个分支位置。
+边界读不到、不是合法 UUID、没有对应 assistant 或仍是上一 turn 的 UUID 时，边界置空。保存 deferred fork/revert 前还会在原生 JSONL 中复验该 assistant UUID。绝不从“最后一条看起来像回答的文本”猜一个分支或回退位置。恢复点必须属于最新保留的网页 Agent Task，不能越过缺少 checkpoint 的较新 Task 去使用更早边界。原生同会话回退因此不能安全执行时，上层推进 `contextEpoch`，下一轮在干净的新 session 中按 Context receipt 重建允许的上下文；不会改用 `--fork-session` 冒充重新生成。
 
-fork 与 revert 对 Claude 都通过同一原生 fork-at-boundary 机制实现：它们不会修改来源 session，而是在下一回合得到新的目标 session。Context receipt 与 EasyWork 文件账本仍在网页操作时恢复/分叉到同一边界，下一次真实消息才完成 Claude 原生侧。
+显式 fork 不修改来源 session，并在下一回合得到新的目标 session；revert 和重新生成则保留当前 session。旧版 EasyWork 曾把重新生成错误保存成同 Binding 的 `pendingFork`；当前启动时会把这种状态及其 Context receipt 迁回来源 session。真正的网页分支拥有不同 Binding/native-store owner，不会被误迁移。
 
 ## 10. 思考强度兼容
 
