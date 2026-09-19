@@ -20,8 +20,14 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { GatewayError } from "@/app/core/contracts";
-import { useAppRuntime } from "../../runtime/AppRuntime";
-import { CONVERSATIONS_CHANGED_EVENT, type ConversationsChangedDetail } from "../../runtime/cacheEvents";
+import { useAppRuntime, type ServerConnectionOperation, type ServerConnectionSnapshot } from "../../runtime/AppRuntime";
+import {
+  CONVERSATIONS_CHANGED_EVENT,
+  SERVERS_CHANGED_EVENT,
+  readServersChangeRevision,
+  type ConversationsChangedDetail,
+  type ServersChangedDetail,
+} from "../../runtime/cacheEvents";
 import { Button } from "../../ui/Button";
 import { Modal } from "../../ui/Modal";
 import styles from "./ServerManager.module.css";
@@ -183,31 +189,26 @@ export function ServerEditor({ server, onClose, onSaved, embedded = false }: { s
   return embedded ? form : <Modal title={editing ? "服务器配置" : "添加服务器"} size="wide" onClose={onClose}>{form}</Modal>;
 }
 
-function ConnectDialog({ server, busy, onBusyChange, onConnected, onClose, onChanged }: { server: ServerRecord; busy: boolean; onBusyChange: (busy: boolean) => void; onConnected: (connection: ServerRecord["connection"]) => void; onClose: () => void; onChanged: () => Promise<void> }) {
+function ConnectDialog({ server, onConnected, onClose }: { server: ServerRecord; onConnected: (connection: ServerConnectionSnapshot) => void; onClose: () => void }) {
   const runtime = useAppRuntime();
   const [twoFactorCode, setTwoFactorCode] = useState("");
   const [fingerprint, setFingerprint] = useState<string | null>(null);
-  const attemptActive = useRef(false);
+  const busy = runtime.serverConnectionOperations.has(server.profile.id);
   const connect = async (acceptedFingerprint?: string) => {
-    if (busy || attemptActive.current) return;
-    attemptActive.current = true;
-    onBusyChange(true);
+    if (busy) return;
     try {
-      const result = await runtime.api.post<ServerRecord["connection"]>(`/api/servers/${server.profile.id}/connect`, { twoFactorCode: twoFactorCode.trim() || null, ...(acceptedFingerprint ? { acceptedFingerprint } : {}) });
-      onConnected(result.data);
+      const connection = await runtime.connectServer(server.profile.id, { twoFactorCode: twoFactorCode.trim() || null, ...(acceptedFingerprint ? { acceptedFingerprint } : {}) });
+      onConnected(connection);
       runtime.notify("SSH 已连接", "success");
       onClose();
-      // The connect response is authoritative. Refresh dependent views after
-      // closing the dialog so Agent discovery cannot prolong its spinner.
-      void Promise.allSettled([onChanged(), runtime.refreshBootstrap()]);
+      // The connect response has already updated every button through the
+      // runtime. Reconcile the remaining bootstrap fields in the background.
+      void runtime.refreshBootstrap().catch(() => undefined);
     } catch (reason) {
       if (reason instanceof GatewayError && reason.code === "SSH_HOST_KEY_CONFIRMATION_REQUIRED") {
         const detail = reason.details as { fingerprint?: string } | null;
         if (detail?.fingerprint) setFingerprint(detail.fingerprint);
       } else runtime.notify(connectionErrorMessage(reason), "error");
-    } finally {
-      attemptActive.current = false;
-      onBusyChange(false);
     }
   };
   return <Modal title="连接 SSH" subtitle={`${server.profile.username}@${server.profile.host}:${server.profile.port}`} size="compact" onClose={onClose}>
@@ -221,54 +222,100 @@ function ConnectDialog({ server, busy, onBusyChange, onConnected, onClose, onCha
 
 function ShieldFingerprint() { return <span data-ui-icon="" className={styles.fingerprintIcon}><KeyRound size={21} /></span>; }
 
-function Detail({ server, connecting, onEdit, onConnect, onDisconnect }: { server: ServerRecord; connecting: boolean; onEdit: () => void; onConnect: () => void; onDisconnect: () => Promise<void> }) {
+function Detail({ server, operation, onEdit, onConnect, onDisconnect }: { server: ServerRecord; operation?: ServerConnectionOperation; onEdit: () => void; onConnect: () => void; onDisconnect: () => Promise<void> }) {
+  const connecting = operation === "connect";
+  const disconnecting = operation === "disconnect";
   const status: ServerStatus = connecting ? "connecting" : server.connection.status;
   const connected = status === "connected";
-  const conversations = server.conversations ?? server.conversationIds.map((id) => ({ id, title: "未命名对话" }));
+  const conversations = server.conversations;
   return <div className={styles.detail}>
     <header className={styles.detailHeading}><div data-ui-icon="" className={styles.serverMark}>{connected ? <Wifi size={23} /> : <ServerOff size={23} />}</div><div><h2>{server.profile.name}</h2><p>{server.profile.username}@{server.profile.host}:{server.profile.port}</p></div><Status value={status} /></header>
     <div className={styles.facts}><div><span>认证方式</span><strong>{server.profile.authMethod === "private-key" ? "SSH 私钥" : "密码"}</strong></div><div><span>关联对话</span><strong>{server.conversationIds.length}</strong></div><div><span>最近活动</span><strong>{server.connection.lastActiveAt ? new Date(server.connection.lastActiveAt).toLocaleString("zh-CN") : "—"}</strong></div></div>
-    <section className={styles.bindingSection}><div className={styles.subheading}><UsersRound size={17} /><h3>连接对话</h3></div>{conversations.length ? <div className={styles.bindingList}>{conversations.map((conversation) => <div key={conversation.id}><span title={conversation.title}>{conversation.title}</span><i>{connected ? "SSH 可用" : "等待连接"}</i></div>)}</div> : <div className={styles.noBindings}>还没有对话使用这台服务器</div>}</section>
-    <footer className={styles.detailActions}><Button onClick={onEdit}>配置</Button>{connected ? <Button variant="danger" icon={<Unplug size={16} />} onClick={() => void onDisconnect()}>断开 SSH</Button> : <Button variant="primary" icon={connecting ? <LoaderCircle className={styles.spin} size={16} /> : <Cable size={16} />} onClick={onConnect} disabled={connecting || server.connection.status === "connecting"}>{connecting ? "连接中" : "连接 SSH"}</Button>}</footer>
+    <section className={styles.bindingSection}><div className={styles.subheading}><UsersRound size={17} /><h3>连接对话</h3></div>{conversations === undefined && server.conversationIds.length ? <div className={styles.noBindings}>正在读取关联对话…</div> : conversations?.length ? <div className={styles.bindingList}>{conversations.map((conversation) => <div key={conversation.id}><span title={conversation.title}>{conversation.title}</span><i>{connected ? "SSH 可用" : "等待连接"}</i></div>)}</div> : <div className={styles.noBindings}>还没有对话使用这台服务器</div>}</section>
+    <footer className={styles.detailActions}><Button onClick={onEdit} disabled={Boolean(operation)}>配置</Button>{connected ? <Button variant="danger" icon={disconnecting ? <LoaderCircle className={styles.spin} size={16} /> : <Unplug size={16} />} disabled={Boolean(operation)} onClick={() => void onDisconnect()}>{disconnecting ? "断开中" : "断开 SSH"}</Button> : <Button variant="primary" icon={connecting ? <LoaderCircle className={styles.spin} size={16} /> : <Cable size={16} />} onClick={onConnect} disabled={Boolean(operation) || server.connection.status === "connecting"}>{connecting ? "连接中" : "连接 SSH"}</Button>}</footer>
   </div>;
 }
 
-const serverPageCache = new Map<string, { servers: ServerRecord[]; selectedId: string | null; cachedAt: number }>();
+type ServerPageCacheEntry = {
+  servers: ServerRecord[];
+  selectedId: string | null;
+  cachedAt: number;
+  changeRevision: number;
+};
+
+const serverPageCache = new Map<string, ServerPageCacheEntry>();
+
+function reconcileConnectionStatuses(servers: ServerRecord[], summaries: ReturnType<typeof useAppRuntime>["bootstrap"]) {
+  const statusById = new Map(summaries?.servers.map((server) => [server.id, server.status]) ?? []);
+  return servers.map((server) => {
+    const status = statusById.get(server.profile.id);
+    return status && status !== server.connection.status
+      ? { ...server, connection: { ...server.connection, status } }
+      : server;
+  });
+}
 
 export default function ServerManager() {
   const runtime = useAppRuntime();
   const { api, notify, refreshBootstrap } = runtime;
   const cacheKey = runtime.bootstrap?.actor.id || "unresolved";
   const initialCache = serverPageCache.get(cacheKey);
-  const [servers, setServers] = useState<ServerRecord[]>(() => initialCache?.servers || []);
+  const [servers, setServers] = useState<ServerRecord[]>(() => reconcileConnectionStatuses(initialCache?.servers || [], runtime.bootstrap));
   const [selectedId, setSelectedId] = useState<string | null>(() => initialCache?.selectedId || null);
   const [loading, setLoading] = useState(() => !initialCache);
   const [editing, setEditing] = useState<"new" | "selected" | null>(null);
   const [connectionDialogOpen, setConnectionDialogOpen] = useState(false);
-  const [connectingServerIds, setConnectingServerIds] = useState<ReadonlySet<string>>(() => new Set());
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   const savedInEditor = useRef(false);
 
   const load = useCallback(async (preferred?: string) => {
     try {
-      const result = await api.get<ServerRecord[]>("/api/servers");
-      setServers(result.data);
+      const result = await api.get<ServerRecord[]>("/api/servers?includeConversationTitles=false");
+      const cachedConversations = new Map((serverPageCache.get(cacheKey)?.servers || []).map((server) => [server.profile.id, server.conversations]));
+      const nextServers = result.data.map((server) => {
+        const conversations = cachedConversations.get(server.profile.id);
+        return conversations === undefined ? server : { ...server, conversations };
+      });
+      setServers(nextServers);
       setSelectedId((current) => {
-        const next = preferred || (current && result.data.some((item) => item.profile.id === current) ? current : result.data[0]?.profile.id ?? null);
-        serverPageCache.set(cacheKey, { servers: result.data, selectedId: next, cachedAt: Date.now() });
+        const next = preferred || (current && nextServers.some((item) => item.profile.id === current) ? current : nextServers[0]?.profile.id ?? null);
+        serverPageCache.set(cacheKey, { servers: nextServers, selectedId: next, cachedAt: Date.now(), changeRevision: readServersChangeRevision() });
         return next;
       });
     } catch (reason) { notify(reason instanceof Error ? reason.message : "服务器读取失败", "error"); }
   }, [api, cacheKey, notify]);
   useEffect(() => {
     const cached = serverPageCache.get(cacheKey);
-    // Server configuration is durable and every mutation in this view updates
-    // this cache explicitly. Keep the last snapshot for the whole SPA session
-    // instead of imposing an arbitrary five-minute reload on navigation.
-    if (cached) return;
+    // Keep the last snapshot for instant navigation, but revalidate it after a
+    // server mutation performed by another view (for example, the chat page).
+    if (cached?.changeRevision === readServersChangeRevision()) return;
     const handle = window.setTimeout(() => { void load().finally(() => setLoading(false)); }, 0);
     return () => window.clearTimeout(handle);
   }, [cacheKey, load]);
+  useEffect(() => {
+    if (!selectedId) return;
+    const server = servers.find((item) => item.profile.id === selectedId);
+    if (!server || server.conversations !== undefined) return;
+    const controller = new AbortController();
+    void api.get<ServerRecord>(`/api/servers/${encodeURIComponent(selectedId)}?includeConversationTitles=true`, controller.signal)
+      .then((result) => setServers((current) => current.map((item) => item.profile.id === selectedId ? result.data : item)))
+      .catch((reason) => {
+        if (controller.signal.aborted) return;
+        setServers((current) => current.map((item) => item.profile.id === selectedId
+          ? { ...item, conversations: item.conversationIds.map((id) => ({ id, title: "未命名对话" })) }
+          : item));
+        notify(reason instanceof Error ? reason.message : "关联对话读取失败", "error");
+      });
+    return () => controller.abort();
+  }, [api, notify, selectedId, servers]);
+  useEffect(() => {
+    const changed = (event: Event) => {
+      const detail = (event as CustomEvent<ServersChangedDetail>).detail;
+      void load(detail?.serverId).finally(() => setLoading(false));
+    };
+    window.addEventListener(SERVERS_CHANGED_EVENT, changed);
+    return () => window.removeEventListener(SERVERS_CHANGED_EVENT, changed);
+  }, [load]);
   useEffect(() => {
     // Conversation titles and bindings are server-detail data too.  Refresh
     // only when an actual mutation announces an invalidation; navigation keeps
@@ -282,18 +329,23 @@ export default function ServerManager() {
     return () => window.removeEventListener(CONVERSATIONS_CHANGED_EVENT, changed);
   }, [load]);
   useEffect(() => {
-    if (!loading) serverPageCache.set(cacheKey, { servers, selectedId, cachedAt: serverPageCache.get(cacheKey)?.cachedAt || Date.now() });
+    if (!loading) {
+      const cached = serverPageCache.get(cacheKey);
+      // load() creates the entry even for a valid empty list. If no entry
+      // exists, the initial request failed and the next visit should retry.
+      if (!cached) return;
+      serverPageCache.set(cacheKey, {
+        servers,
+        selectedId,
+        cachedAt: cached.cachedAt,
+        // State-only changes must not make a stale snapshot look revalidated;
+        // load() advances this revision after the authoritative GET succeeds.
+        changeRevision: cached.changeRevision,
+      });
+    }
   }, [cacheKey, loading, selectedId, servers]);
   const selected = useMemo(() => servers.find((item) => item.profile.id === selectedId) ?? null, [servers, selectedId]);
-  const setConnectionPending = useCallback((serverId: string, pending: boolean) => {
-    setConnectingServerIds((current) => {
-      const next = new Set(current);
-      if (pending) next.add(serverId);
-      else next.delete(serverId);
-      return next;
-    });
-  }, []);
-  const markConnected = useCallback((serverId: string, connection: ServerRecord["connection"]) => {
+  const markConnected = useCallback((serverId: string, connection: ServerConnectionSnapshot) => {
     setServers((current) => current.map((server) => server.profile.id === serverId
       ? { ...server, connection: { ...server.connection, ...connection, status: "connected", lastError: null } }
       : server));
@@ -301,7 +353,14 @@ export default function ServerManager() {
 
   const disconnect = async () => {
     if (!selected) return;
-    try { await api.post(`/api/servers/${selected.profile.id}/disconnect`, {}); notify("SSH 已断开", "success"); await load(selected.profile.id); await refreshBootstrap(); }
+    try {
+      const connection = await runtime.disconnectServer(selected.profile.id);
+      setServers((current) => current.map((server) => server.profile.id === selected.profile.id
+        ? { ...server, connection: { ...server.connection, ...connection, status: "disconnected", lastError: null } }
+        : server));
+      notify("SSH 已断开", "success");
+      void refreshBootstrap().catch(() => undefined);
+    }
     catch (reason) { notify(reason instanceof Error ? reason.message : "断开失败", "error"); }
   };
 
@@ -312,12 +371,12 @@ export default function ServerManager() {
     {loading ? <div className={styles.centerState}><LoaderCircle className={styles.spin} size={22} />正在读取远程服务器</div> : <div className={styles.manager}>
       <aside className={styles.serverList}>
         <div className={styles.serverItems}>
-          {servers.map((server) => <button key={server.profile.id} className={server.profile.id === selectedId ? styles.selectedServer : ""} onClick={() => { setSelectedId(server.profile.id); setEditing(null); setMobileDetailOpen(true); }}><span data-ui-icon="" className={styles.listIcon}><Server size={18} /></span><span><strong>{server.profile.name}</strong><small>{server.profile.host}</small></span><Status value={connectingServerIds.has(server.profile.id) ? "connecting" : server.connection.status} /></button>)}
+          {servers.map((server) => <button key={server.profile.id} className={server.profile.id === selectedId ? styles.selectedServer : ""} onClick={() => { setSelectedId(server.profile.id); setEditing(null); setMobileDetailOpen(true); }}><span data-ui-icon="" className={styles.listIcon}><Server size={18} /></span><span><strong>{server.profile.name}</strong><small>{server.profile.host}</small></span><Status value={runtime.serverConnectionOperations.get(server.profile.id) === "connect" ? "connecting" : server.connection.status} /></button>)}
           <button className={styles.addServer} onClick={() => { savedInEditor.current = false; setEditing("new"); setMobileDetailOpen(true); }}><span data-ui-icon="" className={styles.addServerIcon}><Plus size={17} /></span><strong>新建服务器</strong></button>
         </div>
       </aside>
-      <section className={styles.detailPanel}>{editing ? <ServerEditor embedded server={editing === "selected" ? selected ?? undefined : undefined} onClose={() => { setEditing(null); if (editing === "new" && !savedInEditor.current) setMobileDetailOpen(false); }} onSaved={async (serverId) => { await load(serverId); await refreshBootstrap(); savedInEditor.current = true; }} /> : selected ? <Detail server={selected} connecting={connectingServerIds.has(selected.profile.id)} onEdit={() => { savedInEditor.current = false; setEditing("selected"); }} onConnect={() => setConnectionDialogOpen(true)} onDisconnect={disconnect} /> : <div className={styles.emptyDetail}><Server size={25} /><strong>选择或新建一台服务器</strong></div>}</section>
+      <section className={styles.detailPanel}>{editing ? <ServerEditor embedded server={editing === "selected" ? selected ?? undefined : undefined} onClose={() => { setEditing(null); if (editing === "new" && !savedInEditor.current) setMobileDetailOpen(false); }} onSaved={async (serverId) => { await load(serverId); await refreshBootstrap(); savedInEditor.current = true; }} /> : selected ? <Detail server={selected} operation={runtime.serverConnectionOperations.get(selected.profile.id)} onEdit={() => { savedInEditor.current = false; setEditing("selected"); }} onConnect={() => setConnectionDialogOpen(true)} onDisconnect={disconnect} /> : <div className={styles.emptyDetail}><Server size={25} /><strong>选择或新建一台服务器</strong></div>}</section>
     </div>}
-    {connectionDialogOpen && selected ? <ConnectDialog server={selected} busy={connectingServerIds.has(selected.profile.id)} onBusyChange={(busy) => setConnectionPending(selected.profile.id, busy)} onConnected={(connection) => markConnected(selected.profile.id, connection)} onClose={() => setConnectionDialogOpen(false)} onChanged={async () => load(selected.profile.id)} /> : null}
+    {connectionDialogOpen && selected ? <ConnectDialog server={selected} onConnected={(connection) => markConnected(selected.profile.id, connection)} onClose={() => setConnectionDialogOpen(false)} /> : null}
   </div>;
 }

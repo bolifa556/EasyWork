@@ -76,6 +76,10 @@ SSH Worker 属于主机级连接池，不属于某个 HTTP 请求或短时页面
 
 系统同时限制单账号和全平台连接数量、并发通道数量、捕获输出大小和空闲资源。某项能力耗尽或失败只影响该能力，不把整台服务器错误地标为不可用。
 
+网页的服务器页和对话连接弹框共用 `AppRuntime` 的连接与断开操作。同一服务器的重复连接共用进行中的请求，相反操作在当前操作结束前被阻止；按钮和对话侧栏立即显示“连接中”或“断开中”。成功响应先更新统一连接状态和连接代次，再在后台刷新服务器详情与 bootstrap，不等待整份页面资料加载完成才结束按钮状态；迟到的 bootstrap 响应会合并期间已发生的连接变化。
+
+服务器首屏使用 `GET /api/servers?includeConversationTitles=false` 读取轻量列表，选中服务器后才用 `GET /api/servers/:id?includeConversationTitles=true` 补齐关联对话名称。前端按账号保留最近列表，在服务器配置、连接或绑定变化事件后重新校验；实际对话改名、删除也会失效关联详情，普通导航无需轮询整份列表。
+
 同一底层连接上的 `session` 类 channel（命令、SFTP、PTY、交互式 Agent 进程）使用有界并发闸门。channel 是一条 SSH 连接内复用的逻辑流，不是一次新的登录；持久 Agent 进程占用的 channel 也计入额度，避免文件版本、Skill 准备和 Agent 预热并行时冲破服务端 `MaxSessions`。
 
 当前每条 SSH 连接最多登记 10 个 `session` channel，并把后台类 channel 限制在 8 个，为用户触发的前台命令预留两个位置。普通命令默认进入前台优先队列；SFTP、PTY 和保活属于后台流。channel 在 `close`、`end` 或 `error` 任一终态只释放一次额度。普通命令退出后立即关闭；每次 SFTP 操作独立打开并在 `finally` 中结束；PTY 和交互式 Agent 进程则按功能需要保持。

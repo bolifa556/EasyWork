@@ -1029,6 +1029,10 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     ? runtime.bootstrap?.projects.find((project) => project.id === initialProjectId)?.name.trim() || null
     : null;
   const selectedServer = runtime.bootstrap?.servers.find((server) => server.id === serverId);
+  const serverConnectionOperation = serverId ? runtime.serverConnectionOperations.get(serverId) : undefined;
+  const serverConnecting = serverConnectionOperation === "connect" || selectedServer?.status === "connecting";
+  const serverDisconnecting = serverConnectionOperation === "disconnect";
+  const serverConnectionReady = selectedServer?.status === "connected" && conversationConnectionEnabled;
   const currentServerCacheKey = serverCacheKey(actorId, serverId, configScope, selectedServer);
   const taskRoutedAgentId = (liveTask && liveTask.conversationId === conversationId ? liveTask.route?.agentId : null)
     ?? latestConversationTask?.route?.agentId
@@ -2418,7 +2422,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     : "继续当前工作";
   const conversationWorkConnected = activeMode !== "work" || Boolean(selectedServer?.status === "connected" && conversationConnectionEnabled);
   const openConversationConnection = () => {
-    if (!serverBindingLoading) setConnectionDialogOpen(true);
+    if (!serverBindingLoading && !serverConnectionOperation) setConnectionDialogOpen(true);
   };
   const toggleWorkspaceDirectory = async () => {
     if (!conversationId) return;
@@ -2505,7 +2509,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
             loadError={agentLoadError || capabilityError}
             onRetry={() => setSetupRetryRevision((revision) => revision + 1)}
           /></span> : null}
-          <button className={`${styles.connection} ${selectedServer?.status !== "connected" || !conversationConnectionEnabled ? styles.off : ""}`} aria-label={selectedServer?.status === "connected" && conversationConnectionEnabled ? "远程服务器已连接，打开连接详情" : "远程服务器未连接，打开连接设置"} disabled={serverBindingLoading} onClick={openConversationConnection}>{serverBindingLoading ? <LoaderCircle className={styles.spin} size={14} /> : selectedServer?.status === "connected" && conversationConnectionEnabled ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{serverBindingLoading ? "读取中" : selectedServer?.status === "connected" && conversationConnectionEnabled ? "已连接" : "未连接"}</span></button>
+          <button className={`${styles.connection} ${serverConnecting || serverDisconnecting ? styles.connectionPending : !serverConnectionReady ? styles.off : ""}`} aria-label={serverConnectionReady ? "远程服务器已连接，打开连接详情" : serverConnecting ? "远程服务器连接中" : serverDisconnecting ? "远程服务器断开中" : "远程服务器未连接，打开连接设置"} disabled={serverBindingLoading || Boolean(serverConnectionOperation)} onClick={openConversationConnection}>{serverBindingLoading || serverConnecting || serverDisconnecting ? <LoaderCircle className={styles.spin} size={14} /> : serverConnectionReady ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{serverBindingLoading ? "读取中" : serverConnecting ? "连接中" : serverDisconnecting ? "断开中" : serverConnectionReady ? "已连接" : "未连接"}</span></button>
         </> : null}
         </div>
       </header>}
@@ -2515,7 +2519,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         <div className={styles.emptyComposer}><Composer key={`new:${initialProjectId ?? "standalone"}:${mode}`} conversationId={conversationId} referenceMode={mode} draftKey={`new:${initialProjectId ?? "standalone"}:${mode}`} disabled={!workReady} placeholder={mode === "work" ? workReady ? "描述要在远端完成的工作" : !selectedAgentAuthenticated ? "请先登录 Qoder CN" : "请先完成工作环境设置" : "给 EasyWork 发消息"} onSend={send} /></div>
         {mode === "work" ? <>
           <div className={styles.setup}>
-            <button className={`${styles.setupStep} ${serverId ? styles.done : ""}`} onClick={() => setConnectionDialogOpen(true)}><Server size={16} />{selectedServer ? selectedServer.name : "连接远程服务器"}</button>
+            <button className={`${styles.setupStep} ${serverId ? styles.done : ""}`} disabled={Boolean(serverConnectionOperation)} onClick={openConversationConnection}>{serverConnecting || serverDisconnecting ? <LoaderCircle className={styles.spin} size={16} /> : <Server size={16} />}{serverConnecting ? "连接中" : serverDisconnecting ? "断开中" : selectedServer ? selectedServer.name : "连接远程服务器"}</button>
             {serverId && (setupLoading || agentsAvailable) ? setupLoading ? <button className={styles.setupStep} disabled><LoaderCircle className={styles.spin} size={16} />正在扫描 Agent</button> : <AgentControl
               serverId={serverId}
               agents={effectiveAgentOptions}
@@ -2570,17 +2574,17 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       {workspacePickerOpen && serverId && agentId ? <WorkspaceDialog serverId={serverId} serverName={selectedServer?.name || "远程服务器"} conversationId={conversationId} branchId={detail?.summary.activeBranchId} options={workspaceOptions} current={workspace} allowVirtual={Boolean(serverCapabilities?.features.workspaces.virtual)} busy={switchingWorkspace} onClose={() => setWorkspacePickerOpen(false)} onSelect={async (nextWorkspaceId, nextWorkspace, nextWorkspacePath) => { if (nextWorkspace) setWorkspaceOptions((current) => current.some((item) => item.id === nextWorkspace.id) ? current : [...current, nextWorkspace]); if (conversationId) await switchWorkspace(nextWorkspaceId, nextWorkspace); else { choose("workspace", nextWorkspaceId, nextWorkspacePath); setWorkspacePickerOpen(false); } }} /> : null}
       {routeSwitchConfirmation ? <Modal title={routeSwitchConfirmation === "workspace" ? "切换工作区？" : "切换 Agent？"} size="compact" onClose={() => settleRouteSwitchConfirmation(false)}><div className={styles.modeConfirm}><p>{routeSwitchConfirmation === "workspace" ? "后续请求将在所选工作区执行，当前 Agent 的原生对话和网页对话都会继续。" : "后续请求将由所选 Agent 处理，并继续该 Agent 自己的原生对话；当前网页对话会保留。"}</p><footer><Button onClick={() => settleRouteSwitchConfirmation(false)}>取消</Button><Button variant="primary" onClick={() => settleRouteSwitchConfirmation(true)}>确认切换</Button></footer></div></Modal> : null}
       {agentConfigAgent && agentConfigAgent.agentId !== "qoder-cn" && serverId && serverCapabilities?.features.agents.configure ? <AgentConfigDialog serverId={serverId} configScope={configScope} agent={agentConfigAgent} onChanged={refreshAgents} onClose={() => setAgentConfigAgentId(null)} /> : null}
-      {connectionDialogOpen ? <ConversationConnectionDialog selectedServerId={serverId} conversationId={conversationId} conversationEnabled={conversationConnectionEnabled} conversationScoped={Boolean(conversationId && boundServerId)} onClose={() => setConnectionDialogOpen(false)} onChanged={async () => { await refreshBootstrap(); }} onConversationConnectionChanged={async (enabled, connectedId) => { setConversationConnectionEnabled(enabled); if (connectedId) { setBoundServerId(connectedId); setServerId(connectedId); } }} onConnected={async (connectedId) => { await refreshBootstrap(); if (!conversationId) choose("server", connectedId); else setServerId(connectedId); }} /> : null}
+      {connectionDialogOpen ? <ConversationConnectionDialog selectedServerId={serverId} conversationId={conversationId} conversationEnabled={conversationConnectionEnabled} conversationScoped={Boolean(conversationId && boundServerId)} onClose={() => setConnectionDialogOpen(false)} onChanged={async () => { await refreshBootstrap(); }} onConversationConnectionChanged={async (enabled, connectedId) => { setConversationConnectionEnabled(enabled); if (connectedId) { setBoundServerId(connectedId); setServerId(connectedId); } }} onConnected={(connectedId) => { if (!conversationId) choose("server", connectedId); else setServerId(connectedId); }} /> : null}
       {manualAgentOpen && serverId ? <ManualAgentDialog serverId={serverId} agents={effectiveAgentOptions} onClose={() => setManualAgentOpen(false)} onAdded={async (nextAgentId) => { await refreshAgents(); if (!conversationId) choose("agent", nextAgentId); }} /> : null}
     </section>
     {conversationId ? <><button type="button" className={`${styles.railScrim} ${runtime.rightRailOpen ? styles.railOpen : ""}`} aria-label="收起功能栏" onClick={() => runtime.setRightRailOpen(false)} /><aside data-mobile-drawer-panel="right" inert={!runtime.rightRailOpen} aria-hidden={!runtime.rightRailOpen} className={`${styles.rail} ${runtime.rightRailOpen ? styles.railOpen : styles.railClosed} ${activeMode === "chat" ? styles.chatRail : ""}`}>
       {activeMode === "work" ? <>
-        <section className={`${styles.railCard} ${selectedServer?.status === "connected" && conversationConnectionEnabled ? styles.railConnected : styles.railDisconnected}`}>
-          <div className={styles.railConnectionHeading}><span>远程连接</span><span className={styles.railConnectionState}><i data-ui-icon="" />{selectedServer?.status === "connected" && conversationConnectionEnabled ? "已连接" : "未连接"}</span></div>
+        <section className={`${styles.railCard} ${serverConnectionReady ? styles.railConnected : serverConnecting || serverDisconnecting ? styles.railConnecting : styles.railDisconnected}`}>
+          <div className={styles.railConnectionHeading}><span>远程连接</span><span className={styles.railConnectionState}><i data-ui-icon="" />{serverConnecting ? "连接中" : serverDisconnecting ? "断开中" : serverConnectionReady ? "已连接" : "未连接"}</span></div>
           <strong className={styles.railValue}>{selectedServer?.name || "未连接"}</strong>
-          <span className={styles.railSub}>{selectedServer ? selectedServer.status === "connected" && conversationConnectionEnabled ? `${selectedServer.username}@${selectedServer.host}` : selectedServer.host : ""}</span>
+          <span className={styles.railSub}>{selectedServer ? serverConnectionReady ? `${selectedServer.username}@${selectedServer.host}` : selectedServer.host : ""}</span>
           <div className={styles.railActions}>
-            <button disabled={serverBindingLoading} onClick={openConversationConnection}>{selectedServer?.status === "connected" && conversationConnectionEnabled ? <Wifi size={14} /> : <WifiOff size={14} />}连接</button>
+            <button disabled={serverBindingLoading || Boolean(serverConnectionOperation)} onClick={openConversationConnection}>{serverConnecting || serverDisconnecting ? <LoaderCircle className={styles.spin} size={14} /> : serverConnectionReady ? <Wifi size={14} /> : <WifiOff size={14} />}{serverConnecting ? "连接中" : serverDisconnecting ? "断开中" : serverConnectionReady ? "连接详情" : "连接"}</button>
           </div>
         </section>
         <section className={styles.railCard}>

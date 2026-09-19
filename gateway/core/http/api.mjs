@@ -185,6 +185,7 @@ export function createApi(options) {
 
   router.route("GET", "/api/servers", async (request) => {
     const servers = await request.services.servers.list();
+    if (request.query.includeConversationTitles === "false") return servers;
     const conversationIds = [...new Set(servers.flatMap((server) => server.conversationIds || []))];
     const titles = new Map((await request.services.conversations.getConversationSummaries(conversationIds))
       .map((conversation) => [conversation.id, conversation.title]));
@@ -194,7 +195,16 @@ export function createApi(options) {
     }));
   });
   router.route("POST", "/api/servers", (request) => request.services.servers.create(requiredBody(request)));
-  router.route("GET", "/api/servers/:id", (request) => request.services.servers.get(request.params.id));
+  router.route("GET", "/api/servers/:id", async (request) => {
+    const server = await request.services.servers.get(request.params.id);
+    if (request.query.includeConversationTitles !== "true") return server;
+    const titles = new Map((await request.services.conversations.getConversationSummaries(server.conversationIds || []))
+      .map((conversation) => [conversation.id, conversation.title]));
+    return {
+      ...server,
+      conversations: (server.conversationIds || []).map((id) => ({ id, title: titles.get(id) || "未命名对话" })),
+    };
+  });
   router.route("PATCH", "/api/servers/:id", (request) => request.services.servers.update(request.params.id, withRevision(request)));
   router.route("POST", "/api/servers/:id/credential/reveal", (request) => request.services.servers.revealCredential(request.params.id), {
     secretResponse: true,

@@ -28,6 +28,7 @@
 .agentHeaderControl { display:inline-flex; min-width:0; }
 .connection { display:inline-flex; width:auto; min-width:0; height:38px; align-items:center; justify-content:center; gap:6px; padding:0 10px; border:1px solid rgb(65 128 76 / 24%); border-radius:10px; background:rgb(231 246 234 / 82%); color:#397347; font:inherit; font-size:12px; font-weight:600; white-space:nowrap; cursor:pointer; backdrop-filter:blur(10px); transition:border-color 140ms ease,background 140ms ease,color 140ms ease,opacity 140ms ease; }
 .connection.off { border-color:rgb(171 74 61 / 20%); background:rgb(255 253 248 / 82%); color:#a34c43; }
+.connectionPending { border-color:rgb(176 126 45 / 24%); background:rgb(251 245 226 / 88%); color:#946b29; }
 .connection:hover { border-color:rgb(83 99 63 / 25%); background:rgb(245 244 239 / 94%); color:var(--ew-green-deep); }
 .connection:disabled { cursor:default; opacity:.68; }
 .withRail .connection { display:none; }
@@ -256,12 +257,15 @@
 .railCard { min-width:0; margin:0 0 7px; padding:11px 12px 12px; border:1px solid rgb(79 73 59 / 12%); border-radius:13px; background:rgb(255 253 248 / 46%); box-shadow:0 1px 2px rgb(69 58 37 / 3%); }
 .railCard:first-child { padding:14px 14px 13px 16px; }
 .railConnected { background:linear-gradient(90deg,rgb(65 128 76 / 7%),transparent 68%),rgb(255 253 248 / 50%); box-shadow:inset 2px 0 #5c8c62,0 1px 2px rgb(69 58 37 / 3%); }
+.railConnecting { background:linear-gradient(90deg,rgb(176 126 45 / 7%),transparent 68%),rgb(255 253 248 / 50%); box-shadow:inset 2px 0 #b17d2f,0 1px 2px rgb(69 58 37 / 3%); }
 .railDisconnected { background:linear-gradient(90deg,rgb(172 66 54 / 6%),transparent 68%),rgb(255 253 248 / 50%); box-shadow:inset 2px 0 #b8574e,0 1px 2px rgb(69 58 37 / 3%); }
 .railTitle,.railConnectionHeading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; color:#625e54; font-family:var(--ew-font); font-size:var(--rail-font-size); font-weight:650; }
 .railConnectionState { display:inline-flex; min-height:24px; align-items:center; gap:6px; padding:0 8px; border:1px solid rgb(172 66 54 / 18%); border-radius:999px; background:#faece9; color:#98453d; font-family:var(--ew-font); font-size:var(--rail-sub-font-size); font-weight:650; }
 .railConnectionState i { width:8px; height:8px; flex:0 0 8px; border-radius:50%; background:#b8574e; box-shadow:0 0 0 3px rgb(184 87 78 / 11%); }
 .railConnected .railConnectionState { border-color:rgb(65 128 76 / 20%); background:#e8f4e9; color:#347043; }
 .railConnected .railConnectionState i { background:#4f8b5a; box-shadow:0 0 0 3px rgb(79 139 90 / 12%); }
+.railConnecting .railConnectionState { border-color:rgb(176 126 45 / 20%); background:#f8efd6; color:#8a6326; }
+.railConnecting .railConnectionState i { background:#b17d2f; box-shadow:0 0 0 3px rgb(177 125 47 / 12%); }
 .railAction { display:inline-flex; min-width:48px; min-height:27px; align-items:center; justify-content:center; padding:0 8px; border:1px solid rgb(82 105 68 / 14%); border-radius:8px; background:rgb(255 253 248 / 60%); color:#59634d; font:inherit; font-size:var(--rail-font-size); font-weight:610; cursor:pointer; }
 .railAction:hover:not(:disabled) { border-color:rgb(82 105 68 / 20%); background:rgb(243 239 229 / 80%); color:var(--ew-green-deep); }
 .railAction:disabled { opacity:.42; cursor:not-allowed; }
@@ -392,14 +396,19 @@
   .railCard { margin-bottom:6px; padding:10px 11px; border-radius:12px; }
   .railCard:first-child { padding:11px 12px; }
   .railConnected,
+  .railConnecting,
   .railDisconnected { display:grid; grid-template-areas:"heading heading" "value actions" "sub actions"; grid-template-columns:minmax(0,1fr) 92px; column-gap:9px; }
   .railConnected .railConnectionHeading,
+  .railConnecting .railConnectionHeading,
   .railDisconnected .railConnectionHeading { grid-area:heading; margin-bottom:5px; }
   .railConnected > .railValue,
+  .railConnecting > .railValue,
   .railDisconnected > .railValue { grid-area:value; align-self:end; }
   .railConnected > .railSub,
+  .railConnecting > .railSub,
   .railDisconnected > .railSub { grid-area:sub; align-self:start; }
   .railConnected > .railActions,
+  .railConnecting > .railActions,
   .railDisconnected > .railActions { grid-area:actions; align-self:center; margin:5px 0 0; }
   .railWorkspaceValue { direction:ltr; text-align:left; }
   .railWorkspaceValue:has(> bdi) { direction:rtl; text-align:right; }

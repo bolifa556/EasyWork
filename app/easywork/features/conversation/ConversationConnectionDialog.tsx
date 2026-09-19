@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } f
 import { Check, KeyRound, LoaderCircle, Plus, Save, Settings2, ShieldCheck, Upload, Wifi, WifiOff } from "lucide-react";
 import { GatewayError } from "@/app/core/contracts";
 import { useAppRuntime } from "../../runtime/AppRuntime";
+import { announceServersChanged } from "../../runtime/cacheEvents";
 import { Modal } from "../../ui/Modal";
 import type { ServerRecord } from "../servers/ServerManager";
 import styles from "./ConversationConnectionDialog.module.css";
@@ -68,7 +69,7 @@ export function ConversationConnectionDialog({
   conversationEnabled?: boolean;
   conversationScoped?: boolean;
   onClose: () => void;
-  onConnected: (serverId: string) => Promise<void>;
+  onConnected: (serverId: string) => void;
   onConversationConnectionChanged?: (enabled: boolean, serverId: string | null) => Promise<void>;
   onChanged: () => Promise<void>;
 }) {
@@ -88,7 +89,7 @@ export function ConversationConnectionDialog({
   const keyFileInput = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async (preferred?: string | null, keepConfiguration = false) => {
-    const result = await runtime.api.get<ConnectionServerRecord[]>("/api/servers");
+    const result = await runtime.api.get<ConnectionServerRecord[]>("/api/servers?includeConversationTitles=false");
     const requestedId = preferred === undefined ? selectedServerId : preferred;
     const nextServer = result.data.find((item) => item.profile.id === requestedId) ?? (requestedId ? null : result.data[0] ?? null);
     setServers(result.data);
@@ -116,10 +117,14 @@ export function ConversationConnectionDialog({
     () => servers.find((server) => server.profile.id === selectedId) ?? null,
     [selectedId, servers],
   );
+  const selectedOperation = selected ? runtime.serverConnectionOperations.get(selected.profile.id) : undefined;
+  const connecting = busy === "connect" || selectedOperation === "connect";
+  const disconnecting = busy === "disconnect" || selectedOperation === "disconnect";
+  const operationBusy = Boolean(busy || selectedOperation);
   const selectedSshConnected = selected?.connection.status === "connected";
   const displayedConnected = Boolean(selectedSshConnected && (!conversationScoped || conversationEnabled));
-  const displayedStatus = busy === "connect" ? "connecting" : displayedConnected ? "connected" : "disconnected";
-  const displayedError = busy !== "connect"
+  const displayedStatus = connecting ? "connecting" : displayedConnected ? "connected" : "disconnected";
+  const displayedError = !connecting
     && selected
     && connectionAttemptError?.serverId === selected.profile.id
     && !fingerprint
@@ -172,7 +177,7 @@ export function ConversationConnectionDialog({
       && (savedCredentialReusable || credentialPresent),
   );
 
-  const persist = async ({ notify = false }: { notify?: boolean } = {}) => {
+  const persist = async ({ notify = false, reconcile = true }: { notify?: boolean; reconcile?: boolean } = {}) => {
     const profile = {
       name: draft.name.trim() || draft.host.trim(),
       host: draft.host.trim(),
@@ -194,13 +199,15 @@ export function ConversationConnectionDialog({
       await runtime.api.patch(`/api/servers/${encodeURIComponent(selected.profile.id)}`, {
         ...patch,
       }, { expectedRevision: selected.profile.revision });
+      announceServersChanged({ serverId: selected.profile.id, kind: "updated" });
     } else {
       const result = await runtime.api.post<{ id: string }>("/api/servers", { ...profile, credential });
       id = result.data.id;
+      announceServersChanged({ serverId: id, kind: "created" });
     }
     if (!id) return null;
     await load(id, false);
-    await onChanged();
+    if (reconcile) void onChanged().catch(() => undefined);
     if (notify) runtime.notify(selected ? "服务器配置已保存" : "服务器已添加", "success");
     return id;
   };
@@ -221,27 +228,30 @@ export function ConversationConnectionDialog({
   };
 
   const connect = async () => {
-    if (busy) return;
+    if (operationBusy) return;
     setBusy("connect");
     setConnectionAttemptError(null);
     try {
       let id = selected?.profile.id ?? null;
-      if (!id || configurationOpen) id = await persist();
+      if (!id || configurationOpen) id = await persist({ reconcile: false });
       if (!id) return;
       const current = servers.find((server) => server.profile.id === id) ?? selected;
       if (current?.connection.status !== "connected") {
         try {
-          await runtime.api.post(`/api/servers/${encodeURIComponent(id)}/connect`, {
+          const connection = await runtime.connectServer(id, {
             twoFactorCode: twoFactorCode.trim() || null,
             ...(fingerprint && trustHost ? { acceptedFingerprint: fingerprint } : {}),
           });
+          setServers((items) => items.map((server) => server.profile.id === id
+            ? { ...server, connection: { ...server.connection, ...connection, status: "connected", lastError: null } }
+            : server));
         } catch (reason) {
           if (reason instanceof GatewayError && reason.code === "SSH_HOST_KEY_CONFIRMATION_REQUIRED") {
             const details = reason.details as { fingerprint?: string } | null;
             if (details?.fingerprint) setFingerprint(details.fingerprint);
           } else {
             const message = errorText(reason);
-            await load(id).catch(() => undefined);
+            void load(id).catch(() => undefined);
             setConnectionAttemptError({ serverId: id, message });
             runtime.notify(message, "error");
           }
@@ -253,20 +263,20 @@ export function ConversationConnectionDialog({
       try {
         if (conversationId) {
           await runtime.api.post(`/api/conversations/${encodeURIComponent(conversationId)}/server-binding`, { serverId: id });
+          announceServersChanged({ serverId: id, kind: "binding" });
           await onConversationConnectionChanged?.(true, id);
         }
       } catch (reason) {
-        await load(id).catch(() => undefined);
+        void load(id).catch(() => undefined);
         runtime.notify(`SSH 已连接，但当前对话关联失败：${errorText(reason)}`, "error");
         return;
       }
-      await load(id).catch(() => undefined);
-      // The SSH connection and conversation binding are already authoritative.
-      // A transient bootstrap refresh must not turn a successful connection
-      // into a red "SSH connection failed" notification.
-      await onConnected(id).catch(() => onChanged().catch(() => undefined));
+      onConnected(id);
       runtime.notify("SSH 已连接", "success");
       onClose();
+      // Server discovery and the full bootstrap are reconciliation work. They
+      // must not hold the successful connection button in its loading state.
+      void Promise.allSettled([load(id), onChanged()]);
     } catch (reason) {
       runtime.notify(errorText(reason), "error");
     } finally {
@@ -275,17 +285,18 @@ export function ConversationConnectionDialog({
   };
 
   const selectConnectedServer = async () => {
-    if (!selected || busy) return;
+    if (!selected || operationBusy) return;
     setBusy("connect");
     try {
       const id = selected.profile.id;
       if (conversationId) {
         await runtime.api.post(`/api/conversations/${encodeURIComponent(conversationId)}/server-binding`, { serverId: id });
+        announceServersChanged({ serverId: id, kind: "binding" });
         await onConversationConnectionChanged?.(true, id);
       }
-      await runtime.refreshBootstrap();
-      await onConnected(id);
+      onConnected(id);
       onClose();
+      void onChanged().catch(() => undefined);
     } catch (reason) {
       runtime.notify(errorText(reason), "error");
     } finally {
@@ -294,19 +305,21 @@ export function ConversationConnectionDialog({
   };
 
   const disconnectConversation = async () => {
-    if (!selected || busy) return;
+    if (!selected || operationBusy) return;
     setBusy("disconnect");
     try {
       if (conversationScoped && conversationId) {
         await runtime.api.delete(`/api/conversations/${encodeURIComponent(conversationId)}/server-binding`, { body: {} });
+        announceServersChanged({ serverId: selected.profile.id, kind: "binding" });
         await onConversationConnectionChanged?.(false, null);
       } else {
-        await runtime.api.post(`/api/servers/${encodeURIComponent(selected.profile.id)}/disconnect`, {});
+        const connection = await runtime.disconnectServer(selected.profile.id);
+        setServers((items) => items.map((server) => server.profile.id === selected.profile.id
+          ? { ...server, connection: { ...server.connection, ...connection, status: "disconnected", lastError: null } }
+          : server));
       }
-      await load(selected.profile.id);
-      await runtime.refreshBootstrap();
-      await onChanged();
       runtime.notify(conversationScoped ? "此对话已断开远程服务器" : "SSH 已断开", "success");
+      void Promise.allSettled([load(selected.profile.id), onChanged()]);
     } catch (reason) {
       runtime.notify(errorText(reason), "error");
     } finally {
@@ -345,9 +358,9 @@ export function ConversationConnectionDialog({
           </div> : null}
           <div className={`${styles.quickActions} ${displayedConnected ? styles.quickActionsConnected : ""}`}>
             <button className={styles.quickButton} type="button" onClick={() => setConfigurationOpen(true)}><Settings2 size={15} />配置</button>
-            {displayedConnected ? conversationScoped ? <button className={`${styles.quickButton} ${styles.quickDisconnect}`} type="button" disabled={Boolean(busy)} onClick={() => void disconnectConversation()}>{busy === "disconnect" ? <LoaderCircle className={styles.spin} size={15} /> : <WifiOff size={15} />}{busy === "disconnect" ? "断开中" : "断开连接"}</button> : <button className={`${styles.quickButton} ${styles.quickUse}`} type="button" disabled={Boolean(busy)} onClick={() => void selectConnectedServer()}>{busy === "connect" ? <LoaderCircle className={styles.spin} size={15} /> : <Check size={15} />}{busy === "connect" ? "使用中" : "使用此连接"}</button> : <>
+            {displayedConnected ? conversationScoped ? <button className={`${styles.quickButton} ${styles.quickDisconnect}`} type="button" disabled={operationBusy} onClick={() => void disconnectConversation()}>{disconnecting ? <LoaderCircle className={styles.spin} size={15} /> : <WifiOff size={15} />}{disconnecting ? "断开中" : "断开连接"}</button> : <button className={`${styles.quickButton} ${styles.quickUse}`} type="button" disabled={operationBusy} onClick={() => void selectConnectedServer()}>{connecting ? <LoaderCircle className={styles.spin} size={15} /> : <Check size={15} />}{connecting ? "使用中" : "使用此连接"}</button> : <>
               <input className={styles.quickOtp} value={twoFactorCode} inputMode="numeric" onChange={(event) => setTwoFactorCode(event.target.value.replace(/\D/g, ""))} placeholder="请输入2FA验证码（可选）" aria-label="2FA 验证码（可选）" autoComplete="one-time-code" />
-              <button className={styles.quickButton} type="button" disabled={busy === "connect" || Boolean(fingerprint && !trustHost)} onClick={() => void connect()}>{busy === "connect" ? <LoaderCircle className={styles.spin} size={15} /> : <KeyRound size={15} />}{busy === "connect" ? "连接中" : "连接"}</button>
+              <button className={styles.quickButton} type="button" disabled={operationBusy || Boolean(fingerprint && !trustHost)} onClick={() => void connect()}>{connecting ? <LoaderCircle className={styles.spin} size={15} /> : <KeyRound size={15} />}{connecting ? "连接中" : "连接"}</button>
             </>}
           </div>
         </div> : <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void connect(); }}>
@@ -376,8 +389,8 @@ export function ConversationConnectionDialog({
           <label className={styles.field}><span>2FA 验证码（可选）</span><input value={twoFactorCode} inputMode="numeric" onChange={(event) => setTwoFactorCode(event.target.value.replace(/\D/g, ""))} placeholder="请输入当前动态验证码" aria-label="2FA 验证码（可选）" autoComplete="one-time-code" /></label>
           {fingerprint ? <div className={styles.hostConfirm}><span><ShieldCheck size={16} /><strong>确认主机指纹</strong></span><code>{fingerprint}</code><label><input type="checkbox" checked={trustHost} onChange={(event) => setTrustHost(event.target.checked)} />我已核对并信任此主机</label></div> : null}
           <div className={styles.formActions}>
-            <button type="button" disabled={!complete || Boolean(busy)} onClick={() => void save()}>{busy === "save" ? <LoaderCircle className={styles.spin} size={15} /> : <Save size={15} />}{busy === "save" ? "保存中" : "保存"}</button>
-            {selectedSshConnected ? <button className={styles.formDisconnect} type="button" disabled={Boolean(busy)} onClick={() => void disconnectConversation()}><WifiOff size={16} />断开 SSH</button> : <button type="submit" disabled={!complete || busy === "connect" || Boolean(fingerprint && !trustHost)}>{busy === "connect" ? <LoaderCircle className={styles.spin} size={16} /> : <KeyRound size={16} />}{busy === "connect" ? "连接中" : "连接 SSH"}</button>}
+            <button type="button" disabled={!complete || operationBusy} onClick={() => void save()}>{busy === "save" ? <LoaderCircle className={styles.spin} size={15} /> : <Save size={15} />}{busy === "save" ? "保存中" : "保存"}</button>
+            {selectedSshConnected ? <button className={styles.formDisconnect} type="button" disabled={operationBusy} onClick={() => void disconnectConversation()}>{disconnecting ? <LoaderCircle className={styles.spin} size={16} /> : <WifiOff size={16} />}{disconnecting ? "断开中" : "断开 SSH"}</button> : <button type="submit" disabled={!complete || operationBusy || Boolean(fingerprint && !trustHost)}>{connecting ? <LoaderCircle className={styles.spin} size={16} /> : <KeyRound size={16} />}{connecting ? "连接中" : "连接 SSH"}</button>}
           </div>
         </form>}
       </div>

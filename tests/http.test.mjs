@@ -176,6 +176,33 @@ test("Server list resolves bound conversation ids to readable titles", async () 
   ]);
 });
 
+test("Server list can skip conversation titles for a fast first paint and hydrate one server on demand", async () => {
+  let summaryReads = 0;
+  const record = { profile: { id: "server_a" }, connection: { status: "connected" }, conversationIds: ["conversation_a"] };
+  const services = {
+    servers: {
+      async list() { return [record]; },
+      async get(id) { assert.equal(id, "server_a"); return record; },
+    },
+    conversations: {
+      async getConversationSummaries() {
+        summaryReads += 1;
+        return [{ id: "conversation_a", title: "部署生产环境" }];
+      },
+    },
+  };
+  const api = createApi({ auth, servicesForActor: async () => services });
+  const lightweight = await api.dispatch({ method: "GET", url: "/api/servers?includeConversationTitles=false", headers: { authorization: "Bearer valid-token" } });
+  assert.equal(lightweight.status, 200);
+  assert.equal(summaryReads, 0);
+  assert.equal(lightweight.body.data[0].conversations, undefined);
+
+  const detail = await api.dispatch({ method: "GET", url: "/api/servers/server_a?includeConversationTitles=true", headers: { authorization: "Bearer valid-token" } });
+  assert.equal(detail.status, 200);
+  assert.equal(summaryReads, 1);
+  assert.deepEqual(detail.body.data.conversations, [{ id: "conversation_a", title: "部署生产环境" }]);
+});
+
 test("Profile PATCH cannot replace the authenticated Bearer token through its JSON body", async () => {
   let received = null;
   const profileAuth = {

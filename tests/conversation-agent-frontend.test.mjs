@@ -16,6 +16,8 @@ const connectionDialogPath = new URL("../app/easywork/features/conversation/Conv
 const webContextDialogPath = new URL("../app/easywork/features/conversation/WebContextDialog.tsx", import.meta.url);
 const serverManagerPath = new URL("../app/easywork/features/servers/ServerManager.tsx", import.meta.url);
 const cacheEventsPath = new URL("../app/easywork/runtime/cacheEvents.ts", import.meta.url);
+const appRuntimePath = new URL("../app/easywork/runtime/AppRuntime.tsx", import.meta.url);
+const startupDataPath = new URL("../app/easywork/runtime/startup-data.ts", import.meta.url);
 const timelinePath = new URL("../app/easywork/features/conversation/ConversationTimeline.tsx", import.meta.url);
 const copySource = await readFile(new URL("../app/easywork/features/conversation/conversation-copy.mjs", import.meta.url), "utf8");
 const timelineStylePath = new URL("../app/easywork/features/conversation/ConversationTimeline.module.css", import.meta.url);
@@ -92,6 +94,36 @@ test("对话删除或重命名只按事件失效服务器详情缓存，不引�
   assert.match(servers, /const changed = \(event: Event\) =>/);
   assert.match(servers, /if \(detail\?\.optimistic\) return/);
   assert.doesNotMatch(servers, /setInterval/);
+});
+
+test("所有 SSH 入口共用单次连接锁并立即同步状态，服务器页优先读取轻量列表", async () => {
+  const [dialog, servers, events, appRuntime, startup, view] = await Promise.all([
+    readFile(connectionDialogPath, "utf8"),
+    readFile(serverManagerPath, "utf8"),
+    readFile(cacheEventsPath, "utf8"),
+    readFile(appRuntimePath, "utf8"),
+    readFile(startupDataPath, "utf8"),
+    readFile(viewPath, "utf8"),
+  ]);
+  assert.match(events, /export const SERVERS_CHANGED_EVENT = "easywork:servers-changed"/);
+  assert.match(events, /let serversChangeRevision = 0/);
+  assert.match(events, /serversChangeRevision \+= 1/);
+  assert.match(appRuntime, /serverConnectionRequests = useRef\(new Map/);
+  assert.match(appRuntime, /if \(active\?\.kind === "connect"\) return active\.promise/);
+  assert.match(appRuntime, /updateBootstrapServerConnection\(serverId, \{ status: "connected", generation: result\.data\.generation \}\)/);
+  assert.match(appRuntime, /pendingBootstrapServerChanges/);
+  assert.match(dialog, /runtime\.connectServer\(id,/);
+  assert.match(servers, /runtime\.connectServer\(server\.profile\.id,/);
+  assert.doesNotMatch(dialog, /api\.post\(`\/api\/servers\/\$\{encodeURIComponent\(id\)\}\/connect`/);
+  assert.match(dialog, /Promise\.allSettled\(\[load\(id\), onChanged\(\)\]\)/);
+  assert.match(servers, /\/api\/servers\?includeConversationTitles=false/);
+  assert.match(servers, /includeConversationTitles=true/);
+  assert.match(startup, /view\.kind === "servers"[\s\S]+?api\.prefetch\("\/api\/servers\?includeConversationTitles=false"\)/);
+  assert.match(servers, /cached\?\.changeRevision === readServersChangeRevision\(\)/);
+  assert.match(servers, /reconcileConnectionStatuses\(initialCache\?\.servers \|\| \[\], runtime\.bootstrap\)/);
+  assert.match(servers, /addEventListener\(SERVERS_CHANGED_EVENT, changed\)/);
+  assert.match(view, /serverConnecting \? "连接中" : serverDisconnecting \? "断开中" : serverConnectionReady \? "连接详情" : "连接"/);
+  assert.match(view, /className=\{`\$\{styles\.setupStep\}[\s\S]+?disabled=\{Boolean\(serverConnectionOperation\)\}[\s\S]+?onClick=\{openConversationConnection\}/);
 });
 
 test("远程服务器页标题不重复展示列表数量", async () => {
@@ -1131,12 +1163,12 @@ test("Work 首轮交接前失败后可幂等重试虚拟工作区且不会先写
 test("远程连接错误只在当前弹框实际发起连接失败后显示", async () => {
   const [dialog, manager] = await Promise.all([readFile(connectionDialogPath, "utf8"), readFile(serverManagerPath, "utf8")]);
   assert.match(dialog, /connectionAttemptError/);
-  assert.match(dialog, /const displayedError = busy !== "connect"/);
+  assert.match(dialog, /const displayedError = !connecting/);
   assert.match(dialog, /connectionAttemptError\?\.serverId === selected\.profile\.id/);
-  assert.match(dialog, /setConnectionAttemptError\(null\);[\s\S]+?runtime\.api\.post\(`\/api\/servers\/\$\{encodeURIComponent\(id\)\}\/connect`/);
+  assert.match(dialog, /setConnectionAttemptError\(null\);[\s\S]+?runtime\.connectServer\(id,/);
   assert.match(dialog, /setConnectionAttemptError\(\{ serverId: id, message \}\)/);
   assert.match(dialog, /SSH 已连接，但当前对话关联失败/);
-  assert.match(dialog, /await onConnected\(id\)\.catch\(\(\) => onChanged\(\)\.catch/);
+  assert.match(dialog, /onConnected\(id\);[\s\S]+?Promise\.allSettled\(\[load\(id\), onChanged\(\)\]\)/);
   assert.doesNotMatch(dialog, /attemptedServerIds/);
   assert.doesNotMatch(dialog, /selected\.connection\.lastError && !fingerprint \?/);
   assert.doesNotMatch(dialog, /\[load, runtime, selectedServerId\]/);

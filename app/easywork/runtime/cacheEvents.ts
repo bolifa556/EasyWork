@@ -1,6 +1,7 @@
 import type { ConversationSummary } from "@/app/core/contracts";
 
 export const CONVERSATIONS_CHANGED_EVENT = "easywork:conversations-changed";
+export const SERVERS_CHANGED_EVENT = "easywork:servers-changed";
 
 export type ConversationsChangedDetail = {
   conversationId: string;
@@ -10,6 +11,23 @@ export type ConversationsChangedDetail = {
   title?: string;
   revision?: number;
 };
+
+export type ServersChangedDetail = {
+  serverId: string;
+  kind: "created" | "updated" | "connected" | "disconnected" | "binding";
+};
+
+let serversChangeRevision = 0;
+
+export function readServersChangeRevision() {
+  return serversChangeRevision;
+}
+
+export function announceServersChanged(detail: ServersChangedDetail) {
+  serversChangeRevision += 1;
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent<ServersChangedDetail>(SERVERS_CHANGED_EVENT, { detail }));
+}
 
 const CHANNEL_NAME = "easywork-conversations";
 const STORAGE_KEY = "easywork.conversations-changed";

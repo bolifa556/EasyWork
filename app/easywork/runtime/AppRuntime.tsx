@@ -21,7 +21,7 @@ import { prefetchRouteData } from "./startup-data";
 import { startupDestination } from "./startup-route";
 import { prefetchHelpDocument } from "../features/help/help-document";
 import { useFilePreviewTabs } from "./useFilePreviewTabs";
-import { announceConversationsChanged, subscribeConversationsChanged, type ConversationsChangedDetail } from "./cacheEvents";
+import { announceConversationsChanged, announceServersChanged, subscribeConversationsChanged, type ConversationsChangedDetail } from "./cacheEvents";
 import { applyBootstrapConversationChange, preserveConversationRows } from "./conversation-list";
 export type { WorkspacePreviewTab } from "./useFilePreviewTabs";
 
@@ -61,6 +61,38 @@ export type AppView =
 
 type Toast = { id: string; tone: "neutral" | "success" | "error"; message: string };
 
+export type ServerConnectionSnapshot = {
+  status: "disconnected" | "connecting" | "connected" | "failed";
+  desiredConnection?: boolean;
+  connectedAt?: string | null;
+  disconnectedAt?: string | null;
+  lastActiveAt?: string | null;
+  lastKeepAliveAt?: string | null;
+  generation?: number;
+  lastError?: { code: string; message: string } | null;
+};
+
+export type ServerConnectionOperation = "connect" | "disconnect";
+
+type BootstrapServerConnectionChange = {
+  serverId: string;
+  status: "disconnected" | "connecting" | "connected";
+  generation?: number;
+};
+
+function applyBootstrapServerConnectionChange(current: BootstrapResponse | null, change: BootstrapServerConnectionChange) {
+  if (!current) return current;
+  let changed = false;
+  const servers = current.servers.map((server) => {
+    if (server.id !== change.serverId) return server;
+    const connectionGeneration = Number.isFinite(change.generation) ? Number(change.generation) : server.connectionGeneration;
+    if (server.status === change.status && server.connectionGeneration === connectionGeneration) return server;
+    changed = true;
+    return { ...server, status: change.status, connectionGeneration };
+  });
+  return changed ? { ...current, servers } : current;
+}
+
 export type WorkspaceSidebarSession = {
   conversationId: string;
   serverId: string;
@@ -87,6 +119,9 @@ type RuntimeValue = ReturnType<typeof useFilePreviewTabs> & {
   setRightRailOpen: (open: boolean) => void;
   setWorkspaceSidebar: (session: WorkspaceSidebarSession | null) => void;
   refreshBootstrap: () => Promise<void>;
+  serverConnectionOperations: ReadonlyMap<string, ServerConnectionOperation>;
+  connectServer: (serverId: string, options?: { twoFactorCode?: string | null; acceptedFingerprint?: string }) => Promise<ServerConnectionSnapshot>;
+  disconnectServer: (serverId: string) => Promise<ServerConnectionSnapshot>;
   updateConversationNavigation: (conversation: Omit<ConversationSummary, "runningTaskId">) => void;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string) => Promise<void>;
@@ -217,6 +252,9 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
   const bootstrapGeneration = useRef(0);
   const pendingBootstrapChanges = useRef(new Set<ConversationsChangedDetail[]>());
+  const pendingBootstrapServerChanges = useRef(new Set<BootstrapServerConnectionChange[]>());
+  const serverConnectionRequests = useRef(new Map<string, { kind: ServerConnectionOperation; promise: Promise<ServerConnectionSnapshot> }>());
+  const [serverConnectionOperations, setServerConnectionOperations] = useState<ReadonlyMap<string, ServerConnectionOperation>>(() => new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<AppView>(() => typeof window === "undefined"
@@ -270,10 +308,15 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     const route = parseRoute(window.location.pathname, window.location.search);
     const query = route.kind === "conversation" ? `?conversationId=${encodeURIComponent(route.conversationId)}` : "";
     const changes: ConversationsChangedDetail[] = [];
+    const serverChanges: BootstrapServerConnectionChange[] = [];
     pendingBootstrapChanges.current.add(changes);
+    pendingBootstrapServerChanges.current.add(serverChanges);
     let result;
     try { result = await retryGateway(() => api.get<BootstrapResponse>(`/api/bootstrap${query}`)); }
-    finally { pendingBootstrapChanges.current.delete(changes); }
+    finally {
+      pendingBootstrapChanges.current.delete(changes);
+      pendingBootstrapServerChanges.current.delete(serverChanges);
+    }
     if (requestedSession !== sessionSource.read() || generation !== bootstrapGeneration.current) return;
     setBootstrap((current) => {
       if (!current || current.actor.id !== result.data.actor.id) return result.data;
@@ -282,10 +325,76 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
         recentConversations: preserveConversationRows(current.recentConversations, result.data.recentConversations),
         runningTasks: mergeTaskSnapshots(current.runningTasks, result.data.runningTasks)
           .filter((task) => incomingIds.has(task.id) && isActiveTask(task)) };
-      return changes.reduce((snapshot, change) => applyBootstrapConversationChange(snapshot, change)!, next);
+      const withConversationChanges = changes.reduce((snapshot, change) => applyBootstrapConversationChange(snapshot, change)!, next);
+      return serverChanges.reduce((snapshot, change) => applyBootstrapServerConnectionChange(snapshot, change)!, withConversationChanges);
     });
     setError(null);
   }, [api, sessionSource, setBootstrap]);
+
+  const updateBootstrapServerConnection = useCallback((serverId: string, connection: Pick<ServerConnectionSnapshot, "status" | "generation">) => {
+    const status = connection.status === "connected" || connection.status === "connecting" ? connection.status : "disconnected";
+    const change: BootstrapServerConnectionChange = { serverId, status, ...(Number.isFinite(connection.generation) ? { generation: Number(connection.generation) } : {}) };
+    for (const changes of pendingBootstrapServerChanges.current) changes.push(change);
+    setBootstrap((current) => applyBootstrapServerConnectionChange(current, change));
+  }, []);
+
+  const connectServer = useCallback((serverId: string, options: { twoFactorCode?: string | null; acceptedFingerprint?: string } = {}) => {
+    const active = serverConnectionRequests.current.get(serverId);
+    if (active?.kind === "connect") return active.promise;
+    if (active) return Promise.reject(new Error("服务器连接状态正在变更"));
+    setServerConnectionOperations((current) => new Map(current).set(serverId, "connect"));
+    updateBootstrapServerConnection(serverId, { status: "connecting" });
+    const promise = api.post<ServerConnectionSnapshot>(`/api/servers/${encodeURIComponent(serverId)}/connect`, options)
+      .then((result) => {
+        updateBootstrapServerConnection(serverId, { status: "connected", generation: result.data.generation });
+        announceServersChanged({ serverId, kind: "connected" });
+        return result.data;
+      })
+      .catch((reason) => {
+        updateBootstrapServerConnection(serverId, { status: "disconnected" });
+        void refreshBootstrap().catch(() => undefined);
+        throw reason;
+      })
+      .finally(() => {
+        if (serverConnectionRequests.current.get(serverId)?.promise === promise) serverConnectionRequests.current.delete(serverId);
+        setServerConnectionOperations((current) => {
+          if (current.get(serverId) !== "connect") return current;
+          const next = new Map(current);
+          next.delete(serverId);
+          return next;
+        });
+      });
+    serverConnectionRequests.current.set(serverId, { kind: "connect", promise });
+    return promise;
+  }, [api, refreshBootstrap, updateBootstrapServerConnection]);
+
+  const disconnectServer = useCallback((serverId: string) => {
+    const active = serverConnectionRequests.current.get(serverId);
+    if (active?.kind === "disconnect") return active.promise;
+    if (active) return Promise.reject(new Error("服务器连接状态正在变更"));
+    setServerConnectionOperations((current) => new Map(current).set(serverId, "disconnect"));
+    const promise = api.post<ServerConnectionSnapshot>(`/api/servers/${encodeURIComponent(serverId)}/disconnect`, {})
+      .then((result) => {
+        updateBootstrapServerConnection(serverId, { status: "disconnected", generation: result.data.generation });
+        announceServersChanged({ serverId, kind: "disconnected" });
+        return result.data;
+      })
+      .catch((reason) => {
+        void refreshBootstrap().catch(() => undefined);
+        throw reason;
+      })
+      .finally(() => {
+        if (serverConnectionRequests.current.get(serverId)?.promise === promise) serverConnectionRequests.current.delete(serverId);
+        setServerConnectionOperations((current) => {
+          if (current.get(serverId) !== "disconnect") return current;
+          const next = new Map(current);
+          next.delete(serverId);
+          return next;
+        });
+      });
+    serverConnectionRequests.current.set(serverId, { kind: "disconnect", promise });
+    return promise;
+  }, [api, refreshBootstrap, updateBootstrapServerConnection]);
 
   const updateConversationNavigation = useCallback((conversation: Omit<ConversationSummary, "runningTaskId">) => {
     const route = parseRoute(window.location.pathname, window.location.search);
@@ -546,12 +655,15 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     setRightRailOpen,
     setWorkspaceSidebar,
     refreshBootstrap,
+    serverConnectionOperations,
+    connectServer,
+    disconnectServer,
     updateConversationNavigation,
     login: (username, password) => authenticate("login", username, password),
     register: (username, password) => authenticate("register", username, password),
     logout,
     notify,
-  }), [api, authenticate, bootstrap, error, filePreviews, loading, logout, navigate, notify, realtime, refreshBootstrap, updateConversationNavigation, rightRailOpen, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspaceSidebar]);
+  }), [api, authenticate, bootstrap, connectServer, disconnectServer, error, filePreviews, loading, logout, navigate, notify, realtime, refreshBootstrap, serverConnectionOperations, updateConversationNavigation, rightRailOpen, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspaceSidebar]);
 
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
