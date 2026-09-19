@@ -130,6 +130,8 @@ export class DynamicResourceExtractor {
 
   async preflight(input) { return (await this.#extractor()).preflight(input); }
 
+  async extractImageText(input) { return (await this.#extractor()).extractImageText(input); }
+
   async extract(input) {
     return (await this.#extractor()).extract(input);
   }

@@ -22,6 +22,7 @@ import { AtomicJsonRepository } from "../repository.mjs";
 import { ActorMutationQueue } from "../mutation-queue.mjs";
 import { containsExplicitQueryAnchor, requiredExplicitQueryAnchors } from "../text-relevance.mjs";
 import { documentMetadata } from "./extractor.mjs";
+import { imageMimeType } from "../../../shared/images.mjs";
 
 const RESOURCE_STORE_SCHEMA_VERSION = 1;
 const PROCESSING_FILE_SCHEMA_VERSION = 1;
@@ -297,7 +298,8 @@ export class ResourceService {
       const ownerId = assertId(String(bindingInput.ownerId || ""), "ownerId");
       const bindingPath = assertBindingPath(bindingInput.path);
       await this.#authorize(ownerType, ownerId, "write");
-      await this.extractor.preflight?.({ actor: this.actor, filename, mime });
+      const imageAttachment = ownerType === "conversation" && Boolean(imageMimeType(filename, mime));
+      if (!imageAttachment) await this.extractor.preflight?.({ actor: this.actor, filename, mime });
       const createdSequence = Number(input?.createdSequence ?? 0);
       invariant(Number.isSafeInteger(createdSequence) && createdSequence >= 0, "RESOURCE_SEQUENCE_INVALID", "createdSequence 无效", { status: 400 });
 
@@ -342,6 +344,7 @@ export class ResourceService {
             blobId: blob.id,
             filename,
             parserVersion: this.parserVersion,
+            ...(imageAttachment ? { processingMode: "image-attachment" } : {}),
           }, { clock: this.clock });
           binding = createResourceBinding({
             id: this.#newId("resource_binding"),
@@ -351,6 +354,7 @@ export class ResourceService {
             ownerId,
             path: bindingPath,
             createdSequence,
+            ...(bindingInput.messageId ? { messageId: assertId(bindingInput.messageId, "messageId") } : {}),
           }, { clock: this.clock });
           store.versions.push(version);
           store.bindings.push(binding);
@@ -389,7 +393,8 @@ export class ResourceService {
       const ownerId = assertId(String(bindingInput.ownerId || ""), "ownerId");
       const bindingPath = assertBindingPath(bindingInput.path);
       await this.#authorize(ownerType, ownerId, "write");
-      await this.extractor.preflight?.({ actor: this.actor, filename, mime });
+      const imageAttachment = ownerType === "conversation" && Boolean(imageMimeType(filename, mime));
+      if (!imageAttachment) await this.extractor.preflight?.({ actor: this.actor, filename, mime });
       const createdSequence = Number(input?.createdSequence ?? 0);
       invariant(Number.isSafeInteger(createdSequence) && createdSequence >= 0, "RESOURCE_SEQUENCE_INVALID", "createdSequence 无效", { status: 400 });
 
@@ -410,12 +415,13 @@ export class ResourceService {
           && existingBinding.ownerType === ownerType
           && existingBinding.ownerId === ownerId
           && existingBinding.path === bindingPath
+          && (existingBinding.messageId || null) === (bindingInput.messageId || null)
           && existingBinding.createdSequence === createdSequence
           && existingVersion?.resourceId === resourceId
           && existingVersion.filename === filename
           && existingBlob?.sha256 === expectedSha256
           && existingBlob.size === expectedSize, "RESOURCE_COMMAND_REUSED", "commandId 已用于不同的流式资源导入", { status: 409 });
-        if (!isResourceKnowledgeReady(existingVersion)) {
+        if (!isResourceKnowledgeReady(existingVersion) && !(existingVersion.processingMode === "image-attachment" && existingVersion.parseStatus === "ready")) {
           snapshot = await this.#processVersion(versionId, input?.summary || null);
         }
         return {
@@ -475,8 +481,8 @@ export class ResourceService {
             store.blobs.push(blob);
           }
           invariant(!store.versions.some((entry) => entry.id === versionId) && !store.bindings.some((entry) => entry.id === bindingId), "RESOURCE_STREAM_IMPORT_ID_COLLISION", "流式资源导入标识冲突", { status: 409 });
-          version = createResourceVersion({ id: versionId, actorId: this.actor.actorId, resourceId, blobId: blob.id, filename, parserVersion: this.parserVersion }, { clock: this.clock });
-          binding = createResourceBinding({ id: bindingId, actorId: this.actor.actorId, resourceVersionId: versionId, ownerType, ownerId, path: bindingPath, createdSequence }, { clock: this.clock });
+          version = createResourceVersion({ id: versionId, actorId: this.actor.actorId, resourceId, blobId: blob.id, filename, parserVersion: this.parserVersion, ...(imageAttachment ? { processingMode: "image-attachment" } : {}) }, { clock: this.clock });
+          binding = createResourceBinding({ id: bindingId, actorId: this.actor.actorId, resourceVersionId: versionId, ownerType, ownerId, path: bindingPath, createdSequence, ...(bindingInput.messageId ? { messageId: assertId(bindingInput.messageId, "messageId") } : {}) }, { clock: this.clock });
           store.versions.push(version);
           store.bindings.push(binding);
         }, { expectedRevision: snapshot.revision, clock: this.clock });
@@ -512,6 +518,12 @@ export class ResourceService {
     invariant(version, "RESOURCE_VERSION_NOT_FOUND", "资源版本不存在", { status: 404 });
     const blob = snapshot.data.blobs.find((entry) => entry.id === version.blobId);
     invariant(blob, "RESOURCE_BLOB_MISSING", "资源 Blob 不存在", { status: 500, expose: false });
+    // Conversation images are user input. Keep their originals without invoking
+    // OCR, a summary model or embeddings; OCR is a lazy text-model fallback.
+    if (version.processingMode === "image-attachment") {
+      if (version.parseStatus === "ready") return snapshot;
+      return this.#setVersionProcessing(version.id, { parseStatus: "ready", parseError: null });
+    }
     const raw = await fs.readFile(this.#actorFile(blob.storagePath));
 
     let parsed;
@@ -607,6 +619,7 @@ export class ResourceService {
       for (const binding of bindings) await this.#authorize(binding.ownerType, binding.ownerId, "write");
       await fs.rm(this.#actorFile(processingPath("parsed", versionId)), { force: true });
       await fs.rm(this.#actorFile(processingPath("vectors", versionId)), { force: true });
+      await fs.rm(this.#actorFile(`resources/ocr/${versionId}.json`), { force: true });
       await this.#repository.update((store) => {
         const index = store.versions.findIndex((entry) => entry.id === versionId);
         store.versions[index] = updateResourceVersionProcessing(store.versions[index], {
@@ -669,7 +682,7 @@ export class ResourceService {
         const version = store.versions.find((entry) => entry.id === binding.resourceVersionId);
         if (!version) return;
         removedVersionId = version.id;
-        removedFiles.push(processingPath("parsed", version.id), processingPath("vectors", version.id));
+        removedFiles.push(processingPath("parsed", version.id), processingPath("vectors", version.id), `resources/ocr/${version.id}.json`);
         store.versions = store.versions.filter((entry) => entry.id !== version.id);
         const hasBlobVersion = store.versions.some((entry) => entry.blobId === version.blobId);
         if (hasBlobVersion) return;
@@ -708,7 +721,7 @@ export class ResourceService {
         const orphanVersions = store.versions.filter((entry) => !retainedVersionIds.has(entry.id));
         for (const version of orphanVersions) {
           removedVersionIds.push(version.id);
-          removedFiles.push(processingPath("parsed", version.id), processingPath("vectors", version.id));
+          removedFiles.push(processingPath("parsed", version.id), processingPath("vectors", version.id), `resources/ocr/${version.id}.json`);
         }
         store.versions = store.versions.filter((entry) => retainedVersionIds.has(entry.id));
         const retainedBlobIds = new Set(store.versions.map((entry) => entry.blobId));
@@ -746,7 +759,7 @@ export class ResourceService {
       groupedBindings.set(binding.resourceVersionId, values);
     }
     const visibleVersions = snapshot.data.versions
-      .filter((version) => groupedBindings.has(version.id) && version.parseStatus === "ready")
+      .filter((version) => groupedBindings.has(version.id) && version.parseStatus === "ready" && version.processingMode !== "image-attachment")
       .slice(0, limit);
     const items = await Promise.all(visibleVersions.map(async (version) => {
       const parsedPath = this.#actorFile(processingPath("parsed", version.id));
@@ -797,6 +810,44 @@ export class ResourceService {
     });
   }
 
+  async messageAttachments(messages) {
+    if (!messages?.length) return messages || [];
+    const { data } = await this.#repository.read();
+    const versions = new Map(data.versions.map((entry) => [entry.id, entry]));
+    const blobs = new Map(data.blobs.map((entry) => [entry.id, entry]));
+    return messages.map((message) => {
+      if (message.role !== "user") return message;
+      const attachments = data.bindings.flatMap((binding) => {
+        if (!binding.messageId || binding.invalidatedSequence !== null || ![message.id, message.originMessageId].includes(binding.messageId)) return [];
+        const version = versions.get(binding.resourceVersionId);
+        const blob = blobs.get(version?.blobId);
+        const mime = blob && imageMimeType(version.filename, blob.mime);
+        return mime ? [{ resourceVersionId: version.id, name: version.filename, mime, size: blob.size }] : [];
+      });
+      return attachments.length ? { ...message, attachments } : message;
+    });
+  }
+
+  async imageInput({ resourceVersionId, textOnly = false, signal } = {}) {
+    const { data } = await this.#repository.read();
+    const version = data.versions.find((entry) => entry.id === assertId(resourceVersionId, "resourceVersionId"));
+    const blob = data.blobs.find((entry) => entry.id === version?.blobId);
+    const mime = blob && imageMimeType(version.filename, blob.mime);
+    invariant(mime, "RESOURCE_IMAGE_NOT_FOUND", "图片附件不存在", { status: 404 });
+    const content = await fs.readFile(this.#actorFile(blob.storagePath));
+    if (!textOnly) return { resourceVersionId, filename: version.filename, mime, dataUrl: `data:${mime};base64,${content.toString("base64")}` };
+    const cachePath = this.#actorFile(`resources/ocr/${resourceVersionId}.json`);
+    try {
+      const cached = JSON.parse(await fs.readFile(cachePath, "utf8"));
+      if (cached.sha256 === blob.sha256 && typeof cached.text === "string") return cached.text;
+    } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    const text = typeof this.extractor.extractImageText === "function"
+      ? await this.extractor.extractImageText({ content, filename: version.filename, mime, signal })
+      : (await this.extractor.extract({ content, filename: version.filename, mime, signal })).text;
+    await writeFileAtomically(cachePath, JSON.stringify({ sha256: blob.sha256, text: String(text || "") }));
+    return String(text || "");
+  }
+
   async read(input = {}) {
     const filename = String(input.filename || "").normalize("NFKC").trim();
     invariant(filename.length >= 1 && filename.length <= 512, "RESOURCE_READ_FILENAME_INVALID", "直接读取需要文件概览中的精确文件名", { status: 400 });
@@ -816,7 +867,7 @@ export class ResourceService {
     const results = [];
     const modelImages = [];
     for (const version of snapshot.data.versions) {
-      if (results.length >= 5 || version.parseStatus !== "ready" || !groupedBindings.has(version.id)) continue;
+      if (results.length >= 5 || version.parseStatus !== "ready" || version.processingMode === "image-attachment" || !groupedBindings.has(version.id)) continue;
       if (version.filename.normalize("NFKC") !== filename) continue;
       const parsedEnvelope = await readJson(this.#actorFile(processingPath("parsed", version.id)), "RESOURCE_PARSED_OUTPUT_MISSING");
       invariant(parsedEnvelope.resourceVersionId === version.id, "RESOURCE_PROCESSING_OUTPUT_MISMATCH", "资源处理结果与版本不匹配", { status: 500, expose: false });

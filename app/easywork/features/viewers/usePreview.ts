@@ -3,8 +3,7 @@
 import { useEffect, useState } from "react";
 import type { FileDescriptor } from "@/app/core/registry/viewers";
 import { useAppRuntime } from "../../runtime/AppRuntime";
-
-const MAX_OBJECT_URL_BYTES = 16 * 1024 * 1024;
+import { readPreviewBlob } from "./preview-blob.mjs";
 
 export function usePreview(previewId: string, kind: "text" | "json" = "text") {
   const runtime = useAppRuntime();
@@ -52,34 +51,7 @@ export function usePreviewObjectUrl(previewId: string, descriptor: FileDescripto
   useEffect(() => {
     const controller = new AbortController();
     let objectUrl = "";
-    void (async () => {
-      if (descriptor.size > MAX_OBJECT_URL_BYTES) throw new Error("此文件需要分段渲染，当前查看器暂不支持");
-      if (descriptor.size > (descriptor.maxPreviewBytes || Number.POSITIVE_INFINITY)) {
-        if (!descriptor.acceptsRange || !descriptor.maxPreviewBytes) throw new Error("此文件来源不支持安全的分段预览");
-        const chunks: BlobPart[] = [];
-        for (let start = 0; start < descriptor.size; start += descriptor.maxPreviewBytes) {
-          const endExclusive = Math.min(descriptor.size, start + descriptor.maxPreviewBytes);
-          const response = await runtime.api.raw(`/api/previews/${encodeURIComponent(previewId)}/content`, {
-            method: "GET",
-            signal: controller.signal,
-            headers: { range: `bytes=${start}-${endExclusive - 1}` },
-          });
-          const contentRange = response.headers.get("content-range");
-          if (response.status !== 206 || contentRange !== `bytes ${start}-${endExclusive - 1}/${descriptor.size}`) {
-            throw new Error("预览来源没有返回预期的分段内容");
-          }
-          const bytes = await response.arrayBuffer();
-          if (bytes.byteLength !== endExclusive - start) throw new Error("预览分段长度不一致");
-          chunks.push(bytes);
-        }
-        return new Blob(chunks, { type: descriptor.mime || "application/octet-stream" });
-      }
-      const response = await runtime.api.raw(`/api/previews/${encodeURIComponent(previewId)}/content`, {
-        method: "GET",
-        signal: controller.signal,
-      });
-      return response.blob();
-    })().then((blob) => {
+    void readPreviewBlob(runtime.api, previewId, { size: descriptor.size, mime: descriptor.mime, acceptsRange: descriptor.acceptsRange, maxPreviewBytes: descriptor.maxPreviewBytes }, controller.signal).then((blob) => {
       if (controller.signal.aborted) return;
       objectUrl = URL.createObjectURL(blob);
       setResult({ key: previewId, value: objectUrl, error: null, loading: false });

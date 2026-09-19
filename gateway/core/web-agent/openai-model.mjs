@@ -1,4 +1,5 @@
 import { invariant } from "../errors.mjs";
+import { rejectsImageInput } from "./image-input.mjs";
 
 function endpoint(baseUrl) {
   const value = String(baseUrl || "").trim().replace(/\/+$/, "");
@@ -123,7 +124,9 @@ export class OpenAIChatModel {
     let errorBody = null;
     if (!response.ok) {
       try { errorBody = await response.json(); } catch { /* handled below */ }
-      invariant(false, "MODEL_REQUEST_FAILED", errorBody?.error?.message || `模型 API 返回 ${response.status}`, { status: 502, retryable: response.status >= 500 });
+      const message = errorBody?.error?.message || `模型 API 返回 ${response.status}`;
+      const hasImages = messages.some((entry) => Array.isArray(entry.content) && entry.content.some((part) => part.type === "image_url"));
+      invariant(false, hasImages && rejectsImageInput(response.status, message) ? "MODEL_IMAGE_UNSUPPORTED" : "MODEL_REQUEST_FAILED", message, { status: 502, retryable: response.status >= 500 });
     }
     let content = "";
     let reasoning = "";

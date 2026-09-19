@@ -22,11 +22,11 @@ export const RESOURCE_BINDING_OWNER_TYPES = Object.freeze(["collection", "projec
 const BLOB_KEYS = ["schemaVersion", "entityType", "revision", "id", "actorId", "sha256", "size", "mime", "storagePath", "createdAt", "updatedAt"];
 const VERSION_KEYS = [
   "schemaVersion", "entityType", "revision", "id", "actorId", "resourceId", "blobId", "filename", "parseStatus",
-  "embeddingStatus", "parserVersion", "embeddingProfileId", "parseError", "embeddingError", "createdAt", "updatedAt",
+  "embeddingStatus", "parserVersion", "embeddingProfileId", "parseError", "embeddingError", "createdAt", "updatedAt", "processingMode",
 ];
 const BINDING_KEYS = [
   "schemaVersion", "entityType", "revision", "id", "actorId", "resourceVersionId", "ownerType", "ownerId", "path",
-  "createdSequence", "invalidatedSequence", "createdAt", "updatedAt",
+  "createdSequence", "invalidatedSequence", "createdAt", "updatedAt", "messageId",
 ];
 
 export function validateResourceBlob(blob) {
@@ -56,6 +56,7 @@ export function validateResourceVersion(version) {
   assertId(version.resourceId, "ResourceVersion.resourceId");
   assertId(version.blobId, "ResourceVersion.blobId");
   assertString(version.filename, "ResourceVersion.filename", { max: 4096 });
+  if (version.processingMode !== undefined) assertEnum(version.processingMode, ["image-attachment"], "ResourceVersion.processingMode");
   assertEnum(version.parseStatus, RESOURCE_PROCESSING_STATUSES, "ResourceVersion.parseStatus");
   assertEnum(version.embeddingStatus, RESOURCE_PROCESSING_STATUSES, "ResourceVersion.embeddingStatus");
   assertString(version.parserVersion, "ResourceVersion.parserVersion", { max: 256 });
@@ -70,7 +71,7 @@ export function validateResourceVersion(version) {
 }
 
 export function createResourceVersion(input, options = {}) {
-  assertExactKeys(input, ["id", "actorId", "resourceId", "blobId", "filename", "parserVersion"], "ResourceVersionInput");
+  assertExactKeys(input, ["id", "actorId", "resourceId", "blobId", "filename", "parserVersion", "processingMode"], "ResourceVersionInput");
   const version = {
     ...createHeader("ResourceVersion", options),
     ...clone(input),
@@ -109,6 +110,10 @@ export function validateResourceBinding(binding) {
   assertId(binding.resourceVersionId, "ResourceBinding.resourceVersionId");
   assertEnum(binding.ownerType, RESOURCE_BINDING_OWNER_TYPES, "ResourceBinding.ownerType");
   assertId(binding.ownerId, "ResourceBinding.ownerId");
+  if (binding.messageId !== undefined) {
+    assertId(binding.messageId, "ResourceBinding.messageId");
+    invariant(binding.ownerType === "conversation", "RESOURCE_MESSAGE_OWNER_INVALID", "消息附件必须属于对话", { status: 400 });
+  }
   if (binding.path !== null) assertPortableRelativePath(binding.path, "ResourceBinding.path");
   assertInteger(binding.createdSequence, "ResourceBinding.createdSequence", { min: 0 });
   if (binding.invalidatedSequence !== null) {
@@ -119,7 +124,7 @@ export function validateResourceBinding(binding) {
 }
 
 export function createResourceBinding(input, options = {}) {
-  assertExactKeys(input, ["id", "actorId", "resourceVersionId", "ownerType", "ownerId", "path", "createdSequence"], "ResourceBindingInput");
+  assertExactKeys(input, ["id", "actorId", "resourceVersionId", "ownerType", "ownerId", "path", "createdSequence", "messageId"], "ResourceBindingInput");
   const binding = {
     ...createHeader("ResourceBinding", options),
     ...clone(input),

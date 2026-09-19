@@ -14,6 +14,19 @@ import { emitLinkedRemoteArtifacts } from '../gateway/core/agents/common.mjs';
 const a = {id:'artifact-a',name:'周末安排.md',path:'/work/周末安排.md',lifecycle:'active',createdAt:'2026-09-05',mime:'application/octet-stream',size:1038};
 const b = {...a,id:'artifact-b',name:'比第一个更长的文件名.txt',path:'/work/比第一个更长的文件名.txt'};
 const link = (card,label=card.name) => `[${label}](file://${encodeURI(card.path)})`;
+
+test("remote Markdown images and reference images produce one authorized artifact and keep surrounding prose", () => {
+  const picture = { ...a, name: "结果 图.png", path: "/work/结果 图.png" };
+  const url = `file://${encodeURI(picture.path)}`;
+  const source = `前文\n\n![结果](${url})\n\n[下载](${url})\n\n后文`;
+  assert.equal(parseRemoteArtifactLinks(source).artifacts.length, 1);
+  const html = render(source, [picture]);
+  assert.equal((html.match(/<article/g) || []).length, 1);
+  assert.doesNotMatch(html, /file:\/\/|<img|<p><article/);
+  assert.match(html, /前文/);
+  assert.match(html, /后文/);
+  assert.equal(parseRemoteArtifactLinks(`![结果][pic]\n\n[pic]: ${url}`).artifacts[0].path, picture.path);
+});
 function render(source,cards=[a]) {
  return renderToStaticMarkup(React.createElement(Markdown,{
   remarkPlugins:[remarkGfm,[remarkArtifactCards,{cards}]],

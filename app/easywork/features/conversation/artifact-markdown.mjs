@@ -1,4 +1,5 @@
 import { remoteArtifactPath, stripFileLinkDecoration, FILE_LINK_DECORATION } from "../../../../shared/remote-artifact-links.mjs";
+import { isImageFile } from "../../../../shared/images.mjs";
 
 const isCard = (node) => node.type === "artifactCard";
 const textOf = (node) => node.value || (node.children || []).map(textOf).join("");
@@ -53,10 +54,10 @@ export function remarkArtifactCards({ cards = [] } = {}) {
       return result;
     };
     const transform = (node) => {
-      if (node.type === "link" || node.type === "linkReference") {
-        const target = node.type === "link" ? node.url : definitions.get(node.identifier)?.url;
+      if (["link", "linkReference", "image", "imageReference"].includes(node.type)) {
+        const target = ["link", "image"].includes(node.type) ? node.url : definitions.get(node.identifier)?.url;
         const card = String(target || "").startsWith("file://") ? byPath.get(remoteArtifactPath(target)) : null;
-        if (card) return [marker(card)];
+        if (card) return used.has(card.id) && isImageFile(card) ? [] : [marker(card)];
       }
       if (!node.children) return [node];
       // Old replies can persist only a filename. Replace an exact standalone

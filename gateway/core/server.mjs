@@ -175,6 +175,7 @@ export async function createGatewayServer(options = {}) {
         const ownerId = String(url.searchParams.get("ownerId") || "");
         const filename = String(url.searchParams.get("filename") || "");
         const bindingPath = url.searchParams.get("path");
+        const messageId = url.searchParams.get("messageId");
         const expectedSize = Number(url.searchParams.get("size"));
         const expectedSha256 = String(request.headers["x-content-sha256"] || "");
         const createdSequence = Number(url.searchParams.get("createdSequence") || 0);
@@ -182,6 +183,12 @@ export async function createGatewayServer(options = {}) {
         const modelId = String(url.searchParams.get("modelId") || "").trim();
         invariant(providerId && modelId, "RESOURCE_SUMMARY_ROUTE_REQUIRED", "文件上传需要当前网页模型", { status: 400 });
         const services = await runtime.servicesForActor(session.actor);
+        if (messageId) {
+          invariant(ownerType === "conversation", "RESOURCE_MESSAGE_OWNER_INVALID", "消息附件必须属于对话", { status: 400 });
+          await services.baseConversations.assertReadable(ownerId);
+          const message = await services.baseConversations.storage.readMessage(ownerId, messageId);
+          invariant(message?.role === "user", "RESOURCE_MESSAGE_INVALID", "附件必须关联用户消息", { status: 400 });
+        }
         const uploaded = await services.resources.ingestStream({
           commandId: idempotencyKey(request),
           expectedRevision: headerRevision(request),
@@ -190,7 +197,7 @@ export async function createGatewayServer(options = {}) {
           expectedSize,
           expectedSha256,
           createdSequence,
-          binding: { ownerType, ownerId, path: bindingPath || null },
+          binding: { ownerType, ownerId, path: bindingPath || null, ...(messageId ? { messageId } : {}) },
           summary: { required: true, providerId, modelId },
           openSource: async () => request,
         });

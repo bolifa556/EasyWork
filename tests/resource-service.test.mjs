@@ -64,6 +64,34 @@ async function temporaryFixture(run) {
   }
 }
 
+test("conversation image attachments preserve originals without OCR, summaries or embeddings, and lazily cache text fallback", async () => {
+  await temporaryFixture(async (dataRoot) => {
+    let ocr = 0;
+    const unexpected = () => { throw new Error("image upload must not index"); };
+    const service = new ResourceService(fixtureOptions(dataRoot, actor(), {
+      extractor: { preflight: unexpected, extract: unexpected, extractImageText: async () => { ocr++; return ""; } },
+      embedder: { embed: unexpected, search: unexpected }, summaryGenerator: unexpected,
+    }));
+    const bytes = Buffer.from([1, 2, 3, 4]);
+    const uploaded = await service.ingest({ content: bytes, filename: "photo.png", mime: "image/png", binding: { ownerType: "conversation", ownerId: "conversation_a", messageId: "msg_picture" }, expectedRevision: 0, summary: { required: true } });
+    assert.equal(uploaded.version.processingMode, "image-attachment");
+    assert.equal(uploaded.version.parseStatus, "ready");
+    assert.equal(ocr, 0);
+    assert.deepEqual((await service.catalog({ scope: { conversationId: "conversation_a" }, summary: { required: true } })).items, []);
+    const [message] = await service.messageAttachments([{ id: "msg_picture", role: "user" }]);
+    assert.equal(message.attachments[0].resourceVersionId, uploaded.version.id);
+    assert.equal((await service.messageAttachments([{ id: "msg_other", role: "user" }]))[0].attachments, undefined);
+    const [inherited] = await service.messageAttachments([{ id: "msg_fork", originMessageId: "msg_picture", role: "user" }]);
+    assert.deepEqual(inherited.attachments, message.attachments);
+    const image = await service.imageInput({ resourceVersionId: uploaded.version.id });
+    assert.equal(image.dataUrl, `data:image/png;base64,${bytes.toString("base64")}`);
+    for (let index = 0; index < 2; index++) assert.equal(await service.imageInput({ resourceVersionId: uploaded.version.id, textOnly: true }), "");
+    assert.equal(ocr, 1);
+    const [remote] = await service.materializationDescriptors({ conversationId: "conversation_a", versionIds: [uploaded.version.id] });
+    assert.deepEqual(await readFile(remote.localPath), bytes);
+  });
+});
+
 test("上传时由指定模型生成发现简介，当前目录拒绝缺少新简介的数据", async () => {
   await temporaryFixture(async (dataRoot) => {
     const calls = [];

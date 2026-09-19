@@ -161,3 +161,5 @@ button.artifactPreview { cursor:pointer; }
 .agentThinkingMotion > div { min-height:0; overflow:hidden; }
 .agentReasoningText { margin:0 7px 2px var(--timeline-detail-inset); }
 .agentThinking > .reasoningHeading[aria-expanded="true"] > .reasoningChevron { transform:rotate(90deg); }
+.artifactImageCard { position:relative; display:flex; width:fit-content; max-width:100%; align-items:flex-end; flex-wrap:wrap; gap:8px; padding:3px 0 8px; }
+.artifactImageCard > small { flex-basis:100%; color:var(--ew-red); }

@@ -1,5 +1,6 @@
 import { unified } from "unified";
 import remarkParse from "remark-parse";
+import { isImageFile } from "./images.mjs";
 
 const markdownParser = unified().use(remarkParse);
 
@@ -56,13 +57,13 @@ export function parseRemoteArtifactLinks(value) {
   const artifacts = [];
   const ranges = [];
   walk(tree, (node) => {
-    if (!["link", "linkReference"].includes(node.type)) return;
-    const definition = node.type === "linkReference" ? definitions.get(node.identifier) : null;
-    const target = node.type === "link" ? node.url : definition?.url;
+    if (!["link", "linkReference", "image", "imageReference"].includes(node.type)) return;
+    const definition = ["linkReference", "imageReference"].includes(node.type) ? definitions.get(node.identifier) : null;
+    const target = ["link", "image"].includes(node.type) ? node.url : definition?.url;
     if (!String(target || "").startsWith("file://")) return;
     const artifactPath = remoteArtifactPath(target);
     if (!artifactPath) return;
-    artifacts.push({ source: "remote", path: artifactPath, name: artifactNameFromLink("", artifactPath), kind: "file" });
+    if (!isImageFile({ name: artifactPath }) || !artifacts.some((entry) => entry.path === artifactPath)) artifacts.push({ source: "remote", path: artifactPath, name: artifactNameFromLink("", artifactPath), kind: "file" });
     ranges.push([node.position.start.offset, node.position.end.offset]);
     if (definition) ranges.push([definition.position.start.offset, definition.position.end.offset]);
   });

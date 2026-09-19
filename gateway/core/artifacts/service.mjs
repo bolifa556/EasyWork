@@ -24,6 +24,8 @@ import {
   publicArtifactSummary,
 } from "./contract.mjs";
 import { ArtifactStorage } from "./storage.mjs";
+import { ArtifactImageThumbnails } from "./image-thumbnail.mjs";
+import { isImageFile } from "../../../shared/images.mjs";
 
 const sharedArtifactMutationQueue = new ActorMutationQueue();
 const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -145,6 +147,7 @@ async function commandResult(storage, existing, fingerprint) {
 function sanitizeStreamErrors(source) {
   const output = new PassThrough();
   source.on("error", (error) => output.destroy(new ApiError("ARTIFACT_STREAM_FAILED", "无法读取 Artifact", { status: 502, cause: error })));
+  output.once("close", () => source.destroy());
   source.pipe(output);
   return output;
 }
@@ -160,6 +163,7 @@ export class ArtifactService {
     this.dataRoot = options.dataRoot;
     this.authorizeTask = options.authorizeTask;
     this.remoteSource = options.remoteSource || null;
+    this.imageThumbnails = new ArtifactImageThumbnails();
     this.clock = options.clock || (() => new Date());
     this.idFactory = options.idFactory || ((kind) => `${kind}_${crypto.randomUUID()}`);
     this.maxInlineBytes = Number(options.maxInlineBytes ?? 1024 * 1024);
@@ -426,6 +430,18 @@ export class ArtifactService {
     assertAllowedKeys(input, ["artifactId"], "getSourceServerIdentity");
     const record = await this.#readRecord(input.artifactId);
     return versionFor(record, record.activeVersionId).locator.serverIdentity;
+  }
+
+  async imageThumbnail({ artifactId }) {
+    const record = await this.#readRecord(artifactId);
+    invariant(!["deleted", "expired"].includes(record.lifecycle), "ARTIFACT_NOT_AVAILABLE", "Artifact 已删除或过期", { status: 410 });
+    const { version } = versionFor(record, record.activeVersionId);
+    invariant(isImageFile({ name: record.name, mime: version.mime }), "ARTIFACT_IMAGE_REQUIRED", "该文件不是图片", { status: 400 });
+    const content = await this.imageThumbnails.get({ filePath: this.storage.thumbnailPath(record.id), version, open: async () => {
+      const issued = await this.issueDownload({ artifactId: record.id });
+      return (await this.openDownload({ downloadToken: issued.downloadToken })).stream;
+    } });
+    return { content, versionId: version.id, mime: "image/webp" };
   }
 
   async list(input = {}) {

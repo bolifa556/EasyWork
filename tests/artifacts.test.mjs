@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import sharp from "sharp";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -128,6 +130,51 @@ async function streamText(stream) {
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks).toString("utf8");
 }
+
+test("remote image thumbnails survive SSH disconnects and service restarts, retain aspect ratio, and remain actor-scoped", async () => {
+  await fixture(async (dataRoot) => {
+    const currentActor = actor(), time = clockFixture();
+    const original = await sharp({ create: { width: 1200, height: 1800, channels: 3, background: "#b7c8ad" } }).png().toBuffer();
+    const sha256 = crypto.createHash("sha256").update(original).digest("hex");
+    let connected = false, opened = 0;
+    const remoteSource = {
+      inspect: async () => ({ authorized: true, resolved: true, withinAllowedRoot: true, symlinkSafe: true,
+        canonicalPath: "/srv/work/private/run/photo.png", serverIdentity: SERVER_IDENTITY, workspaceId: "workspace_a",
+        size: original.length, sha256, mime: "image/png", name: "photo.png" }),
+      verifyAvailable: async () => { if (!connected) throw new Error("SSH 未连接"); },
+      openReadStream: async () => { opened++; return Readable.from([original]); },
+    };
+    const options = serviceOptions(dataRoot, currentActor, time.clock, { remoteSource });
+    const service = new ArtifactService(options);
+    const captured = await service.capture({ task: task(currentActor, time.clock), event: remoteEvent(1, { path: "/srv/work/private/run/photo.png", name: "photo.png" }) });
+    const artifactId = captured.artifact.id;
+    await assert.rejects(service.imageThumbnail({ artifactId }), /SSH 未连接/);
+    connected = true;
+    const [first, same] = await Promise.all([service.imageThumbnail({ artifactId }), service.imageThumbnail({ artifactId })]);
+    assert.deepEqual(first.content, same.content);
+    assert.equal(opened, 1, "concurrent thumbnails share one verified remote read");
+    const metadata = await sharp(first.content).metadata();
+    assert.deepEqual([metadata.format, metadata.width, metadata.height], ["webp", 480, 720]);
+    connected = false;
+    const restarted = new ArtifactService(options);
+    assert.deepEqual((await restarted.imageThumbnail({ artifactId })).content, first.content);
+    const container = { artifacts: restarted };
+    container.previews = new PreviewService({ actor: currentActor, hostSource: ActorServiceContainer.prototype.previewHostSource.call(container) });
+    const preview = await ActorServiceContainer.prototype.createPreview.call(container, { source: { kind: "artifact", artifactId }, variant: "thumbnail" });
+    const stream = (await container.previews.openContent({ previewId: preview.previewId })).stream;
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+    assert.deepEqual(Buffer.concat(chunks), first.content);
+    assert.equal(opened, 1, "cached preview requests must not touch SSH");
+    const other = new ArtifactService(serviceOptions(dataRoot, actor("user", "other_image_owner"), time.clock, { remoteSource }));
+    await assert.rejects(other.imageThumbnail({ artifactId }), (error) => error.code === "ARTIFACT_NOT_FOUND");
+    await restarted.delete({ artifactId, expectedRevision: captured.artifact.revision, commandId: "delete_image" });
+    await assert.rejects(restarted.imageThumbnail({ artifactId }), (error) => error.code === "ARTIFACT_NOT_AVAILABLE");
+    await assert.rejects(container.previews.openContent({ previewId: preview.previewId }), (error) => error.code === "ARTIFACT_NOT_AVAILABLE");
+    await restarted.garbageCollect({ commandId: "gc_image", before: "2026-08-12T00:00:00.000Z" });
+    await assert.rejects(access(restarted.storage.thumbnailPath(artifactId)), { code: "ENOENT" });
+  });
+});
 
 test("远端文件与文件卡片预览提供实际服务器名称，文件库和主机文件不带服务器标签", async () => {
   await fixture(async (dataRoot) => {

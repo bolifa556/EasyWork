@@ -6,6 +6,7 @@ export type ResourceOwner = {
   ownerId: string;
   path?: string | null;
   createdSequence?: number;
+  messageId?: string;
 };
 
 export type ResourceUploadResult = {
@@ -132,6 +133,7 @@ export async function uploadResource<T = ResourceUploadResult>(
   });
   if (owner.path) query.set("path", owner.path);
   if (owner.createdSequence !== undefined) query.set("createdSequence", String(owner.createdSequence));
+  if (owner.messageId) query.set("messageId", owner.messageId);
   if (summaryModel?.providerId && summaryModel?.modelId) {
     query.set("providerId", summaryModel.providerId);
     query.set("modelId", summaryModel.modelId);

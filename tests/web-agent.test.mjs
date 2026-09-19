@@ -9,6 +9,24 @@ import { WebAgentRuntime, createDefaultWebAgentTools } from "../gateway/core/web
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const prompts = new PromptRepository({ promptRoot: path.join(repositoryRoot, "prompts") });
 
+test("Work inspects user images even with an empty catalog and never adds image contents to the remote handoff", async () => {
+  let calls = 0;
+  const userContent = [{ type: "text", text: "按截图处理" }, { type: "image_url", image_url: { url: "data:image/png;base64,AQID" } }];
+  const runtime = new WebAgentRuntime({
+    model: { async complete({ messages }) {
+      calls++;
+      assert.deepEqual(messages.at(-1).content, userContent);
+      return { toolCalls: [{ id: "handoff", name: "handoff_submit", input: { candidateIds: [] } }] };
+    } },
+    tools: await createDefaultWebAgentTools(contextServices(), prompts, { workResourceTools: false, workSkillTools: false }),
+    prompts,
+  });
+  const result = await runtime.run({ mode: "work", actor: {}, scope: {}, userMessage: "按截图处理", userContent });
+  assert.equal(calls, 1);
+  assert.deepEqual(result.handoffFragments, []);
+  assert.doesNotMatch(result.content, /base64|AQID/);
+});
+
 function contextServices(overrides = {}, skillOverrides = {}, referenceOverrides = {}) {
   return {
     context: {

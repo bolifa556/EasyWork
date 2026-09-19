@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { Copy } from "lucide-react";
+import { ConversationImage } from "./ConversationImage";
 import { copyText } from "../../ui/clipboard";
 import { codeScrollThumbWidth, codeWheelPosition } from "./code-scroll";
 import { highlightCode } from "./code-highlight";
@@ -358,6 +359,9 @@ const MarkdownRenderContext = createContext<MarkdownRenderOptions>({ compact: fa
 // streamed Markdown changes. Render options travel through context instead of
 // recreating a new component function for every token or artifact update.
 const markdownComponents: Components = {
+  img: function MarkdownImage({ src, alt }) {
+    return typeof src === "string" && src ? <ConversationImage src={src} name={alt || "图片"} /> : null;
+  },
   div: function MarkdownDiv({ node, children, ...props }) {
     const { renderArtifact } = useContext(MarkdownRenderContext);
     const artifactId = node?.properties?.["data-artifact-id"] ?? node?.properties?.dataArtifactId;

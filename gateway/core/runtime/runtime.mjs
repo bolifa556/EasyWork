@@ -401,6 +401,23 @@ export class EasyWorkRuntime {
     await this.cleanupPendingGuests();
   }
 
+  async webModelVision({ actor, providerId, modelId, signal, unsupported = false }) {
+    this.imageCapabilityCache ||= new Map();
+    const key = JSON.stringify([actor.actorId, providerId, modelId]);
+    const cached = this.imageCapabilityCache.get(key);
+    if (unsupported) { this.imageCapabilityCache.set(key, { value: false, expires: Date.now() + 300_000 }); return false; }
+    if (cached?.expires > Date.now()) return cached.value;
+    try {
+      const result = await this.providers.detectModels(actor, { providerId, purpose: "web", signal });
+      const value = result.models.find((entry) => entry.id === modelId)?.capabilities?.vision ?? null;
+      this.imageCapabilityCache.set(key, { value, expires: Date.now() + 300_000 });
+      return value;
+    } catch {
+      signal?.throwIfAborted();
+      return null; // Many compatible endpoints do not implement /models.
+    }
+  }
+
   async createWebModel({ actor, providerId, modelId, mode, runId }) {
     if (this.webModelFactory) return this.webModelFactory({ actor, providerId, modelId, mode, runId, runtime: this });
     const access = await this.providers.resolve(actor, { providerId, purpose: "web", modelId, requireModel: true });

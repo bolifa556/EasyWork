@@ -1,5 +1,8 @@
 "use client";
 
+import { isImageFile } from "../../../../shared/images.mjs";
+import { StoredConversationImage } from "./ConversationImage";
+
 import { useMemo, useState } from "react";
 import { BookOpen, Bot, Box, Brain, Check, ChevronRight, CircleStop, Code2, Copy, Database, Download, File, FileArchive, FileAudio, FileCode2, FileImage, FileSpreadsheet, FileText, FileType2, FileVideo, Gauge, GitBranch, HardDriveDownload, LoaderCircle, MessageCircle, Network, Package, Presentation, Send, ShieldCheck, Square, Terminal, Wrench, X } from "lucide-react";
 import type { ArtifactSummary, RealtimeEnvelope, TaskSummary } from "@/app/core/contracts";
@@ -1394,6 +1397,10 @@ function ArtifactCardRow({ artifact }: { artifact: ArtifactCardData }) {
     } finally { setDownloading(false); }
   };
   const contents = <><span data-ui-icon="" className={styles.artifactGlyph}>{artifactFileIcon(name, mime)}</span><span className={styles.artifactCopy}><strong>{name}</strong><small className={styles.artifactMeta}><span className={styles.artifactFileMeta}>{fileTypeLabel({ name, mime })} · {displayFileSize(artifact.size)}</span>{previewable ? <span className={styles.artifactOpenHint} aria-hidden="true">打开文件</span> : null}</small>{error || artifact.failure ? <em>{error || artifact.failure}</em> : null}</span></>;
+  if (artifactId && !artifact.failure && isImageFile({ name, mime })) return <article className={styles.artifactImageCard} data-artifact-id={artifactId}>
+    <StoredConversationImage name={name} source={{ kind: "artifact", artifactId }} onDownload={() => void download()} downloading={downloading} />
+    {error ? <small role="alert">{error}</small> : null}
+  </article>;
   return <article className={styles.artifactCard} data-artifact-id={artifactId} data-previewable={previewable}>
     {previewable ? <button type="button" className={styles.artifactPreview} aria-label={`预览 ${name}`} onClick={openPreview}>{contents}</button> : <div className={styles.artifactPreview}>{contents}</div>}
     <button className={styles.artifactDownload} data-ui-icon="" type="button" aria-label={`下载 ${name}`} aria-busy={downloading} disabled={!artifactId || downloading || Boolean(artifact.failure)} onClick={() => void download()}>{downloading ? <LoaderCircle className={styles.spin} size={17} /> : <Download size={17} />}</button>

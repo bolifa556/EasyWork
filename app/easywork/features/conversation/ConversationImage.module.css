@@ -1,0 +1,35 @@
+.tile { position:relative; display:inline-flex; max-width:min(300px,100%); flex-direction:column; vertical-align:top; white-space:normal; }
+.thumbnail { position:relative; display:block; max-width:100%; overflow:hidden; padding:0; border:1px solid rgba(79,73,59,.13); border-radius:16px; background:rgba(232,234,223,.52); color:var(--ew-ink-muted); cursor:zoom-in; transition:border-color 160ms ease,box-shadow 160ms ease; }
+.thumbnail img { display:block; width:auto; height:auto; max-width:100%; max-height:360px; object-fit:contain; }
+.emptyThumbnail { display:grid; width:300px; aspect-ratio:4/3; place-items:center; }
+.thumbnail:not(:disabled):hover { border-color:rgba(83,99,63,.34); box-shadow:0 4px 15px rgba(69,58,37,.08); }
+.thumbnail:focus-visible,.remove:focus-visible,.download:focus-visible { outline:2px solid var(--ew-green); outline-offset:3px; }
+.thumbnail:disabled { cursor:default; }
+.expand { position:absolute; right:9px; bottom:9px; display:grid; width:27px; height:27px; place-items:center; border:1px solid rgba(255,255,255,.65); border-radius:8px; background:rgba(255,253,247,.9); color:var(--ew-ink-soft); opacity:0; transform:translateY(3px); transition:opacity 150ms ease,transform 150ms ease; }
+.thumbnail:hover .expand,.thumbnail:focus-visible .expand { opacity:1; transform:none; }
+.download { position:absolute; right:8px; bottom:8px; z-index:1; display:grid; width:26px; height:26px; place-items:center; padding:0; border:1px solid rgba(255,255,255,.24); border-radius:7px; background:rgba(255,253,247,.28); color:var(--ew-green-deep); backdrop-filter:blur(3px); cursor:pointer; opacity:0; pointer-events:none; transition:opacity 140ms ease,background 140ms ease; }
+.tile:hover .download,.tile:has(:focus-visible) .download,.download[aria-busy="true"] { opacity:1; pointer-events:auto; }
+.download:hover:not(:disabled) { background:rgba(255,253,247,.46); }
+.download:disabled { cursor:default; }
+.compact { width:80px; flex:0 0 80px; }
+.compact .thumbnail { width:100%; aspect-ratio:1; border-radius:13px; background:#f4f2e9; }
+.compact .thumbnail img { position:absolute; inset:0; width:100%; height:100%; }
+.compact .expand { right:5px; bottom:5px; width:22px; height:22px; border-radius:6px; }
+.remove { position:absolute; top:-5px; right:-5px; z-index:1; display:grid; width:22px; height:22px; place-items:center; padding:0; border:1px solid rgba(79,73,59,.16); border-radius:50%; background:#fffdf7; color:var(--ew-ink-soft); box-shadow:0 2px 5px rgba(69,58,37,.1); cursor:pointer; }
+.remove:hover { background:#eceade; color:var(--ew-ink); }
+.stored { display:inline-flex; max-width:100%; vertical-align:top; }
+.failure { display:grid; justify-items:center; gap:9px; padding:20px; font-size:12px; }
+.failure small { display:block; margin-top:6px; font-size:11px; color:var(--ew-green-deep); }
+.placeholder { min-height:30px; }
+.backdrop { z-index:1600; background:rgba(31,34,27,.66); backdrop-filter:blur(9px); }
+.lightbox { width:min(1120px,94vw); max-height:94dvh; background:#fffdf7; border:1px solid rgba(255,255,255,.35); border-radius:20px; }
+.lightboxBody { display:grid; min-height:160px; place-items:center; overflow:auto; padding:12px 18px 20px; }
+.fullImage { display:block; width:auto; height:auto; max-width:100%; max-height:calc(90dvh - 100px); object-fit:contain; border-radius:8px; }
+.fullImageStatus { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:7px; margin-top:10px; color:var(--ew-ink-muted); font-size:12px; }
+.fullImageStatus button { border:0; padding:3px 6px; border-radius:5px; background:transparent; color:var(--ew-green-deep); font:inherit; cursor:pointer; }
+.fullImageStatus button:hover { background:rgba(83,99,63,.08); }
+.spin { animation:spin 1s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+@media (max-width:719px) { .compact { width:70px; flex-basis:70px; } .remove { width:26px; height:26px; top:-6px; right:-6px; } .lightbox { width:96vw; border-radius:15px; } .lightboxBody { padding:8px 10px 14px; } .expand { opacity:1; transform:none; } }
+@media (hover:none) { .download { opacity:1; pointer-events:auto; } .download::after { content:""; position:absolute; inset:-7px; } }
+@media (prefers-reduced-motion:reduce) { .thumbnail,.expand,.download { transition:none; } }

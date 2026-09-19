@@ -4,6 +4,8 @@ import { useEffect, useRef, useState, type CSSProperties, type MouseEvent } from
 import { Check, ChevronLeft, ChevronRight, FilePlus2, Folder, FolderSearch, Library, Paperclip, Plus, Sparkles, X } from "lucide-react";
 import { useAppRuntime } from "../../runtime/AppRuntime";
 import styles from "./ComposerResources.module.css";
+import { isImageFile } from "../../../../shared/images.mjs";
+import { LocalConversationImage } from "./ConversationImage";
 
 type CollectionRecord = { id: string; name: string };
 type SkillRecord = { skillId: string; name: string; description: string };
@@ -147,7 +149,9 @@ export function ComposerResourceChips({ value, onChange }: { value: ComposerReso
     onChange(next);
   };
   return <div className={styles.chips} data-composer-resource-chips onPointerDown={(event) => event.stopPropagation()}>
-    {value.files.map((file, index) => <span key={`${file.name}:${file.size}:${index}`}><FilePlus2 size={13} /><span className={styles.chipLabel}>{file.name}</span><button type="button" aria-label={`移除 ${file.name}`} onClick={(event) => remove(event, { ...value, files: value.files.filter((_, item) => item !== index) })}><X size={12} /></button></span>)}
+    {value.files.map((file, index) => isImageFile(file)
+      ? <LocalConversationImage key={`${file.name}:${file.size}:${index}`} file={file} onRemove={() => onChange({ ...value, files: value.files.filter((_, item) => item !== index) })} />
+      : <span className={styles.fileChip} key={`${file.name}:${file.size}:${index}`}><FilePlus2 size={13} /><span className={styles.chipLabel}>{file.name}</span><button type="button" aria-label={`移除 ${file.name}`} onClick={(event) => remove(event, { ...value, files: value.files.filter((_, item) => item !== index) })}><X size={12} /></button></span>)}
     {value.collections.map((collection) => <span key={collection.id}><FolderSearch size={13} /><span className={styles.chipLabel}>{collection.name}</span><button type="button" aria-label={`移除文件集 ${collection.name}`} onClick={(event) => remove(event, { ...value, collections: value.collections.filter((item) => item.id !== collection.id) })}><X size={12} /></button></span>)}
     {value.skills.map((skill) => <span key={skill.skillId}><Sparkles size={13} /><span className={styles.chipLabel}>{skill.displayName}</span><button type="button" aria-label={`移除 Skill ${skill.displayName}`} onClick={(event) => remove(event, { ...value, skills: value.skills.filter((item) => item.skillId !== skill.skillId) })}><X size={12} /></button></span>)}
   </div>;

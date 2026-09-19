@@ -143,6 +143,12 @@ export class DefaultResourceExtractor {
     }
   }
 
+  async extractImageText({ content, filename, mime, signal }) {
+    const extractor = assertOcrExtractor(this.ocrExtractor);
+    await extractor.assertConfigured?.();
+    return normalizeText(await extractor.extract({ content: Buffer.from(content), filename, mime: imageMime(path.extname(filename).toLowerCase(), mime), signal }));
+  }
+
   async extract({ content, filename, mime }) {
     const extension = path.extname(filename).toLowerCase();
     let text;

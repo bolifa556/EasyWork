@@ -150,6 +150,10 @@ export class ArtifactStorage {
     return this.path("records", recordShard(id), `${id}.json`);
   }
 
+  thumbnailPath(id) {
+    return this.path("thumbnails", recordShard(id), `${id}.json`);
+  }
+
   async readRecord(id) {
     const record = await readJson(this.recordPath(id), null);
     if (record === null) return null;
@@ -166,6 +170,7 @@ export class ArtifactStorage {
 
   async deleteRecord(id) {
     await fs.rm(this.recordPath(id), { force: true });
+    await fs.rm(this.thumbnailPath(id), { force: true });
   }
 
   async readCommand(commandId) {

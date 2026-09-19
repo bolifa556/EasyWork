@@ -363,6 +363,7 @@ export class WebAgentRuntime {
     actor,
     scope,
     userMessage,
+    userContent = null,
     context = [],
     initialObservationFragments = [],
     initialHandoffFragments = [],
@@ -489,7 +490,7 @@ export class WebAgentRuntime {
       const onlySubmitAvailable = mode === "work"
         && availableTools.length === 1
         && availableTools[0].name === "handoff_submit";
-      if (onlySubmitAvailable && candidatePool.size === 0) {
+      if (onlySubmitAvailable && candidatePool.size === 0 && !userContent) {
         // There is no contextual choice to make. Calling a provider merely to
         // return handoff_submit([]) adds latency and often produces repetitive
         // reasoning about absent tools. The original user request still goes
@@ -507,7 +508,7 @@ export class WebAgentRuntime {
         ...context,
         ...(observedContext ? [{ role: "system", content: observedContext }] : []),
         ...(previouslyDelivered ? [{ role: "system", content: previouslyDelivered }] : []),
-        { role: "user", content: currentRequest },
+        { role: "user", content: userContent || currentRequest },
       ];
       let continuationGuidanceAdded = false;
       for (let iteration = 0; iteration < this.limits.maxIterations; iteration += 1) {

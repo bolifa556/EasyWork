@@ -32,6 +32,8 @@ import { GatewayError } from "@/app/core/contracts";
 import { isActiveTask, mergeTaskSnapshots } from "@/app/core/task-snapshots";
 import { commandId } from "@/app/core/gateway/client";
 import { uploadResource } from "@/app/core/gateway/resource-upload";
+import { isImageFile } from "../../../../shared/images.mjs";
+import { StoredConversationImage } from "./ConversationImage";
 import { useAppRuntime, type ConversationPanel } from "../../runtime/AppRuntime";
 import { announceConversationsChanged } from "../../runtime/cacheEvents";
 import { TimelineDetailScope } from "./TimelineDetails";
@@ -427,6 +429,7 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
   return <><article className={`${styles.message} ${user ? styles.user : styles.assistant}`} id={`message-${message.id}`}>
     {user ? <div className={styles.messageHead}>你 <span data-ui-icon="" className={styles.dot} /></div> : directRemoteAppend ? null : <div className={styles.messageHead}><span data-ui-icon="" className={styles.dot} /> EasyWork</div>}
     {!user && (timelineEvents?.length || timelineLoading) ? <ConversationTimeline events={timelineEvents || []} mode={timelineMode} taskIdHint={message.taskId || undefined} finalTextHint={displayedContent} loading={timelineLoading} taskById={taskById} settledTaskIds={settledTaskIds} onApproval={onApproval} onInput={onInput} /> : null}
+    {user && message.attachments?.length ? <div className={styles.messageImages}>{message.attachments.filter(isImageFile).map((attachment) => <StoredConversationImage key={attachment.resourceVersionId} name={attachment.name} source={{ kind: "resource", resourceVersionId: attachment.resourceVersionId }} />)}</div> : null}
     {user ? <div className={styles.userBubble}>{message.references?.length ? <span className={styles.messageReferences}>{message.references.map((reference) => <ConversationReferenceLink key={reference.referenceId} reference={reference} />)}</span> : null}{message.content}</div> : <><div className={styles.assistantBody}><ConversationAnswer content={rawDisplayedContent} events={timelineEvents || []} artifacts={artifacts} artifactHistory={artifactHistory} workspaceId={message.taskId ? taskById[message.taskId]?.route.workspaceId : undefined} /></div></>}
     <div className={styles.messageActions}>
       <MessageAction label={copied ? "已复制" : user ? "复制消息" : "复制回复"} showLabel={copied} icon={copied ? <Check size={15} /> : <Copy size={15} />} onClick={copy} />
@@ -541,8 +544,8 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
     }
   }, [conversationId, runtime.api]);
   const send = async () => {
-    if (!value.trim() || busy || inputDisabled || referencePastes.current.size) return;
-    const prompt = value.trim();
+    if ((!value.trim() && !resources.files.some(isImageFile)) || busy || inputDisabled || referencePastes.current.size) return;
+    const prompt = value.trim() || "请查看附图。";
     const pendingResources = resources;
     const pendingReferences = references;
     const previousExpanded = expanded;
@@ -673,6 +676,20 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
     return () => { for (const request of pending) request.abort(); pending.clear(); };
   }, [storageKey]);
   const pasteReference = async (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageFiles = Array.from(event.clipboardData.files).filter(isImageFile);
+    if (imageFiles.length) {
+      event.preventDefault();
+      if (inputDisabled || busy || (activeTask && isActiveTask(activeTask))) return;
+      const stamp = Date.now();
+      const files = imageFiles.map((file, index) => new File([file], `粘贴图片-${stamp}-${index + 1}.${file.name.split(".").at(-1) || "png"}`, { type: file.type, lastModified: stamp }));
+      setResources((current) => ({ ...current, files: [...current.files, ...files] }));
+      const text = event.clipboardData.getData("text/plain");
+      if (text) {
+        const { selectionStart, selectionEnd } = event.currentTarget;
+        setValue((current) => current.slice(0, selectionStart) + text + current.slice(selectionEnd));
+      }
+      return;
+    }
     const id = pastedConversationId(event.clipboardData.getData("text/plain"), window.location.origin);
     if (!id) return;
     event.preventDefault();
@@ -774,7 +791,7 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
         {showStopAction ? <span className={styles.composerAction} data-tooltip={canInterrupt ? "终止任务" : "当前 Agent 不支持终止"}>
           <button className={`${styles.send} ${styles.stop}`} disabled={!canInterrupt || stopping || activeTask?.status === "interrupting"} aria-label={stopping || activeTask?.status === "interrupting" ? "正在终止任务" : "终止任务"} onClick={() => void stop()}>{stopping || activeTask?.status === "interrupting" ? <LoaderCircle className={styles.spin} size={17} /> : <Square size={14} fill="currentColor" />}</button>
         </span> : <span className={styles.composerAction} data-tooltip={busy ? "正在发送" : "发送消息"}>
-          <button className={styles.send} disabled={!value.trim() || inputDisabled || busy || resolvingReferences} aria-label={busy ? "正在发送" : "发送消息"} onClick={() => void send()}>{busy || resolvingReferences ? <LoaderCircle className={styles.spin} size={17} /> : <Send size={17} />}</button>
+          <button className={styles.send} disabled={(!value.trim() && !resources.files.some(isImageFile)) || inputDisabled || busy || resolvingReferences} aria-label={busy ? "正在发送" : "发送消息"} onClick={() => void send()}>{busy || resolvingReferences ? <LoaderCircle className={styles.spin} size={17} /> : <Send size={17} />}</button>
         </span>}
       </div>
       {value && (expanded || canExpand) ? <Button className={styles.expand} compact iconOnly variant="ghost" aria-label={expanded ? "收回编辑器" : "展开编辑器"} icon={expanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />} onClick={() => setExpanded((state) => !state)} /> : null}
@@ -1789,15 +1806,16 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     return { providerId, modelId: selectedModel, scope };
   };
 
-  const uploadConversationFiles = async (targetConversationId: string, files: File[], submissionId: string, selection: WebModelSelection) => {
+  const uploadConversationFiles = async (targetConversationId: string, files: File[], submissionId: string, selection: WebModelSelection, messageId: string) => {
     if (!files.length) return [] as string[];
     const inspected = await api.get<{ revision: number }>(`/api/resources?ownerType=conversation&ownerId=${encodeURIComponent(targetConversationId)}&limit=1`);
     let expectedRevision = inspected.data.revision;
     const uploadedVersionIds: string[] = [];
     for (const [index, file] of files.entries()) {
-      const uploaded = await uploadResource(api, file, { ownerType: "conversation", ownerId: targetConversationId, path: file.name }, expectedRevision, `${submissionId}:resource:${index}`, selection);
+      const uploaded = await uploadResource(api, file, { ownerType: "conversation", ownerId: targetConversationId, path: file.name, messageId }, expectedRevision, `${submissionId}:resource:${index}`, selection);
       expectedRevision = uploaded.data.revision;
       uploadedVersionIds.push(uploaded.data.version.id);
+      if (isImageFile(file)) setMessages((current) => current.map((message) => message.id === messageId ? { ...message, attachments: [...(message.attachments || []).filter((entry) => entry.resourceVersionId !== uploaded.data.version.id), { resourceVersionId: uploaded.data.version.id, name: file.name, mime: file.type, size: file.size }] } : message));
     }
     return uploadedVersionIds;
   };
@@ -1836,7 +1854,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         onAccepted();
         announceConversationsChanged({ conversationId: result.data.conversation.id, kind: "created", conversation: result.data.conversation });
         try {
-          const uploadedVersionIds = await uploadConversationFiles(result.data.conversation.id, resources.files, submissionId, selection);
+          const uploadedVersionIds = await uploadConversationFiles(result.data.conversation.id, resources.files, submissionId, selection, result.data.messageId);
           await api.post(`/api/conversations/${encodeURIComponent(result.data.conversation.id)}/respond`, {
             messageId: result.data.messageId,
             ...responseDescriptor(undefined, resources, selection, uploadedVersionIds),
@@ -1877,7 +1895,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
         copyAgentConfigurationCache(actorId, serverId, configScope, id, configuredAgentIds);
         let workspacePreparation: { kind: "virtual"; branchId: string } | null = null;
         const bindServer = api.post(`/api/conversations/${encodeURIComponent(id)}/server-binding`, { serverId });
-        const uploadFiles = uploadConversationFiles(id, resources.files, submissionId, selection);
+        const uploadFiles = uploadConversationFiles(id, resources.files, submissionId, selection, result.data.messageId);
         let registerWorkspace: Promise<{ data: { workspace: WorkspaceSummary } }> | null = null;
         if (workspace === VIRTUAL_WORKSPACE) {
           // The response worker owns deterministic virtual-workspace creation.
@@ -1972,7 +1990,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
       return nextMessages;
     });
     announceConversationsChanged({ conversationId, kind: "updated" });
-    const uploadedVersionIds = await uploadConversationFiles(conversationId, resources.files, submissionId, selection);
+    const uploadedVersionIds = await uploadConversationFiles(conversationId, resources.files, submissionId, selection, sent.data.messageId);
     if (uploadedVersionIds.length) response.scope.selectedResourceVersions = uploadedVersionIds;
     await runtime.api.post(`/api/conversations/${conversationId}/respond`, { messageId: sent.data.messageId, ...response }, { idempotencyKey: `${submissionId}:respond` });
     void reload().catch((reason) => notify(reason instanceof Error ? reason.message : "对话刷新失败", "error"));

@@ -123,6 +123,7 @@
 .boxMultiline.boxWithResources { grid-template-areas:"chips chips chips chips" "input input input input" "add spacer model send"; grid-template-rows:auto minmax(30px,auto) 38px; }
 .box.boxTaskRunning,.boxMultiline.boxTaskRunning { grid-template-columns:38px minmax(72px,1fr) auto 78px; }
 .resourceChips { display:flex; min-width:0; grid-area:chips; flex-wrap:wrap; align-items:center; gap:5px; padding:2px 3px 0; }
+.messageImages { display:flex; max-width:100%; flex-wrap:wrap; justify-content:flex-end; gap:12px; margin:0 0 10px; }
 .composerAdd { display:grid; grid-area:add; place-items:center; }
 .composerInput { display:flex; min-width:0; grid-area:input; align-items:center; gap:6px; overflow:hidden; }
 .inlineReferences { display:flex; min-width:0; max-width:52%; flex:0 1 auto; align-items:center; gap:4px; overflow-x:auto; overflow-y:hidden; scrollbar-width:none; }

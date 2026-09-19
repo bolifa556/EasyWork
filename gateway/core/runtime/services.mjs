@@ -15,6 +15,7 @@ import { ConversationService } from "../conversations/service.mjs";
 import { WorkDraftService } from "../drafts/service.mjs";
 import { defaultConversationTitle } from "../conversations/contract.mjs";
 import { ApiError, invariant, redactSensitive } from "../errors.mjs";
+import { imageUserContent, withConversationImages } from "../web-agent/image-input.mjs";
 import { MemoryCoordinator, PersistentMemoryService } from "../memory/index.mjs";
 import { resolveActorPath } from "../paths.mjs";
 import { PreviewService } from "../previews/service.mjs";
@@ -1350,7 +1351,10 @@ class ConversationInteractionFacade {
   getConversationSummaries(ids) { return this.base.getConversationSummaries(ids); }
   getConversation(id) { return this.base.getConversation(id); }
   assertReadable(id) { return this.base.assertReadable(id); }
-  listMessages(input) { return this.base.listMessages(input); }
+  async listMessages(input) {
+    const result = await this.base.listMessages(input);
+    return this.container.resources?.messageAttachments ? { ...result, items: await this.container.resources.messageAttachments(result.items) } : result;
+  }
   rename(input) { return this.base.rename(input); }
   setPinned(input) { return this.base.setPinned(input); }
   moveToProject(input) { return this.base.moveToProject(input); }
@@ -3136,7 +3140,7 @@ class WebInteractionService {
       : this.container.conversationContext.history(input.conversationId, branchId).then((entries) => (mode === "work"
         ? workConversationState(entries, target.id)
         : settledConversationHistory(entries, target.id))
-        .map(({ role, content }) => ({ role, content })));
+        );
     const workEnvironmentPromise = mode === "work" && !taskId && !skipWebAgentModel
       ? (async () => {
           const state = workCurrentState(
@@ -3198,8 +3202,41 @@ class WebInteractionService {
       const rendered = await skillTool.render(presented);
       initialHandoffFragments = await skillTool.handoffItems({ output, presented, rendered });
     }
+    const inputMessages = !skipWebAgentModel && this.container.resources?.messageAttachments
+      ? await this.container.resources.messageAttachments([...history.map((entry) => messages.find((message) => message.id === entry.id) || entry), target])
+      : [...history, target];
+    const imagesByMessage = new Map();
+    const imageInputs = new Map();
+    for (const message of inputMessages) {
+      const images = await Promise.all((message.attachments || []).map(async (attachment) => {
+        const id = attachment.resourceVersionId;
+        if (!imageInputs.has(id)) imageInputs.set(id, await this.container.resources.imageInput({ resourceVersionId: id }));
+        return imageInputs.get(id);
+      }));
+      if (images.length) imagesByMessage.set(message.id, images);
+    }
+    // Older clients do not bind uploads to message IDs. Selected versions still
+    // identify the current user input, while keeping authorization scoped.
+    if (!skipWebAgentModel && !imagesByMessage.has(target.id) && selectedResourceVersions.size && this.container.resources?.materializationDescriptors) {
+      const files = await this.container.resources.materializationDescriptors({ conversationId: input.conversationId, versionIds: [...selectedResourceVersions] });
+      const images = [];
+      for (const file of files) {
+        if (!/^image\//i.test(file.mime)) continue;
+        const image = await this.container.resources.imageInput({ resourceVersionId: file.resourceVersionId });
+        imageInputs.set(file.resourceVersionId, image);
+        images.push(image);
+      }
+      if (images.length) imagesByMessage.set(target.id, images);
+    }
+    const imageOptions = { actor: this.container.actor, providerId: input.providerId, modelId: input.modelId };
+    const imageModel = imageInputs.size ? withConversationImages(model, {
+      images: [...imageInputs.values()],
+      resolveVision: (signal) => this.container.runtime.webModelVision?.({ ...imageOptions, signal }) ?? null,
+      readText: (image, signal) => this.container.resources.imageInput({ resourceVersionId: image.resourceVersionId, textOnly: true, signal }),
+      onUnsupported: () => { void this.container.runtime.webModelVision?.({ ...imageOptions, unsupported: true }); },
+    }) : model;
     const runtime = new WebAgentRuntime({
-      model,
+      model: imageModel,
       tools,
       prompts: this.container.runtime.prompts,
       ...(mode === "work" ? { limits: WORK_WEB_AGENT_LIMITS } : {}),
@@ -3224,7 +3261,7 @@ class WebInteractionService {
     const modelContext = [workEnvironment.rendered, skillCatalog, resourceCatalog, conversationReferenceCatalog]
       .filter(Boolean)
       .map((content) => ({ role: "system", content }))
-      .concat(history);
+      .concat(history.map((entry) => ({ role: entry.role, content: imageUserContent(entry.content, imagesByMessage.get(entry.id)) })));
     let result;
     let taskStatus = null;
     let sentHandoffFragments = [];
@@ -3237,6 +3274,7 @@ class WebInteractionService {
         actor: this.container.actor,
         scope: agentScope,
         userMessage: target.content,
+        userContent: imagesByMessage.has(target.id) ? imageUserContent(mode === "work" ? await this.container.runtime.prompts.workRequest(target.content) : target.content, imagesByMessage.get(target.id)) : null,
         context: modelContext,
         initialObservationFragments,
         // Deterministic selections belong to delivery, not the model's
@@ -4131,16 +4169,17 @@ export class ActorServiceContainer {
   }
 
   async createPreview(input) {
-    exactObject(input, ["source", "ttlMs"], "CreatePreview");
+    exactObject(input, ["source", "ttlMs", "variant"], "CreatePreview");
     exactObject(input.source, ["kind", "sourceId", "artifactId", "resourceVersionId", "serverId", "workspaceId", "relativePath"], "CreatePreview.source");
     const kind = String(input.source.kind || "");
+    invariant(input.variant === undefined || (input.variant === "thumbnail" && kind === "artifact"), "PREVIEW_VARIANT_INVALID", "缩略图仅支持图片成果", { status: 400 });
     if (kind === "host") {
       exactObject(input.source, ["kind", "sourceId"], "CreatePreview.host");
       return this.previews.create({ source: { kind: "host", sourceId: String(input.source.sourceId || "") }, ttlMs: input.ttlMs });
     }
     if (kind === "artifact") {
       exactObject(input.source, ["kind", "artifactId"], "CreatePreview.artifact");
-      return this.previews.create({ source: { kind: "host", sourceId: `artifact:${String(input.source.artifactId || "")}` }, ttlMs: input.ttlMs });
+      return this.previews.create({ source: { kind: "host", sourceId: `${input.variant === "thumbnail" ? "artifact-thumbnail" : "artifact"}:${String(input.source.artifactId || "")}` }, ttlMs: input.ttlMs });
     }
     if (kind === "resource") {
       exactObject(input.source, ["kind", "resourceVersionId"], "CreatePreview.resource");
@@ -4164,6 +4203,13 @@ export class ActorServiceContainer {
   previewHostSource() {
     return {
       inspect: async ({ sourceId }) => {
+        if (sourceId.startsWith("artifact-thumbnail:")) {
+          const artifactId = sourceId.slice("artifact-thumbnail:".length);
+          const artifact = await this.artifacts.get({ artifactId });
+          const thumbnail = await this.artifacts.imageThumbnail({ artifactId });
+          return { authorized: true, size: thumbnail.content.length, name: artifact.name, mime: thumbnail.mime, supportsRange: true,
+            metadata: { sourceType: "artifact", revision: artifact.revision }, handle: { type: "artifact-thumbnail", artifactId, versionId: thumbnail.versionId } };
+        }
         if (sourceId.startsWith("artifact:")) {
           const artifactId = sourceId.slice("artifact:".length);
           const artifact = await this.artifacts.get({ artifactId });
@@ -4202,6 +4248,11 @@ export class ActorServiceContainer {
       },
       openReadStream: async ({ handle, range }) => {
         invariant(handle && typeof handle === "object", "PREVIEW_SOURCE_STALE", "Preview 来源已失效", { status: 409 });
+        if (handle.type === "artifact-thumbnail") {
+          const thumbnail = await this.artifacts.imageThumbnail({ artifactId: handle.artifactId });
+          invariant(thumbnail.versionId === handle.versionId, "PREVIEW_SOURCE_STALE", "Artifact 已变化，请重新创建 Preview", { status: 409 });
+          return Readable.from([thumbnail.content.subarray(range.start, range.endExclusive)]);
+        }
         if (handle.type === "artifact") {
           const artifact = await this.artifacts.get({ artifactId: handle.artifactId });
           const version = artifact.versions.at(-1);

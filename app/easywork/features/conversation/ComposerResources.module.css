@@ -203,7 +203,7 @@
   gap: 5px;
 }
 
-.chips > span {
+.chips > span:not([data-image-tile]) {
   display: inline-flex;
   max-width: 210px;
   align-items: center;
@@ -225,7 +225,7 @@
   white-space: nowrap;
 }
 
-.chips button {
+.chips > span:not([data-image-tile]) button {
   display: grid;
   width: 19px;
   height: 19px;
@@ -239,7 +239,8 @@
   cursor: pointer;
 }
 
-.chips button:hover { background: rgba(65, 64, 54, .08); color: var(--ew-ink); }
+.chips > span:not([data-image-tile]) button:hover { background: rgba(65, 64, 54, .08); color: var(--ew-ink); }
+.chips:has([data-image-tile]) { align-items:flex-start; gap:10px; padding:7px 4px 4px; }
 
 @keyframes menuIn {
   from { opacity: 0; transform: translateY(4px) scale(.985); }
@@ -257,6 +258,6 @@
     width: auto;
     max-height: min(56dvh, 420px);
   }
-  .chips > span { min-height:40px; }
-  .chips button { width:32px; height:32px; flex-basis:32px; }
+  .chips > span:not([data-image-tile]) { min-height:40px; }
+  .chips > span:not([data-image-tile]) button { width:32px; height:32px; flex-basis:32px; }
 }
