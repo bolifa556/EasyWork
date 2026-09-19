@@ -689,9 +689,13 @@ test("新建 Work 的 Agent 状态、模型路由与权限菜单保持当前交�
   assert.match(control, /priceFactor/);
   assert.match(control, /当前积分/);
   assert.match(control, /qoderUsage\?\.orgResourcePackage\?\.available === true/);
-  assert.match(control, /const \[qoderModels, setQoderModels\]/);
-  assert.match(control, /qoderModels\.find\(\(model\) => model\.id === \(configuredModelId \|\| "auto"\)\)\?\.name/);
+  assert.match(control, /const \[storedQoderModels, setQoderModels\]/);
+  assert.match(control, /qoderModelLabel\(configuredModelId, qoderModels, qoderUsageBusy\)/);
   assert.match(control, /easywork\.qoder-catalog:v1:/);
+  assert.match(control, /return `\$\{actorId\}:\$\{serverId\}:\$\{QODER_CATALOG_CACHE_SCOPE\}`/);
+  assert.match(control, /legacyPrefix[\s\S]+?candidate!\.savedAt > parsed!\.savedAt/);
+  assert.match(control, /return loading \? "正在读取模型" : "当前模型"/);
+  assert.match(control, /qoderCatalogStateCurrent[\s\S]+?currentCachedQoderCatalog\?\.value\.models \?\? \[\]/);
   assert.match(control, /modelsBusy && !visibleModels\.length/);
   assert.doesNotMatch(control, /qoderUsageBusy \? "正在读取模型"/);
   assert.doesNotMatch(control, /Code2/);
@@ -846,8 +850,11 @@ test("Agent 模型菜单在读取前后保持高度并铺满可滚动区域，�
   assert.match(control, /const visibleModels = isQoderConfig \|\| providerId \? models : providers/);
   assert.match(control, /const modelMenuHeight = 360/);
   assert.match(control, /const selectedModelId = isQoderConfig[\s\S]+?resolvedConfig\?\.values\.model \|\| "auto"/);
-  assert.match(control, /selectedModelId === "auto" \? "Auto" : selectedModelId/);
+  assert.match(control, /qoderModelLabel\(selectedModelId, qoderModels, qoderUsageBusy\)/);
   assert.match(control, /className=\{selectedModelId === item\.id \? styles\.modelSelected : ""\}/);
+  assert.match(control, /title=\{isQoderConfig \? selectedNativeModel\?\.description \|\| selectedModelLabel : selectedModelId\}/);
+  assert.match(control, /title=\{item\.description \|\| \(isQoderConfig \? item\.name : item\.id\)\}/);
+  assert.doesNotMatch(control, /<small title=\{selectedModelId\}/);
   assert.match(styles, /\.modelPanel\s*\{[^}]*display:flex;[^}]*flex-direction:column;[^}]*overflow:hidden;/s);
   assert.match(control, /<div className=\{styles\.modelViewport\}>\{modelsBusy/);
   assert.match(styles, /\.modelViewport\s*\{[^}]*min-height:0;[^}]*flex:1 1 auto;[^}]*overflow-x:hidden;[^}]*overflow-y:auto;/s);

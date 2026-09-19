@@ -36,6 +36,7 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [providers, setProviders] = useState<Provider[]>([]);
+  const [providersLoading, setProvidersLoading] = useState(false);
   const [providerRevision, setProviderRevision] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState({ name: "", baseUrl: "", apiKey: "" });
@@ -132,10 +133,12 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
   };
 
   const openProviders = async () => {
+    setProvidersLoading(true);
     setAccountTab("providers");
     setError(null);
     try { await loadProviders(); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取模型 API"); }
+    finally { setProvidersLoading(false); }
   };
 
   const submitAuth = async (event: FormEvent) => {
@@ -179,10 +182,12 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
 
   const removeProvider = async () => {
     if (!providerPendingDelete) return;
+    const deletedProviderId = providerPendingDelete.id;
     setBusy(true);
     setError(null);
     try {
-      await runtime.api.delete(`/api/providers/${providerPendingDelete.id}`, { body: {}, expectedRevision: providerRevision, idempotencyKey: commandId("provider-delete") });
+      await runtime.api.delete(`/api/providers/${deletedProviderId}`, { body: {}, expectedRevision: providerRevision, idempotencyKey: commandId("provider-delete") });
+      runtime.removeModelProvider(deletedProviderId);
       setProviderPendingDelete(null);
       await loadProviders(null);
       runtime.notify("模型 API 已删除", "success");
@@ -253,7 +258,7 @@ export function AccountDialog({ onClose }: { onClose: () => void }) {
               {error ? <div className={styles.error}>{error}</div> : null}
             </div>
             <div className={styles.profileActions}><Button variant="danger" icon={<LogOut size={16} />} onClick={() => void runtime.logout().then(onClose)}>退出登录</Button><Button className={styles.saveAction} variant="primary" disabled={busy || profileName.trim().length < 2 || profileName.trim() === actor.username} icon={<Save size={16} />} onClick={() => void saveProfile()}>{busy ? "保存中" : "保存"}</Button></div>
-          </div> : <div className={styles.providerLayout}>
+          </div> : providersLoading ? <div className={styles.providerLoading} role="status" aria-live="polite"><LoaderCircle className={styles.spin} size={18} /><span>正在加载模型 API</span></div> : <div className={styles.providerLayout}>
             <aside className={styles.providerNav}>
               {providers.map((provider) => <button key={provider.id} className={`${styles.providerItem} ${selectedId === provider.id ? styles.active : ""}`} onClick={() => selectProvider(provider, provider.id)}><span>{provider.name}</span></button>)}
               <button className={`${styles.providerItem} ${styles.providerAdd} ${selectedId === "new" ? styles.active : ""}`} onClick={() => selectProvider(null, "new")}><Plus size={15} /><span>新建 API</span></button>

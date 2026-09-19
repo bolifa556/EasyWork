@@ -122,6 +122,7 @@ type RuntimeValue = ReturnType<typeof useFilePreviewTabs> & {
   serverConnectionOperations: ReadonlyMap<string, ServerConnectionOperation>;
   connectServer: (serverId: string, options?: { twoFactorCode?: string | null; acceptedFingerprint?: string }) => Promise<ServerConnectionSnapshot>;
   disconnectServer: (serverId: string) => Promise<ServerConnectionSnapshot>;
+  removeModelProvider: (providerId: string) => void;
   updateConversationNavigation: (conversation: Omit<ConversationSummary, "runningTaskId">) => void;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string) => Promise<void>;
@@ -418,6 +419,12 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       } };
     });
   }, [setBootstrap]);
+  const removeModelProvider = useCallback((providerId: string) => {
+    setBootstrap((current) => {
+      if (!current?.providers.some((provider) => provider.id === providerId)) return current;
+      return { ...current, providers: current.providers.filter((provider) => provider.id !== providerId) };
+    });
+  }, [setBootstrap]);
   useEffect(() => subscribeConversationsChanged(change => {
     for (const changes of pendingBootstrapChanges.current) changes.push(change);
     setBootstrap(current => applyBootstrapConversationChange(current, change));
@@ -658,12 +665,13 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     serverConnectionOperations,
     connectServer,
     disconnectServer,
+    removeModelProvider,
     updateConversationNavigation,
     login: (username, password) => authenticate("login", username, password),
     register: (username, password) => authenticate("register", username, password),
     logout,
     notify,
-  }), [api, authenticate, bootstrap, connectServer, disconnectServer, error, filePreviews, loading, logout, navigate, notify, realtime, refreshBootstrap, serverConnectionOperations, updateConversationNavigation, rightRailOpen, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspaceSidebar]);
+  }), [api, authenticate, bootstrap, connectServer, disconnectServer, error, filePreviews, loading, logout, navigate, notify, realtime, refreshBootstrap, removeModelProvider, serverConnectionOperations, updateConversationNavigation, rightRailOpen, setWorkspaceSidebar, sidebarOpen, toasts, token, view, workspaceSidebar]);
 
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

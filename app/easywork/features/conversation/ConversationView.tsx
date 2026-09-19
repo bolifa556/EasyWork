@@ -57,6 +57,7 @@ import { conversationArtifactCards, referencedArtifactsForDownloadReply, stripAr
 import { mergeConversationEvents, retainConversationEvents } from "./conversation-event-retention.mjs";
 import { catchUpConversation } from "./conversation-stream-catchup.mjs";
 import { followConversationScroll, type ConversationScrollPosition } from "./conversation-scroll";
+import { resolveWebModelSelection } from "./web-model-selection.mjs";
 import { PENDING_USER_WORKSPACE_SELECTION, WorkspaceDialog } from "./WorkspaceDialog";
 import { ConversationWorkspacePreview, type WorkspacePreviewHandle } from "../workspace/ConversationWorkspacePreview";
 import styles from "./ConversationView.module.css";
@@ -497,9 +498,16 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
   const referenceRequestSerial = useRef(0);
   const interruptErrorTimer = useRef<number | null>(null);
   const presentedInterruptFailure = useRef<string | null>(null);
-  const selectedProvider = runtime.bootstrap?.providers.find((item) => item.id === providerId) ?? runtime.bootstrap?.providers[0];
-  const provider = runtime.bootstrap?.providers.find((item) => item.id === browsingProviderId) ?? selectedProvider;
-  const model = modelId || "选择模型";
+  const availableProviders = runtime.bootstrap?.providers ?? [];
+  const { selectedProvider, activeModelId } = resolveWebModelSelection(
+    availableProviders,
+    { providerId, modelId },
+    (id: string) => typeof window === "undefined" ? "" : localStorage.getItem(`easywork.web-model:${id}`) || "",
+  );
+  const browsingProvider = availableProviders.find((item) => item.id === browsingProviderId);
+  const providerPageActive = Boolean(providerPage && browsingProvider);
+  const provider = browsingProvider ?? selectedProvider;
+  const model = activeModelId || "选择模型";
   const inputDisabled = Boolean(disabled || pendingWebRun);
   useEffect(() => {
     if (typeof window === "undefined" || !providerId || !modelId) return;
@@ -573,9 +581,9 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
     let accepted = false;
     setBusy(true);
     try {
-      const chosenProviderId = providerId ?? selectedProvider?.id;
+      const chosenProviderId = selectedProvider?.id;
       if (!chosenProviderId) throw new Error("请先配置网页模型 API");
-      if (!modelId) throw new Error("请先选择网页对话模型");
+      if (!activeModelId) throw new Error("请先选择网页对话模型");
       setValue("");
       setResources(emptyComposerResources);
       setReferences([]);
@@ -585,7 +593,7 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
       setExpanded(false);
       setMultiline(false);
       cleared = true;
-      await onSend(prompt, pendingResources, { providerId: chosenProviderId, modelId }, pendingReferences, submissionId, () => {
+      await onSend(prompt, pendingResources, { providerId: chosenProviderId, modelId: activeModelId }, pendingReferences, submissionId, () => {
         accepted = true;
         sessionStorage.removeItem(submissionStorageKey);
       });
@@ -801,8 +809,8 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
       </div>
       {value && (expanded || canExpand) ? <Button className={styles.expand} compact iconOnly variant="ghost" aria-label={expanded ? "收回编辑器" : "展开编辑器"} icon={expanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />} onClick={() => setExpanded((state) => !state)} /> : null}
       {modelOpen ? <div className={styles.modelMenu}>
-        <div className={styles.modelMenuHead}>{providerPage ? <Button compact iconOnly variant="ghost" aria-label="返回模型 API" icon={<ChevronLeft size={15} />} onClick={() => { setProviderPage(false); setBrowsingProviderId(null); }} /> : null}<span>{providerPage ? provider?.name || "模型" : "选择模型"}</span>{providerPage ? <button className={styles.modelRefresh} type="button" aria-label="重新检测模型" disabled={modelsLoading || !provider} onClick={() => provider && void inspectProvider(provider.id)}><RefreshCw className={modelsLoading ? styles.spin : ""} size={14} /></button> : null}</div>
-        <div className={styles.modelList}>{providerPage ? modelsLoading ? <div className={styles.modelState}><LoaderCircle className={styles.spin} size={15} />正在读取模型</div> : modelError ? <div className={styles.modelState}><span>{modelError}</span><button onClick={() => provider && void inspectProvider(provider.id)}>重新检测</button></div> : models.length ? models.map((item) => <button key={item.id} className={`${styles.modelOption} ${modelId === item.id ? styles.selected : ""}`} onClick={() => chooseModel(item.id)}><span>{item.name}</span>{modelId === item.id ? <Check size={15} /> : null}</button>) : <div className={styles.modelState}>暂无可用模型</div> : runtime.bootstrap?.providers.length ? runtime.bootstrap.providers.map((item) => <button key={item.id} disabled={!item.configured} className={`${styles.modelOption} ${styles.providerOption}`} onClick={() => void inspectProvider(item.id)}><span className={styles.providerCopy}><strong>{item.name}</strong><small>{item.configured ? item.baseUrl || "已配置" : "未配置"}</small></span><ChevronRight size={15} /></button>) : <div className={styles.modelState}>请先配置模型 API</div>}</div>
+        <div className={styles.modelMenuHead}>{providerPageActive ? <Button compact iconOnly variant="ghost" aria-label="返回模型 API" icon={<ChevronLeft size={15} />} onClick={() => { setProviderPage(false); setBrowsingProviderId(null); }} /> : null}<span>{providerPageActive ? provider?.name || "模型" : "选择模型"}</span>{providerPageActive ? <button className={styles.modelRefresh} type="button" aria-label="重新检测模型" disabled={modelsLoading || !provider} onClick={() => provider && void inspectProvider(provider.id)}><RefreshCw className={modelsLoading ? styles.spin : ""} size={14} /></button> : null}</div>
+        <div className={styles.modelList}>{providerPageActive ? modelsLoading ? <div className={styles.modelState}><LoaderCircle className={styles.spin} size={15} />正在读取模型</div> : modelError ? <div className={styles.modelState}><span>{modelError}</span><button onClick={() => provider && void inspectProvider(provider.id)}>重新检测</button></div> : models.length ? models.map((item) => <button key={item.id} className={`${styles.modelOption} ${activeModelId === item.id ? styles.selected : ""}`} onClick={() => chooseModel(item.id)}><span>{item.name}</span>{activeModelId === item.id ? <Check size={15} /> : null}</button>) : <div className={styles.modelState}>暂无可用模型</div> : availableProviders.length ? availableProviders.map((item) => <button key={item.id} disabled={!item.configured} className={`${styles.modelOption} ${styles.providerOption}`} onClick={() => void inspectProvider(item.id)}><span className={styles.providerCopy}><strong>{item.name}</strong><small>{item.configured ? item.baseUrl || "已配置" : "未配置"}</small></span><ChevronRight size={15} /></button>) : <div className={styles.modelState}>请先配置模型 API</div>}</div>
         <div className={styles.modelManage}><Button compact variant="ghost" icon={<Brain size={15} />} onClick={() => { setModelOpen(false); setContextOpen(true); }}>管理网页对话上下文配置</Button></div>
       </div> : null}
     </div>
@@ -1760,11 +1768,15 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
   }, [activeMode, boundServerId, conversationConnectionEnabled, conversationId, detail?.summary.activeBranchId, selectedServer?.status, syncConversationWorkspaceRoute, taskRoutedAgentId, taskRoutedWorkspaceId]);
 
   const responseDescriptor = (scopeOverride?: Record<string, unknown>, resources: ComposerResourceSelection = emptyComposerResources, selection?: WebModelSelection, selectedResourceVersions: string[] = []): ResponseDescriptor => {
-    const selectedProvider = selection?.providerId ?? (typeof window === "undefined" ? null : localStorage.getItem("easywork.web-provider"));
-    const selectedModel = selection?.modelId ?? (typeof window === "undefined" ? null : localStorage.getItem("easywork.web-model"));
-    const providerId = runtime.bootstrap?.providers.some((provider) => provider.id === selectedProvider)
-      ? selectedProvider
-      : runtime.bootstrap?.providers[0]?.id;
+    const storedProviderId = selection?.providerId ?? (typeof window === "undefined" ? null : localStorage.getItem("easywork.web-provider"));
+    const storedModelId = selection?.modelId ?? (typeof window === "undefined" ? null : localStorage.getItem("easywork.web-model"));
+    const resolvedSelection = resolveWebModelSelection(
+      runtime.bootstrap?.providers ?? [],
+      { providerId: storedProviderId, modelId: storedModelId },
+      (id: string) => typeof window === "undefined" ? "" : localStorage.getItem(`easywork.web-model:${id}`) || "",
+    );
+    const providerId = resolvedSelection.selectedProvider?.id;
+    const selectedModel = resolvedSelection.activeModelId;
     if (!providerId) throw new Error("请先配置网页模型 API");
     if (!selectedModel) throw new Error("请先选择网页对话模型");
     let scope: Record<string, unknown> = {};
@@ -2584,7 +2596,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
               loggingInAgentId={loggingInAgent}
               canConfigure={Boolean(serverCapabilities?.features.agents.configure)}
               triggerVariant="setup"
-              triggerLabel={selectedAgent?.installed && selectedAgent.status === "ready" && (!selectedAgent.managed || selectedAgent.configured) ? `${selectedAgent.displayName}${selectedAgent.model ? ` · ${selectedAgent.model}` : ""}` : "配置 Agent"}
+              triggerLabel={selectedAgent?.installed && selectedAgent.status === "ready" && (!selectedAgent.managed || selectedAgent.configured) ? `${selectedAgent.displayName}${selectedAgent.agentId !== "qoder-cn" && selectedAgent.model ? ` · ${selectedAgent.model}` : ""}` : "配置 Agent"}
               initialPage="root"
               onSelect={async (nextAgentId) => { await verifyAgentSelection(nextAgentId); choose("agent", nextAgentId); }}
               onInstall={installAgent}

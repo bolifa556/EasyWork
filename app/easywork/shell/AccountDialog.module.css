@@ -21,6 +21,7 @@
 .profileActions { display: flex; grid-column:1/-1; align-items:center; justify-content: space-between; gap: 8px; padding-top:14px; border-top:1px solid var(--ew-line); }
 .error { color: var(--ew-red); font-size: .84rem; }
 .accountTabs { display: flex; gap: 22px; margin-bottom: 14px; border-bottom: 1px solid var(--ew-line); }
+.providerLoading { display: flex; min-height: 0; align-items: center; justify-content: center; gap: 9px; color: var(--ew-ink-muted); font-size: .86rem; }
 .providerLayout { display: grid; min-height: 0; grid-template-columns: 172px minmax(0,1fr); gap: 22px; overflow: hidden; }
 .providerNav { display: flex; flex-direction: column; gap: 4px; padding-right: 12px; border-right: 1px solid var(--ew-line); }
 .providerItem { display: flex; width: 100%; min-height: 38px; align-items: center; gap: 8px; padding: 7px 9px; border: 0; border-radius: 9px; background: transparent; color: var(--ew-ink-soft); text-align: left; cursor: pointer; }

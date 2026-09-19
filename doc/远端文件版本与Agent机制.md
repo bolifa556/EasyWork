@@ -127,7 +127,7 @@ Qoder CN 使用官方 `qoderclicn` 可执行文件和 `QODERCN_CONFIG_DIR`。它
 
 对话运行使用 `--print --input-format stream-json --output-format stream-json --include-partial-messages --permission-prompt-tool stdio`。新会话写入原生 user frame；已有会话以 `--resume <session-id>` 恢复。运行中追加向同一 stdin 发送带 `priority:"now"` 的 user frame，原生协议自行处理即时追问，不制造额外中断回合。工作区改变时，在目标 cwd 启动新进程并 resume 同一个 session；稳定 Binding 的 Qoder project store 继续指向原 native-store owner，因此会话身份和 transcript 连续，配置与 Skill 视图仍属于该 Binding。显式网页分支使用 `--fork-session --session-id --resume-session-at`；回溯和重新生成使用 `--resume <当前 session> --resume-session-at <保留边界>`，不创建新 Qoder session。该边界读取 Qoder transcript 的最新 `active-leaf.leafUuid`，并验证它对应同文件中的 assistant 记录；`last-prompt` 和 stream-json `assistant.uuid` 均不能替代。Qoder 进程在 terminal result 前退出时使用与 Claude Code 相同的带退出码、信号和脱敏 stderr 的明确诊断。
 
-Qoder 原生模型目录使用 SDK `1.0.41` 的 `initialize`、`get_models` 和 `get_usage_info`。后端合并并发探测并缓存 30 秒；前端以 Actor、服务器和 Qoder 版本为键先显示最近目录，5 分钟内直接复用，超过后在打开菜单时刷新，缓存最长保留 30 天。目录项带模型 ID、显示名、Credits 倍率、上下文档位和可选促销信息；旧配置缺少 model 时统一解释为原生 `auto`。套餐、附加和组织资源配额分栏显示，不自行求和；组织资源包仅在 `available: true` 时显示，`cap: -1` 等负数哨兵不作为额度。
+Qoder 原生模型目录使用 SDK `1.0.41` 的 `initialize`、`get_models` 和 `get_usage_info`。后端合并并发探测并缓存 30 秒；前端以 Actor、服务器和 Qoder 账号域为稳定键先显示最近目录，5 分钟内直接复用，超过后在打开菜单时刷新，缓存最长保留 30 天。旧版按 Qoder 安装版本保存的缓存会迁移到稳定键，因此 Agent 扫描或升级不会短暂退回 `qmodel_*` 内部 ID。目录项带模型 ID、显示名、Credits 倍率、上下文档位和可选促销信息；旧配置缺少 model 时统一解释为原生 `auto`。套餐、附加和组织资源配额分栏显示，不自行求和；组织资源包仅在 `available: true` 时显示，`cap: -1` 等负数哨兵不作为额度。
 
 ### 5.6 网页配置与作业提交
 
