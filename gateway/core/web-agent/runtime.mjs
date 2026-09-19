@@ -400,11 +400,25 @@ export class WebAgentRuntime {
     const candidateOverrides = new Map();
     const requiredHandoffPool = new Map();
     const toolCache = new Map();
+    const deliveredObservations = new Map();
+    const deliveryStatus = async (fragments) => {
+      if (!fragments.length) return "";
+      const labels = fragments.map((fragment) => {
+        const name = fragment.reference?.name || fragment.presented?.skills?.[0]?.name || fragment.presented?.resources?.[0]?.filename;
+        const kind = fragment.reference?.kind || (String(fragment.knowledge?.key || "").startsWith("skill:") ? "Skill" : String(fragment.knowledge?.key || "").startsWith("memory:") ? "记忆" : "上下文");
+        return `- ${kind}：${String(name || fragment.knowledge?.content || fragment.rendered || "").replace(/\s+/g, " ").slice(0, 360)}`;
+      });
+      return `${await this.prompts.webToolResult("alreadyDelivered")}\n${[...new Set(labels)].join("\n").slice(0, 8000)}`;
+    };
     const filterObservations = async (fragments) => {
       const values = Array.isArray(fragments) ? fragments : [];
       if (mode !== "work" || typeof observationFilter !== "function" || !values.length) return values;
       const filtered = await observationFilter(values.map((entry) => structuredClone(entry)));
-      return Array.isArray(filtered) ? filtered : values;
+      if (!Array.isArray(filtered)) return values;
+      for (const fragment of filtered) {
+        if (fragment.deliveryState === "delivered") deliveredObservations.set(fragment.knowledge?.key || fragment.rendered, fragment);
+      }
+      return filtered.filter((fragment) => fragment.deliveryState !== "delivered");
     };
     const visibleInitialObservations = await filterObservations(initialObservationFragments);
     const visibleInitialHandoff = await filterObservations(initialHandoffFragments);
@@ -482,15 +496,17 @@ export class WebAgentRuntime {
         // through the normal remote dispatch path with an empty context delta.
         return completeWork(0);
       }
-      const system = await this.prompts.system(mode, { onlySubmitAvailable });
+      const system = await this.prompts.system(mode);
       const currentRequest = mode === "work"
         ? await this.prompts.workRequest(userMessage)
         : String(userMessage || "");
       const observedContext = await renderWebAgentObservations([...candidatePool.values()], mode, this.prompts);
+      const previouslyDelivered = await deliveryStatus([...deliveredObservations.values()]);
       const messages = [
         { role: "system", content: system },
         ...context,
         ...(observedContext ? [{ role: "system", content: observedContext }] : []),
+        ...(previouslyDelivered ? [{ role: "system", content: previouslyDelivered }] : []),
         { role: "user", content: currentRequest },
       ];
       let continuationGuidanceAdded = false;
@@ -746,6 +762,7 @@ export class WebAgentRuntime {
               : String(renderedSource || "").trim();
             const observed = [];
             const resultCandidates = [];
+            const deliveredCandidates = [];
             let observationsFiltered = false;
             if (tool.handoff && rendered) {
               const candidates = await tool.handoffItems({ input, output, presented, rendered });
@@ -765,6 +782,10 @@ export class WebAgentRuntime {
                 rawCandidates.push(fragment);
               }
               const visibleCandidates = await filterObservations(rawCandidates);
+              for (const fragment of rawCandidates) {
+                const key = fragment.knowledge?.key || fragment.rendered;
+                if (deliveredObservations.has(key) && !visibleCandidates.some((entry) => (entry.knowledge?.key || entry.rendered) === key)) deliveredCandidates.push(fragment);
+              }
               observationsFiltered = visibleCandidates.length !== rawCandidates.length;
               if (rawCandidates.length && visibleCandidates.length === 0) allObserved = true;
               for (const fragment of visibleCandidates) {
@@ -792,10 +813,12 @@ export class WebAgentRuntime {
             const modelSuffix = mode === "work" || allObserved
               ? await tool.modelSuffix({ input, output: rawOutput, presented })
               : "";
-            const content = allObserved
+            const content = allObserved && deliveredCandidates.length
+              ? [await deliveryStatus(deliveredCandidates), modelSuffix].filter(Boolean).join(presentation.sectionSeparator)
+              : allObserved
               ? [await this.prompts.webToolResult("alreadyObserved"), modelSuffix].filter(Boolean).join(presentation.sectionSeparator)
               : mode === "work"
-                ? await workToolResult(resultCandidates, rendered, this.prompts, presentation, modelSuffix)
+                ? [await workToolResult(resultCandidates, rendered, this.prompts, presentation, modelSuffix), await deliveryStatus(deliveredCandidates)].filter(Boolean).join(presentation.sectionSeparator)
                 : rendered || await this.prompts.webToolResult("emptyResult");
             messages.push({ role: "tool", toolCallId: call.id, name: call.name, content });
             const modelMessages = allObserved ? [] : await tool.modelMessages({ input, output, presented });

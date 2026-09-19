@@ -484,7 +484,7 @@ test("skill deployment uploads immutable actor files only to ~/.easywork/skills 
   const dataRoot = path.join(root, "data");
   const currentActor = actor();
   const actorRoot = actorDataRoot(dataRoot, currentActor);
-  const sourceRelative = "skills/packages/check/1.0/files/SKILL.md";
+  const sourceRelative = "skills/packages/check/.installed/files/SKILL.md";
   const localPath = path.join(actorRoot, ...sourceRelative.split("/"));
   await fs.mkdir(path.dirname(localPath), { recursive: true });
   const content = Buffer.from("# checked skill\n");
@@ -502,12 +502,12 @@ test("skill deployment uploads immutable actor files only to ~/.easywork/skills 
       skillId: "check",
       version: "1.0",
       sha256: digest,
-      targetRoot: "~/.easywork/skills/check/1.0",
-      entrypoint: "~/.easywork/skills/check/1.0/SKILL.md",
+      targetRoot: "~/.easywork/skills/check",
+      entrypoint: "~/.easywork/skills/check/SKILL.md",
       files: [{
         relativePath: "SKILL.md",
         source: { actorRelativePath: sourceRelative, sha256: digest, size: content.length },
-        target: { path: "~/.easywork/skills/check/1.0/SKILL.md", expectedSha256: digest },
+        target: { path: "~/.easywork/skills/check/SKILL.md", expectedSha256: digest },
         status: "upload-required",
       }],
       operations: [{ kind: "verify-or-upload" }],
@@ -517,7 +517,7 @@ test("skill deployment uploads immutable actor files only to ~/.easywork/skills 
   const refs = await deployment.ensure(plan);
   const actorKey = cryptoHash(Buffer.from(`${currentActor.actorType}:${currentActor.actorId}`));
   const remotePath = `/home/alice/.easywork/skills/packages/${actorKey}/${digest}`;
-  assert.deepEqual(refs, [{ skillId: "check", version: "1.0", sha256: digest, remotePath, entrypoint: `${remotePath}/SKILL.md` }]);
+  assert.deepEqual(refs, [{ skillId: "check", sha256: digest, remotePath, entrypoint: `${remotePath}/SKILL.md` }]);
   assert.equal(remote.uploads.length, 1);
   assert.equal(remote.files.get(`${remotePath}/SKILL.md`).toString(), content.toString());
   await deployment.ensure(plan);

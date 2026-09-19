@@ -45,16 +45,7 @@ export {
   validateEffectiveContextScope,
 } from "./context.mjs";
 
-export {
-  activateSkillVersion,
-  createSkillRegistry,
-  createSkillVersion,
-  createTaskSkillPin,
-  registerSkillVersion,
-  validateSkillRegistry,
-  validateSkillVersion,
-  validateTaskSkillPin,
-} from "./skill.mjs";
+export { createInstalledSkill, validateInstalledSkill } from "./skill.mjs";
 
 export {
   createTaskReport,

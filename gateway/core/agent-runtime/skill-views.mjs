@@ -131,7 +131,7 @@ export async function restoreSkillSnapshot(executor, paths, snapshot) {
     }
     const document = await executor.readFile(`${ownedRoot}/${skillId}/SKILL.md`);
     const pin = descriptor.skillPins.find((item) => item.skillId === skillId);
-    const record = { ...(pin || { skillId, version: "branch-local", sha256: hash(document) }), nativeName: parseNativeSkill(document).metadata.name, viewHash: hash(JSON.stringify(files)), ownedRoot: `${ownedRoot}/${skillId}`, remotePath: `${paths.skillsRoot}/${skillId}` };
+    const record = { ...(pin || { skillId, sha256: hash(document) }), nativeName: parseNativeSkill(document).metadata.name, viewHash: hash(JSON.stringify(files)), ownedRoot: `${ownedRoot}/${skillId}`, remotePath: `${paths.skillsRoot}/${skillId}` };
     const pendingLink = `${record.remotePath}.snapshot-${crypto.randomUUID()}`;
     const result = await executor.exec(`ln -s -- ${quote(record.ownedRoot)} ${quote(pendingLink)} && mv -Tf -- ${quote(pendingLink)} ${quote(record.remotePath)}`, { maxOutputBytes: 2048 });
     invariant(result.code === 0, "AGENT_SKILL_VIEW_FAILED", "无法建立分支独立技能目录", { status: 502 });

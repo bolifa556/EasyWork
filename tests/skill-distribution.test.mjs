@@ -45,6 +45,22 @@ async function fixture(t) {
     marketPath: `/api/skill-center/market/${market.id}`, personalPath: `/api/skill-center/installed/${market.skillId}` };
 }
 
+test("市场简介随安装交给各用户，目录直接复用并忽略旧的个人发现简介缓存", async (t) => {
+  const f = await fixture(t);
+  for (const user of [f.owner, f.empty]) {
+    assert.equal((await f.request(`${f.marketPath}/install`, { session: user, method: "POST", body: {} })).status, 200);
+    const session = await f.gateway.runtime.auth.resolveSession(user.token);
+    const services = await f.gateway.runtime.servicesForActor(session.actor);
+    const cacheFile = path.join(actorDataRoot(f.dataRoot, session.actor), "skills/discovery.json");
+    await fs.writeFile(cacheFile, "obsolete per-user discovery cache");
+    const catalog = await services.skills.listInstalledKnowledge();
+    assert.equal(catalog.items[0].description, f.market.description);
+    assert.equal(Object.hasOwn(catalog.items[0], "discoveryDescription"), false);
+    const prompt = await f.gateway.runtime.prompts.skillCatalog(catalog.items);
+    assert.match(JSON.stringify(prompt), /已部署应用的使用方法/);
+  }
+});
+
 test("开启全体部署给现有和新注册用户安装，已有个人修改和附件保持原样", async (t) => {
   const f = await fixture(t);
   const { request, owner, admin, marketPath, personalPath } = f;
@@ -65,8 +81,8 @@ test("开启全体部署给现有和新注册用户安装，已有个人修改�
   const newcomer = await f.register("distribution-new");
   // Verify registration itself installs the package, before opening any page.
   const newIndex = JSON.parse(await fs.readFile(path.join(actorDataRoot(f.dataRoot, newcomer.actor), "skills/index.json"), "utf8"));
-  assert.equal(newIndex.data.registries[0].skillId, f.market.skillId);
-  assert.equal(newIndex.data.versions.length, 1);
+  assert.equal(newIndex.data.skills[0].skillId, f.market.skillId);
+  assert.equal(newIndex.data.skills.length, 1);
   const latest = await request(marketPath, { session: admin, method: "PATCH", revision: enabled.data.item.revision, body: { fileUpdates: [{ path: "SKILL.md", content: "# 市场更新后的运行方式" }] } });
   assert.equal(latest.status, 200);
   assert.deepEqual(latest.data.deployment, { installed: 0, skipped: 4, failed: 0 });

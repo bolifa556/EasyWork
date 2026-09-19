@@ -10,18 +10,21 @@ import { actorDataRoot } from "../gateway/core/paths.mjs";
 import { isAutomaticSkillApplicable } from "../gateway/core/skills/applicability.mjs";
 import { SkillService } from "../gateway/core/skills/index.mjs";
 
-test("cached Skill choices resolve the exact selected package after a newer version is installed", async () => {
+test("旧选择只保留技能身份，更新后读取当前安装内容，不受旧标签或哈希约束", async () => {
   await fixture(async (dataRoot) => {
     const service = new SkillService(serviceOptions(dataRoot, actor()));
-    const one = await service.uploadVersion(skillInput());
-    const selected = { knowledge: { key: "skill:shell-helper", version: `semantic-v1:1.0.0:${one.version.sha256}` } };
-    const two = await service.uploadVersion(skillInput({ version: "2.0.0", expectedRevision: one.revision }));
-    assert.deepEqual(await service.resolveKnowledgePins([selected]), [{ skillId: "shell-helper", version: "1.0.0", sha256: one.version.sha256 }]);
-    await assert.rejects(() => service.resolveKnowledgePins([selected, { knowledge: { key: "skill:shell-helper", version: `semantic-v1:2.0.0:${two.version.sha256}` } }]), { code: "SKILL_SELECTED_VERSION_CONFLICT" });
-    await assert.rejects(() => service.resolveKnowledgePins([{ knowledge: { key: "skill:shell-helper", version: `semantic-v1:1.0.0:${"0".repeat(64)}` } }]), { code: "SKILL_SELECTED_VERSION_UNAVAILABLE" });
+    const one = await service.uploadPackage(skillInput());
+    const selected = { knowledge: { key: "skill:shell-helper", version: "semantic-v1:old:" + one.skill.sha256 } };
+    const two = await service.uploadPackage(skillInput({ expectedRevision: one.revision, files: [
+      { path: "scripts/main.mjs", content: "current installed content" }, { path: "README.md", content: "updated" },
+    ] }));
+    assert.deepEqual(await service.resolveSkills([selected, { knowledge: { key: "skill:shell-helper", version: "stale" } }]), [{ skillId: "shell-helper", sha256: two.skill.sha256 }]);
+    const plan = await service.createDeploymentPlan({ taskId: "task_a", pins: [{ skillId: "shell-helper", version: "missing", sha256: one.skill.sha256 }] });
+    assert.equal(plan.skills[0].sha256, two.skill.sha256);
+    assert.equal(Object.hasOwn(plan.skills[0], "version"), false);
+    assert.equal((await service.inspect()).data.skills.length, 1);
   });
 });
-
 function actor(actorType = "user", actorId = "skill_owner") {
   return createActorContext({
     actorType,
@@ -72,7 +75,6 @@ test("Skill 发现只按显式适用范围匹配服务器和调度器", () => {
 function skillInput(overrides = {}) {
   return {
     skillId: "shell-helper",
-    version: "1.0.0",
     manifest: {
       name: "Shell Helper",
       description: "读取远程环境",
@@ -97,27 +99,26 @@ async function fixture(run) {
   }
 }
 
-test("上传 Skill 会在 Actor skills 目录保存不可变版本，并登记为活动版本", async () => {
+test("上传 Skill 在 Actor 目录保存唯一安装内容", async () => {
   await fixture(async (dataRoot) => {
     for (const currentActor of [actor("user", "same_skill"), actor("guest", "same_skill")]) {
       const service = new SkillService(serviceOptions(dataRoot, currentActor));
-      const uploaded = await service.uploadVersion(skillInput());
+      const uploaded = await service.uploadPackage(skillInput());
       assert.equal(uploaded.duplicate, false);
-      assert.equal(uploaded.registry.activeVersionId, uploaded.version.id);
-      assert.equal(uploaded.registry.versions[0].sha256, uploaded.version.sha256);
-      assert.equal(uploaded.version.manifest.entrypoint, "scripts/main.mjs");
+      assert.equal(Object.hasOwn(uploaded.skill, "version"), false);
+      assert.equal(uploaded.skill.manifest.entrypoint, "scripts/main.mjs");
       const root = actorDataRoot(dataRoot, currentActor);
-      const packageRoot = path.join(root, "skills", "packages", "shell-helper", "1.0.0");
+      const packageRoot = path.join(root, "skills", "packages", "shell-helper", ".installed");
       assert.equal(await readFile(path.join(packageRoot, "files", "README.md"), "utf8"), "# Shell Helper\n");
       const descriptor = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
-      assert.equal(descriptor.sha256, uploaded.version.sha256);
+      assert.equal(descriptor.sha256, uploaded.skill.sha256);
       assert.deepEqual(descriptor.files.map((file) => file.path), ["README.md", "scripts/main.mjs"]);
       assert.match(packageRoot, currentActor.actorType === "user" ? /[\\/]users[\\/]same_skill[\\/]/ : /[\\/]guests[\\/]same_skill[\\/]/);
       const catalog = await service.listInstalledKnowledge();
       assert.deepEqual(catalog.items[0].applicability, { mode: "all", serverKind: "all", allowServers: [], denyServers: [], forceEnabled: false });
       assert.deepEqual(catalog.items.map((entry) => ({ skillId: entry.skillId, knowledge: entry.knowledge })), [{
         skillId: "shell-helper",
-        knowledge: { key: "skill:shell-helper", version: `semantic-v1:1.0.0:${uploaded.version.sha256}` },
+        knowledge: { key: "skill:shell-helper", version: uploaded.skill.sha256 },
       }]);
     }
   });
@@ -126,7 +127,7 @@ test("上传 Skill 会在 Actor skills 目录保存不可变版本，并登记�
 test("内部 Skill 目录始终携带当前 applicability，个人配置覆盖默认范围", async () => {
   await fixture(async (dataRoot) => {
     const service = new SkillService(serviceOptions(dataRoot, actor()));
-    await service.uploadVersion(skillInput());
+    await service.uploadPackage(skillInput());
     await service.updateApplicability("shell-helper", { serverKind: "standard", allowServers: [], denyServers: [] });
     const catalog = await service.listInstalledKnowledge();
     assert.deepEqual(catalog.items[0].applicability, { mode: "all", serverKind: "standard", allowServers: [], denyServers: [], forceEnabled: false });
@@ -189,22 +190,22 @@ test("Windows 最终 rename EPERM 时以 package.json 最后提交，Registry �
       packageCommitSleep: async () => undefined,
     }));
 
-    const uploaded = await service.uploadVersion(skillInput());
+    const uploaded = await service.uploadPackage(skillInput());
     assert.equal(renameCalls, 8);
     assert.deepEqual(operations, ["files", "package.json"]);
-    const packageRoot = path.join(actorRoot, "skills", "packages", "shell-helper", "1.0.0");
+    const packageRoot = path.join(actorRoot, "skills", "packages", "shell-helper", ".installed");
     const descriptor = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
     const index = JSON.parse(await readFile(indexPath, "utf8"));
-    assert.equal(descriptor.sha256, uploaded.version.sha256);
-    assert.equal(index.data.versions.length, 1);
-    assert.equal(index.data.versions[0].sha256, descriptor.sha256);
+    assert.equal(descriptor.sha256, uploaded.skill.sha256);
+    assert.equal(index.data.skills.length, 1);
+    assert.equal(index.data.skills[0].sha256, descriptor.sha256);
   });
 });
 
 test("磁盘上已有已提交包时绝不覆盖或清理其内容", async () => {
   await fixture(async (dataRoot) => {
     const currentActor = actor();
-    const packageRoot = path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages", "shell-helper", "1.0.0");
+    const packageRoot = path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages", "shell-helper", ".installed");
     await fsPromises.mkdir(path.join(packageRoot, "files"), { recursive: true });
     await writeFile(path.join(packageRoot, "files", "sentinel.txt"), "keep\n", "utf8");
     await writeFile(path.join(packageRoot, "package.json"), `${JSON.stringify({
@@ -215,7 +216,7 @@ test("磁盘上已有已提交包时绝不覆盖或清理其内容", async () =>
     })}\n`, "utf8");
 
     const service = new SkillService(serviceOptions(dataRoot, currentActor));
-    await assert.rejects(() => service.uploadVersion(skillInput()), (error) => error?.code === "SKILL_PACKAGE_PATH_CONFLICT");
+    await assert.rejects(() => service.uploadPackage(skillInput()), (error) => error?.code === "SKILL_PACKAGE_PATH_CONFLICT");
     assert.equal(await readFile(path.join(packageRoot, "files", "sentinel.txt"), "utf8"), "keep\n");
     const descriptor = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
     assert.equal(descriptor.sha256, "different-committed-package");
@@ -226,122 +227,70 @@ test("manifest 与文件 path 使用严格 schema，危险包不会在 Actor 目
   await fixture(async (dataRoot) => {
     const currentActor = actor();
     const service = new SkillService(serviceOptions(dataRoot, currentActor));
-    await assert.rejects(() => service.uploadVersion(skillInput({
+    await assert.rejects(() => service.uploadPackage(skillInput({
       manifest: { ...skillInput().manifest, extra: "legacy" },
     })), (error) => error?.code === "SKILL_MANIFEST_SCHEMA_INVALID");
-    await assert.rejects(() => service.uploadVersion(skillInput({
+    await assert.rejects(() => service.uploadPackage(skillInput({
       files: [{ path: "../escape.mjs", content: "bad" }],
       manifest: { ...skillInput().manifest, entrypoint: "../escape.mjs" },
     })), (error) => error?.code === "SKILL_FILE_PATH_INVALID");
-    await assert.rejects(() => service.uploadVersion(skillInput({
+    await assert.rejects(() => service.uploadPackage(skillInput({
       manifest: { ...skillInput().manifest, entrypoint: "scripts/missing.mjs" },
     })), (error) => error?.code === "SKILL_ENTRYPOINT_MISSING");
     await assert.rejects(() => access(path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages")));
   });
 });
 
-test("相同 skillId/version/hash 上传幂等，不同内容不能覆盖，Registry 可显式切换版本", async () => {
+test("同一技能只保留当前安装内容，相同上传幂等，内容更新原位替换", async () => {
   await fixture(async (dataRoot) => {
     const service = new SkillService(serviceOptions(dataRoot, actor()));
-    const v1 = await service.uploadVersion(skillInput());
-    const duplicate = await service.uploadVersion(skillInput({ expectedRevision: v1.revision }));
+    const first = await service.uploadPackage(skillInput());
+    const duplicate = await service.uploadPackage(skillInput({ expectedRevision: first.revision }));
     assert.equal(duplicate.duplicate, true);
-    assert.equal(duplicate.revision, v1.revision);
-    assert.equal(duplicate.version.id, v1.version.id);
-    await assert.rejects(() => service.uploadVersion(skillInput({
-      expectedRevision: v1.revision,
-      files: [
-        { path: "scripts/main.mjs", content: "export default async () => 'changed';\n" },
-        { path: "README.md", content: "# Shell Helper\n" },
-      ],
-    })), (error) => error?.code === "SKILL_VERSION_IMMUTABLE");
-
-    const secondVersion = await service.uploadVersion(skillInput({
-      version: "2.0.0",
-      expectedRevision: v1.revision,
-      activate: false,
-      files: [
-        { path: "scripts/main.mjs", content: "export default async () => 'second';\n" },
-        { path: "README.md", content: "# Shell Helper second release\n" },
-      ],
-    }));
-    assert.equal(secondVersion.registry.activeVersionId, v1.version.id);
-    const activated = await service.activateVersion({ skillId: "shell-helper", version: "2.0.0", expectedRevision: secondVersion.revision });
-    assert.equal(activated.registry.activeVersionId, secondVersion.version.id);
+    assert.equal(duplicate.revision, first.revision);
+    const changed = await service.uploadPackage(skillInput({ expectedRevision: first.revision, files: [{ path: "scripts/main.mjs", content: "changed" }] }));
+    assert.equal(changed.skill.id, first.skill.id);
+    assert.equal(changed.skill.packagePath, first.skill.packagePath);
+    assert.notEqual(changed.skill.sha256, first.skill.sha256);
+    assert.deepEqual((await service.inspect()).data.skills, [changed.skill]);
+    assert.equal(service.activateVersion, undefined);
+    assert.equal(service.deleteVersion, undefined);
   });
 });
-
-test("Task pin 固定 version 与 sha256；被固定版本拒绝删除，释放 pin 后才能 GC", async () => {
+test("部署按任务授权读取当前技能，卸载不再受到历史选择的锁定", async () => {
+  await fixture(async (dataRoot) => {
+    const service = new SkillService(serviceOptions(dataRoot, actor()));
+    const installed = await service.uploadPackage(skillInput());
+    await service.createDeploymentPlan({ taskId: "task_a", skills: [{ skillId: "shell-helper" }] });
+    await assert.rejects(() => service.createDeploymentPlan({ taskId: "task_forbidden", skills: [{ skillId: "shell-helper" }] }), { code: "SKILL_TASK_FORBIDDEN" });
+    await service.uninstall({ skillId: "shell-helper", expectedRevision: installed.revision });
+    assert.deepEqual((await service.inspect()).data, { skills: [] });
+    await assert.rejects(() => service.resolveSkills([{ knowledge: { key: "skill:shell-helper" } }]), { code: "SKILL_NOT_INSTALLED" });
+  });
+});
+test("卸载技能会移除当前包、索引和范围配置", async () => {
   await fixture(async (dataRoot) => {
     const currentActor = actor();
     const service = new SkillService(serviceOptions(dataRoot, currentActor));
-    const uploaded = await service.uploadVersion(skillInput());
-    const pinned = await service.pinTask({
-      taskId: "task_a",
-      skills: [{ skillId: "shell-helper" }],
-      expectedRevision: uploaded.revision,
-    });
-    assert.deepEqual(pinned.taskSkillPins, [{ skillId: "shell-helper", version: "1.0.0", sha256: uploaded.version.sha256 }]);
-    const duplicate = await service.pinTask({
-      taskId: "task_a",
-      skills: [{ skillId: "shell-helper", version: "1.0.0" }],
-      expectedRevision: pinned.revision,
-    });
-    assert.equal(duplicate.duplicate, true);
-    await assert.rejects(() => service.deleteVersion({
-      skillId: "shell-helper",
-      version: "1.0.0",
-      expectedRevision: pinned.revision,
-    }), (error) => error?.code === "SKILL_VERSION_PINNED");
-    await assert.rejects(() => service.pinTask({
-      taskId: "task_forbidden",
-      skills: [],
-      expectedRevision: pinned.revision,
-    }), (error) => error?.code === "SKILL_TASK_FORBIDDEN");
-
-    const released = await service.releaseTaskPins({ taskId: "task_a", expectedRevision: pinned.revision });
-    const deleted = await service.deleteVersion({ skillId: "shell-helper", version: "1.0.0", expectedRevision: released.revision });
-    const state = await service.inspect();
-    assert.deepEqual(state.data, { registries: [], versions: [], taskPins: [] });
-    await assert.rejects(() => access(path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages", "shell-helper", "1.0.0")));
-    assert.equal(deleted.revision, state.revision);
+    const installed = await service.installPackage(skillInput({ applicability: { mode: "work", forceEnabled: true } }));
+    await service.uninstall({ skillId: "shell-helper", expectedRevision: installed.revision });
+    assert.deepEqual((await service.inspect()).data, { skills: [] });
+    assert.deepEqual((await service.listInstalled()).items, []);
+    await assert.rejects(() => access(path.join(actorDataRoot(dataRoot, currentActor), "skills/packages/shell-helper")));
   });
 });
-
-test("卸载技能会直接移除全部版本和 Task 固定记录", async () => {
-  await fixture(async (dataRoot) => {
-    const currentActor = actor();
-    const service = new SkillService(serviceOptions(dataRoot, currentActor));
-    const first = await service.uploadVersion(skillInput());
-    const second = await service.uploadVersion(skillInput({
-      version: "2.0.0",
-      expectedRevision: first.revision,
-      files: [
-        { path: "scripts/main.mjs", content: "export default async () => 'second';\n" },
-        { path: "README.md", content: "# Shell Helper second release\n" },
-      ],
-    }));
-    const pinned = await service.pinTask({ taskId: "task_a", skills: [{ skillId: "shell-helper", version: "1.0.0" }], expectedRevision: second.revision });
-    const uninstalled = await service.uninstall({ skillId: "shell-helper", expectedRevision: pinned.revision });
-    assert.equal(uninstalled.removedVersions, 2);
-    assert.equal(uninstalled.removedTaskPins, 1);
-    assert.deepEqual((await service.inspect()).data, { registries: [], versions: [], taskPins: [] });
-    await assert.rejects(() => access(path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages", "shell-helper")));
-  });
-});
-
 test("部署计划只指向 ~/.easywork/skills，按远端 hash 幂等，并向 Agent 暴露固定 entrypoint", async () => {
   await fixture(async (dataRoot) => {
     const currentActor = actor();
     const service = new SkillService(serviceOptions(dataRoot, currentActor));
-    const uploaded = await service.uploadVersion(skillInput());
-    const pinned = await service.pinTask({ taskId: "task_a", skills: [{ skillId: "shell-helper" }], expectedRevision: uploaded.revision });
+    const uploaded = await service.uploadPackage(skillInput());
+    const pinned = { taskSkillPins: [{ skillId: "shell-helper" }] };
     const plan = await service.createDeploymentPlan({ taskId: "task_a", pins: pinned.taskSkillPins });
     assert.equal(plan.remoteBase, "~/.easywork/skills");
     assert.equal(plan.skills.length, 1);
     assert.equal(plan.skills[0].operations.length, 2);
-    assert.equal(plan.agentSkillRefs[0].entrypoint, "~/.easywork/skills/shell-helper/1.0.0/scripts/main.mjs");
-    assert.ok(plan.skills[0].files.every((file) => file.target.path.startsWith("~/.easywork/skills/shell-helper/1.0.0/")));
+    assert.equal(plan.agentSkillRefs[0].entrypoint, "~/.easywork/skills/shell-helper/scripts/main.mjs");
+    assert.ok(plan.skills[0].files.every((file) => file.target.path.startsWith("~/.easywork/skills/shell-helper/")));
     assert.ok(plan.skills[0].files.every((file) => file.source.actorRelativePath.startsWith("skills/packages/")));
     assert.equal(JSON.stringify(plan).includes(".claude"), false);
     assert.equal(JSON.stringify(plan).includes(".codex"), false);
@@ -361,11 +310,11 @@ test("部署计划只指向 ~/.easywork/skills，按远端 hash 幂等，并向 
   });
 });
 
-test("Skill 上下文检索读取已校验的活动或选定版本正文，并保持 Actor 隔离", async () => {
+test("Skill 检索读取当前安装内容并保持 Actor 隔离", async () => {
   await fixture(async (dataRoot) => {
     const currentActor = actor();
     const service = new SkillService(serviceOptions(dataRoot, currentActor));
-    const uploaded = await service.uploadVersion(skillInput({
+    const uploaded = await service.uploadPackage(skillInput({
       files: [
         { path: "scripts/main.mjs", content: "export default async () => 'EW-SKILL-PROOF-C7';\n" },
         { path: "SKILL.md", content: "创建 skill-proof.txt，内容必须是 EW-SKILL-PROOF-C7。\n" },
@@ -374,13 +323,13 @@ test("Skill 上下文检索读取已校验的活动或选定版本正文，并�
     }));
     const results = await service.searchContext({
       query: "验收 Skill 创建文件",
-      selectedSkillVersions: [{ skillId: "shell-helper", version: "1.0.0" }],
+      selectedSkillIds: ["shell-helper"],
       limit: 4,
     });
     assert.equal(results.length, 1);
     assert.equal(results[0].skillId, "shell-helper");
-    assert.equal(results[0].version, "1.0.0");
-    assert.equal(results[0].sha256, uploaded.version.sha256);
+    assert.equal(Object.hasOwn(results[0], "version"), false);
+    assert.equal(results[0].sha256, uploaded.skill.sha256);
     assert.match(results[0].files.find((entry) => entry.path === "SKILL.md").content, /skill-proof\.txt/);
     assert.match(results[0].files.find((entry) => entry.path === "scripts\/main\.mjs").content, /EW-SKILL-PROOF-C7/);
     assert.equal(results[0].files.some((entry) => entry.path === "assets/binary.bin"), false);
@@ -390,13 +339,13 @@ test("Skill 上下文检索读取已校验的活动或选定版本正文，并�
   });
 });
 
-test("生成部署描述符前会重新验证本地版本内容哈希", async () => {
+test("生成部署描述符前会重新验证本地文件完整性", async () => {
   await fixture(async (dataRoot) => {
     const currentActor = actor();
     const service = new SkillService(serviceOptions(dataRoot, currentActor));
-    const uploaded = await service.uploadVersion(skillInput());
-    const pinned = await service.pinTask({ taskId: "task_a", skills: [{ skillId: "shell-helper" }], expectedRevision: uploaded.revision });
-    const entrypoint = path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages", "shell-helper", "1.0.0", "files", "scripts", "main.mjs");
+    const uploaded = await service.uploadPackage(skillInput());
+    const pinned = { taskSkillPins: [{ skillId: "shell-helper" }] };
+    const entrypoint = path.join(actorDataRoot(dataRoot, currentActor), "skills", "packages", "shell-helper", ".installed", "files", "scripts", "main.mjs");
     await writeFile(entrypoint, "tampered\n", "utf8");
     await assert.rejects(() => service.createDeploymentPlan({
       taskId: "task_a",
@@ -408,8 +357,8 @@ test("生成部署描述符前会重新验证本地版本内容哈希", async ()
 test("并发上传使用 Actor 级串行队列，旧 expectedRevision 不会覆盖新 Registry", async () => {
   await fixture(async (dataRoot) => {
     const service = new SkillService(serviceOptions(dataRoot, actor()));
-    const first = service.uploadVersion(skillInput());
-    const stale = service.uploadVersion(skillInput({
+    const first = service.uploadPackage(skillInput());
+    const stale = service.uploadPackage(skillInput({
       skillId: "second-skill",
       manifest: { ...skillInput().manifest, name: "Second" },
       expectedRevision: 0,
@@ -419,8 +368,8 @@ test("并发上传使用 Actor 级串行队列，旧 expectedRevision 不会覆�
     assert.equal(staleResult.status, "rejected");
     assert.equal(staleResult.reason.code, "REVISION_CONFLICT");
     const state = await service.inspect();
-    assert.equal(state.data.registries.length, 1);
-    assert.equal(state.data.registries[0].skillId, "shell-helper");
+    assert.equal(state.data.skills.length, 1);
+    assert.equal(state.data.skills[0].skillId, "shell-helper");
     await assert.rejects(() => access(path.join(actorDataRoot(dataRoot, actor()), "skills", "packages", "second-skill")));
   });
 });

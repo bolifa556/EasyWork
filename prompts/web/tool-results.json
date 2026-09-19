@@ -1,6 +1,6 @@
 {
   "emptyResult": "没有找到相关内容。",
-  "alreadyObserved": "没有新增内容；命中的同一版本已经在当前上下文中。",
+  "alreadyObserved": "没有新增内容；命中的内容已经在当前上下文中。",
   "alreadyQueried": "本轮已执行过相同查询，结果保留在前文，没有新增内容。直接复用相关候选；仍有资料缺口时调整查询或读取后续区段，资料齐全后结束检索。",
   "failedResult": "查询失败：{{ERROR_MESSAGE}}",
   "toolUnavailable": "当前没有可用工具：{{TOOL_NAME}}",
@@ -15,8 +15,8 @@
   "workContinue": "继续当前资料选择，复用已经完成的判断与查询。仍缺资料时直接调用相关查询工具；资料齐全时单独调用 handoff_submit。无需重述分析或撰写面向用户的回答。",
   "candidateRewriteUnknown": "候选不存在、已失效或不允许整理：{{CANDIDATE_ID}}",
   "candidateRewritten": "候选 {{CANDIDATE_ID}} 已完成本轮临时整理；如需发送，继续用原 candidate_id 调用 handoff_submit。",
-  "observationWorkHeading": "本轮可见记忆与当前分支已经读取的知识候选；可直接提交相关 candidate_id，无需重复读取相同版本：",
-  "observationChatHeading": "本轮可见记忆与当前分支已经读取的知识；回答时可直接使用，无需重复读取相同版本：",
+  "observationWorkHeading": "本轮可见记忆与当前分支已经读取的知识候选；可直接提交相关 candidate_id，无需重复读取未变化的内容：",
+  "observationChatHeading": "本轮可见记忆与当前分支已经读取的知识；回答时可直接使用，无需重复读取未变化的内容：",
   "observationCandidate": "candidate_id: {{CANDIDATE_ID}}\n",
   "observationItem": "{{CANDIDATE}}{{KIND}}：{{NAME}}\n{{CONTENT}}",
   "observationMemoryItem": "{{CANDIDATE}}{{CONTENT}}",
@@ -66,5 +66,6 @@
   "continuationIndent": "  ",
   "truncationSuffix": "…",
   "itemSeparator": "\n",
-  "sectionSeparator": "\n\n"
+  "sectionSeparator": "\n\n",
+  "alreadyDelivered": "以下内容之前已经成功发送给当前远端 Agent 对话，可以直接复用。本轮无需重复读取或发送，不要将这些内容列为新的下发材料。"
 }

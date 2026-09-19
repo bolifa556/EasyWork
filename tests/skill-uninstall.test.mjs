@@ -52,18 +52,18 @@ test("连续卸载同步剩余技能的全局版本，正常请求不额外刷�
   assert.deepEqual(calls, [{ method: "DELETE", expectedRevision: firstRevision }, { method: "DELETE", expectedRevision: firstRevision + 1 }]);
 });
 
-test("Task 固定技能导致版本过期时重新核对一次，卸载仍清除可变固定记录", async (t) => {
+test("其他页面编辑技能导致列表过期时重新核对一次，卸载仍然成功", async (t) => {
   const { service, api, calls } = await fixture(t);
   const before = await service.listInstalled();
   const item = before.items.find((entry) => entry.skillId === "skill-a");
-  await service.pinTask({ taskId: "task_running", skills: [{ skillId: item.skillId }], expectedRevision: before.revision });
+  await service.updateInstalled(item.skillId, { name: "edited", expectedRevision: before.revision });
   let refreshed = [];
   const result = await uninstallInstalledSkill(api, item, (items) => { refreshed = items; });
   assert.equal(refreshed.find((entry) => entry.skillId === item.skillId).id, item.id);
   assert.equal(refreshed[0].revision, before.revision + 1);
   assert.deepEqual(calls.map((call) => call.method), ["DELETE", "GET", "DELETE"]);
   assert.deepEqual(installedSkillsAfterUninstall(refreshed, result), (await service.listInstalled()).items);
-  assert.equal((await service.inspect()).data.taskPins.length, 0);
+  assert.equal((await service.inspect()).data.skills.some((entry) => entry.skillId === item.skillId), false);
 });
 
 test("其他页面已卸载同一技能时清理过期列表，不再次删除或报错", async (t) => {

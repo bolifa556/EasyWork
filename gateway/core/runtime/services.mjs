@@ -1,3 +1,4 @@
+import { selectedSkillIds } from "../../../shared/skill-selection.mjs";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -412,7 +413,7 @@ function effectiveScope(actor, summary, branchId, input = {}, taskId = null, pre
     resourceBindingSnapshotId: input.resourceBindingSnapshotId == null ? null : String(input.resourceBindingSnapshotId),
     selectedCollectionIds: Object.freeze((input.selectedCollectionIds || []).map(String)),
     selectedResourceVersions: Object.freeze((input.selectedResourceVersions || []).map(String)),
-    selectedSkillVersions: Object.freeze((input.selectedSkillVersions || []).map((entry) => Object.freeze({ skillId: String(entry.skillId), version: String(entry.version) }))),
+    selectedSkillIds: Object.freeze(selectedSkillIds(input)),
     capabilities: Object.freeze((input.capabilities || []).map(String)),
     contextEpoch: Number(input.contextEpoch || 0),
   });
@@ -1845,14 +1846,17 @@ export class RemoteTaskLifecycle {
     await this.#synchronizeNativeTurnReceipt(bindingKey, scope.conversationId, scope.branchId);
     const binding = await this.container.taskRuntime.loadBinding(bindingKey);
     const nativeSessionId = binding?.native?.sessionId || binding?.native?.threadId || binding?.state?.sessionId || null;
-    if (!nativeSessionId) return deduplicated;
-    // A package pin proves deployment, not invocation or model compliance.
-    // Keep applicable Skills available for selection in each new turn. Cached
-    // observations avoid rereading their source; deployment reuses the owned
-    // view, while the adapter invokes the selected native Skill explicitly.
-    const skillFragments = deduplicated.filter((entry) => /^skill:(.+)$/.test(String(entry?.knowledge?.key || "")));
+    const installedIds = new Set((binding?.native?.skillPins || []).map((entry) => String(entry.skillId)));
+    const explicitIds = new Set(selectedSkillIds(scope));
+    const skillFragments = deduplicated.filter((entry) => String(entry?.knowledge?.key || "").startsWith("skill:"));
     const contextualFragments = deduplicated.filter((entry) => !skillFragments.includes(entry));
-    const pendingSkills = new Set(skillFragments);
+    // A deployed skill remains in the binding's own directory, including edits
+    // made by its native Agent. Only an explicit composer choice resends it.
+    const pendingSkills = new Set(skillFragments.filter((entry) => {
+      const id = entry.knowledge.key.slice("skill:".length);
+      return explicitIds.has(id) || !installedIds.has(id);
+    }));
+    if (!nativeSessionId) return deduplicated.filter((entry) => !skillFragments.includes(entry) || pendingSkills.has(entry));
     const knowledgeFragments = contextualFragments.filter((entry) => entry?.knowledge?.key && entry?.knowledge?.version);
     const semanticFragments = contextualFragments.filter((entry) => !entry?.knowledge?.key || !entry?.knowledge?.version);
     const acceptedKnowledge = await this.container.contextHub.unacknowledgedKnowledge({
@@ -1894,46 +1898,10 @@ export class RemoteTaskLifecycle {
         : remaining.has(String(entry?.rendered || ""))));
   }
 
-  async filterForcedSkillCatalog({ scope, skills }) {
-    const selectedIds = new Set((scope.selectedSkillVersions || []).map((pin) => String(pin.skillId)));
-    const bindingKey = createAgentBindingKey(scope, scope.agentId);
-    const checks = this.container.forcedSkillChecks ||= new Map();
-    let check = checks.get(scope.conversationId);
-    // Remember the active binding, not every binding ever seen: A -> B -> A
-    // must inspect A again on its next question, even if B had no forced Skills.
-    if (check?.bindingKey !== bindingKey) {
-      check = { bindingKey, checked: false, pending: new Set() };
-      checks.set(scope.conversationId, check);
-      if (checks.size > 256) checks.delete(checks.keys().next().value);
-    }
-    const identity = (skill) => {
-      const version = /^(?:semantic-v1:)?([^:]+):([a-f0-9]{64})$/.exec(String(skill.knowledge?.version || ""));
-      return version ? JSON.stringify([skill.skillId, version[1], version[2]]) : null;
-    };
-    if (!check.checked) {
-      const forced = skills.filter(isForcedWorkSkill);
-      const binding = forced.length ? await this.container.taskRuntime.loadBinding(bindingKey) : null;
-      const installed = new Set((binding?.native?.skillPins || []).map((pin) => JSON.stringify([pin.skillId, pin.version, pin.sha256])));
-      check.pending = new Set(forced.filter((skill) => !identity(skill) || !installed.has(identity(skill))).map(identity));
-      check.checked = true;
-    }
-    // Reuse this decision on consecutive questions. No remote/model check is
-    // needed until the webpage conversation switches its remote binding.
-    return skills.filter((skill) => {
-      if (!isForcedWorkSkill(skill) || selectedIds.has(String(skill.skillId))) return true;
-      return check.pending.has(identity(skill));
-    });
-  }
-
-  settleForcedSkillDelivery(scope, dispatch) {
-    const check = this.container.forcedSkillChecks?.get(scope.conversationId);
-    if (!check || check.bindingKey !== createAgentBindingKey(scope, scope.agentId) || !check.pending.size) return;
-    if (dispatch?.operation === "create" && ["running", "completed"].includes(dispatch.start?.status)) {
-      for (const pin of dispatch.task.skillPins || []) check.pending.delete(JSON.stringify([pin.skillId, pin.version, pin.sha256]));
-    } else {
-      // An interrupted/failed startup is not proof that installation finished.
-      check.checked = false;
-    }
+  async skillCatalogForBinding({ scope, skills }) {
+    const binding = await this.container.taskRuntime.loadBinding(createAgentBindingKey(scope, scope.agentId));
+    const installedIds = new Set((binding?.native?.skillPins || []).map((entry) => String(entry.skillId)));
+    return skills.map((skill) => ({ ...skill, deliveryState: installedIds.has(String(skill.skillId)) ? "delivered" : "pending" }));
   }
 
   async nativeTaskConversationKnowledge(task, conversationId, branchId, { includeAssistant = task?.status === "completed" } = {}) {
@@ -2125,18 +2093,6 @@ export class RemoteTaskLifecycle {
       idempotencyKey,
     }, { commandId: idempotencyKey });
     if (this.extraction.runId) await this.container.webInteractionStore.addTask(this.extraction.runId, taskId);
-    if (created.task.skillPins.length > 0) {
-      const skillSnapshot = await this.container.skills.inspect();
-      await this.container.skills.pinTask({
-        taskId,
-        skills: created.task.skillPins.map((pin) => ({
-          skillId: pin.skillId,
-          version: pin.version,
-          mandatory: true,
-        })),
-        expectedRevision: skillSnapshot.meta.revision,
-      });
-    }
     await this.container.memoryCoordinator.registerTask({
       taskId,
       scope: taskScope,
@@ -2963,22 +2919,6 @@ class WebInteractionService {
     const requestRelevantInstalledSkills = () => {
       requestRelevantInstalledSkillsPromise ||= (async () => {
         if (skipWebAgentModel) return [];
-        await this.container.skills.ensureDiscoveryDescriptions(async ({ name, authorDescription, entrypoint, files, sha256 }) => {
-          const prompt = await this.container.runtime.prompts.skillDiscovery({ name, authorDescription, entrypoint, files });
-          return this.container.runtime.completeAuxiliary({
-            actor: this.container.actor,
-            providerId: input.providerId,
-            modelId: input.modelId,
-            mode: "chat",
-            runId: `skill_discovery_${crypto.createHash("sha256").update(`${sha256}:${input.providerId}:${input.modelId}`).digest("hex").slice(0, 32)}`,
-            system: prompt.system,
-            input: prompt.input,
-            // Reasoning models consume the same output allowance before they
-            // emit the requested sentence. Let the provider finish the reply;
-            // the discovery normalizer still enforces the stored shape.
-            maxOutputTokens: null,
-          });
-        });
         const result = await this.container.skills.listInstalledKnowledge();
         let items = (Array.isArray(result?.items) ? result.items : []).filter((skill) => isSkillApplicableToMode({ skill, mode }));
         if (mode === "work" && scope.serverId) {
@@ -2990,16 +2930,19 @@ class WebInteractionService {
       })();
       return requestRelevantInstalledSkillsPromise;
     };
-    const filterWorkObservations = async (fragments) => {
+    const filterWorkObservations = async (fragments, withDeliveryStatus = false) => {
       if (!Array.isArray(fragments) || !fragments.length) return [];
       if (!taskLifecycle) return fragments;
       const eligibleSkillIds = new Set((await requestRelevantInstalledSkills()).map((entry) => String(entry.skillId)));
       const eligibleFragments = filterEligibleSkillObservations(fragments, eligibleSkillIds);
       if (!eligibleFragments.length) return [];
-      return taskLifecycle.filterHandoff({
-        scope: await resolvedAgentBindingScope(),
-        fragments: eligibleFragments,
-      });
+      const pending = await taskLifecycle.filterHandoff({ scope: await resolvedAgentBindingScope(), fragments: eligibleFragments });
+      if (!withDeliveryStatus) return pending;
+      const identity = (fragment) => fragment?.knowledge?.key && fragment?.knowledge?.version
+        ? `knowledge:${fragment.knowledge.key}\0${fragment.knowledge.version}`
+        : `content:${String(fragment?.rendered || "").trim()}`;
+      const accepted = new Set(pending.map(identity));
+      return eligibleFragments.map((fragment) => accepted.has(identity(fragment)) ? fragment : { ...fragment, deliveryState: "delivered" });
     };
     const priorObservationsPromise = skipWebAgentModel
       ? Promise.resolve([])
@@ -3041,7 +2984,7 @@ class WebInteractionService {
       applicableInstalledSkillCatalogPromise ||= (async () => {
         let items = await requestRelevantInstalledSkills();
         if (taskLifecycle) {
-          items = await taskLifecycle.filterForcedSkillCatalog({ scope: await resolvedAgentBindingScope(), skills: items });
+          items = await taskLifecycle.skillCatalogForBinding({ scope: await resolvedAgentBindingScope(), skills: items });
         }
         return items;
       })();
@@ -3052,8 +2995,15 @@ class WebInteractionService {
       installedSkillCatalogPromise ||= (async () => {
         let items = await applicableInstalledSkillCatalog();
         if (mode === "work") {
-          const pinnedIds = new Set(scope.selectedSkillVersions.map((entry) => entry.skillId));
-          items = items.filter((entry) => !pinnedIds.has(entry.skillId) && !isForcedWorkSkill(entry));
+          const pinnedIds = new Set(selectedSkillIds(scope));
+          items = items.filter((entry) => !pinnedIds.has(entry.skillId) && (!isForcedWorkSkill(entry) || entry.deliveryState === "delivered"));
+        } else {
+          const observedSkills = new Map((await priorObservationsPromise)
+            .filter((fragment) => String(fragment.knowledge?.key || "").startsWith("skill:"))
+            .map((fragment) => [fragment.knowledge.key, fragment.knowledge.version]));
+          items = items.map((entry) => ({ ...entry,
+            readState: observedSkills.get(entry.knowledge.key) === entry.knowledge.version ? "read" : "unread",
+          }));
         }
         return items;
       })();
@@ -3062,13 +3012,12 @@ class WebInteractionService {
     const explicitlySelectedSkillEvidencePromise = mode === "work" && !skipWebAgentModel
       ? (async () => {
           const applicable = await applicableInstalledSkillCatalog();
-          const pins = new Map(scope.selectedSkillVersions.map((entry) => [String(entry.skillId), entry]));
-          const selected = applicable.filter((entry) => pins.has(String(entry.skillId)) || isForcedWorkSkill(entry));
+          const pins = new Set(selectedSkillIds(scope));
+          const selected = applicable.filter((entry) => pins.has(String(entry.skillId)) || (isForcedWorkSkill(entry) && entry.deliveryState !== "delivered"));
           const groups = await Promise.all(selected.map((entry) => this.container.skills.searchContext({
             query: String(target.content || entry.skillId),
             limit: 1,
             selectedSkillIds: [entry.skillId],
-            ...(pins.has(String(entry.skillId)) ? { selectedSkillVersions: [pins.get(String(entry.skillId))] } : {}),
           })));
           const evidence = groups.flat();
           return evidence;
@@ -3132,12 +3081,10 @@ class WebInteractionService {
           const normalizedName = String(name || "").trim().toLocaleLowerCase("zh-CN");
           const skill = installed.find((entry) => String(entry.name || "").trim().toLocaleLowerCase("zh-CN") === normalizedName);
           if (!skill) return { skills: [] };
-          const pinnedVersion = scope.selectedSkillVersions.find((entry) => entry.skillId === skill.skillId) || null;
           const items = await this.container.skills.searchContext({
             query: String(query || name || "").trim(),
             limit: 1,
             selectedSkillIds: [skill.skillId],
-            ...(pinnedVersion ? { selectedSkillVersions: [pinnedVersion] } : {}),
           });
           return { skills: items };
         },
@@ -3211,7 +3158,7 @@ class WebInteractionService {
         })
       : Promise.resolve("");
     const skillCatalogPromise = !skipWebAgentModel
-      ? installedSkillCatalog().then((entries) => this.container.runtime.prompts.skillCatalog(entries))
+      ? installedSkillCatalog().then((entries) => this.container.runtime.prompts.skillCatalog(entries, mode))
       : Promise.resolve("");
     const conversationReferenceCatalogPromise = !skipWebAgentModel && conversationReferences.length
       ? this.container.runtime.prompts.conversationReferenceCatalog(conversationReferences)
@@ -3232,7 +3179,11 @@ class WebInteractionService {
       requestRelevantInstalledSkills(),
     ]);
     const forcedSkillIds = new Set((mode === "work" ? requestRelevantSkills.filter(isForcedWorkSkill) : []).map((skill) => `skill:${skill.skillId}`));
-    const modelObservations = priorObservations.filter((fragment) => !forcedSkillIds.has(String(fragment.knowledge?.key || "")));
+    const currentSkills = new Map(requestRelevantSkills.map((entry) => [entry.knowledge.key, entry.knowledge.version]));
+    const modelObservations = priorObservations.filter((fragment) => {
+      const key = String(fragment.knowledge?.key || "");
+      return !forcedSkillIds.has(key) && (!key.startsWith("skill:") || currentSkills.get(key) === fragment.knowledge?.version);
+    });
     const eligibleSkillIds = new Set(requestRelevantSkills.map((skill) => String(skill.skillId)));
     const initialObservationFragments = [
       ...memoryCatalogFragments,
@@ -3303,7 +3254,7 @@ class WebInteractionService {
         emitStarted: false,
         skipModel: skipWebAgentModel,
         ...(taskLifecycle ? {
-          observationFilter: (fragments) => filterEligibleSkillObservations(fragments, eligibleSkillIds),
+          observationFilter: (fragments) => filterWorkObservations(filterEligibleSkillObservations(fragments, eligibleSkillIds), true),
           handoffFilter: filterWorkObservations,
         } : {}),
       });
@@ -3321,15 +3272,10 @@ class WebInteractionService {
         // The orchestrator starts the same preparation while version, Skill,
         // and context work runs in parallel. AgentRuntimeTransport coalesces it
         // with this early warmup, so dispatch must not wait for it here.
-        const mergedSkillPins = new Map((Array.isArray(agentScope.skillPins) ? agentScope.skillPins : [])
-          .map((pin) => [String(pin.skillId), pin]));
-        const submittedSkills = (result.selectedHandoffFragments || result.handoffFragments || [])
+        const submittedSkills = (result.handoffFragments || [])
           .filter((fragment) => String(fragment?.knowledge?.key || "").startsWith("skill:"));
-        // Cached observations and newly read candidates use the same exact
-        // registry resolution. A tool read in this round is not a receipt.
-        const resolvedPins = submittedSkills.length ? await this.container.skills.resolveKnowledgePins(submittedSkills) : [];
-        for (const pin of resolvedPins) mergedSkillPins.set(pin.skillId, pin);
-        agentScope.skillPins = [...mergedSkillPins.values()];
+        // Resolve selected IDs against the user's installed files at dispatch time.
+        agentScope.skillPins = submittedSkills.length ? await this.container.skills.resolveSkills(submittedSkills) : [];
         const dispatch = await taskLifecycle.dispatch({
           scope: agentScope,
           userMessage: target.content,
@@ -3341,10 +3287,8 @@ class WebInteractionService {
           idempotencyKey: `${input.runId}:handoff`,
           directRemoteTaskId: directRemoteTask?.id || null,
         }).catch((error) => {
-          taskLifecycle.settleForcedSkillDelivery(agentScope, null);
-          throw error;
+            throw error;
         });
-        taskLifecycle.settleForcedSkillDelivery(agentScope, dispatch);
         taskId = dispatch.taskId;
         sentHandoffFragments = [...(dispatch.handoffFragments || [])];
         const deliveredReferences = handoffEventReferences(dispatch.handoffFragments || []);
@@ -4395,7 +4339,6 @@ export class ActorServiceContainer {
       output.skills = eligible.length ? await this.skills.searchContext({
         query,
         limit,
-        selectedSkillVersions: scope.selectedSkillVersions,
         selectedSkillIds: eligible.map((entry) => entry.skillId),
       }) : [];
     }

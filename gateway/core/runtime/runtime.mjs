@@ -682,12 +682,6 @@ export class EasyWorkRuntime {
     router.route("POST", "/api/conversations/:id/context/compact", (request) => request.services.conversationContext.compact(request.params.id));
 
     router.route("GET", "/api/providers/manage", (request) => request.services.providers.inspectUserProviders(request.session.actor));
-    router.route("POST", "/api/skills/:skillId/activate", (request) => request.services.skills.activateVersion({
-      skillId: request.params.skillId,
-      version: requiredObject(request.body, "激活 Skill 版本").version,
-      expectedRevision: expectedRevision(request),
-      commandId: commandId(request),
-    }));
     router.route("GET", "/api/skills/deployments", async (request) => {
       const servers = await request.services.servers.list();
       const connected = servers.filter((entry) => entry.connection.status === "connected" && entry.profile.serverIdentity);

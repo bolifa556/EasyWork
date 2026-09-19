@@ -8,7 +8,10 @@
 - `tasks/`：标题生成等独立模型任务。
 - `resources/`：OCR 的 system/user 指令。
 - `skills/`：由 EasyWork 提供、最终会进入 Agent 原生 Skill 视图的内置 Skill 包。
-- `web/system.md` + `web/system-modes.json`：Chat 与 Work 共用的上下文检索流程；模式配置提供最终去向，并在 Work 当前没有任何可读候选时给出同一流程的空交接呈现。
+- `web/system-chat.md`：Chat 网页 Agent 的完整基础系统提示词，负责按需读取上下文并直接回答用户。
+- `web/system-work.md`：Work 网页 Agent 的完整基础系统提示词，负责筛选并向远端 Agent 交接必要上下文；同时覆盖可检索和当前只允许提交候选的情况。
+- `web/skill-catalog-chat.json`：Chat 的技能目录说明，标记当前对话分支已经读取且内容未变化的技能。
+- `web/skill-catalog.json`：Work 的技能目录说明，标记已发送到当前远端对话的技能。
 - `web/tools.json`：网页 Agent 实际可调用工具的模型说明和输入 Schema。
 - `web/tool-results.json`：工具结果回送模型时使用的文本模板。
 - `context/`：发送给模型的对话角色文本与远端交接布局。

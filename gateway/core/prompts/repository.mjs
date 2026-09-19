@@ -62,13 +62,9 @@ export class PromptRepository {
     return renderPromptTemplate(await this.#read(...segments), variables);
   }
 
-  async system(mode, { onlySubmitAvailable = false } = {}) {
+  async system(mode) {
     invariant(["chat", "work"].includes(mode), "PROMPT_MODE_INVALID", "网页 Agent 模式无效", { status: 400 });
-    const outcomes = await this.#json("web", "system-modes.json");
-    const outcomeNames = ["chat", "work", "workSubmitOnly"];
-    invariant(Object.keys(outcomes).length === outcomeNames.length && outcomeNames.every((key) => typeof outcomes[key] === "string" && outcomes[key].trim()), "PROMPT_MODE_OUTCOME_INVALID", "网页 Agent 模式终点不完整", { status: 500, expose: false });
-    const outcome = mode === "work" && onlySubmitAvailable ? outcomes.workSubmitOnly : outcomes[mode];
-    return (await this.#render(["web", "system.md"], { MODE_OUTCOME: outcome })).trim();
+    return (await this.#read("web", mode === "chat" ? "system-chat.md" : "system-work.md")).trim();
   }
 
   async workRequest(userMessage = "") {
@@ -142,13 +138,16 @@ export class PromptRepository {
     return renderPromptTemplate(config.document, { ITEMS: items.length ? items.join(config.separator) : config.empty }).trim();
   }
 
-  async skillCatalog(entries = []) {
-    const config = await this.#json("web", "skill-catalog.json");
+  async skillCatalog(entries = [], mode = "work") {
+    invariant(["chat", "work"].includes(mode), "PROMPT_MODE_INVALID", "网页 Agent 模式无效", { status: 400 });
+    const config = await this.#json("web", mode === "chat" ? "skill-catalog-chat.json" : "skill-catalog.json");
     invariant(["document", "empty", "item", "separator"].every((key) => typeof config[key] === "string"), "SKILL_CATALOG_PROMPT_INVALID", "Skill 目录 Prompt 不完整", { status: 500, expose: false });
     const inline = (value, maximum) => promptValue(value).replace(/\s+/g, " ").trim().slice(0, maximum);
     const items = (Array.isArray(entries) ? entries : []).map((entry) => renderPromptTemplate(config.item, {
       NAME: inline(entry?.name, 180),
       DESCRIPTION: inline(entry?.discoveryDescription || entry?.description, 500),
+      DELIVERY_STATUS: entry?.deliveryState === "delivered" ? "（已发送到当前远端对话，可直接复用）" : "",
+      READ_STATUS: entry?.readState === "read" ? "（已读取）" : "",
     }));
     return renderPromptTemplate(config.document, { ITEMS: items.length ? items.join(config.separator) : config.empty }).trim();
   }

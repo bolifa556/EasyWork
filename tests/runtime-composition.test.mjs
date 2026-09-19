@@ -116,7 +116,7 @@ test("组合 Gateway 完成注册、严格 bootstrap、项目、流式对话并�
   assert.equal(initial.payload.data.device.id, "runtime-device");
   assert.equal(initial.payload.data.device.firstVisit, true);
   const skills = await requestJson(active.baseUrl, "/api/skills", { token });
-  assert.deepEqual(skills.payload.data, { registries: [], versions: [], taskPins: [] });
+  assert.deepEqual(skills.payload.data, { skills: [] });
   assert.equal(skills.payload.meta.revision, 0);
 
   const project = await requestJson(active.baseUrl, "/api/projects", {

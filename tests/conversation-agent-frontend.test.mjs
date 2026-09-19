@@ -1158,12 +1158,12 @@ test("网页上下文区分模型原生 usage 与明确标注的估算值", asyn
   assert.doesNotMatch(services, /function estimatedTokens\(value\) \{\s*return Math\.max\(0, Math\.ceil\(String\(value \|\| ""\)\.length \/ 4\)\);/);
 });
 
-test("Composer 复用流式资源上传，Chat 与 Work 共用文件概览，并保留精确 Skill pins", async () => {
+test("Composer 复用流式资源上传，Chat 与 Work 共用文件概览，技能选择只传技能 ID", async () => {
   const [view, resources, services] = await Promise.all([readFile(viewPath, "utf8"), readFile(resourcesPath, "utf8"), readFile(servicesPath, "utf8")]);
   assert.match(view, /uploadResource\(api, file/);
   assert.doesNotMatch(view, /contentBase64|FileReader/);
   assert.match(resources, /\/api\/collections/);
-  assert.match(resources, /\/api\/skills/);
+  assert.match(resources, /\/api\/skill-center\/installed/);
   assert.match(view, /scope\.selectedCollectionIds/);
   assert.match(view, /scope\.selectedResourceVersions/);
   assert.match(services, /project\?\.collectionIds/);
@@ -1174,9 +1174,10 @@ test("Composer 复用流式资源上传，Chat 与 Work 共用文件概览，并
   assert.match(services, /const resourceCatalogPromise = !skipWebAgentModel[\s\S]+?prompts\.resourceCatalog/);
   assert.doesNotMatch(services, /const resourceCatalogPromise = mode === "work"/);
   assert.doesNotMatch(services, /initialToolChoice:\s*forceResourceSearch/);
-  assert.match(view, /scope\.skillPins/);
-  assert.match(services, /this\.container\.skills\.pinTask/);
-  assert.match(services, /created\.task\.skillPins/);
+  assert.match(view, /scope\.selectedSkillIds/);
+  assert.doesNotMatch(resources, /activeVersionId|SelectedSkillPin/);
+  assert.match(services, /this\.container\.skills\.resolveSkills/);
+  assert.doesNotMatch(services, /this\.container\.skills\.pinTask/);
 });
 
 test("新建远端会话未附加普通上下文时仍展示原生部署的 Skill", async () => {

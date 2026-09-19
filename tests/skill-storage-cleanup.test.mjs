@@ -99,32 +99,25 @@ test("清理已删除、旧版及未完成包；待审核、被拒绝和有效�
   assert.equal((await market.cleanupStorage()).removedPackages.length, 0);
 });
 
-test("个人清理只保留当前包，移除旧任务索引但保留其他账户及当前附件", async (t) => {
+test("个人清理移除无引用包，保留当前附件和其他账户", async (t) => {
   const { dataRoot } = await fixture(t);
-  const owner = actor("owner"), other = actor("other");
+  const owner = actor("owner");
+  const other = actor("other");
   const skills = new SkillService({ dataRoot, actor: owner, authorizeTask: async () => true });
   const otherSkills = new SkillService({ dataRoot, actor: other, authorizeTask: async () => true });
-  const input = { skillId: "skill-one", version: "1", expectedRevision: 0, manifest: { name: "技能", description: "", entrypoint: "SKILL.md", permissions: [] }, files: upload().files };
-  const first = await skills.uploadVersion(input);
-  await otherSkills.uploadVersion(input);
-  const otherBefore = await otherSkills.getInstalledDetail(input.skillId);
-  const pin = await skills.pinTask({ taskId: "task-one", skills: [{ skillId: input.skillId }], expectedRevision: first.revision });
-  const second = await skills.uploadVersion({ ...input, version: "2", expectedRevision: pin.revision });
-  const root = path.join(actorDataRoot(dataRoot, owner), "skills");
-  await fs.mkdir(path.join(root, "packages/skill-orphan/unfinished"), { recursive: true });
-  const plan = await cleanupSkillStorage({ dataRoot });
-  const ownPlan = plan.scopes.find((entry) => entry.scope === "users/owner");
-  assert.equal(ownPlan.removedPackages.length, 2);
-  assert.equal((await skills.inspect()).data.versions.length, 2);
-  await cleanupSkillStorage({ dataRoot, dryRun: false });
-  const remaining = await skills.inspect();
-  assert.deepEqual(remaining.data.versions, [second.version]);
-  assert.equal(remaining.data.taskPins.length, 0);
-  assert.deepEqual(await fs.readdir(path.join(root, "packages/skill-one")), ["2"]);
-  assert.deepEqual(await otherSkills.getInstalledDetail(input.skillId), otherBefore);
-  assert.match((await skills.getInstalledDetail(input.skillId)).files.find((file) => file.path === "references/guide.md").content, /原始附件/);
+  const input = { skillId: "skill-one", manifest: { name: "技能", description: "", entrypoint: "SKILL.md", permissions: [] }, files: upload().files };
+  const installed = await skills.installPackage(input);
+  await otherSkills.installPackage(input);
+  const obsolete = path.join(actorDataRoot(dataRoot, owner), "skills/packages/skill-one/obsolete");
+  await fs.mkdir(obsolete, { recursive: true });
+  await fs.writeFile(path.join(obsolete, "old"), "obsolete");
+  assert.deepEqual((await skills.cleanupStorage()).removedPackages, ["packages/skill-one/obsolete"]);
+  await fs.access(obsolete);
+  await skills.cleanupStorage({ dryRun: false });
+  await assert.rejects(() => fs.access(obsolete), { code: "ENOENT" });
+  assert.deepEqual((await skills.inspect()).data.skills, [installed.skill]);
+  assert.equal((await otherSkills.listInstalled()).items.length, 1);
 });
-
 test("清理前校验所有保留包，损坏时不删除任何账户的数据", async (t) => {
   const { dataRoot, state, publish } = await fixture(t);
   await publish("有效");
@@ -133,7 +126,7 @@ test("清理前校验所有保留包，损坏时不删除任何账户的数据",
   const owner = actor("corrupt-owner");
   const skills = new SkillService({ dataRoot, actor: owner, authorizeTask: async () => false });
   const installed = await skills.createInstalled({ ...upload("个人"), commandId: "personal" });
-  const file = path.join(actorDataRoot(dataRoot, owner), path.dirname(installed.version.packagePath), "files/SKILL.md");
+  const file = path.join(actorDataRoot(dataRoot, owner), path.dirname(installed.skill.packagePath), "files/SKILL.md");
   await fs.writeFile(file, "damaged");
   const before = await fs.readFile(state, "utf8");
   await assert.rejects(() => cleanupSkillStorage({ dataRoot, dryRun: false }), { code: "SKILL_PACKAGE_FILE_CORRUPT" });

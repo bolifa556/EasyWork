@@ -5,16 +5,7 @@ import path from "node:path";
 
 import { requireAuthenticatedActor } from "../actor.mjs";
 import { invariant } from "../errors.mjs";
-import {
-  activateSkillVersion,
-  createSkillRegistry,
-  createSkillVersion,
-  createTaskSkillPin,
-  registerSkillVersion,
-  validateSkillRegistry,
-  validateSkillVersion,
-  validateTaskSkillPin,
-} from "../entities/skill.mjs";
+import { createInstalledSkill, validateInstalledSkill } from "../entities/skill.mjs";
 import { revisedHeader } from "../entities/common.mjs";
 import { ActorMutationQueue } from "../mutation-queue.mjs";
 import { assertActorOwnedPath, resolveActorPath } from "../paths.mjs";
@@ -39,42 +30,11 @@ function clone(value) {
 }
 
 function defaultStore() {
-  return { registries: [], versions: [], taskPins: [] };
+  return { skills: [] };
 }
 
 function defaultApplicabilityStore(actorId) {
   return { actorId, items: [] };
-}
-
-function defaultDiscoveryStore(actorId) {
-  return { actorId, items: [] };
-}
-
-function validateDiscoveryStore(store, actorId) {
-  if (!store || typeof store !== "object" || Array.isArray(store) || store.actorId !== actorId || !Array.isArray(store.items)) return false;
-  if (Object.keys(store).length !== 2) return false;
-  const seen = new Set();
-  return store.items.every((entry) => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.keys(entry).length !== 5) return false;
-    const key = `${entry.skillId}\0${entry.version}\0${entry.sha256}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return typeof entry.skillId === "string" && SAFE_SEGMENT_PATTERN.test(entry.skillId)
-      && typeof entry.version === "string" && SAFE_SEGMENT_PATTERN.test(entry.version)
-      && typeof entry.sha256 === "string" && /^[a-f0-9]{64}$/u.test(entry.sha256)
-      && typeof entry.description === "string" && entry.description.trim().length > 0 && entry.description.length <= 600
-      && Number.isFinite(Date.parse(entry.updatedAt));
-  });
-}
-
-function normalizeDiscoveryDescription(value) {
-  const result = String(value || "")
-    .replace(/^```[^\n]*\n?/u, "")
-    .replace(/\n?```$/u, "")
-    .replace(/\s+/gu, " ")
-    .trim();
-  invariant(result.length > 0, "SKILL_DISCOVERY_DESCRIPTION_EMPTY", "Skill 发现简介模型没有返回有效内容", { status: 502, retryable: true });
-  return result.slice(0, 600);
 }
 
 function validateApplicabilityStore(store, actorId) {
@@ -167,7 +127,7 @@ function normalizeFiles(files, limits) {
   return normalized.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function hashPackage(skillId, version, manifest, files) {
+function hashPackage(skillId, manifest, files) {
   const hash = crypto.createHash("sha256");
   const feed = (value) => {
     const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
@@ -175,7 +135,6 @@ function hashPackage(skillId, version, manifest, files) {
     hash.update(buffer);
   };
   feed(skillId);
-  feed(version);
   feed(JSON.stringify(manifest));
   for (const file of files) {
     feed(file.path);
@@ -184,15 +143,14 @@ function hashPackage(skillId, version, manifest, files) {
   return hash.digest("hex");
 }
 
-function packageRelativeRoot(skillId, version) {
-  return `skills/packages/${skillId}/${version}`;
+function packageRelativeRoot(skillId) {
+  return `skills/packages/${skillId}/.installed`;
 }
 
-function packageDescriptor(skillId, version, sha256, manifest, files) {
+function packageDescriptor(skillId, sha256, manifest, files) {
   return {
     schemaVersion: PACKAGE_SCHEMA_VERSION,
     skillId,
-    version,
     sha256,
     manifest: clone(manifest),
     files: files.map((file) => ({
@@ -220,59 +178,20 @@ function skillSearchScore(text, terms) {
 
 function assertStore(store, actorId) {
   invariant(store && typeof store === "object" && !Array.isArray(store), "SKILL_STORE_INVALID", "Skill 索引无效", { status: 500, expose: false });
-  invariant(Object.keys(store).length === 3 && ["registries", "versions", "taskPins"].every((key) => Array.isArray(store[key])), "SKILL_STORE_INVALID", "Skill 索引结构无效", {
-    status: 500,
-    expose: false,
-  });
-  const allIds = new Set();
-  for (const version of store.versions) {
-    validateSkillVersion(version);
-    invariant(version.actorId === actorId, "SKILL_ACTOR_MISMATCH", "SkillVersion 不属于当前 Actor", { status: 403 });
-    invariant(!allIds.has(version.id), "SKILL_ENTITY_ID_DUPLICATE", "Skill 实体 ID 重复", { status: 500, expose: false });
-    allIds.add(version.id);
+  // Read-only compatibility boundary for installations created before the flat catalog.
+  if (Array.isArray(store.registries) && Array.isArray(store.versions) && Array.isArray(store.taskPins)) {
+    invariant([...store.registries, ...store.versions, ...store.taskPins].every((entry) => entry.actorId === actorId), "SKILL_ACTOR_MISMATCH", "技能不属于当前用户", { status: 403 });
+    return true;
   }
-  const versionIds = new Set(store.versions.map((entry) => entry.id));
-  const versionKeys = store.versions.map((entry) => `${entry.skillId}:${entry.version}`);
-  invariant(new Set(versionKeys).size === versionKeys.length, "SKILL_VERSION_DUPLICATE", "相同 Skill 版本不能重复", { status: 500, expose: false });
-  for (const registry of store.registries) {
-    validateSkillRegistry(registry);
-    invariant(registry.actorId === actorId, "SKILL_ACTOR_MISMATCH", "SkillRegistry 不属于当前 Actor", { status: 403 });
-    invariant(registry.versions.every((entry) => {
-      if (!versionIds.has(entry.skillVersionId)) return false;
-      const version = store.versions.find((candidate) => candidate.id === entry.skillVersionId);
-      return version.skillId === registry.skillId && version.version === entry.version && version.sha256 === entry.sha256;
-    }), "SKILL_REGISTRY_VERSION_MISSING", "Skill Registry 引用了不存在或不匹配的版本", { status: 500, expose: false });
-    invariant(!allIds.has(registry.id), "SKILL_ENTITY_ID_DUPLICATE", "Skill 实体 ID 重复", { status: 500, expose: false });
-    allIds.add(registry.id);
+  invariant(Object.keys(store).length === 1 && Array.isArray(store.skills), "SKILL_STORE_INVALID", "Skill 索引结构无效", { status: 500, expose: false });
+  const ids = new Set();
+  for (const skill of store.skills) {
+    validateInstalledSkill(skill);
+    invariant(skill.actorId === actorId, "SKILL_ACTOR_MISMATCH", "技能不属于当前用户", { status: 403 });
+    invariant(!ids.has(skill.skillId), "SKILL_DUPLICATE", "同一技能只能安装一份", { status: 500, expose: false });
+    ids.add(skill.skillId);
   }
-  for (const pin of store.taskPins) {
-    validateTaskSkillPin(pin);
-    invariant(pin.actorId === actorId, "SKILL_ACTOR_MISMATCH", "TaskSkillPin 不属于当前 Actor", { status: 403 });
-    const version = store.versions.find((entry) => entry.id === pin.skillVersionId);
-    invariant(version && version.skillId === pin.skillId && version.version === pin.version && version.sha256 === pin.sha256, "SKILL_PIN_VERSION_MISMATCH", "TaskSkillPin 与版本不一致", {
-      status: 500,
-      expose: false,
-    });
-    invariant(!allIds.has(pin.id), "SKILL_ENTITY_ID_DUPLICATE", "Skill 实体 ID 重复", { status: 500, expose: false });
-    allIds.add(pin.id);
-  }
-  const registrySkillIds = store.registries.map((entry) => entry.skillId);
-  invariant(new Set(registrySkillIds).size === registrySkillIds.length, "SKILL_REGISTRY_DUPLICATE", "同一 Skill 只能有一个 Registry", { status: 500, expose: false });
-  const pinKeys = store.taskPins.map((entry) => `${entry.taskId}:${entry.skillId}`);
-  invariant(new Set(pinKeys).size === pinKeys.length, "SKILL_TASK_PIN_DUPLICATE", "同一 Task 不能重复固定 Skill", { status: 500, expose: false });
   return true;
-}
-
-function removeVersionFromRegistry(registry, skillVersionId, options) {
-  const versions = registry.versions.filter((entry) => entry.skillVersionId !== skillVersionId);
-  const next = {
-    ...clone(registry),
-    ...revisedHeader(registry, options.expectedRevision, options),
-    versions,
-    activeVersionId: registry.activeVersionId === skillVersionId ? null : registry.activeVersionId,
-  };
-  validateSkillRegistry(next);
-  return next;
 }
 
 async function readCommittedPackage(fileSystem, finalRoot) {
@@ -288,7 +207,6 @@ function assertReusablePackage(existing, descriptor) {
   invariant(
     existing?.schemaVersion === descriptor.schemaVersion
       && existing.skillId === descriptor.skillId
-      && existing.version === descriptor.version
       && existing.sha256 === descriptor.sha256,
     "SKILL_PACKAGE_PATH_CONFLICT",
     "Skill 包目录已被不同内容占用",
@@ -320,7 +238,7 @@ async function writePackageDirectory(finalRoot, descriptor, files, options = {})
     await fileSystem.writeFile(path.join(staging, "package.json"), `${JSON.stringify(descriptor, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     // Windows indexers and sync clients can briefly hold a freshly-written
     // directory open.  Keep the commit atomic, but tolerate that transient
-    // lock instead of exposing a half-created Skill version to the registry.
+    // lock instead of exposing a half-created Skill package to the registry.
     let renamed = false;
     for (let attempt = 0; attempt < 8; attempt += 1) {
       try {
@@ -339,7 +257,7 @@ async function writePackageDirectory(finalRoot, descriptor, files, options = {})
       // an indexer inspects freshly-created files.  Materialise into the final
       // directory with the descriptor copied last; the registry is still the
       // sole visibility boundary, so an interrupted copy is never exposed as
-      // an installed version and is removed by the retry path above.
+      // an installed package and is removed by the retry path above.
       let ownsFinalRoot = false;
       try {
         // Claim the final directory itself rather than recursively merging
@@ -374,15 +292,14 @@ async function writePackageDirectory(finalRoot, descriptor, files, options = {})
   }
 }
 
-function remoteRoot(skillId, version) {
-  return `~/.easywork/skills/${skillId}/${version}`;
+function remoteRoot(skillId) {
+  return `~/.easywork/skills/${skillId}`;
 }
 
 export class SkillService {
   #repository;
   #applicabilityRepository;
   #deploymentRepository;
-  #discoveryRepository;
 
   constructor(options) {
     invariant(options?.actor?.actorId, "ACTOR_CONTEXT_REQUIRED", "SkillService 需要 ActorContext", { status: 500, expose: false });
@@ -430,15 +347,6 @@ export class SkillService {
         && store.items.every((entry) => entry && Object.keys(entry).length === 2
           && ["marketSkillId", "deploymentId"].every((field) => typeof entry[field] === "string" && SAFE_SEGMENT_PATTERN.test(entry[field]))),
     });
-    this.#discoveryRepository = new AtomicJsonRepository({
-      dataRoot: this.dataRoot,
-      actor: this.actor,
-      relativePath: "skills/discovery.json",
-      schemaVersion: 1,
-      defaultData: () => defaultDiscoveryStore(this.actor.actorId),
-      validate: (store) => validateDiscoveryStore(store, this.actor.actorId),
-      queue: inlineRepositoryQueue,
-    });
   }
 
   async #applicabilityBySkill() {
@@ -454,22 +362,46 @@ export class SkillService {
     return assertActorOwnedPath(this.dataRoot, this.actor, resolveActorPath(this.dataRoot, this.actor, relativePath));
   }
 
-  async #mutate(operation) {
+  async #readStore() {
     return this.mutationQueue.run(this.actor, async () => {
       await recoverSkillPackageEdit(this.#actorPath("skills"), (relativeRoot) => this.#expectedPackageHash(relativeRoot));
-      return operation();
+      const snapshot = await this.#repository.read();
+      if (Array.isArray(snapshot.data.skills)) return snapshot;
+      const skills = [];
+      for (const registry of snapshot.data.registries) {
+        const legacy = snapshot.data.versions.find((entry) => entry.id === registry.activeVersionId);
+        if (!legacy) continue;
+        const verified = await this.#loadVerifiedPackage(legacy, { legacy: true });
+        const manifest = normalizeManifest({ ...legacy.manifest, name: registry.displayName, description: registry.description });
+        const files = verified.files.map((entry) => ({ path: entry.relativePath, content: entry.content }));
+        const sha256 = hashPackage(legacy.skillId, manifest, files);
+        const relativeRoot = packageRelativeRoot(legacy.skillId);
+        await writePackageDirectory(this.#actorPath(relativeRoot), packageDescriptor(legacy.skillId, sha256, manifest, files), files,
+          { fileSystem: this.packageFileSystem, sleep: this.packageCommitSleep });
+        skills.push({ ...createInstalledSkill({ id: registry.id, actorId: this.actor.actorId, skillId: legacy.skillId,
+          sha256, packagePath: relativeRoot + "/package.json", manifest }, { clock: this.clock }),
+          createdAt: registry.createdAt, updatedAt: registry.updatedAt, installedAt: legacy.installedAt });
+      }
+      const migrated = await this.#repository.replace({ skills }, { expectedRevision: snapshot.revision, clock: this.clock });
+      await this.#collectPackages(migrated.data);
+      return migrated;
     });
+  }
+
+  async #mutate(operation) {
+    return this.mutationQueue.run(this.actor, operation);
   }
 
   async #expectedPackageHash(relativeRoot) {
     const snapshot = await this.#repository.read();
-    return snapshot.data.versions.find((entry) => entry.packagePath === `skills/${relativeRoot}/package.json`)?.sha256 || null;
+    const entries = snapshot.data.skills || snapshot.data.versions;
+    return entries.find((entry) => entry.packagePath === "skills/" + relativeRoot + "/package.json")?.sha256 || null;
   }
 
   async #collectPackages(store, dryRun = false) {
     const root = this.#actorPath("skills");
     const packages = await skillStoragePath(root, "packages");
-    const referenced = new Set(store.versions.map((entry) => path.posix.dirname(entry.packagePath).slice("skills/".length)));
+    const referenced = new Set(store.skills.map((entry) => path.posix.dirname(entry.packagePath).slice("skills/".length)));
     const directories = await fs.readdir(packages, { withFileTypes: true }).catch((error) => {
       if (error.code === "ENOENT") return [];
       throw error;
@@ -480,8 +412,8 @@ export class SkillService {
       const directory = await skillStoragePath(root, relativeRoot);
       if (![...referenced].some((value) => value.startsWith(`${relativeRoot}/`))) obsolete.push(relativeRoot);
       else if (entry.isDirectory()) {
-        for (const version of await fs.readdir(directory, { withFileTypes: true })) {
-          const candidate = `${relativeRoot}/${version.name}`;
+        for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+          const candidate = `${relativeRoot}/${entry.name}`;
           if (!referenced.has(candidate)) obsolete.push(candidate);
         }
       }
@@ -495,38 +427,32 @@ export class SkillService {
 
   async cleanupStorage({ dryRun = true } = {}) {
     return this.#mutate(async () => {
-      const snapshot = await this.#repository.read();
-      const active = new Set(snapshot.data.registries.map((entry) => entry.activeVersionId));
-      const draft = clone(snapshot.data);
-      const removedVersions = draft.versions.filter((entry) => !active.has(entry.id));
-      draft.versions = draft.versions.filter((entry) => active.has(entry.id));
-      draft.taskPins = draft.taskPins.filter((entry) => active.has(entry.skillVersionId));
-      for (const registry of draft.registries) registry.versions = registry.versions.filter((entry) => active.has(entry.skillVersionId));
-      draft.registries = draft.registries.filter((entry) => entry.versions.length > 0);
+      // A preview must not migrate the index, recover transactions or delete packages.
+      const snapshot = dryRun ? await this.#repository.read() : await this.#readStore();
+      const legacy = !Array.isArray(snapshot.data.skills);
+      const skills = legacy ? snapshot.data.registries.flatMap((registry) => {
+        const skill = snapshot.data.versions.find((entry) => entry.id === registry.activeVersionId);
+        return skill ? [skill] : [];
+      }) : snapshot.data.skills;
+      const skillIds = new Set(skills.map((entry) => entry.skillId));
       const applicability = await this.#applicabilityRepository.read();
-      const skillIds = new Set(draft.registries.map((entry) => entry.skillId));
       const removedApplicability = applicability.data.items.filter((entry) => !skillIds.has(entry.skillId)).map((entry) => entry.skillId);
-      const sourceRepairs = [];
-      for (const version of draft.versions) {
-        const verified = await this.#loadVerifiedPackage(version);
+      const repairs = [];
+      for (const skill of skills) {
+        const verified = await this.#loadVerifiedPackage(skill, { legacy });
         const files = verified.files.map((file) => ({ path: file.relativePath, content: file.content }));
-        const restored = restoreOriginalSkillFiles({ skillId: version.skillId, ...version.manifest, files });
-        if (restored.length < files.length) sourceRepairs.push({ version, files: restored });
+        const restored = restoreOriginalSkillFiles({ skillId: skill.skillId, ...skill.manifest, files });
+        if (restored.length < files.length) repairs.push({ skill, files: restored });
       }
-      const removedPackages = await this.#collectPackages(draft, true);
+      const removedPackages = await this.#collectPackages({ skills }, dryRun);
       if (!dryRun) {
-        if (JSON.stringify(draft) !== JSON.stringify(snapshot.data)) await this.#repository.update(() => draft, { expectedRevision: snapshot.revision, clock: this.clock });
-        await this.#collectPackages(draft);
         if (removedApplicability.length) await this.#applicabilityRepository.update((store) => {
           store.items = store.items.filter((entry) => skillIds.has(entry.skillId));
         }, { expectedRevision: applicability.revision, clock: this.clock });
-        for (const { version, files } of sourceRepairs) {
-          const current = await this.#repository.read();
-          const registry = current.data.registries.find((entry) => entry.skillId === version.skillId);
-          await this.#saveInstalledPackage(current, registry, version, version.manifest, normalizeFiles(files, this));
-        }
+        for (const { skill, files } of repairs) await this.#saveInstalledPackage(await this.#readStore(), skill, skill.manifest, normalizeFiles(files, this));
       }
-      return { dryRun, removedPackages, retainedPackages: draft.versions.map((entry) => entry.packagePath), removedVersions: removedVersions.map(({ skillId, version }) => ({ skillId, version })), removedApplicability, restoredSources: sourceRepairs.map(({ version }) => ({ skillId: version.skillId, path: version.manifest.entrypoint })) };
+      return { dryRun, removedPackages, retainedPackages: skills.map((entry) => entry.packagePath), removedApplicability,
+        restoredSources: repairs.map(({ skill }) => ({ skillId: skill.skillId, path: skill.manifest.entrypoint })) };
     });
   }
 
@@ -537,122 +463,29 @@ export class SkillService {
   }
 
   async inspect() {
-    return this.#repository.read();
+    return this.#readStore();
   }
 
   async listInstalled() {
-    const [snapshot, applicability] = await Promise.all([this.#repository.read(), this.#applicabilityBySkill()]);
-    return {
-      revision: snapshot.revision,
-      items: snapshot.data.registries
-        .map((registry) => ({
-          id: registry.id,
-          skillId: registry.skillId,
-          version: snapshot.data.versions.find((version) => version.id === registry.activeVersionId)?.version || null,
-          name: registry.displayName,
-          description: registry.description,
-          updatedAt: registry.updatedAt,
-          revision: snapshot.revision,
-          applicability: applicability.get(registry.skillId) || clone(DEFAULT_SKILL_APPLICABILITY),
-        }))
-        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
-    };
-  }
-
-  async ensureDiscoveryDescriptions(generator) {
-    invariant(typeof generator === "function", "SKILL_DISCOVERY_GENERATOR_REQUIRED", "Skill 发现简介需要可用模型", { status: 503 });
-    const [currentInstalled, currentDiscovery] = await Promise.all([this.#repository.read(), this.#discoveryRepository.read()]);
-    const activeKeys = currentInstalled.data.registries.flatMap((registry) => {
-      const version = currentInstalled.data.versions.find((entry) => entry.id === registry.activeVersionId);
-      return version ? [`${registry.skillId}\0${version.version}\0${version.sha256}`] : [];
-    }).sort();
-    const discoveryKeys = currentDiscovery.data.items.map((entry) => `${entry.skillId}\0${entry.version}\0${entry.sha256}`).sort();
-    if (activeKeys.length === discoveryKeys.length && activeKeys.every((entry, index) => entry === discoveryKeys[index])) {
-      return { generated: 0 };
-    }
-    return this.#mutate(async () => {
-      const [installed, discovery] = await Promise.all([this.#repository.read(), this.#discoveryRepository.read()]);
-      const active = installed.data.registries.flatMap((registry) => {
-        const version = installed.data.versions.find((entry) => entry.id === registry.activeVersionId);
-        return version ? [{ registry, version }] : [];
-      });
-      const cached = new Map(discovery.data.items.map((entry) => [`${entry.skillId}\0${entry.version}\0${entry.sha256}`, entry]));
-      const generated = await Promise.all(active.map(async ({ registry, version }) => {
-        const key = `${registry.skillId}\0${version.version}\0${version.sha256}`;
-        if (cached.has(key)) return cached.get(key);
-        const verified = await this.#loadVerifiedPackage(version);
-        let remaining = MAX_SKILL_SEARCH_TOTAL_BYTES;
-        const files = [];
-        const ordered = [...verified.files].sort((left, right) => {
-          const leftPrimary = left.relativePath === version.manifest.entrypoint || left.relativePath === "SKILL.md" ? 0 : 1;
-          const rightPrimary = right.relativePath === version.manifest.entrypoint || right.relativePath === "SKILL.md" ? 0 : 1;
-          return leftPrimary - rightPrimary || left.relativePath.localeCompare(right.relativePath);
-        });
-        for (const file of ordered) {
-          if (remaining <= 0 || file.content.includes(0)) continue;
-          const bytes = file.content.subarray(0, Math.min(file.content.length, MAX_SKILL_SEARCH_FILE_BYTES, remaining));
-          if (!bytes.length) continue;
-          files.push({ path: file.relativePath, content: bytes.toString("utf8") });
-          remaining -= bytes.length;
-        }
-        const description = normalizeDiscoveryDescription(await generator({
-          skillId: registry.skillId,
-          name: registry.displayName,
-          authorDescription: registry.description,
-          version: version.version,
-          sha256: version.sha256,
-          entrypoint: version.manifest.entrypoint,
-          files,
-        }));
-        return {
-          skillId: registry.skillId,
-          version: version.version,
-          sha256: version.sha256,
-          description,
-          updatedAt: this.clock().toISOString(),
-        };
-      }));
-      const nextDiscovery = { actorId: this.actor.actorId, items: generated };
-      if (JSON.stringify(nextDiscovery) !== JSON.stringify(discovery.data)) {
-        await this.#discoveryRepository.replace(nextDiscovery, {
-          expectedRevision: discovery.revision,
-          clock: this.clock,
-        });
-      }
-      return { generated: generated.filter((entry) => !cached.has(`${entry.skillId}\0${entry.version}\0${entry.sha256}`)).length };
-    });
+    const [snapshot, applicability] = await Promise.all([this.#readStore(), this.#applicabilityBySkill()]);
+    return { revision: snapshot.revision, items: snapshot.data.skills.map((skill) => ({
+      id: skill.id, skillId: skill.skillId, name: skill.manifest.name, description: skill.manifest.description,
+      updatedAt: skill.updatedAt, revision: snapshot.revision,
+      applicability: applicability.get(skill.skillId) || clone(DEFAULT_SKILL_APPLICABILITY),
+    })).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)) };
   }
 
   async listInstalledKnowledge() {
-    const [snapshot, applicability, discovery] = await Promise.all([
-      this.#repository.read(),
-      this.#applicabilityBySkill(),
-      this.#discoveryRepository.read(),
-    ]);
-    const discoveryByVersion = new Map(discovery.data.items.map((entry) => [`${entry.skillId}\0${entry.version}\0${entry.sha256}`, entry.description]));
-    return {
-      revision: snapshot.revision,
-      items: snapshot.data.registries
-        .flatMap((registry) => {
-          const version = snapshot.data.versions.find((entry) => entry.id === registry.activeVersionId);
-          if (!version) return [];
-          return [{
-            id: registry.id,
-            skillId: registry.skillId,
-            name: registry.displayName,
-            description: registry.description,
-            discoveryDescription: discoveryByVersion.get(`${registry.skillId}\0${version.version}\0${version.sha256}`) || "",
-            updatedAt: registry.updatedAt,
-            revision: snapshot.revision,
-            applicability: applicability.get(registry.skillId) || clone(DEFAULT_SKILL_APPLICABILITY),
-            knowledge: {
-              key: `skill:${registry.skillId}`,
-              version: `semantic-v1:${version.version}:${version.sha256}`,
-            },
-          }];
-        })
-        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
-    };
+    // The installed package already carries the uploaded/market description.
+    // Reuse it for discovery instead of creating a second per-user summary.
+    return this.#mutate(async () => {
+      const installed = await this.listInstalled();
+      const snapshot = await this.#readStore();
+      const skills = new Map(snapshot.data.skills.map((skill) => [skill.skillId, skill]));
+      return { ...installed, items: installed.items.map((entry) => ({ ...entry,
+        knowledge: { key: "skill:" + entry.skillId, version: skills.get(entry.skillId).sha256 },
+      })) };
+    });
   }
 
   async getInstalledDetail(skillIdInput) {
@@ -661,12 +494,10 @@ export class SkillService {
 
   async #getInstalledDetail(skillIdInput) {
     const skillId = assertSegment(String(skillIdInput || ""), "skillId");
-    const [snapshot, applicability] = await Promise.all([this.#repository.read(), this.#applicabilityBySkill()]);
-    const registry = snapshot.data.registries.find((entry) => entry.skillId === skillId);
+    const [snapshot, applicability] = await Promise.all([this.#readStore(), this.#applicabilityBySkill()]);
+    const registry = snapshot.data.skills.find((entry) => entry.skillId === skillId);
     invariant(registry, "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
-    const version = snapshot.data.versions.find((entry) => entry.id === registry.activeVersionId);
-    invariant(version, "SKILL_ACTIVE_VERSION_REQUIRED", "技能没有可用内容", { status: 409 });
-    const verified = await this.#loadVerifiedPackage(version);
+    const verified = await this.#loadVerifiedPackage(registry);
     let remainingBytes = MAX_SKILL_SEARCH_TOTAL_BYTES;
     const files = verified.files.map((file) => {
       const binary = file.content.includes(0);
@@ -685,13 +516,13 @@ export class SkillService {
     return {
       id: registry.id,
       skillId: registry.skillId,
-      name: registry.displayName,
-      description: registry.description,
+      name: registry.manifest.name,
+      description: registry.manifest.description,
       updatedAt: registry.updatedAt,
       revision: snapshot.revision,
       applicability: applicability.get(registry.skillId) || clone(DEFAULT_SKILL_APPLICABILITY),
-      entrypoint: version.manifest.entrypoint,
-      primaryFile: version.manifest.entrypoint,
+      entrypoint: registry.manifest.entrypoint,
+      primaryFile: registry.manifest.entrypoint,
       files,
     };
   }
@@ -707,7 +538,6 @@ export class SkillService {
       || files[0].path;
     return this.installPackage({
       skillId,
-      version: "1",
       manifest: {
         name: typeof input?.name === "string" ? input.name.trim() : input?.name,
         description: typeof input?.description === "string" ? input.description.trim() : input?.description ?? "",
@@ -715,7 +545,7 @@ export class SkillService {
         permissions: [],
       },
       files,
-    });
+    }, { createOnly: true });
   }
 
   async updateInstalled(skillIdInput, input) {
@@ -725,57 +555,45 @@ export class SkillService {
   async #updateInstalled(skillIdInput, input) {
     requireAuthenticatedActor(this.actor);
     const skillId = assertSegment(String(skillIdInput || ""), "skillId");
-    const snapshot = await this.#repository.read();
-    const registry = snapshot.data.registries.find((entry) => entry.skillId === skillId);
+    const snapshot = await this.#readStore();
+    const registry = snapshot.data.skills.find((entry) => entry.skillId === skillId);
     invariant(registry, "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
     assertExpectedRevision(snapshot.revision, input?.expectedRevision);
-    const activeVersion = snapshot.data.versions.find((entry) => entry.id === registry.activeVersionId);
-    invariant(activeVersion, "SKILL_ACTIVE_VERSION_REQUIRED", "技能没有可用内容", { status: 409 });
-    const verified = await this.#loadVerifiedPackage(activeVersion);
+    const skill = registry;
+    const verified = await this.#loadVerifiedPackage(skill);
     const updates = input?.fileUpdates === undefined ? [] : normalizeFiles(input.fileUpdates, this);
     invariant(updates.every((file) => /\.md$/i.test(file.path) && !file.content.includes(0)), "SKILL_MARKDOWN_UPDATE_INVALID", "只能编辑文本 Markdown 文件", { status: 400 });
     const existingPaths = new Set(verified.files.map((file) => file.relativePath));
     invariant(updates.every((file) => existingPaths.has(file.path)), "SKILL_MARKDOWN_UPDATE_NOT_FOUND", "要编辑的 Markdown 文件不存在", { status: 404 });
     const updateMap = new Map(updates.map((file) => [file.path, file.content]));
     const manifest = normalizeManifest({
-      ...activeVersion.manifest,
-      name: input?.name === undefined ? registry.displayName : typeof input.name === "string" ? input.name.trim() : input.name,
-      description: input?.description === undefined ? registry.description : typeof input.description === "string" ? input.description.trim() : input.description,
+      ...skill.manifest,
+      name: input?.name === undefined ? registry.manifest.name : typeof input.name === "string" ? input.name.trim() : input.name,
+      description: input?.description === undefined ? registry.manifest.description : typeof input.description === "string" ? input.description.trim() : input.description,
     });
     const originalFiles = verified.files.map((file) => ({ path: file.relativePath, content: file.content }));
-    const restoredFiles = restoreOriginalSkillFiles({ skillId, ...activeVersion.manifest, files: originalFiles });
+    const restoredFiles = restoreOriginalSkillFiles({ skillId, ...skill.manifest, files: originalFiles });
     const updatedFiles = originalFiles.map((file) => ({ ...file, content: updateMap.get(file.path) ?? file.content }));
     const files = normalizeFiles(restoredFiles.length < originalFiles.length && updateMap.has(manifest.entrypoint) && !updateMap.has("SKILL.md")
       ? updatedFiles.filter((file) => file.path !== "SKILL.md")
-      : restoreOriginalSkillFiles({ skillId, ...activeVersion.manifest, files: updatedFiles }), this);
+      : restoreOriginalSkillFiles({ skillId, ...skill.manifest, files: updatedFiles }), this);
     // Validate Agent compatibility; its generated SKILL.md belongs to the runtime view.
     normalizeNativeSkillFiles({ skillId, ...manifest, files });
-    return this.#saveInstalledPackage(snapshot, registry, activeVersion, manifest, files);
+    return this.#saveInstalledPackage(snapshot, skill, manifest, files);
   }
 
-  async #saveInstalledPackage(snapshot, registry, activeVersion, manifest, files) {
-    const skillId = registry.skillId;
-    const sha256 = hashPackage(skillId, activeVersion.version, manifest, files);
-    const version = { ...activeVersion, ...revisedHeader(activeVersion, activeVersion.revision, { clock: this.clock }), sha256, manifest };
-    const nextRegistry = {
-      ...registry, ...revisedHeader(registry, registry.revision, { clock: this.clock }),
-      displayName: manifest.name, description: manifest.description,
-      versions: [{ skillVersionId: version.id, version: version.version, sha256 }],
-    };
+  async #saveInstalledPackage(snapshot, prior, manifest, files) {
+    const skillId = prior.skillId;
+    const sha256 = hashPackage(skillId, manifest, files);
+    const skill = { ...prior, ...revisedHeader(prior, prior.revision, { clock: this.clock }), sha256, manifest };
     const result = await replaceSkillPackage({
-      root: this.#actorPath("skills"), relativeRoot: path.posix.dirname(activeVersion.packagePath).slice("skills/".length),
-      descriptor: packageDescriptor(skillId, version.version, sha256, manifest, files), files,
+      root: this.#actorPath("skills"), relativeRoot: path.posix.dirname(prior.packagePath).slice("skills/".length),
+      descriptor: packageDescriptor(skillId, sha256, manifest, files), files,
       readExpectedHash: (relativeRoot) => this.#expectedPackageHash(relativeRoot),
-      commit: () => this.#repository.update((store) => {
-        store.versions = [...store.versions.filter((entry) => entry.skillId !== skillId), version];
-        store.registries = store.registries.map((entry) => entry.skillId === skillId ? nextRegistry : entry);
-        // Existing Task records and remote snapshots keep their own history.
-        // Stale mutable pins must not resolve to the replacement content.
-        store.taskPins = store.taskPins.filter((entry) => entry.skillId !== skillId);
-      }, { expectedRevision: snapshot.revision, clock: this.clock }),
+      commit: () => this.#repository.update((store) => { store.skills = store.skills.map((entry) => entry.skillId === skillId ? skill : entry); },
+        { expectedRevision: snapshot.revision, clock: this.clock }),
     });
-    await this.#collectPackages(result.data);
-    return { revision: result.revision, duplicate: false, version: clone(version), registry: clone(nextRegistry) };
+    return { revision: result.revision, duplicate: false, skill: clone(skill) };
   }
 
   async searchContext(input = {}) {
@@ -786,48 +604,23 @@ export class SkillService {
     const query = String(input.query || "").trim();
     const terms = queryTerms(query);
     const limit = Math.min(20, Math.max(1, Number(input.limit) || 8));
-    const selectedVersions = Array.isArray(input.selectedSkillVersions)
-      ? input.selectedSkillVersions.map((entry) => ({
-        skillId: assertSegment(String(entry?.skillId || ""), "selectedSkillVersions[].skillId"),
-        version: assertSegment(String(entry?.version || ""), "selectedSkillVersions[].version"),
-      }))
-      : [];
-    const selectedKeys = new Set(selectedVersions.map((entry) => `${entry.skillId}:${entry.version}`));
-    const selectedSkillIds = new Set((Array.isArray(input.selectedSkillIds) ? input.selectedSkillIds : [])
-      .map((entry) => assertSegment(String(entry || ""), "selectedSkillIds[]")));
-    const snapshot = await this.#repository.read();
-    const candidates = snapshot.data.registries.flatMap((registry) => {
-      const versions = selectedKeys.size > 0
-        ? snapshot.data.versions.filter((entry) => entry.skillId === registry.skillId && selectedKeys.has(`${entry.skillId}:${entry.version}`))
-        : snapshot.data.versions.filter((entry) => entry.id === registry.activeVersionId);
-      return selectedSkillIds.size > 0 && !selectedSkillIds.has(registry.skillId) ? [] : versions.map((version) => ({ registry, version }));
-    });
-    const ranked = candidates
-      .map((entry) => ({
-        ...entry,
-        score: skillSearchScore([
-          entry.registry.skillId,
-          entry.registry.displayName,
-          entry.registry.description,
-          entry.version.manifest.name,
-          entry.version.manifest.description,
-          entry.version.manifest.entrypoint,
-        ].join("\n"), terms),
-      }))
-      .filter((entry) => entry.score > 0 || selectedKeys.has(`${entry.version.skillId}:${entry.version.version}`) || selectedSkillIds.has(entry.version.skillId))
-      .sort((left, right) => right.score - left.score || right.version.updatedAt.localeCompare(left.version.updatedAt))
-      .slice(0, limit);
+    const selectedSkillIds = new Set((input.selectedSkillIds || []).map((id) => assertSegment(String(id), "selectedSkillIds[]")));
+    const snapshot = await this.#readStore();
+    const ranked = snapshot.data.skills.filter((entry) => !selectedSkillIds.size || selectedSkillIds.has(entry.skillId))
+      .map((skill) => ({ skill, score: skillSearchScore([skill.skillId, skill.manifest.name, skill.manifest.description, skill.manifest.entrypoint].join("\n"), terms) }))
+      .filter(({ skill, score }) => score > 0 || selectedSkillIds.has(skill.skillId))
+      .sort((a, b) => b.score - a.score || b.skill.updatedAt.localeCompare(a.skill.updatedAt)).slice(0, limit);
 
     const results = [];
     let remainingBytes = MAX_SKILL_SEARCH_TOTAL_BYTES;
-    for (const { registry, version, score } of ranked) {
+    for (const { skill, score } of ranked) {
       if (remainingBytes <= 0) break;
-      const verified = await this.#loadVerifiedPackage(version);
+      const verified = await this.#loadVerifiedPackage(skill);
       const files = verified.files
         .filter((file) => SEARCHABLE_SKILL_FILE_PATTERN.test(file.relativePath) && !file.content.includes(0))
         .map((file) => {
           const text = file.content.subarray(0, Math.min(file.content.length, MAX_SKILL_SEARCH_FILE_BYTES)).toString("utf8");
-          const preferred = file.relativePath === "SKILL.md" ? 100 : file.relativePath === version.manifest.entrypoint ? 80 : 0;
+          const preferred = file.relativePath === "SKILL.md" ? 100 : file.relativePath === skill.manifest.entrypoint ? 80 : 0;
           return { ...file, text, score: preferred + skillSearchScore(`${file.relativePath}\n${text}`, terms) };
         })
         .sort((left, right) => right.score - left.score || left.relativePath.localeCompare(right.relativePath));
@@ -846,13 +639,12 @@ export class SkillService {
         remainingBytes -= Buffer.byteLength(included);
       }
       results.push({
-        skillId: registry.skillId,
-        version: version.version,
-        sha256: version.sha256,
-        name: registry.displayName,
-        description: registry.description,
-        entrypoint: version.manifest.entrypoint,
-        permissions: clone(version.manifest.permissions),
+        skillId: skill.skillId,
+        sha256: skill.sha256,
+        name: skill.manifest.name,
+        description: skill.manifest.description,
+        entrypoint: skill.manifest.entrypoint,
+        permissions: clone(skill.manifest.permissions),
         score,
         files: selectedFiles,
       });
@@ -860,139 +652,55 @@ export class SkillService {
     return results;
   }
 
-  async resolveKnowledgePins(fragments = []) {
-    return this.#mutate(() => this.#resolveKnowledgePins(fragments));
-  }
-
-  async #resolveKnowledgePins(fragments = []) {
-    const snapshot = await this.#repository.read();
-    const pins = new Map();
-    for (const fragment of fragments) {
-      const skillId = /^skill:(.+)$/.exec(String(fragment?.knowledge?.key || ""))?.[1];
-      if (!skillId) continue;
-      const identity = /^(?:semantic-v1:)?([^:]+):([a-f0-9]{64})$/.exec(String(fragment.knowledge.version || ""));
-      const version = identity && snapshot.data.versions.find((entry) => entry.skillId === skillId && entry.version === identity[1] && entry.sha256 === identity[2]);
-      invariant(version && snapshot.data.registries.some((entry) => entry.skillId === skillId), "SKILL_SELECTED_VERSION_UNAVAILABLE", "所选 Skill 的精确版本已不可用，请重新选择", { status: 409, retryable: true });
-      await this.#loadVerifiedPackage(version);
-      const prior = pins.get(skillId);
-      invariant(!prior || prior.sha256 === version.sha256, "SKILL_SELECTED_VERSION_CONFLICT", "同一轮不能选择同一 Skill 的不同版本", { status: 409 });
-      pins.set(skillId, { skillId, version: version.version, sha256: version.sha256 });
-    }
-    return [...pins.values()];
-  }
-
-  async uploadVersion(input) {
-    return this.#uploadVersion(input);
-  }
-
-  async #uploadVersion(input, { install = false, initialApplicability = null, ifAbsent = false } = {}) {
+  async resolveSkills(fragments = []) {
     return this.#mutate(async () => {
-      const skillId = assertSegment(String(input?.skillId || ""), "skillId");
-      const versionLabel = assertSegment(String(input?.version || ""), "version");
-      const manifest = normalizeManifest(input?.manifest);
-      const files = normalizeFiles(input?.files, this);
-      // Preserve uploaded files byte-for-byte; materialize native entries at deployment.
-      normalizeNativeSkillFiles({ skillId, ...manifest, files });
-      invariant(files.some((file) => file.path === manifest.entrypoint), "SKILL_ENTRYPOINT_MISSING", "manifest.entrypoint 必须指向包内文件", {
-        status: 400,
-        details: { entrypoint: manifest.entrypoint },
-      });
-      const sha256 = hashPackage(skillId, versionLabel, manifest, files);
-      const current = await this.#repository.read();
-      if (install && ifAbsent) {
-        const registry = current.data.registries.find((entry) => entry.skillId === skillId);
-        if (registry) {
-          const version = current.data.versions.find((entry) => entry.id === registry.activeVersionId);
-          invariant(version, "SKILL_ACTIVE_VERSION_MISSING", "个人技能的活动版本不存在", { status: 409 });
-          return { revision: current.revision, duplicate: true, version: clone(version), registry: clone(registry) };
-        }
+      const snapshot = await this.#readStore();
+      const ids = new Set(fragments.map((fragment) => /^skill:(.+)$/.exec(String(fragment?.knowledge?.key || ""))?.[1]).filter(Boolean));
+      const result = [];
+      for (const skillId of ids) {
+        const skill = snapshot.data.skills.find((entry) => entry.skillId === skillId);
+        invariant(skill, "SKILL_NOT_INSTALLED", "所选技能已卸载，请重新选择", { status: 404 });
+        await this.#loadVerifiedPackage(skill);
+        result.push({ skillId, sha256: skill.sha256 });
       }
-      if (!install) assertExpectedRevision(current.revision, input?.expectedRevision);
-      const existing = current.data.versions.find((entry) => entry.skillId === skillId && entry.version === versionLabel);
-      if (existing) {
-        invariant(existing.sha256 === sha256, "SKILL_VERSION_IMMUTABLE", "相同 Skill 版本已经存在，内容不能覆盖", {
-          status: 409,
-          details: { skillId, version: versionLabel, existingSha256: existing.sha256 },
-        });
-        return {
-          revision: current.revision,
-          duplicate: true,
-          version: clone(existing),
-          registry: clone(current.data.registries.find((entry) => entry.skillId === skillId)),
-        };
-      }
-
-      const relativeRoot = packageRelativeRoot(skillId, versionLabel);
-      const finalRoot = this.#actorPath(relativeRoot);
-      const descriptor = packageDescriptor(skillId, versionLabel, sha256, manifest, files);
-      let packageCreated = false;
-      try {
-        const existingPackage = JSON.parse(await fs.readFile(path.join(finalRoot, "package.json"), "utf8"));
-        invariant(existingPackage.sha256 === sha256, "SKILL_PACKAGE_PATH_CONFLICT", "Skill 包目录已被不同内容占用", { status: 409 });
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
-        const written = await writePackageDirectory(finalRoot, descriptor, files, {
-          fileSystem: this.packageFileSystem,
-          sleep: this.packageCommitSleep,
-        });
-        packageCreated = written.created;
-      }
-
-      let skillVersion;
-      let registry;
-      let result;
-      try {
-        result = await this.#repository.update((store) => {
-          skillVersion = createSkillVersion({
-            id: this.#newId("skill_version"),
-            actorId: this.actor.actorId,
-            skillId,
-            version: versionLabel,
-            sha256,
-            packagePath: `${relativeRoot}/package.json`,
-            manifest,
-          }, { clock: this.clock });
-          const registryIndex = store.registries.findIndex((entry) => entry.skillId === skillId);
-          if (registryIndex < 0) {
-            registry = createSkillRegistry({
-              id: this.#newId("skill_registry"),
-              actorId: this.actor.actorId,
-              skillId,
-              displayName: manifest.name,
-              description: manifest.description,
-            }, { clock: this.clock });
-            registry = registerSkillVersion(registry, skillVersion, { expectedRevision: registry.revision, activate: input?.activate !== false, clock: this.clock });
-            store.registries.push(registry);
-          } else {
-            registry = registerSkillVersion(store.registries[registryIndex], skillVersion, {
-              expectedRevision: store.registries[registryIndex].revision,
-              activate: input?.activate !== false,
-              clock: this.clock,
-            });
-            registry = {
-              ...registry,
-              displayName: manifest.name,
-              description: manifest.description,
-            };
-            validateSkillRegistry(registry);
-            store.registries[registryIndex] = registry;
-          }
-          store.versions.push(skillVersion);
-        }, { expectedRevision: current.revision, clock: this.clock });
-      } catch (error) {
-        if (packageCreated) await fs.rm(finalRoot, { recursive: true, force: true }).catch(() => undefined);
-        throw error;
-      }
-      if (initialApplicability && !current.data.registries.some((entry) => entry.skillId === skillId)) {
-        await this.#updateApplicability(skillId, initialApplicability);
-      }
-      return { revision: result.revision, duplicate: false, version: clone(skillVersion), registry: clone(registry) };
+      return result;
     });
   }
 
-  async installPackage(input, { ifAbsent = false } = {}) {
+  async uploadPackage(input) {
+    return this.#installPackage(input, { requireRevision: true });
+  }
+
+  async installPackage(input, { ifAbsent = false, createOnly = false } = {}) {
+    return this.#installPackage(input, { ifAbsent, createOnly });
+  }
+
+  async #installPackage(input, { ifAbsent = false, requireRevision = false, createOnly = false } = {}) {
     const initialApplicability = input?.applicability === undefined ? null : normalizeSkillApplicability(input.applicability);
-    return this.#uploadVersion({ ...input, activate: true }, { install: true, initialApplicability, ifAbsent });
+    return this.#mutate(async () => {
+      const skillId = assertSegment(String(input?.skillId || ""), "skillId");
+      const manifest = normalizeManifest(input?.manifest);
+      const files = normalizeFiles(input?.files, this);
+      normalizeNativeSkillFiles({ skillId, ...manifest, files });
+      invariant(files.some((file) => file.path === manifest.entrypoint), "SKILL_ENTRYPOINT_MISSING", "manifest.entrypoint 必须指向包内文件", { status: 400 });
+      const snapshot = await this.#readStore();
+      const prior = snapshot.data.skills.find((entry) => entry.skillId === skillId);
+      if (ifAbsent && prior) return { revision: snapshot.revision, duplicate: true, skill: clone(prior) };
+      if (requireRevision) assertExpectedRevision(snapshot.revision, input?.expectedRevision);
+      const sha256 = hashPackage(skillId, manifest, files);
+      if (prior?.sha256 === sha256) return { revision: snapshot.revision, duplicate: true, skill: clone(prior) };
+      invariant(!prior || !createOnly, "SKILL_CREATE_CONFLICT", "同一上传请求不能用于不同内容", { status: 409 });
+      if (prior) return this.#saveInstalledPackage(snapshot, prior, manifest, files);
+      const relativeRoot = packageRelativeRoot(skillId);
+      const written = await writePackageDirectory(this.#actorPath(relativeRoot), packageDescriptor(skillId, sha256, manifest, files), files,
+        { fileSystem: this.packageFileSystem, sleep: this.packageCommitSleep });
+      const skill = createInstalledSkill({ id: this.#newId("skill"), actorId: this.actor.actorId, skillId, sha256, packagePath: relativeRoot + "/package.json", manifest }, { clock: this.clock });
+      let result;
+      try { result = await this.#repository.update((store) => { store.skills.push(skill); }, { expectedRevision: snapshot.revision, clock: this.clock }); }
+      catch (error) { if (written.created) await removeSkillDirectory(this.#actorPath("skills"), relativeRoot.slice("skills/".length)); throw error; }
+      if (initialApplicability) await this.#updateApplicability(skillId, initialApplicability);
+      return { revision: result.revision, duplicate: false, skill: clone(skill) };
+    });
   }
 
   async installMarketDeployment(input, { marketSkillId, deploymentId }) {
@@ -1001,7 +709,7 @@ export class SkillService {
     return this.#mutate(async () => {
       const receipt = await this.#deploymentRepository.read();
       if (receipt.data.items.some((entry) => entry.marketSkillId === marketSkillId && entry.deploymentId === deploymentId)) {
-        return { duplicate: true, revision: (await this.#repository.read()).revision };
+        return { duplicate: true, revision: (await this.#readStore()).revision };
       }
       const result = await this.installPackage(input, { ifAbsent: true });
       // Remember completed distributions even if the user later uninstalls.
@@ -1021,8 +729,8 @@ export class SkillService {
   async #updateApplicability(skillIdInput, input) {
     const skillId = assertSegment(String(skillIdInput || ""), "skillId");
     const applicability = normalizeSkillApplicability(input);
-    const installed = await this.#repository.read();
-    invariant(installed.data.registries.some((entry) => entry.skillId === skillId), "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
+    const installed = await this.#readStore();
+    invariant(installed.data.skills.some((entry) => entry.skillId === skillId), "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
     const current = await this.#applicabilityRepository.read();
     const updatedAt = this.clock().toISOString();
     const result = await this.#applicabilityRepository.update((store) => {
@@ -1034,167 +742,41 @@ export class SkillService {
     return { skillId, applicability: clone(applicability), revision: result.revision, updatedAt };
   }
 
-  async activateVersion(input) {
-    return this.#mutate(async () => {
-      const skillId = assertSegment(String(input?.skillId || ""), "skillId");
-      const versionLabel = assertSegment(String(input?.version || ""), "version");
-      let registry;
-      const result = await this.#repository.update((store) => {
-        const registryIndex = store.registries.findIndex((entry) => entry.skillId === skillId);
-        invariant(registryIndex >= 0, "SKILL_REGISTRY_NOT_FOUND", "Skill 不存在", { status: 404 });
-        const skillVersion = store.versions.find((entry) => entry.skillId === skillId && entry.version === versionLabel);
-        invariant(skillVersion, "SKILL_VERSION_NOT_FOUND", "Skill 版本不存在", { status: 404 });
-        registry = activateSkillVersion(store.registries[registryIndex], skillVersion.id, {
-          expectedRevision: store.registries[registryIndex].revision,
-          clock: this.clock,
-        });
-        store.registries[registryIndex] = registry;
-      }, { expectedRevision: input?.expectedRevision, clock: this.clock });
-      return { revision: result.revision, registry: clone(registry) };
-    });
-  }
-
-  async pinTask(input) {
-    return this.#mutate(async () => {
-      const taskId = assertId(String(input?.taskId || ""), "taskId");
-      await this.#authorizeTask(taskId, "write");
-      invariant(Array.isArray(input?.skills) && input.skills.length <= 256, "SKILL_SELECTION_INVALID", "Task Skill 选择无效", { status: 400 });
-      const current = await this.#repository.read();
-      assertExpectedRevision(current.revision, input?.expectedRevision);
-      const selections = input.skills.map((selection) => {
-        invariant(selection && typeof selection === "object" && !Array.isArray(selection), "SKILL_SELECTION_INVALID", "Task Skill 选择无效", { status: 400 });
-        invariant(Object.keys(selection).every((key) => ["skillId", "version", "mandatory"].includes(key)), "SKILL_SELECTION_INVALID", "Task Skill 选择包含未知字段", { status: 400 });
-        const skillId = assertSegment(String(selection.skillId || ""), "skillId");
-        const registry = current.data.registries.find((entry) => entry.skillId === skillId);
-        invariant(registry, "SKILL_REGISTRY_NOT_FOUND", "Skill 不存在", { status: 404, details: { skillId } });
-        const skillVersion = selection.version
-          ? current.data.versions.find((entry) => entry.skillId === skillId && entry.version === assertSegment(String(selection.version), "version"))
-          : current.data.versions.find((entry) => entry.id === registry.activeVersionId);
-        invariant(skillVersion, "SKILL_ACTIVE_VERSION_REQUIRED", "Skill 没有可固定的活动版本", { status: 409, details: { skillId } });
-        return { skillVersion, mandatory: selection.mandatory !== false };
-      });
-      invariant(new Set(selections.map((entry) => entry.skillVersion.skillId)).size === selections.length, "SKILL_SELECTION_DUPLICATE", "Task 不能重复选择同一 Skill", { status: 400 });
-
-      const existingPins = current.data.taskPins.filter((entry) => entry.taskId === taskId);
-      if (existingPins.length > 0) {
-        const expected = selections.map((entry) => `${entry.skillVersion.id}:${entry.mandatory}`).sort();
-        const actual = existingPins.map((entry) => `${entry.skillVersionId}:${entry.mandatory}`).sort();
-        invariant(JSON.stringify(actual) === JSON.stringify(expected), "SKILL_TASK_PINS_IMMUTABLE", "Task 的 Skill 版本已经固定，不能替换", { status: 409 });
-        return {
-          revision: current.revision,
-          duplicate: true,
-          pins: clone(existingPins),
-          taskSkillPins: existingPins.map(({ skillId, version, sha256 }) => ({ skillId, version, sha256 })),
-        };
-      }
-
-      const pins = selections.map(({ skillVersion, mandatory }) => createTaskSkillPin({
-        id: this.#newId("task_skill_pin"),
-        actorId: this.actor.actorId,
-        taskId,
-        skillVersion,
-        mandatory,
-      }, { clock: this.clock }));
-      const result = await this.#repository.update((store) => {
-        store.taskPins.push(...pins);
-      }, { expectedRevision: current.revision, clock: this.clock });
-      return {
-        revision: result.revision,
-        duplicate: false,
-        pins: clone(pins),
-        taskSkillPins: pins.map(({ skillId, version, sha256 }) => ({ skillId, version, sha256 })),
-      };
-    });
-  }
-
-  async releaseTaskPins(input) {
-    return this.#mutate(async () => {
-      const taskId = assertId(String(input?.taskId || ""), "taskId");
-      await this.#authorizeTask(taskId, "delete");
-      const result = await this.#repository.update((store) => {
-        store.taskPins = store.taskPins.filter((entry) => entry.taskId !== taskId);
-      }, { expectedRevision: input?.expectedRevision, clock: this.clock });
-      return { revision: result.revision, taskId };
-    });
-  }
-
-  async deleteVersion(input) {
-    return this.#mutate(async () => {
-      const skillId = assertSegment(String(input?.skillId || ""), "skillId");
-      const versionLabel = assertSegment(String(input?.version || ""), "version");
-      const current = await this.#repository.read();
-      assertExpectedRevision(current.revision, input?.expectedRevision);
-      const skillVersion = current.data.versions.find((entry) => entry.skillId === skillId && entry.version === versionLabel);
-      invariant(skillVersion, "SKILL_VERSION_NOT_FOUND", "Skill 版本不存在", { status: 404 });
-      const pin = current.data.taskPins.find((entry) => entry.skillVersionId === skillVersion.id);
-      invariant(!pin, "SKILL_VERSION_PINNED", "该 Skill 版本仍被 Task 固定，不能删除", {
-        status: 409,
-        details: pin ? { taskId: pin.taskId, skillId, version: versionLabel } : undefined,
-      });
-      const result = await this.#repository.update((store) => {
-        const registryIndex = store.registries.findIndex((entry) => entry.skillId === skillId);
-        invariant(registryIndex >= 0, "SKILL_REGISTRY_NOT_FOUND", "Skill 不存在", { status: 404 });
-        const nextRegistry = removeVersionFromRegistry(store.registries[registryIndex], skillVersion.id, {
-          expectedRevision: store.registries[registryIndex].revision,
-          clock: this.clock,
-        });
-        store.versions = store.versions.filter((entry) => entry.id !== skillVersion.id);
-        if (nextRegistry.versions.length === 0) store.registries.splice(registryIndex, 1);
-        else store.registries[registryIndex] = nextRegistry;
-      }, { expectedRevision: current.revision, clock: this.clock });
-      await removeSkillDirectory(this.#actorPath("skills"), `packages/${skillId}/${versionLabel}`);
-      return { revision: result.revision, skillId, version: versionLabel };
-    });
-  }
-
   async uninstall(input) {
     return this.#mutate(async () => {
       const skillId = assertSegment(String(input?.skillId || ""), "skillId");
-      const current = await this.#repository.read();
-      assertExpectedRevision(current.revision, input?.expectedRevision);
-      const registry = current.data.registries.find((entry) => entry.skillId === skillId);
-      invariant(registry, "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
-      const versionIds = new Set(registry.versions.map((entry) => entry.skillVersionId));
-      const removedTaskPins = current.data.taskPins.filter((entry) => versionIds.has(entry.skillVersionId)).length;
-      const result = await this.#repository.update((store) => {
-        store.registries = store.registries.filter((entry) => entry.skillId !== skillId);
-        store.versions = store.versions.filter((entry) => !versionIds.has(entry.id));
-        // Uninstall is an explicit catalog decision. Historical Tasks retain
-        // their immutable skillPins snapshot, while the mutable deployment
-        // index stops resolving those pins immediately.
-        store.taskPins = store.taskPins.filter((entry) => !versionIds.has(entry.skillVersionId));
-      }, { expectedRevision: current.revision, clock: this.clock });
-      await removeSkillDirectory(this.#actorPath("skills"), `packages/${skillId}`);
+      const snapshot = await this.#readStore();
+      assertExpectedRevision(snapshot.revision, input?.expectedRevision);
+      invariant(snapshot.data.skills.some((entry) => entry.skillId === skillId), "SKILL_REGISTRY_NOT_FOUND", "技能不存在", { status: 404 });
+      const result = await this.#repository.update((store) => { store.skills = store.skills.filter((entry) => entry.skillId !== skillId); }, { expectedRevision: snapshot.revision, clock: this.clock });
+      await removeSkillDirectory(this.#actorPath("skills"), "packages/" + skillId);
       const applicability = await this.#applicabilityRepository.read();
-      await this.#applicabilityRepository.update((store) => {
-        store.items = store.items.filter((entry) => entry.skillId !== skillId);
-      }, { expectedRevision: applicability.revision, clock: this.clock });
-      return { revision: result.revision, skillId, removedVersions: versionIds.size, removedTaskPins };
+      await this.#applicabilityRepository.update((store) => { store.items = store.items.filter((entry) => entry.skillId !== skillId); }, { expectedRevision: applicability.revision, clock: this.clock });
+      return { revision: result.revision, skillId };
     });
   }
 
-  async #loadVerifiedPackage(skillVersion) {
-    const packagePath = this.#actorPath(skillVersion.packagePath);
+  async #loadVerifiedPackage(skill, { legacy = false } = {}) {
+    const packagePath = this.#actorPath(skill.packagePath);
     const descriptor = JSON.parse(await fs.readFile(packagePath, "utf8"));
     invariant(
       descriptor?.schemaVersion === PACKAGE_SCHEMA_VERSION
-      && descriptor.skillId === skillVersion.skillId
-      && descriptor.version === skillVersion.version
-      && descriptor.sha256 === skillVersion.sha256
+      && descriptor.skillId === skill.skillId
+      && descriptor.sha256 === skill.sha256
       && Array.isArray(descriptor.files),
       "SKILL_PACKAGE_CORRUPT",
-      "Skill package.json 与登记版本不一致",
+      "Skill package.json 与登记内容不一致",
       { status: 500, expose: false },
     );
     invariant(
-      Object.keys(descriptor).length === 6
-      && ["schemaVersion", "skillId", "version", "sha256", "manifest", "files"].every((key) => Object.hasOwn(descriptor, key)),
+      Object.keys(descriptor).length === (legacy ? 6 : 5)
+      && ["schemaVersion", "skillId", "sha256", "manifest", "files"].every((key) => Object.hasOwn(descriptor, key)),
       "SKILL_PACKAGE_CORRUPT",
       "Skill package.json 字段无效",
       { status: 500, expose: false },
     );
     const manifest = normalizeManifest(descriptor.manifest);
-    invariant(JSON.stringify(manifest) === JSON.stringify(skillVersion.manifest), "SKILL_PACKAGE_CORRUPT", "Skill manifest 与登记版本不一致", {
+    invariant(JSON.stringify(manifest) === JSON.stringify(skill.manifest), "SKILL_PACKAGE_CORRUPT", "Skill manifest 与登记内容不一致", {
       status: 500,
       expose: false,
     });
@@ -1209,21 +791,28 @@ export class SkillService {
       const relativePath = assertRelativeFilePath(entry.path, "package.files[].path");
       invariant(!seen.has(relativePath), "SKILL_PACKAGE_CORRUPT", "Skill package.json 包含重复路径", { status: 500, expose: false });
       seen.add(relativePath);
-      const sourceRelativePath = `${packageRelativeRoot(skillVersion.skillId, skillVersion.version)}/files/${relativePath}`;
+      const sourceRelativePath = `${path.posix.dirname(skill.packagePath)}/files/${relativePath}`;
       const sourcePath = this.#actorPath(sourceRelativePath);
       const content = await fs.readFile(sourcePath);
       const sha256 = crypto.createHash("sha256").update(content).digest("hex");
       invariant(sha256 === entry.sha256 && content.length === entry.size, "SKILL_PACKAGE_FILE_CORRUPT", "Skill 包文件校验失败", {
         status: 500,
         expose: false,
-        details: { skillId: skillVersion.skillId, version: skillVersion.version, path: relativePath },
+        details: { skillId: skill.skillId, path: relativePath },
       });
       invariant(sourcePath.startsWith(`${root}${path.sep}`), "SKILL_PACKAGE_FILE_ESCAPE", "Skill 包文件越界", { status: 500, expose: false });
       files.push({ relativePath, sourceRelativePath, sha256, size: content.length, content });
     }
     invariant(files.some((file) => file.relativePath === manifest.entrypoint), "SKILL_PACKAGE_CORRUPT", "Skill entrypoint 文件不存在", { status: 500, expose: false });
-    const calculated = hashPackage(skillVersion.skillId, skillVersion.version, manifest, files.map((file) => ({ path: file.relativePath, content: file.content })));
-    invariant(calculated === skillVersion.sha256, "SKILL_PACKAGE_HASH_MISMATCH", "Skill 版本内容哈希校验失败", { status: 500, expose: false });
+    let calculated;
+    if (legacy) {
+      const digest = crypto.createHash("sha256");
+      const feed = (value) => { const bytes = Buffer.from(value); digest.update(Buffer.from(bytes.length + ":")); digest.update(bytes); };
+      feed(skill.skillId); feed(skill.version); feed(JSON.stringify(manifest));
+      for (const file of files) { feed(file.relativePath); feed(file.content); }
+      calculated = digest.digest("hex");
+    } else calculated = hashPackage(skill.skillId, manifest, files.map((file) => ({ path: file.relativePath, content: file.content })));
+    invariant(calculated === skill.sha256, "SKILL_PACKAGE_HASH_MISMATCH", "Skill 内容哈希校验失败", { status: 500, expose: false });
     return {
       descriptor,
       files: files.map((file) => ({
@@ -1243,30 +832,18 @@ export class SkillService {
   async #createDeploymentPlan(input) {
     const taskId = assertId(String(input?.taskId || ""), "taskId");
     await this.#authorizeTask(taskId, "read");
-    const snapshot = await this.#repository.read();
-    const storedPins = snapshot.data.taskPins.filter((entry) => entry.taskId === taskId);
-    invariant(storedPins.length > 0 || (input?.pins || []).length === 0, "SKILL_TASK_PINS_REQUIRED", "Task Skill 尚未固定", { status: 409 });
-    const requestedPins = input?.pins || storedPins.map(({ skillId, version, sha256 }) => ({ skillId, version, sha256 }));
-    invariant(Array.isArray(requestedPins), "SKILL_PINS_INVALID", "Skill pins 无效", { status: 400 });
-    const requestedKeys = requestedPins.map((pin) => `${pin.skillId}:${pin.version}:${pin.sha256}`).sort();
-    const storedKeys = storedPins.map((pin) => `${pin.skillId}:${pin.version}:${pin.sha256}`).sort();
-    invariant(JSON.stringify(requestedKeys) === JSON.stringify(storedKeys), "SKILL_PIN_SET_MISMATCH", "部署 Skill 必须与 Task 固定版本集合完全一致", { status: 409 });
+    const snapshot = await this.#readStore();
+    const selections = input?.skills || input?.pins || [];
+    invariant(Array.isArray(selections), "SKILL_SELECTION_INVALID", "Skill 选择无效", { status: 400 });
+    const ids = [...new Set(selections.map((entry) => assertSegment(String(entry.skillId || ""), "skillId")))];
     const remoteHashes = input?.remoteHashes && typeof input.remoteHashes === "object" ? input.remoteHashes : {};
     const skills = [];
-    for (const pin of requestedPins) {
-      const skillId = assertSegment(String(pin.skillId || ""), "skillId");
-      const versionLabel = assertSegment(String(pin.version || ""), "version");
-      const sha256 = String(pin.sha256 || "");
-      invariant(/^[a-f0-9]{64}$/.test(sha256), "SKILL_PIN_HASH_INVALID", "Skill pin sha256 无效", { status: 400 });
-      const storedPin = storedPins.find((entry) => entry.skillId === skillId);
-      invariant(storedPin && storedPin.version === versionLabel && storedPin.sha256 === sha256, "SKILL_PIN_MISMATCH", "调用的 Skill 与 Task 固定版本不一致", {
-        status: 409,
-        details: { skillId, version: versionLabel },
-      });
-      const skillVersion = snapshot.data.versions.find((entry) => entry.id === storedPin.skillVersionId);
-      invariant(skillVersion, "SKILL_VERSION_NOT_FOUND", "Task 固定的 Skill 版本不存在", { status: 500, expose: false });
-      const verified = await this.#loadVerifiedPackage(skillVersion);
-      const targetRoot = remoteRoot(skillId, versionLabel);
+    for (const skillId of ids) {
+      const skill = snapshot.data.skills.find((entry) => entry.skillId === skillId);
+      invariant(skill, "SKILL_NOT_INSTALLED", "所选技能已卸载，请重新选择", { status: 404 });
+      const verified = await this.#loadVerifiedPackage(skill);
+      const sha256 = skill.sha256;
+      const targetRoot = remoteRoot(skillId);
       const files = verified.files.map((file) => {
         const targetPath = `${targetRoot}/${file.relativePath}`;
         const upToDate = remoteHashes[targetPath] === file.sha256;
@@ -1279,11 +856,10 @@ export class SkillService {
       });
       skills.push({
         skillId,
-        version: versionLabel,
         sha256,
-        manifest: clone(skillVersion.manifest),
+        manifest: clone(skill.manifest),
         targetRoot,
-        entrypoint: `${targetRoot}/${skillVersion.manifest.entrypoint}`,
+        entrypoint: `${targetRoot}/${skill.manifest.entrypoint}`,
         files,
         operations: files.filter((file) => file.status === "upload-required").map((file) => ({
           kind: "verify-or-upload",
@@ -1298,7 +874,7 @@ export class SkillService {
       actorId: this.actor.actorId,
       remoteBase: "~/.easywork/skills",
       skills,
-      agentSkillRefs: skills.map(({ skillId, version, sha256, entrypoint }) => ({ skillId, version, sha256, entrypoint })),
+      agentSkillRefs: skills.map(({ skillId, sha256, entrypoint }) => ({ skillId, sha256, entrypoint })),
     };
   }
 

@@ -235,7 +235,7 @@ export function createApi(options) {
   });
 
   router.route("GET", "/api/skills", (request) => request.services.skills.inspect());
-  router.route("POST", "/api/skills", (request) => request.services.skills.uploadVersion({ ...requiredBody(request), commandId: commandId(request) }));
+  router.route("POST", "/api/skills", (request) => request.services.skills.uploadPackage({ ...requiredBody(request), commandId: commandId(request) }));
   router.route("GET", "/api/skill-center/installed", (request) => request.services.skills.listInstalled());
   router.route("POST", "/api/skill-center/installed", (request) => request.services.skills.createInstalled({
     ...exactBody(request, ["name", "description", "files"], ["name", "files"], "上传个人技能"),

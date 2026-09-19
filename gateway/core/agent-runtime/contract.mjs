@@ -179,7 +179,6 @@ export function assertEasyWorkSkillPaths(skills, skillsRoot) {
     });
     return Object.freeze({
       skillId: assertRuntimeIdentifier(skill?.skillId, "skillId"),
-      version: String(skill?.version || ""),
       remotePath,
       sha256: String(skill?.sha256 || "").toLowerCase(),
       ...(skill?.entrypoint ? { entrypoint: String(skill.entrypoint) } : {}),

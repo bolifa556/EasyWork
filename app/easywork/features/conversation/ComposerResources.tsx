@@ -6,28 +6,17 @@ import { useAppRuntime } from "../../runtime/AppRuntime";
 import styles from "./ComposerResources.module.css";
 
 type CollectionRecord = { id: string; name: string };
-type SkillRegistry = {
-  skillId: string;
-  displayName: string;
-  description: string;
-  activeVersionId: string | null;
-  versions: Array<{ skillVersionId: string; version: string; sha256: string }>;
-};
-type SkillCatalog = { registries: SkillRegistry[] };
+type SkillRecord = { skillId: string; name: string; description: string };
+type SkillCatalog = { items: SkillRecord[] };
 
-export type SelectedSkillPin = { skillId: string; displayName: string; version: string; sha256: string };
+export type SelectedSkill = { skillId: string; displayName: string };
 export type ComposerResourceSelection = {
   files: File[];
   collections: CollectionRecord[];
-  skills: SelectedSkillPin[];
+  skills: SelectedSkill[];
 };
 
 export const emptyComposerResources: ComposerResourceSelection = { files: [], collections: [], skills: [] };
-
-function activePin(registry: SkillRegistry): SelectedSkillPin | null {
-  const version = registry.versions.find((item) => item.skillVersionId === registry.activeVersionId);
-  return version ? { skillId: registry.skillId, displayName: registry.displayName, version: version.version, sha256: version.sha256 } : null;
-}
 
 export function ComposerResources({ value, disabled, onChange }: {
   value: ComposerResourceSelection;
@@ -41,7 +30,7 @@ export function ComposerResources({ value, disabled, onChange }: {
   const [page, setPage] = useState<"root" | "collections" | "skills">("root");
   const [direction, setDirection] = useState<"up" | "down">("up");
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
-  const [skills, setSkills] = useState<SkillRegistry[]>([]);
+  const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [collectionsLoaded, setCollectionsLoaded] = useState(false);
   const [skillsLoaded, setSkillsLoaded] = useState(false);
@@ -75,8 +64,8 @@ export function ComposerResources({ value, disabled, onChange }: {
     if (skillsLoaded) return;
     setLoading(true);
     try {
-      const result = await runtime.api.get<SkillCatalog>("/api/skills");
-      setSkills(Array.isArray(result.data?.registries) ? result.data.registries : []);
+      const result = await runtime.api.get<SkillCatalog>("/api/skill-center/installed");
+      setSkills(Array.isArray(result.data?.items) ? result.data.items : []);
       setSkillsLoaded(true);
     } catch (reason) { runtime.notify(reason instanceof Error ? reason.message : "Skill 读取失败", "error"); }
     finally { setLoading(false); }
@@ -87,14 +76,13 @@ export function ComposerResources({ value, disabled, onChange }: {
     onChange({ ...value, collections: selected ? value.collections.filter((item) => item.id !== collection.id) : [...value.collections, collection] });
   };
 
-  const toggleSkill = (registry: SkillRegistry) => {
-    const pin = activePin(registry);
-    if (!pin) return;
+  const toggleSkill = (registry: SkillRecord) => {
+    const pin = { skillId: registry.skillId, displayName: registry.name };
     const selected = value.skills.some((item) => item.skillId === pin.skillId);
     onChange({ ...value, skills: selected ? value.skills.filter((item) => item.skillId !== pin.skillId) : [...value.skills, pin] });
   };
 
-  const activeSkills = skills.filter((registry) => activePin(registry));
+  const activeSkills = skills;
   const skillMenuHeight = Math.min(54 + Math.max(activeSkills.length, 1) * 52, 314);
   const collectionMenuHeight = Math.min(54 + Math.max(collections.length, 1) * 48, 314);
   const menuStyle = {
@@ -128,11 +116,10 @@ export function ComposerResources({ value, disabled, onChange }: {
         <div className={styles.page} aria-hidden={page !== "skills"}>
           <button type="button" className={styles.pageBack} aria-label="返回" onClick={() => setPage("root")}><ChevronLeft size={16} /><span>返回</span></button>
           <div className={styles.options}>{loading && page === "skills" ? <p>正在读取…</p> : activeSkills.map((registry) => {
-            const pin = activePin(registry);
             const selected = value.skills.some((item) => item.skillId === registry.skillId);
-            return <button type="button" key={registry.skillId} disabled={!pin} className={selected ? styles.selected : ""} onClick={() => toggleSkill(registry)}>
+            return <button type="button" key={registry.skillId} className={selected ? styles.selected : ""} onClick={() => toggleSkill(registry)}>
               <span data-ui-icon="" className={styles.menuIcon}><Sparkles size={16} /></span>
-              <span className={styles.optionCopy}><strong>{registry.displayName}</strong>{registry.description ? <small>{registry.description}</small> : null}</span>
+              <span className={styles.optionCopy}><strong>{registry.name}</strong>{registry.description ? <small>{registry.description}</small> : null}</span>
               <span className={styles.optionCheck}>{selected ? <Check size={14} /> : null}</span>
             </button>;
           })}{!loading && !activeSkills.length ? <p>暂无已安装的技能</p> : null}</div>

@@ -137,7 +137,7 @@ function validateStore(store) {
     assertSegment(item.packageId, "market.packageId");
     invariant(!ids.has(item.id), "SKILL_CENTER_STORE_INVALID", "技能中心实体 ID 重复", { status: 500, expose: false });
     invariant(typeof item.name === "string" && typeof item.description === "string", "SKILL_CENTER_STORE_INVALID", "市场技能信息无效", { status: 500, expose: false });
-    invariant(Number.isSafeInteger(item.revision) && item.revision > 0 && Number.isSafeInteger(item.release) && item.release > 0, "SKILL_CENTER_STORE_INVALID", "市场技能 revision 无效", { status: 500, expose: false });
+    invariant(Number.isSafeInteger(item.revision) && item.revision > 0, "SKILL_CENTER_STORE_INVALID", "市场技能 revision 无效", { status: 500, expose: false });
     normalizeSkillApplicability(item.applicability || DEFAULT_SKILL_APPLICABILITY);
     invariant(item.deployToAllUsers === undefined || typeof item.deployToAllUsers === "boolean", "SKILL_CENTER_STORE_INVALID", "技能全体部署设置无效", { status: 500 });
     if (item.deployToAllUsers) assertSegment(item.deploymentId, "market.deploymentId");
@@ -454,7 +454,6 @@ export class SkillMarketplaceService {
           createdAt: previous?.createdAt || now,
           updatedAt: now,
           revision: previous ? previous.revision + 1 : 1,
-          release: previous ? previous.release + 1 : 1,
         };
         if (index >= 0) store.market[index] = next;
         else store.market.push(next);
@@ -615,7 +614,6 @@ export class SkillMarketplaceService {
           createdAt: now,
           updatedAt: now,
           revision: 1,
-          release: 1,
         };
         store.market.push(marketItem);
       }
@@ -691,7 +689,6 @@ export class SkillMarketplaceService {
           deploymentId: input?.deployToAllUsers === true && !current.deployToAllUsers ? this.#newId("skill_deployment") : current.deploymentId || null,
           updatedAt: this.#now(),
           revision: current.revision + 1,
-          release: current.release + 1,
         };
         store.market[index] = updated;
         this.#syncSubmissionPackages(store, updated);
@@ -741,10 +738,8 @@ export class SkillMarketplaceService {
       return { item, loaded: await this.#loadPackage(item, { includeContent: false }) };
     });
     if (!item) return { skipped: true, duplicate: true };
-    const version = `market-${item.release}-${item.packageSha256.slice(0, 12)}`;
     const input = {
       skillId: item.skillId,
-      version,
       manifest: {
         name: item.name,
         description: item.description,

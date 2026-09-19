@@ -1,3 +1,4 @@
+import { selectedSkillIds } from "../../../shared/skill-selection.mjs";
 import crypto from "node:crypto";
 
 import { assertNoSensitiveFields, invariant } from "../errors.mjs";
@@ -30,7 +31,7 @@ export const CONTEXT_ENTRY_KINDS = Object.freeze([
 const SCOPE_KEYS = [
   "actorType", "actorId", "userId", "projectId", "conversationId", "workspaceId", "taskId", "serverId", "serverIdentity", "versionDomainId", "memoryMode",
   "branchId", "memorySnapshotSequence", "memorySnapshotVersionIds", "resourceBindingSnapshotId", "selectedCollectionIds",
-  "selectedResourceVersions", "selectedSkillVersions", "capabilities", "contextEpoch", "memoryBaselineSequence",
+  "selectedResourceVersions", "selectedSkillIds", "selectedSkillVersions", "capabilities", "contextEpoch", "memoryBaselineSequence",
 ];
 const SESSION_KEYS = [
   "schemaVersion", "entityType", "revision", "id", "actorId", "consumer", "consumerId", "scope", "budget", "status",
@@ -40,14 +41,6 @@ const DELIVERY_KEYS = [
   "schemaVersion", "entityType", "revision", "id", "actorId", "sessionId", "sequence", "mode", "entries", "supersedes",
   "digest", "createdAt", "updatedAt",
 ];
-
-function validateSelectedSkillVersion(value, field) {
-  assertExactKeys(value, ["skillId", "version"], field);
-  return {
-    skillId: assertId(value.skillId, `${field}.skillId`),
-    version: assertString(value.version, `${field}.version`, { max: 128 }),
-  };
-}
 
 export function validateEffectiveContextScope(scope) {
   assertExactKeys(scope, SCOPE_KEYS, "EffectiveContextScope");
@@ -73,7 +66,7 @@ export function validateEffectiveContextScope(scope) {
   assertNullableId(scope.resourceBindingSnapshotId, "EffectiveContextScope.resourceBindingSnapshotId");
   assertUnique(assertArray(scope.selectedCollectionIds, "EffectiveContextScope.selectedCollectionIds", (value, field) => assertId(value, field)), "EffectiveContextScope.selectedCollectionIds");
   assertUnique(assertArray(scope.selectedResourceVersions || [], "EffectiveContextScope.selectedResourceVersions", (value, field) => assertId(value, field)), "EffectiveContextScope.selectedResourceVersions");
-  assertUnique(assertArray(scope.selectedSkillVersions, "EffectiveContextScope.selectedSkillVersions", validateSelectedSkillVersion), "EffectiveContextScope.selectedSkillVersions", (value) => `${value.skillId}@${value.version}`);
+  assertUnique(assertArray(selectedSkillIds(scope), "EffectiveContextScope.selectedSkillIds", assertId), "EffectiveContextScope.selectedSkillIds");
   assertUnique(assertArray(scope.capabilities, "EffectiveContextScope.capabilities", (value, field) => assertId(value, field)), "EffectiveContextScope.capabilities");
   assertInteger(scope.contextEpoch, "EffectiveContextScope.contextEpoch", { min: 0 });
   invariant((scope.serverIdentity === null) === (scope.serverId === null), "CONTEXT_SCOPE_SERVER_INCOMPLETE", "serverId 和 serverIdentity 必须同时存在或同时为空", { status: 400 });

@@ -139,7 +139,7 @@ test("读取命中已知正文时仍保留后续位置，能够继续取得并�
       if (calls === 2) return { toolCalls: [{ id: "head", name: "resource_read", input: { filename: "交付要求.md", start: 0 } }] };
       if (calls === 3) {
         const response = messages.find(message => message.toolCallId === "head").content;
-        assert.match(response, /同一版本已经在当前上下文中/);
+        assert.match(response, /内容已经在当前上下文中/);
         assert.match(response, /start=120/);
         return { toolCalls: [{ id: "tail", name: "resource_read", input: { filename: "交付要求.md", start: 120 } }] };
       }

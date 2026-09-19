@@ -572,7 +572,7 @@ test("网页 Agent 的不同文件查询命中同一知识版本时不重复注�
   assert.equal(result.observedFragments.length, 1);
   assert.equal(result.content, "我会继续使用三句以内的简短回答。");
   const secondToolResult = modelMessages[2].find((message) => message.toolCallId === "resource-synonym");
-  assert.match(secondToolResult.content, /同一版本已经在当前上下文中/);
+  assert.match(secondToolResult.content, /内容已经在当前上下文中/);
   assert.doesNotMatch(secondToolResult.content, /用户偏好回答不超过三句话/);
   const injectedFacts = modelMessages[2]
     .filter((message) => message.role === "tool")
@@ -1167,7 +1167,7 @@ test("Work 网页 Agent 只从已过滤目录发现 Skill，不重复读取服�
   assert.equal(result.handoffFragments[0].toolName, "skill_search");
   assert.deepEqual(result.handoffFragments[0].knowledge, {
     key: "skill:skill_private",
-    version: "semantic-v1:private-version:private-sha",
+    version: "private-sha",
     content: "本科生算力平台使用规范\n适用于 Work 模式下的 USTC 算力平台操作。\n# 平台执行\n先确认当前节点，再检查 Slurm 状态。",
   });
   const ready = events.find((event) => event.kind === "run.handoff.ready");

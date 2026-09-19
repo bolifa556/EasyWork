@@ -636,7 +636,7 @@ test("RemoteTaskLifecycle 筛选新交接前先确认重启遗留的已投递知
   assert.deepEqual(fragments, []);
 });
 
-test("RemoteTaskLifecycle keeps deployed Skills selectable for native invocation without adding them to ordinary prompt", async () => {
+test("RemoteTaskLifecycle reuses deployed Skills and sends them again only to a fresh binding", async () => {
   let nativeSessionId = "native-a";
   const known = { key: "skill:platform-guide", version: "1.0.0:hash-a" };
   const lifecycle = new RemoteTaskLifecycle({
@@ -663,7 +663,7 @@ test("RemoteTaskLifecycle keeps deployed Skills selectable for native invocation
   ];
   const effectiveScope = { ...scope, actorType: "user", actorId: "user-runtime", branchId: "branch-runtime", contextEpoch: 0 };
 
-  assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments })).map((entry) => entry.knowledge.key), ["skill:platform-guide", "skill:health-check"]);
+  assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments })).map((entry) => entry.knowledge.key), ["skill:health-check"]);
   nativeSessionId = "native-b";
   assert.deepEqual((await lifecycle.filterHandoff({ scope: effectiveScope, fragments })).map((entry) => entry.knowledge.key), ["skill:platform-guide", "skill:health-check"]);
 });

@@ -552,7 +552,7 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
       references: pendingReferences.map((entry) => entry.conversationId),
       files: pendingResources.files.map((file) => [file.name, file.size, file.lastModified]),
       collections: pendingResources.collections.map((entry) => entry.id),
-      skills: pendingResources.skills.map((entry) => [entry.skillId, entry.version, entry.sha256]),
+      skills: pendingResources.skills.map((entry) => entry.skillId),
     });
     let submissionId = "";
     try {
@@ -1780,8 +1780,7 @@ function ConversationScreen({ conversationId, initialProjectId, initialMode, ini
     if (resources.collections.length) scope.selectedCollectionIds = resources.collections.map((collection) => collection.id);
     if (selectedResourceVersions.length) scope.selectedResourceVersions = [...new Set(selectedResourceVersions)];
     if (resources.skills.length) {
-      scope.selectedSkillVersions = resources.skills.map(({ skillId, version }) => ({ skillId, version }));
-      scope.skillPins = resources.skills.map(({ skillId, version, sha256 }) => ({ skillId, version, sha256 }));
+      scope.selectedSkillIds = resources.skills.map(({ skillId }) => skillId);
     }
     return { providerId, modelId: selectedModel, scope };
   };

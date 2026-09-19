@@ -213,9 +213,9 @@ Qoder 的原生分支参数为：
 
 当前上下文用量以 `message.usage`、`message_delta.usage` 或 assistant frame 的原生 `context_usage` report 为准。Qoder 只返回 `context_usage_ratio` 或 token 计数暂时为 0 时，适配器会结合终态 `modelUsage.contextWindow` 还原当前窗口 token；终端 `result.usage` 的累计 token 仍只进入任务报告，不能覆盖当前 context window。配置页显示的上限优先使用当前 `contextLimit`，即自动压缩计算窗口。读取只消费 Binding 事件缓存，不向会话注入测试 prompt；网页用量缓存按 Actor、服务器、配置域、Binding 和 Agent 隔离，并在 context revision 变化或压缩后强制刷新。partial delta 与完成快照按 message/content/tool 原生 ID 合并，避免重复正文和连续思考块。
 
-`artifacts_update` 中 `kind: "changed"` 的条目作为内部 `file_change` 进入版本账本，避免与普通 Edit/Write 结果重复展示；`kind: "presented"` 的条目形成用户可见 artifact 卡片。memory 与 skill evolution 状态只记入内部作业状态，不替换 EasyWork 的记忆和 Skill 版本源。
+`artifacts_update` 中 `kind: "changed"` 的条目作为内部 `file_change` 进入版本账本，避免与普通 Edit/Write 结果重复展示；`kind: "presented"` 的条目形成用户可见 artifact 卡片。memory 与 skill evolution 状态只记入内部作业状态，不替换 EasyWork 的记忆和技能库当前内容。
 
-Binding 的 `skills/` 链接到 `QODERCN_CONFIG_DIR/skills`。本轮明确选择的 Skill 生成原生命令入口并在 user frame 中调用；Skill 内容、附件、用户文件和写前版本 Hook 都使用与其他 Agent 相同的固定版本及 Binding 隔离机制。Cron 工具被禁用，因为当前网页 Task 流不负责在任务完成后长期调度通知。
+Binding 的 `skills/` 链接到 `QODERCN_CONFIG_DIR/skills`。本轮明确选择的 Skill 使用技能库当前内容生成原生命令入口并在 user frame 中调用；自动选择和强制项复用已发送的技能，网页 Agent 能看到已发送状态。Skill 内容、附件及用户文件均按 Binding 隔离，用户文件和工作区写前 Hook 沿用公共文件版本机制。Cron 工具被禁用，因为当前网页 Task 流不负责在任务完成后长期调度通知。
 
 作业提交记录使用 Bash/shell 工具调用的结构化输入和对应 `tool_result` 输出，通过原生 call ID 关联后交给四种 Agent 共用的提交检测器。只有直接执行 `sbatch` 且返回可验证成功回执才进入持久账本；查询结果、文件文本和 Agent 总结不补录。后台跟踪器随后直接查询调度器并保存终态，不依赖 Qoder 再次查询或用户打开算力面板。
 

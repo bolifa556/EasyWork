@@ -97,7 +97,7 @@ type ListResult<T> = { items: T[]; revision: number };
 type SkillsPageCache = {
   installed: SkillSummary[];
   market: SkillSummary[];
-  uploads: UploadSummary[];
+  uploadLists: Record<string, UploadSummary[]>;
   loadedListKeys: string[];
 };
 type PackageFile = { path: string; content: string };
@@ -157,7 +157,7 @@ function ApplicabilityFields({ value, onChange }: { value: SkillApplicability; o
       <label><span>仅允许</span><input value={allowText} placeholder="留空表示不限制；可填服务器 ID、名称或主机名" onChange={(event) => { setAllowText(event.target.value); onChange({ ...value, allowServers: splitServerRules(event.target.value) }); }} /></label>
       <label><span>禁止</span><input value={denyText} placeholder="可填多个，以逗号分隔" onChange={(event) => { setDenyText(event.target.value); onChange({ ...value, denyServers: splitServerRules(event.target.value) }); }} /></label>
     </fieldset>
-    {!chatOnly ? <label className={styles.forceSkill}><span>是否强制启用该技能</span><select value={value.forceEnabled ? "yes" : "no"} onChange={(event) => onChange({ ...value, forceEnabled: event.target.value === "yes" })}><option value="no">否，按需选择</option><option value="yes">是，自动发送</option></select><small>工作对话中，符合服务器范围时自动发送给远端 Agent；同一远端对话不重复发送相同版本。</small></label> : null}
+    {!chatOnly ? <label className={styles.forceSkill}><span>是否强制启用该技能</span><select value={value.forceEnabled ? "yes" : "no"} onChange={(event) => onChange({ ...value, forceEnabled: event.target.value === "yes" })}><option value="no">否，按需选择</option><option value="yes">是，自动发送</option></select><small>工作对话中，符合服务器范围时自动发送给远端 Agent；同一远端对话已发送的技能会直接复用。</small></label> : null}
   </div>;
 }
 
@@ -616,9 +616,11 @@ export default function SkillsView() {
   const cacheKey = `${runtime.bootstrap?.actor.id || "unresolved"}:${admin ? "admin" : "member"}`;
   const initialCache = skillsPageCache.get(cacheKey);
   const reviewTab: ReviewTab = view.reviewTab || "pending";
+  const listKeyFor = useCallback((tab: SkillTab, uploadReviewTab: ReviewTab = reviewTab) => `${authenticated ? "user" : "guest"}:${admin ? "admin" : "member"}:${tab}${tab === "uploads" ? admin ? `:${uploadReviewTab}` : ":all" : ""}`, [admin, authenticated, reviewTab]);
+  const activeListKey = listKeyFor(activeTab);
   const [installed, setInstalled] = useState<SkillSummary[]>(() => initialCache?.installed || []);
   const [market, setMarket] = useState<SkillSummary[]>(() => initialCache?.market || []);
-  const [uploads, setUploads] = useState<UploadSummary[]>(() => initialCache?.uploads || []);
+  const [uploadLists, setUploadLists] = useState<Record<string, UploadSummary[]>>(() => initialCache?.uploadLists || {});
   const [loadedListKeys, setLoadedListKeys] = useState<Set<string>>(() => new Set(initialCache?.loadedListKeys || []));
   const [query, setQuery] = useState("");
   const [busyReview, setBusyReview] = useState<string | null>(null);
@@ -626,33 +628,41 @@ export default function SkillsView() {
   const [editingSkill, setEditingSkill] = useState<{ source: DetailSource; id: string } | null>(null);
   const [pendingAction, setPendingAction] = useState<{ kind: "delete" | "uninstall"; item: SkillSummary } | null>(null);
   const [showUploader, setShowUploader] = useState(false);
-  const listKeyFor = useCallback((tab: SkillTab) => `${authenticated ? "user" : "guest"}:${admin ? "admin" : "member"}:${tab}${tab === "uploads" ? `:${reviewTab}` : ""}`, [admin, authenticated, reviewTab]);
-  const activeListKey = listKeyFor(activeTab);
+  const revalidatedListKeys = useRef(new Set<string>());
+  const listLoadGenerations = useRef(new Map<string, number>());
+  const uploads = uploadLists[activeListKey] || [];
 
   const loadTab = useCallback(async (tab: SkillTab, signal?: AbortSignal) => {
     const key = listKeyFor(tab);
+    const generation = (listLoadGenerations.current.get(key) || 0) + 1;
+    listLoadGenerations.current.set(key, generation);
+    const current = () => !signal?.aborted && listLoadGenerations.current.get(key) === generation;
     try {
       if (tab === "installed") {
         const result = await api.get<ListResult<SkillSummary>>("/api/skill-center/installed", signal);
-        if (!signal?.aborted) setInstalled(result.data.items);
+        if (current()) setInstalled(result.data.items);
       } else if (tab === "market") {
         const result = await api.get<ListResult<SkillSummary>>("/api/skill-center/market", signal);
-        if (!signal?.aborted) setMarket(result.data.items);
+        if (current()) setMarket(result.data.items);
       } else if (authenticated) {
         const status = admin ? reviewTab : undefined;
         const result = await api.get<ListResult<UploadSummary>>(`/api/skill-center/uploads${status ? `?status=${status}` : ""}`, signal);
-        if (!signal?.aborted) setUploads(result.data.items);
-      } else if (!signal?.aborted) {
-        setUploads([]);
+        if (current()) setUploadLists((lists) => ({ ...lists, [key]: [...new Map(result.data.items.map((item) => [item.id, item])).values()] }));
+      } else if (current()) {
+        setUploadLists((lists) => ({ ...lists, [key]: [] }));
       }
-      if (!signal?.aborted) setLoadedListKeys((current) => new Set(current).add(key));
+      if (current()) setLoadedListKeys((keys) => new Set(keys).add(key));
+      return current();
     } catch (reason) {
-      if (!signal?.aborted) notify(errorMessage(reason), "error");
+      if (current()) notify(errorMessage(reason), "error");
+      return false;
     }
   }, [admin, api, authenticated, listKeyFor, notify, reviewTab]);
 
   const invalidateTab = useCallback((tab: SkillTab) => {
     const key = listKeyFor(tab);
+    listLoadGenerations.current.set(key, (listLoadGenerations.current.get(key) || 0) + 1);
+    revalidatedListKeys.current.delete(key);
     setLoadedListKeys((current) => {
       const next = new Set(current);
       next.delete(key);
@@ -660,16 +670,55 @@ export default function SkillsView() {
     });
   }, [listKeyFor]);
 
+  const invalidateUploadReviewLists = useCallback(() => {
+    const keys = new Set([listKeyFor("uploads", "pending"), listKeyFor("uploads", "reviewed")]);
+    for (const key of keys) {
+      listLoadGenerations.current.set(key, (listLoadGenerations.current.get(key) || 0) + 1);
+      revalidatedListKeys.current.delete(key);
+    }
+    setLoadedListKeys((current) => {
+      const next = new Set(current);
+      for (const key of keys) next.delete(key);
+      return next;
+    });
+    setUploadLists((current) => {
+      const next = { ...current };
+      for (const key of keys) delete next[key];
+      return next;
+    });
+  }, [listKeyFor]);
+
+  const removeReviewedUploadFromLists = useCallback((submissionId: string) => {
+    const pendingKey = listKeyFor("uploads", "pending");
+    const reviewedKey = listKeyFor("uploads", "reviewed");
+    for (const key of new Set([pendingKey, reviewedKey])) listLoadGenerations.current.set(key, (listLoadGenerations.current.get(key) || 0) + 1);
+    revalidatedListKeys.current.delete(reviewedKey);
+    setUploadLists((current) => {
+      const next = { ...current };
+      for (const key of new Set([pendingKey, reviewedKey])) {
+        if (next[key]) next[key] = next[key].filter((entry) => entry.id !== submissionId);
+      }
+      return next;
+    });
+    setLoadedListKeys((current) => {
+      if (!current.has(reviewedKey)) return current;
+      const next = new Set(current);
+      next.delete(reviewedKey);
+      return next;
+    });
+  }, [listKeyFor]);
+
   useEffect(() => {
-    if (loadedListKeys.has(activeListKey)) return;
+    if (loadedListKeys.has(activeListKey) && revalidatedListKeys.current.has(activeListKey)) return;
+    revalidatedListKeys.current.add(activeListKey);
     const controller = new AbortController();
     void Promise.resolve().then(() => loadTab(activeTab, controller.signal));
     return () => controller.abort();
   }, [activeListKey, activeTab, loadTab, loadedListKeys]);
 
   useEffect(() => {
-    skillsPageCache.set(cacheKey, { installed, market, uploads, loadedListKeys: [...loadedListKeys] });
-  }, [cacheKey, installed, loadedListKeys, market, uploads]);
+    skillsPageCache.set(cacheKey, { installed, market, uploadLists, loadedListKeys: [...loadedListKeys] });
+  }, [cacheKey, installed, loadedListKeys, market, uploadLists]);
 
   const navigateTab = (tab: SkillTab) => {
     setQuery("");
@@ -694,7 +743,7 @@ export default function SkillsView() {
     try {
       await runtime.api.post(`/api/skill-center/uploads/${encodeURIComponent(item.id)}/review`, { decision }, { expectedRevision: item.revision, idempotencyKey: commandId("skill-review") });
       runtime.notify(decision === "approve" ? "技能已通过并进入市场" : "技能已拒绝", "success");
-      setUploads((current) => current.filter((entry) => entry.id !== item.id));
+      removeReviewedUploadFromLists(item.id);
       invalidateTab("market");
     } catch (reason) { runtime.notify(errorMessage(reason), "error"); }
     finally { setBusyReview(null); }
@@ -752,7 +801,11 @@ export default function SkillsView() {
   };
 
   if (view.detailId && view.detailSource) return <DetailPage key={`${view.detailSource}:${view.detailId}`} source={view.detailSource} id={view.detailId} admin={admin} authenticated={authenticated} startEditing={editingSkill?.source === view.detailSource && editingSkill.id === view.detailId} onBack={back} onChanged={async () => {
-    if (view.detailSource === "upload") invalidateTab("market");
+    if (view.detailSource === "upload") {
+      removeReviewedUploadFromLists(view.detailId);
+      invalidateTab("market");
+      return;
+    }
     await loadTab(activeTab);
   }} onEditFinished={() => setEditingSkill(null)} />;
 
@@ -769,9 +822,9 @@ export default function SkillsView() {
         : admin ? <div className={styles.toolbarActions}><Button compact icon={showUploader ? <X size={15} /> : <Upload size={15} />} onClick={() => setShowUploader((visible) => !visible)}>{showUploader ? "收起上传" : "上传技能"}</Button></div> : null}
     </div>
 
-    {uploadOpen ? <UploadPanel destination={activeTab === "installed" ? "installed" : "review"} authenticated={authenticated} onUploaded={async () => { setQuery(""); await loadTab(activeTab); setShowUploader(false); }} /> : null}
+    {uploadOpen ? <UploadPanel destination={activeTab === "installed" ? "installed" : "review"} authenticated={authenticated} onUploaded={async () => { setQuery(""); if (activeTab === "uploads") invalidateUploadReviewLists(); else await loadTab(activeTab); setShowUploader(false); }} /> : null}
     {activeTab === "uploads" && admin && !uploadOpen ? <nav className={styles.reviewTabs} aria-label="审核分类"><button className={reviewTab === "pending" ? styles.activeReview : ""} onClick={() => changeReviewTab("pending")}>待审核</button><button className={reviewTab === "reviewed" ? styles.activeReview : ""} onClick={() => changeReviewTab("reviewed")}>已审核</button></nav> : null}
-    {activeTab === "uploads" && !admin ? <UploadPanel authenticated={authenticated} onUploaded={() => loadTab("uploads")} /> : null}
+    {activeTab === "uploads" && !admin ? <UploadPanel authenticated={authenticated} onUploaded={async () => { invalidateUploadReviewLists(); }} /> : null}
     {uploadOpen ? null : !loadedListKeys.has(activeListKey) ? <div className={styles.centerState}><LoaderCircle className={styles.spin} size={22} />正在读取列表</div>
       : activeTab === "uploads"
         ? uploads.length

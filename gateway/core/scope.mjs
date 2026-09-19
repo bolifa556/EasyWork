@@ -1,3 +1,4 @@
+import { selectedSkillIds } from "../../shared/skill-selection.mjs";
 import crypto from "node:crypto";
 import net from "node:net";
 import { domainToASCII } from "node:url";
@@ -71,10 +72,7 @@ export function createEffectiveContextScope(input) {
     memorySnapshotVersionIds: Object.freeze([...(input?.memorySnapshotVersionIds || [])].map(String)),
     resourceBindingSnapshotId: optionalId(input?.resourceBindingSnapshotId, "resourceBindingSnapshotId"),
     selectedCollectionIds: Object.freeze([...(input?.selectedCollectionIds || [])].map(String)),
-    selectedSkillVersions: Object.freeze((input?.selectedSkillVersions || []).map((entry) => Object.freeze({
-      skillId: String(entry.skillId),
-      version: String(entry.version),
-    }))),
+    selectedSkillIds: Object.freeze(selectedSkillIds(input)),
     capabilities: Object.freeze([...new Set((input?.capabilities || []).map(String))].sort()),
     contextEpoch,
   });

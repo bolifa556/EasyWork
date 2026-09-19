@@ -88,7 +88,6 @@ function validateSkillPin(pin, field) {
   const sha256 = assertString(pin.sha256, `${field}.sha256`, { min: 64, max: 64, pattern: /^[a-f0-9]{64}$/ });
   return {
     skillId: assertId(pin.skillId, `${field}.skillId`),
-    version: assertString(pin.version, `${field}.version`, { max: 128 }),
     sha256,
   };
 }
@@ -163,7 +162,7 @@ export function createTask(input, options = {}) {
     route: clone(input.route),
     contextSessionId: input.contextSessionId,
     agentBindingId: input.agentBindingId,
-    skillPins: clone(input.skillPins),
+    skillPins: input.skillPins.map((pin, index) => validateSkillPin(pin, `Task.skillPins[${index}]`)),
     resourceBindingSnapshotId: input.resourceBindingSnapshotId,
     versionCheckpointId: input.versionCheckpointId,
     budgets: clone(input.budgets),

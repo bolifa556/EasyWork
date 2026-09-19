@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   TASK_STATUSES,
   TASK_TRANSITIONS,
-  activateSkillVersion,
   canTransitionTask,
   createArtifact,
   createContextDelivery,
@@ -12,14 +11,11 @@ import {
   createResourceBinding,
   createResourceBlob,
   createResourceVersion,
-  createSkillRegistry,
-  createSkillVersion,
+  createInstalledSkill,
   createTask,
-  createTaskSkillPin,
   invalidateResourceBinding,
   isResourceKnowledgeReady,
   materializeRemoteArtifact,
-  registerSkillVersion,
   transitionContextSession,
   transitionTask,
   updateResourceVersionProcessing,
@@ -110,14 +106,13 @@ function contextEntry(overrides = {}) {
   };
 }
 
-function skillVersionInput(overrides = {}) {
+function installedSkillInput(overrides = {}) {
   return {
     id: "skill_version_01",
     actorId: "user_01",
     skillId: "skill_shell",
-    version: "1.0.0",
     sha256: SHA_A,
-    packagePath: "skills/packages/skill_shell/1.0.0.zip",
+    packagePath: "skills/packages/skill_shell/.installed/package.json",
     manifest: {
       name: "Shell Helper",
       description: "只读检查远端环境",
@@ -399,39 +394,14 @@ test("ContextSession actor 不匹配、未 sealed 投递和空 invalidate 均被
   }, at(AT_2)), "SENSITIVE_VALUE_FORBIDDEN");
 });
 
-test("Skill registry 固定 version/hash，登记和激活均使用 revision", () => {
-  const firstVersion = createSkillVersion(skillVersionInput(), at(AT_0));
-  const secondVersion = createSkillVersion(skillVersionInput({ id: "skill_version_02", version: "2.0.0", sha256: SHA_B }), at(AT_1));
-  let registry = createSkillRegistry({
-    id: "skill_registry_01", actorId: "user_01", skillId: "skill_shell", displayName: "Shell Helper", description: "远端检查工具",
-  }, at(AT_0));
-  registry = registerSkillVersion(registry, firstVersion, { expectedRevision: 0, ...at(AT_1) });
-  assert.equal(registry.activeVersionId, firstVersion.id);
-  registry = registerSkillVersion(registry, secondVersion, { expectedRevision: 1, activate: false, ...at(AT_2) });
-  assert.equal(registry.activeVersionId, firstVersion.id);
-  registry = activateSkillVersion(registry, secondVersion.id, { expectedRevision: 2, ...at(AT_2) });
-  assert.equal(registry.activeVersionId, secondVersion.id);
-  assert.equal(registry.revision, 3);
-
-  const pin = createTaskSkillPin({ id: "pin_01", actorId: "user_01", taskId: "task_01", skillVersion: secondVersion, mandatory: true }, at(AT_2));
-  assert.equal(pin.version, "2.0.0");
-  assert.equal(pin.sha256, SHA_B);
-  assert.ok(Object.isFrozen(pin));
+test("技能实体仅记录当前安装内容，不包含版本或历史注册表", () => {
+  const skill = createInstalledSkill(installedSkillInput(), at(AT_0));
+  assert.equal(skill.skillId, "skill_shell");
+  assert.equal(skill.sha256, SHA_A);
+  assert.equal(Object.hasOwn(skill, "version"), false);
+  assert.ok(Object.isFrozen(skill));
 });
-
-test("Skill registry 禁止跨用户版本与不安全 entrypoint", () => {
-  const registry = createSkillRegistry({
-    id: "skill_registry_02", actorId: "user_01", skillId: "skill_shell", displayName: "Shell", description: "",
-  }, at(AT_0));
-  const foreign = createSkillVersion(skillVersionInput({ id: "skill_version_foreign", actorId: "user_02" }), at(AT_0));
-  expectCode(() => registerSkillVersion(registry, foreign, { expectedRevision: 0, ...at(AT_1) }), "SKILL_REGISTRY_OWNERSHIP_MISMATCH");
-  expectCode(() => createSkillVersion(skillVersionInput({
-    id: "skill_version_bad",
-    manifest: { name: "Bad", description: "", entrypoint: "../escape.mjs", permissions: [] },
-  }), at(AT_0)), "ENTITY_PATH_TRAVERSAL");
-
-  expectCode(() => createSkillVersion(skillVersionInput({
-    id: "skill_version_absolute",
-    packagePath: "C:/outside/skill.zip",
-  }), at(AT_0)), "ENTITY_PATH_NOT_RELATIVE");
+test("技能实体拒绝不安全的包和入口路径", () => {
+  expectCode(() => createInstalledSkill(installedSkillInput({ manifest: { name: "Bad", description: "", entrypoint: "../escape.mjs", permissions: [] } }), at(AT_0)), "ENTITY_PATH_TRAVERSAL");
+  expectCode(() => createInstalledSkill(installedSkillInput({ packagePath: "C:/outside/skill.zip" }), at(AT_0)), "ENTITY_PATH_NOT_RELATIVE");
 });

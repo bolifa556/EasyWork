@@ -1493,7 +1493,7 @@ function isolatedRuntimeFingerprint(agentId, configuration, route, installation 
       binaryPath: installation.binaryPath,
     } : null,
     agentProfile,
-    skillPins: [...skillPins].map(({ skillId, version, sha256, viewHash }) => ({ skillId, version, sha256, viewHash })).sort((a, b) => a.skillId.localeCompare(b.skillId)),
+    skillPins: [...skillPins].map(({ skillId, sha256, viewHash }) => ({ skillId, sha256, viewHash })).sort((a, b) => a.skillId.localeCompare(b.skillId)),
     configuration,
     route: route ? {
       baseUrl: route.baseUrl,
@@ -1915,7 +1915,7 @@ export class AgentRuntimeTransport {
     await restoreSkillSnapshot(this.executor, paths, request.binding.native?.skillSnapshot);
     const currentView = await readSkillView(this.executor, paths);
     const inheritedPins = [...new Map([...(request.binding.native?.skillPins || []), ...(request.recoveredSkillPins || [])].map((pin) => [pin.skillId, pin])).values()];
-    const missingPins = inheritedPins.filter((pin) => !currentView.skills.some((item) => item.skillId === pin.skillId && item.sha256 === pin.sha256));
+    const missingPins = inheritedPins.filter((pin) => !currentView.skills.some((item) => item.skillId === pin.skillId));
     const recoveredSkillRefs = missingPins.length ? await this.skillDeployment.ensurePins(missingPins) : [];
     // Only a verified native-session replacement supplies recovered pins.  It
     // rebuilds the old session's discoverable capabilities without copying a
@@ -2134,7 +2134,6 @@ export class AgentRuntimeTransport {
     for (const skill of skillPins) {
       knownSkills.set(String(skill.skillId), {
         skillId: String(skill.skillId),
-        version: String(skill.version),
         sha256: String(skill.sha256),
         ...(skill.viewHash ? { viewHash: skill.viewHash } : {}),
         ...(skill.nativeName ? { nativeName: skill.nativeName } : {}),

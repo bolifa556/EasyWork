@@ -437,14 +437,14 @@ test("全部模式强制 Skill 在 Chat 按需读取，下一轮复用正文且�
   const skillName = "通用核验说明";
   const skillBody = "核验时保留蓝色签收记录。";
   const modelInputs = [];
-  let discoveryLimits;
+  let discoveryCalls = 0;
   let skillReads = 0;
   const { services } = await fixture(t, ({ runId }) => {
     let iteration = 0;
     return {
-      async complete({ messages, tools = [], limits }) {
+      async complete({ messages, tools = [] }) {
         if (String(messages[0]?.content || "").includes("你为一个已安装 Skill 生成发现简介")) {
-          discoveryLimits = limits;
+          discoveryCalls++;
           return { content: "当用户需要核验签收记录或沿用核验规则时使用，要求保留蓝色签收记录。", reasoning: "", toolCalls: [], usage: null };
         }
         if (!tools.some((tool) => tool.name === "skill_search")) {
@@ -476,7 +476,11 @@ test("全部模式强制 Skill 在 Chat 按需读取，下一轮复用正文且�
   });
   await services.interactions.waitFor(first.response.runId);
   await services.waitForIdle();
-  assert.equal(discoveryLimits.maxOutputTokens, null);
+  assert.equal(discoveryCalls, 0, "对话复用已安装技能简介，不按用户再次生成");
+  assert.ok(modelInputs[0].some((entry) => String(entry.content).includes("核验记录的通用规则。")));
+  const initialCatalog = modelInputs[0].find((entry) => String(entry.content).startsWith("可用 Skill 目录\n\n"))?.content;
+  assert.ok(initialCatalog, "Chat 使用独立技能目录");
+  assert.doesNotMatch(initialCatalog, /（已读取）|已发送|远端/);
   assert.equal(skillReads, 1);
   assert.ok(modelInputs.some((messages) => messages.some((entry) => String(entry.content).includes(skillBody))));
   const current = await services.baseConversations.getConversation(first.conversation.id);
@@ -489,6 +493,23 @@ test("全部模式强制 Skill 在 Chat 按需读取，下一轮复用正文且�
   await services.interactions.waitFor(second.response.runId);
   assert.equal(skillReads, 1);
   assert.ok(modelInputs[0].some((entry) => String(entry.content).includes(skillBody)));
+  const readCatalog = modelInputs[0].find((entry) => String(entry.content).startsWith("可用 Skill 目录\n\n"))?.content;
+  assert.ok(readCatalog?.includes(`${skillName}（已读取）`), "后续提问标记本分支已经读取的技能");
+  await services.waitForIdle();
+  await services.skills.updateInstalled("all-mode-forced", {
+    expectedRevision: (await services.skills.listInstalled()).revision,
+    fileUpdates: [{ path: "SKILL.md", content: "核验时保留绿色签收记录。" }],
+  });
+  modelInputs.length = 0;
+  const third = await services.conversations.sendMessage({
+    mode: "chat", conversationId: first.conversation.id, branchId: first.branchId,
+    content: "沿用核验规则。", expectedRevision: (await services.baseConversations.getConversation(first.conversation.id)).summary.revision,
+    commandId: "chat-forced-skill-updated", response: { providerId: "platform-web", modelId: "memory-model", scope: {} },
+  });
+  await services.interactions.waitFor(third.response.runId);
+  const updatedCatalog = modelInputs[0].find((entry) => String(entry.content).startsWith("可用 Skill 目录\n\n"))?.content;
+  assert.ok(updatedCatalog);
+  assert.doesNotMatch(updatedCatalog, /（已读取）/, "技能内容改变后不能继续标记已读取");
 });
 
 test("Work Skill 目录只依据显式适用范围过滤，不从名称简介猜测服务器", async (t) => {

@@ -321,11 +321,7 @@ function knowledgeForSearchResult(source, entry, presented) {
         : Array.isArray(item.instructions) ? item.instructions.map(nonEmptyText) : []),
     ].filter(Boolean).join("\n");
     const skillId = nonEmptyText(entry?.skillId ?? entry?.id ?? item.name) || `content:${semanticDigest(content)}`;
-    const sourceVersion = [nonEmptyText(entry?.version), nonEmptyText(entry?.sha256)].filter(Boolean).join(":") || semanticDigest(content);
-    // This identity pins the source package even when the Web Agent selects
-    // cached knowledge. Native Skill invocation is separate from deployment;
-    // neither a read nor a package pin proves model compliance.
-    return { key: `skill:${skillId}`, version: `semantic-v1:${sourceVersion}`, content };
+    return { key: `skill:${skillId}`, version: nonEmptyText(entry?.sha256) || semanticDigest(content), content };
   }
   const content = nonEmptyText(JSON.stringify(presented || {}));
   return { key: `${source}:content:${semanticDigest(content)}`, version: semanticDigest(content), content };

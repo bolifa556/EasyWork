@@ -53,7 +53,7 @@ test("自定义文件名上传、安装及反复编辑均原样保存，只在 A
   const source = "---\r\nname: 应用技能\r\ndescription: 使用应用\r\n---\r\n\r\n# 原始内容\r\n";
   const payload = { name: "应用技能", description: "使用应用", files: [{ path: "create_easyworkSkill.md", content: source }] };
   const created = await request("/api/skill-center/installed", { token: member, method: "POST", body: payload, command: "custom-skill-source" });
-  const endpoint = `/api/skill-center/installed/${created.data.registry.skillId}`;
+  const endpoint = `/api/skill-center/installed/${created.data.skill.skillId}`;
   let detail = (await request(endpoint, { token: member })).data;
   assert.deepEqual(detail.files.map((file) => file.path), ["create_easyworkSkill.md"]);
   assert.equal(detail.primaryFile, "create_easyworkSkill.md");
@@ -61,13 +61,13 @@ test("自定义文件名上传、安装及反复编辑均原样保存，只在 A
   for (const replacement of [source.replace("原始内容", "第一次修改"), source.replace("原始内容", "第二次修改")]) {
     const edited = await request(endpoint, { token: member, method: "PATCH", revision: detail.revision, body: { fileUpdates: [{ path: "create_easyworkSkill.md", content: replacement }] } });
     assert.equal(edited.status, 200);
-    assert.equal(edited.data.version.packagePath, created.data.version.packagePath);
+    assert.equal(edited.data.skill.packagePath, created.data.skill.packagePath);
     detail = (await request(endpoint, { token: member })).data;
     assert.deepEqual(detail.files.map((file) => file.path), ["create_easyworkSkill.md"]);
     assert.equal(detail.files[0].content, replacement);
   }
   const session = await gateway.runtime.auth.resolveSession(member);
-  const root = path.join(actorDataRoot(gateway.runtime.dataRoot, session.actor), path.dirname(created.data.version.packagePath));
+  const root = path.join(actorDataRoot(gateway.runtime.dataRoot, session.actor), path.dirname(created.data.skill.packagePath));
   assert.deepEqual(await fs.readdir(path.join(root, "files")), ["create_easyworkSkill.md"]);
   const submission = (await request("/api/skill-center/uploads", { token: admin, method: "POST", body: payload, command: "custom-market-source" })).data.item;
   const market = (await request(`/api/skill-center/uploads/${submission.id}/review`, { token: admin, method: "POST", revision: submission.revision, body: { decision: "approve" } })).data.market;
@@ -98,11 +98,11 @@ test("旧自动生成副本合并回原文件，保留个人编辑、中文元�
   const restored = after.files.find((file) => file.path === manifest.entrypoint).content;
   assert.equal(restored, source.replace("用户同一", "用户同意"));
   assert.equal(parseNativeSkill(restored).metadata.name, manifest.name);
-  const root = path.join(actorDataRoot(gateway.runtime.dataRoot, actor), path.dirname(installed.version.packagePath));
+  const root = path.join(actorDataRoot(gateway.runtime.dataRoot, actor), path.dirname(installed.skill.packagePath));
   assert.deepEqual(await fs.readFile(path.join(root, "files/assets/data.bin")), binary);
   await assert.rejects(() => fs.access(path.join(root, "files/SKILL.md")), { code: "ENOENT" });
   assert.deepEqual((await skills.cleanupStorage()).restoredSources, []);
-  assert.equal((await skills.inspect()).data.versions.length, 1);
+  assert.equal((await skills.inspect()).data.skills.length, 1);
 });
 
 test("普通用户原位编辑个人技能，保留资源文件和适用范围并清理旧包", async (t) => {
@@ -110,7 +110,7 @@ test("普通用户原位编辑个人技能，保留资源文件和适用范围�
   const create = () => request("/api/skill-center/installed", { token: member, method: "POST", body: upload, command: "personal-upload-one" });
   const created = await create();
   assert.equal(created.status, 200);
-  const { skillId } = created.data.registry;
+  const { skillId } = created.data.skill;
   const endpoint = `/api/skill-center/installed/${skillId}`;
   const before = (await request(endpoint, { token: member })).data;
   assert.equal(before.name, upload.name);
@@ -129,13 +129,13 @@ test("普通用户原位编辑个人技能，保留资源文件和适用范围�
   const session = await gateway.runtime.auth.resolveSession(member);
   const services = await gateway.runtime.servicesForActor(session.actor);
   const binary = Buffer.from([0, 255, 1, 2, 128]);
-  const seeded = await services.skills.uploadVersion({
+  const seeded = await services.skills.uploadPackage({
     skillId, version: "with-binary", expectedRevision: before.revision,
-    manifest: created.data.version.manifest,
+    manifest: created.data.skill.manifest,
     files: [...upload.files, { path: "assets/data.bin", content: binary }],
   });
-  const oldSelection = [{ knowledge: { key: `skill:${skillId}`, version: `semantic-v1:${seeded.version.version}:${seeded.version.sha256}` } }];
-  assert.equal((await services.skills.resolveKnowledgePins(oldSelection)).length, 1);
+  const oldSelection = [{ knowledge: { key: `skill:${skillId}`, version: `semantic-v1:${seeded.skill.version}:${seeded.skill.sha256}` } }];
+  assert.equal((await services.skills.resolveSkills(oldSelection)).length, 1);
   const changed = await request(endpoint, { token: member, method: "PATCH", revision: seeded.revision, body: {
     name: "编辑后的个人技能", description: "新的简介",
     fileUpdates: [{ path: "SKILL.md", content: "# 新的步骤\n\n仅执行个人规则。" }, { path: "references/notes.md", content: "新增笔记" }],
@@ -147,18 +147,18 @@ test("普通用户原位编辑个人技能，保留资源文件和适用范围�
   assert.deepEqual(after.applicability, scope);
   assert.match(after.files.find((file) => file.path === "SKILL.md").content, /仅执行个人规则/);
   assert.equal(after.files.find((file) => file.path === "scripts/check.py").content, upload.files[2].content);
-  await assert.rejects(() => services.skills.resolveKnowledgePins(oldSelection), { code: "SKILL_SELECTED_VERSION_UNAVAILABLE" });
-  assert.equal(changed.data.version.id, seeded.version.id);
-  assert.equal(changed.data.version.version, seeded.version.version);
-  assert.equal(changed.data.version.packagePath, seeded.version.packagePath);
-  assert.notEqual(changed.data.version.sha256, seeded.version.sha256);
+  assert.deepEqual(await services.skills.resolveSkills(oldSelection), [{ skillId, sha256: changed.data.skill.sha256 }]);
+  assert.equal(changed.data.skill.id, seeded.skill.id);
+  assert.equal(Object.hasOwn(changed.data.skill, "version"), false);
+  assert.equal(changed.data.skill.packagePath, seeded.skill.packagePath);
+  assert.notEqual(changed.data.skill.sha256, seeded.skill.sha256);
   const packageFiles = (version) => path.join(actorDataRoot(services.skills.dataRoot, session.actor), path.dirname(version.packagePath), "files");
-  assert.deepEqual(await fs.readFile(path.join(packageFiles(changed.data.version), "assets/data.bin")), binary);
-  assert.match(await fs.readFile(path.join(packageFiles(seeded.version), "SKILL.md"), "utf8"), /仅执行个人规则/);
-  await assert.rejects(() => fs.access(packageFiles(created.data.version)), { code: "ENOENT" });
+  assert.deepEqual(await fs.readFile(path.join(packageFiles(changed.data.skill), "assets/data.bin")), binary);
+  assert.match(await fs.readFile(path.join(packageFiles(seeded.skill), "SKILL.md"), "utf8"), /仅执行个人规则/);
+  assert.equal(changed.data.skill.packagePath, created.data.skill.packagePath);
   const skillRoot = path.join(actorDataRoot(services.skills.dataRoot, session.actor), "skills");
-  assert.deepEqual(await fs.readdir(path.join(skillRoot, "packages", skillId)), [seeded.version.version]);
-  assert.equal((await services.skills.inspect()).data.versions.length, 1);
+  assert.deepEqual(await fs.readdir(path.join(skillRoot, "packages", skillId)), [".installed"]);
+  assert.equal((await services.skills.inspect()).data.skills.length, 1);
   await assert.rejects(() => fs.access(path.join(skillRoot, ".pending-package-edit")), { code: "ENOENT" });
 
   const parallel = await Promise.all(["第一次编辑", "第二次编辑"].map((name) => request(endpoint, { token: member, method: "PATCH", revision: after.revision, body: { name } })));

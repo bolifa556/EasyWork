@@ -74,12 +74,11 @@ export class SshSkillDeployment {
     const skills = [];
     for (const pin of pins) {
       const skillId = segment(pin.skillId, "skillId");
-      const version = segment(pin.version, "version");
-      const relativeRoot = `skills/packages/${skillId}/${version}`;
+      const relativeRoot = `skills/packages/${skillId}/.installed`;
       const descriptor = JSON.parse(await fs.readFile(resolveActorPath(this.dataRoot, this.actor, `${relativeRoot}/package.json`), "utf8"));
-      invariant(descriptor.sha256 === pin.sha256 && descriptor.skillId === skillId && descriptor.version === version && Array.isArray(descriptor.files), "REMOTE_SKILL_SOURCE_CHANGED", "继承技能的固定包已变化", { status: 409 });
-      const targetRoot = `~/.easywork/skills/${skillId}/${version}`;
-      skills.push({ skillId, version, sha256: pin.sha256, targetRoot, manifest: descriptor.manifest,
+      invariant(descriptor.skillId === skillId && Array.isArray(descriptor.files), "REMOTE_SKILL_SOURCE_CHANGED", "技能当前安装内容不可用", { status: 409 });
+      const targetRoot = `~/.easywork/skills/${skillId}`;
+      skills.push({ skillId, sha256: descriptor.sha256, targetRoot, manifest: descriptor.manifest,
         entrypoint: `${targetRoot}/${descriptor.manifest.entrypoint}`, operations: [],
         files: descriptor.files.map((file) => ({ relativePath: file.path, source: { actorRelativePath: `${relativeRoot}/files/${file.path}`, sha256: file.sha256, size: file.size }, target: { path: `${targetRoot}/${file.path}`, expectedSha256: file.sha256 } })),
       });
@@ -102,12 +101,11 @@ export class SshSkillDeployment {
     const results = [];
     for (const skill of value.skills) {
       const skillId = segment(skill?.skillId, "skillId");
-      const version = segment(skill?.version, "version");
       const expectedPackageHash = String(skill?.sha256 || "");
       invariant(/^[a-f0-9]{64}$/.test(expectedPackageHash) && Array.isArray(skill.files) && Array.isArray(skill.operations), "REMOTE_SKILL_PLAN_INVALID", "Skill deployment plan 内容无效", { status: 400 });
       const targetRoot = `${this.root}/${expectedPackageHash}`;
       const staging = `${this.root}/.stage-${expectedPackageHash}-${crypto.randomUUID()}`;
-      const expectedTildeRoot = `~/.easywork/skills/${skillId}/${version}`;
+      const expectedTildeRoot = `~/.easywork/skills/${skillId}`;
       invariant(skill.targetRoot === expectedTildeRoot && skill.entrypoint?.startsWith(`${expectedTildeRoot}/`), "REMOTE_SKILL_TARGET_ESCAPE", "Skill 目标路径越界", { status: 403 });
       const files = [];
       let published = null;
@@ -118,11 +116,11 @@ export class SshSkillDeployment {
         const relativePath = this.#relative(file?.relativePath);
         const source = exactObject(file?.source, ["actorRelativePath", "sha256", "size"], "Skill source");
         const target = exactObject(file?.target, ["path", "expectedSha256"], "Skill target");
-        const expectedTarget = `~/.easywork/skills/${skillId}/${version}/${relativePath}`;
+        const expectedTarget = `~/.easywork/skills/${skillId}/${relativePath}`;
         invariant(target.path === expectedTarget && target.expectedSha256 === source.sha256 && /^[a-f0-9]{64}$/.test(source.sha256), "REMOTE_SKILL_TARGET_ESCAPE", "Skill 文件目标或摘要无效", { status: 403 });
         const localPath = resolveActorPath(this.dataRoot, this.actor, source.actorRelativePath);
         const localBytes = await fs.readFile(localPath);
-        invariant(localBytes.length <= MAX_SKILL_FILE_BYTES && localBytes.length === source.size && sha256(localBytes) === source.sha256, "REMOTE_SKILL_SOURCE_CHANGED", "Skill 源文件与固定版本不一致", { status: 409, details: { skillId, version, path: relativePath } });
+        invariant(localBytes.length <= MAX_SKILL_FILE_BYTES && localBytes.length === source.size && sha256(localBytes) === source.sha256, "REMOTE_SKILL_SOURCE_CHANGED", "Skill 源文件与本次待发送内容不一致", { status: 409, details: { skillId, path: relativePath } });
         const remotePath = `${published ? targetRoot : staging}/${relativePath}`;
         let currentHash = null;
         try { currentHash = sha256(await this.executor.readFile(remotePath)); } catch (error) { if (!["ENOENT", "NO_SUCH_FILE", 2].includes(error?.code)) throw error; }
@@ -131,14 +129,14 @@ export class SshSkillDeployment {
           invariant(!published, "REMOTE_SKILL_CACHE_CORRUPT", "远端不可变技能文件已变化", { status: 409 });
           await this.executor.upload(localPath, remotePath);
           const verified = await this.executor.readFile(remotePath);
-          invariant(verified.length <= MAX_SKILL_FILE_BYTES && sha256(verified) === source.sha256, "REMOTE_SKILL_VERIFY_FAILED", "远端 Skill 文件校验失败", { status: 502, details: { skillId, version, path: relativePath } });
+          invariant(verified.length <= MAX_SKILL_FILE_BYTES && sha256(verified) === source.sha256, "REMOTE_SKILL_VERIFY_FAILED", "远端 Skill 文件校验失败", { status: 502, details: { skillId, path: relativePath } });
           status = "deployed";
         }
         files.push({ path: relativePath, sha256: source.sha256, size: source.size, status });
       }
       const manifest = skill.manifest || { name: skillId, description: skillId, entrypoint: path.posix.relative(expectedTildeRoot, skill.entrypoint), permissions: [] };
       if (!published) {
-        await this.executor.writeAtomic(`${staging}/package.json`, `${JSON.stringify({ schemaVersion: 1, actorId: this.actor.actorId, skillId, version, sha256: expectedPackageHash, manifest, files })}\n`, { mode: 0o600 });
+        await this.executor.writeAtomic(`${staging}/package.json`, `${JSON.stringify({ schemaVersion: 1, actorId: this.actor.actorId, skillId, sha256: expectedPackageHash, manifest, files })}\n`, { mode: 0o600 });
         const publication = await this.executor.exec(`[ ! -e ${quote(targetRoot)} ] && mv -T -- ${quote(staging)} ${quote(targetRoot)}`, { maxOutputBytes: 2048 });
         invariant(publication.code === 0, "REMOTE_SKILL_PUBLICATION_FAILED", "无法原子发布远端技能包", { status: 502 });
       }
@@ -148,7 +146,6 @@ export class SshSkillDeployment {
         serverId: this.serverId,
         serverIdentity: this.serverIdentity,
         skillId,
-        version,
         sha256: expectedPackageHash,
         remotePath: targetRoot,
         entrypoint,
@@ -156,13 +153,13 @@ export class SshSkillDeployment {
         status: files.some((file) => file.status === "deployed") ? "deployed" : "up-to-date",
         updatedAt: new Date(this.clock()).toISOString(),
       };
-      const prior = index.items.findIndex((entry) => entry.actorId === record.actorId && entry.skillId === skillId && entry.version === version);
+      const prior = index.items.findIndex((entry) => entry.actorId === record.actorId && entry.skillId === skillId);
       if (prior >= 0) index.items[prior] = record;
       else index.items.push(record);
       results.push(record);
     }
     await this.executor.writeAtomic(this.indexPath, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
-    return results.map(({ skillId, version, sha256: hash, remotePath, entrypoint }) => ({ skillId, version, sha256: hash, remotePath, entrypoint }));
+    return results.map(({ skillId, sha256: hash, remotePath, entrypoint }) => ({ skillId, sha256: hash, remotePath, entrypoint }));
   }
 
   async inspect() {
@@ -199,10 +196,9 @@ export class SshSkillDeployment {
   #validateRefs(refs) {
     return refs.map((entry) => {
       const skillId = segment(entry?.skillId, "skillId");
-      const version = segment(entry?.version, "version");
       const remotePath = path.posix.normalize(String(entry?.remotePath || ""));
       invariant(/^[a-f0-9]{64}$/.test(String(entry.sha256)) && remotePath === `${this.root}/${entry.sha256}`, "REMOTE_SKILL_TARGET_ESCAPE", "Skill 引用越界", { status: 403 });
-      return { skillId, version, sha256: String(entry.sha256 || ""), remotePath };
+      return { skillId, sha256: String(entry.sha256 || ""), remotePath };
     });
   }
 }

@@ -1,0 +1,6 @@
+{
+  "document": "可用 Skill 目录\n\n标记“已读取”的技能已经在之前读取过，无需重复读取\n\n{{ITEMS}}",
+  "empty": "（当前没有可用 Skill）",
+  "item": "- {{NAME}}{{READ_STATUS}}：{{DESCRIPTION}}",
+  "separator": "\n"
+}
