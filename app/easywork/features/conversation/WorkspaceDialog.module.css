@@ -45,7 +45,7 @@
 .spin { animation:spin 750ms linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
 @media (max-width:719px) {
-  .panel { height:min(90dvh,760px); }
+  .panel { width:100%; height:min(88dvh,760px); min-height:0; max-height:calc(100dvh - 40px); background:#fffdf7; }
   .kindSelect > span:first-child { display:none; }
   .virtual,.user { padding-right:13px; padding-left:13px; }
   .directoryToolbar { grid-template-columns:minmax(0,1fr) 38px 38px 38px; }

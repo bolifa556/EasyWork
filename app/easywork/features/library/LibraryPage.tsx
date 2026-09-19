@@ -327,7 +327,7 @@ function CollectionsView({
   }, [collections, query]);
 
   return (
-    <div className={styles.page}>
+    <div className={`${styles.page} ew-page-scrollbar`}>
       <header className={styles.pageHeader}>
         <div className={styles.titleLine}><span data-ui-icon="" className={styles.titleIcon}><FileStack size={19} /></span><h1>文件库</h1></div>
       </header>
@@ -498,7 +498,7 @@ function CollectionDetail({ collection, files, busyAction, onBack, onUpload, onU
 
   return (
     <div
-      className={styles.page}
+      className={`${styles.page} ew-page-scrollbar`}
       onDragEnter={(event) => activateDropTarget(event, directory)}
       onDragOver={(event) => activateDropTarget(event, directory)}
       onDragLeave={(event) => leaveDropTarget(event, directory)}

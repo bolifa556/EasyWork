@@ -107,7 +107,8 @@
 .composerPlanRow[data-status="completed"] .taskPlanStatus { color:var(--ew-green); }
 .composerPlanRow[data-status="running"] .taskPlanStatus { color:#7b668f; }
 .composerPlanRow[data-status="failed"] .taskPlanStatus { color:var(--ew-red); }
-.composerPlanOpen .composerPlanCurrent { height:calc(var(--plan-count) * var(--plan-row-height) + 2px); overflow-y:auto; }
+.composerPlanOpen .composerPlanCurrent { height:calc(var(--plan-count) * var(--plan-row-height) + 2px); overflow-y:auto; scrollbar-width:none; }
+.composerPlanOpen .composerPlanCurrent::-webkit-scrollbar { display:none; width:0; height:0; }
 .composerPlanOpen .composerPlanRows { transform:translateY(0); }
 .taskPlanList { display:grid; gap:6px; min-width:0; }
 .taskPlanStep { display:grid; min-width:0; grid-template-columns:17px minmax(0,1fr); align-items:start; gap:7px; color:var(--ew-ink-soft); font-size:var(--rail-font-size,13.5px); line-height:1.42; }
@@ -134,7 +135,10 @@
 .referenceInlineLink svg { flex:0 0 auto; }
 .referenceInlineLink span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .referenceInlineLink:hover span { text-decoration:underline; }
-.textarea { width:auto; min-width:0; height:30px; min-height:30px; max-height:96px; flex:1 1 160px; resize:none; overflow-x:hidden; overflow-y:hidden; overscroll-behavior:contain; border:0; background:transparent; color:var(--ew-ink); outline:0; padding:4px 2px; font:inherit; font-size:15.5px; line-height:22px; }
+.textarea { width:auto; min-width:0; height:30px; min-height:30px; max-height:96px; flex:1 1 160px; resize:none; overflow-x:hidden; overflow-y:hidden; overscroll-behavior:contain; border:0; background:transparent; color:var(--ew-ink); outline:0; padding:4px 2px; font:inherit; font-size:15.5px; line-height:22px; scrollbar-color:rgb(99 108 98 / 30%) transparent; scrollbar-width:thin; }
+.textarea::-webkit-scrollbar { width:9px; height:9px; background:transparent; }
+.textarea::-webkit-scrollbar-thumb { border:3px solid transparent; border-radius:999px; background:rgb(99 108 98 / 30%); background-clip:padding-box; }
+.textarea::-webkit-scrollbar-track,.textarea::-webkit-scrollbar-corner { background:transparent; }
 .textarea::placeholder { color: var(--ew-ink-muted); }
 .boxMultiline .textarea { align-self:stretch; padding:3px 34px 3px 8px; }
 .boxExpanded { height:min(68vh,620px); min-height:420px; grid-template-rows:minmax(0,1fr) 38px; }
@@ -344,6 +348,7 @@
   .boxMultiline.mobileComposerActive.boxWithResources,
   .boxExpanded.mobileComposerActive.boxWithResources { grid-template-areas:"chips chips chips" "add input send"; grid-template-rows:auto 36px; }
   .composerInput { height:36px; }
+  .emptyComposer .box:not(.mobileComposerActive) .composerInput { -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 26px),transparent); mask-image:linear-gradient(to right,#000 calc(100% - 26px),transparent); }
   .textarea,
   .boxMultiline .textarea,
   .boxExpanded .textarea { height:36px!important; min-height:36px; max-height:36px; align-self:center; padding:6px 3px; overflow-x:auto!important; overflow-y:auto!important; font-size:var(--ew-mobile-control); line-height:24px; white-space:nowrap; }
@@ -375,8 +380,6 @@
   .emptyInner { position:relative; width:100%; height:100%; min-height:100%; grid-template-rows:minmax(12px,1fr) auto 140px 0 minmax(12px,1fr) auto; align-content:normal; padding:64px 9px calc(42px + env(safe-area-inset-bottom)); transform:none; }
   .emptyTitle { grid-row:2; margin:0 12px 16px; font-size:1.25rem; transition:opacity 150ms ease,transform 180ms ease; animation:mobileStartIn 180ms cubic-bezier(.22,1,.36,1); }
   .emptyInner:global([data-composer-focused]) .emptyTitle { opacity:0; transform:translateY(-8px); }
-  .emptyInner:global([data-composer-focused]) { grid-template-rows:minmax(0,1fr) auto 0 0 minmax(0,1fr) auto; padding-top:54px; }
-  .emptyInner:global([data-composer-focused]) .setup { visibility:hidden; pointer-events:none; }
   .emptyComposer { width:100%; grid-row:6; }
   .setup { width:min(100%,300px); grid-row:3; align-items:stretch; justify-content:flex-start; gap:4px; margin:0 auto; padding-inline:12px; animation:mobileStartIn 180ms cubic-bezier(.22,1,.36,1); }
   .setupStep,

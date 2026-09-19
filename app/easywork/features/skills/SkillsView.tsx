@@ -575,7 +575,7 @@ function DetailPage({ source, id, admin, authenticated, startEditing, onBack, on
   const displayedApplicability = detail.applicability || defaultApplicability;
   const canEditScope = source === "installed" || (source === "market" && admin);
 
-  return <div className={styles.detailPage}>
+  return <div className={`${styles.detailPage} ew-page-scrollbar`}>
     <header className={styles.detailHeader}>
       <div className={styles.detailTitle}><span data-ui-icon="" className={styles.detailIcon}><Sparkles size={19} /></span><span><h1>{detail.name}</h1><small>{detail.description || "暂无简介"}</small></span></div>
       <div className={styles.detailActions}>
@@ -813,7 +813,7 @@ export default function SkillsView() {
   const list = activeTab === "market" ? market : installed;
   const needle = query.trim().toLocaleLowerCase("zh-CN");
   const filtered = list.filter((item) => !needle || `${item.name}\n${item.description}`.toLocaleLowerCase("zh-CN").includes(needle));
-  return <div className={styles.page}>
+  return <div className={`${styles.page} ew-page-scrollbar`}>
     <SkillsHeader />
     <div className={styles.toolbar}>
       <PrimaryTabs active={activeTab} onChange={navigateTab} />

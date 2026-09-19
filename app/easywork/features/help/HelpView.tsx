@@ -55,7 +55,7 @@ export default function HelpView() {
     void runtime.api.post("/api/auth/help-seen", {}).catch(() => undefined);
   }, [actorId, bootstrapReady, runtime.api, runtime.loading]);
 
-  return <section className={styles.page}>
+  return <section className={`${styles.page} ew-page-scrollbar`}>
     {loading ? <div className={styles.loading} role="status"><span className={styles.loadingRing} data-loading-spinner="" aria-hidden="true" /><span>正在读取帮助</span></div> : error ? <section className={styles.unavailable}><TriangleAlert size={24} /><strong>{error}</strong><button type="button" onClick={() => void load().catch((reason) => setError(reason instanceof Error ? reason.message : "帮助读取失败"))}>重新读取</button></section> : <article className={styles.document}><ReactMarkdown
       remarkPlugins={[remarkGfm, remarkMath]}
       rehypePlugins={[rehypeKatex]}

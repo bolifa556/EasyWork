@@ -56,6 +56,29 @@ html {
 
 body { overflow: hidden; }
 
+/* Page-level scroll regions use the same quiet scrollbar as the conversation
+   timeline. Keep this class on the element that owns the right-edge scroll. */
+.ew-page-scrollbar {
+  scrollbar-color: rgb(99 108 98 / 30%) transparent;
+  scrollbar-width: thin;
+}
+
+.ew-page-scrollbar::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+  background: transparent;
+}
+
+.ew-page-scrollbar::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: rgb(99 108 98 / 30%);
+  background-clip: padding-box;
+}
+
+.ew-page-scrollbar::-webkit-scrollbar-track,
+.ew-page-scrollbar::-webkit-scrollbar-corner { background: transparent; }
+
 button,
 input,
 textarea,

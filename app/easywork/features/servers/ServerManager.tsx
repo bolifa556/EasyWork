@@ -364,7 +364,7 @@ export default function ServerManager() {
     catch (reason) { notify(reason instanceof Error ? reason.message : "断开失败", "error"); }
   };
 
-  return <div className={`${styles.page} ${mobileDetailOpen ? styles.mobileDetailPage : ""}`}>
+  return <div className={`${styles.page} ${mobileDetailOpen ? styles.mobileDetailPage : ""} ew-page-scrollbar`}>
     <header className={styles.pageHeader}>
       <div className={styles.titleLine}>{mobileDetailOpen ? <button className={styles.mobileBack} aria-label="返回服务器列表" onClick={() => { setMobileDetailOpen(false); setEditing(null); }}><ArrowLeft size={17} /></button> : null}<span data-ui-icon="" className={styles.titleIcon}><Server size={19} /></span><h1>远程服务器</h1></div>
     </header>
