@@ -75,11 +75,11 @@
 
 | 部署主机 | 发布包 | 运行环境 |
 | --- | --- | --- |
-| Windows 10 / 11，x64 | `easywork-0.1.2-windows-x64.zip` | 内置 Node.js |
-| Ubuntu 22.04 及以上，x64 | `easywork-0.1.2-linux-x64.tar.gz` | 内置 Node.js |
-| CentOS 7.9，x64 | `easywork-0.1.2-linux-centos7-x64.tar.gz` | 内置兼容 glibc 2.17 的 Node.js |
+| Windows 10 / 11，x64 | [easywork-0.1.2-windows-x64.zip](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-windows-x64.zip) | 内置 Node.js |
+| Ubuntu 22.04 及以上，x64 | [easywork-0.1.2-linux-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-linux-x64.tar.gz) | 内置 Node.js |
+| CentOS 7.9，x64 | [easywork-0.1.2-linux-centos7-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-linux-centos7-x64.tar.gz) | 内置兼容 glibc 2.17 的 Node.js |
 
-从 [Releases 页面](../../releases) 下载对应包。自行构建的文件位于 `releases/`，附带 `SHA256SUMS.txt` 校验文件。解压后即可启动网页服务，无需另装 Node.js。
+从 [Releases 页面](https://github.com/bolifa556/EasyWork/releases) 下载对应包。自行构建的文件位于 `releases/`，附带 `SHA256SUMS.txt` 校验文件。解压后即可启动网页服务，无需另装 Node.js。
 
 CentOS 7 请使用专用包，其中的 Node.js 来自 [glibc 2.17 社区构建](https://github.com/nodejs/unofficial-builds#builds)。
 

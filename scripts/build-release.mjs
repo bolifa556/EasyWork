@@ -87,7 +87,7 @@ const dependencies = [...trace.fileList].map((entry) => entry.replaceAll("\\", "
 
 const common = path.join(cache, "common");
 await resetStage(common);
-for (const entry of ["dist", "gateway", "shared", "prompts", "help", "public", "doc", "assets", "README.md", "README_zh.md", ".env.example", "agent-app/update-agent-app.mjs"]) {
+for (const entry of ["dist", "gateway", "shared", "prompts", "help", "public", "doc", "assets", "LICENSE", "README.md", "README_zh.md", ".env.example", "agent-app/update-agent-app.mjs"]) {
   await copyRelative(entry, common);
 }
 // Ship only the pinned catalog and download tools. The local Agent binaries,

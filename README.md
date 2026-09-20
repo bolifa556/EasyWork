@@ -75,11 +75,11 @@ Releases are **x86-64 / AMD64 only**. Windows 10 and Windows 11 share one packag
 
 | Host system | Package | Runtime |
 | --- | --- | --- |
-| Windows 10 / 11, x64 | `easywork-0.1.2-windows-x64.zip` | Node.js included |
-| Ubuntu 22.04 or later, x64 | `easywork-0.1.2-linux-x64.tar.gz` | Node.js included |
-| CentOS 7.9, x64 | `easywork-0.1.2-linux-centos7-x64.tar.gz` | Node.js compatible with glibc 2.17 included |
+| Windows 10 / 11, x64 | [easywork-0.1.2-windows-x64.zip](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-windows-x64.zip) | Node.js included |
+| Ubuntu 22.04 or later, x64 | [easywork-0.1.2-linux-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-linux-x64.tar.gz) | Node.js included |
+| CentOS 7.9, x64 | [easywork-0.1.2-linux-centos7-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-linux-centos7-x64.tar.gz) | Node.js compatible with glibc 2.17 included |
 
-Download the matching package from [Releases](../../releases). Local builds are written to `releases/` with `SHA256SUMS.txt`. Extract the archive and start the web service; a separate Node.js installation is unnecessary.
+Download the matching package from [Releases](https://github.com/bolifa556/EasyWork/releases). Local builds are written to `releases/` with `SHA256SUMS.txt`. Extract the archive and start the web service; a separate Node.js installation is unnecessary.
 
 Use the dedicated CentOS 7 package for that system. It includes the Node.js [glibc 2.17 community build](https://github.com/nodejs/unofficial-builds#builds).
 
