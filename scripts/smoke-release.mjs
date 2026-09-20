@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -18,33 +18,43 @@ assert.deepEqual(metadata.agentPlatforms, ["linux-x64", "linux-x64-musl", "linux
 const agentRoot = path.join(root, "agent-app");
 const agentManifest = JSON.parse(await readFile(path.join(agentRoot, "manifest.json"), "utf8"));
 assert.deepEqual(Object.keys(agentManifest.agents).sort(), ["claudecode", "codex", "opencode", "qodercncli"]);
-const { HostAgentArtifactCatalog } = await import(pathToFileURL(path.join(root, "gateway/core/agent-runtime/manifest.mjs")));
-const catalog = new HostAgentArtifactCatalog({ root: agentRoot });
-const runtimeAgentId = (id) => ({ claudecode: "claude-code", qodercncli: "qoder-cn" })[id] || id;
+assert.equal(metadata.agentApplicationsBundled, false);
+const wrappers = process.platform === "win32" ? ["update-agent-app.cmd", "update-agent-app.ps1"] : ["update-agent-app.sh"];
+assert.deepEqual((await readdir(agentRoot)).sort(), ["manifest.json", "update-agent-app.mjs", ...wrappers].sort(), "Only download scripts and catalog; no Agent applications");
+const { artifactPath, compatibilityReleases } = await import(pathToFileURL(path.join(agentRoot, "update-agent-app.mjs")));
 for (const [id, agent] of Object.entries(agentManifest.agents)) {
   assert.equal(agent.version, metadata.agents[id]);
   assert.deepEqual(Object.keys(agent.artifacts).sort(), [...metadata.agentPlatforms].sort(), "All declared remote Linux agent platforms");
-  for (const platform of metadata.agentPlatforms) await catalog.resolve(runtimeAgentId(id), platform, { verify: false });
+  for (const release of [agent, ...compatibilityReleases(agent)]) {
+    for (const artifact of Object.values(release.artifacts)) await artifactPath(agentRoot, id, artifact);
+  }
 }
-async function runUpdater(command, args) {
+async function runUpdater(command, args, expectedCode = 0, expectedText = "Usage:") {
   const updater = spawn(command, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   for (const stream of [updater.stdout, updater.stderr]) stream.on("data", (chunk) => { output += chunk; });
   const [code] = await once(updater, "exit");
-  assert.equal(code, 0, output);
-  assert.ok(output.includes("Agent packages verified and ready"), output);
+  assert.equal(code, expectedCode, output);
+  assert.ok(output.includes(expectedText), output);
 }
 if (process.platform === "win32") {
-  await runUpdater(process.env.ComSpec || "cmd.exe", ["/d", "/c", "agent-app\\update-agent-app.cmd", "--check"]);
-  await runUpdater("powershell.exe", ["-NoProfile", "-File", path.join(agentRoot, "update-agent-app.ps1"), "-Check", "-Agent", "codex"]);
+  await runUpdater(process.env.ComSpec || "cmd.exe", ["/d", "/c", "agent-app\\update-agent-app.cmd"]);
+  await runUpdater("powershell.exe", ["-NoProfile", "-File", path.join(agentRoot, "update-agent-app.ps1")]);
+  await runUpdater("powershell.exe", ["-NoProfile", "-File", path.join(agentRoot, "update-agent-app.ps1"), "-Check", "-Agent", "codex"], 1, "Missing Agent file");
 } else {
-  await runUpdater("sh", [path.join(agentRoot, "update-agent-app.sh"), "--check"]);
+  await runUpdater("sh", [path.join(agentRoot, "update-agent-app.sh")]);
+  await runUpdater("sh", [path.join(agentRoot, "update-agent-app.sh"), "--agent", "codex", "--check"], 1, "Missing Agent file");
 }
 const requirePackage = createRequire(path.join(root, "package.json"));
 const { createCanvas } = requirePackage("@napi-rs/canvas");
 const canvas = createCanvas(32, 32);
 canvas.getContext("2d").fillRect(0, 0, 16, 16);
 assert.ok(canvas.toBuffer("image/png").length > 50, "Native image rendering");
+const sharp = requirePackage("sharp");
+const thumbnail = await sharp(canvas.toBuffer("image/png")).rotate().resize({ width: 16, height: 16, fit: "inside", withoutEnlargement: true }).webp({ quality: 84 }).toBuffer();
+const thumbnailInfo = await sharp(thumbnail).metadata();
+assert.equal(thumbnailInfo.width, 16, "Packaged image thumbnail runtime");
+assert.equal(thumbnailInfo.format, "webp");
 const { DefaultResourceExtractor } = await import(pathToFileURL(path.join(root, "gateway/core/resources/extractor.mjs")));
 const textContent = "EasyWork release document extraction works correctly.";
 const stream = `BT /F1 12 Tf 30 100 Td (${textContent}) Tj ET`;
@@ -137,7 +147,7 @@ try {
     clearTimeout(timeout);
     socket.close();
   }
-  console.log(JSON.stringify({ target: metadata.target, os: `${os.type()} ${os.release()}`, node: process.versions.node, arch: process.arch, agents: metadata.agents, checks: ["bundled remote Linux agent catalog", "native updater scripts and SHA-256 verification", "native canvas", "PDF extraction", "Word extraction", "SSH library", "home page", `${assets.length} static assets`, "registration", "clean data", "authenticated API", "WebSocket"] }, null, 2));
+  console.log(JSON.stringify({ target: metadata.target, os: `${os.type()} ${os.release()}`, node: process.versions.node, arch: process.arch, agents: metadata.agents, checks: ["pinned Agent catalog without applications", "platform download scripts", "image thumbnails", "native canvas", "PDF extraction", "Word extraction", "SSH library", "home page", `${assets.length} static assets`, "registration", "clean data", "authenticated API", "WebSocket"] }, null, 2));
 } catch (error) {
   console.error(logs);
   throw error;

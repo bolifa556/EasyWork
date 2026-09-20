@@ -7,7 +7,8 @@
       "sha256": "1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97",
       "platform": "win32",
       "systems": ["Windows 10", "Windows 11"],
-      "canvasPackage": "@napi-rs/canvas-win32-x64-msvc"
+      "canvasPackage": "@napi-rs/canvas-win32-x64-msvc",
+      "sharpPackages": ["@img/sharp-win32-x64"]
     },
     "linux-x64": {
       "archive": "node-v22.23.2-linux-x64.tar.gz",
@@ -15,7 +16,8 @@
       "sha256": "b294a556e639d64338823920e5866c21c02741742d2e1529ee1a225c1ec9252a",
       "platform": "linux",
       "systems": ["Ubuntu 22.04+ (glibc 2.35+)"],
-      "canvasPackage": "@napi-rs/canvas-linux-x64-gnu"
+      "canvasPackage": "@napi-rs/canvas-linux-x64-gnu",
+      "sharpPackages": ["@img/sharp-linux-x64", "@img/sharp-libvips-linux-x64"]
     },
     "linux-centos7-x64": {
       "archive": "node-v22.23.2-linux-x64-glibc-217.tar.xz",
@@ -24,6 +26,7 @@
       "platform": "linux",
       "systems": ["CentOS 7.9 (glibc 2.17)"],
       "canvasPackage": "@napi-rs/canvas-linux-x64-gnu",
+      "sharpPackages": ["@img/sharp-wasm32", "@emnapi/runtime", "tslib"],
       "runtimeNote": "Community Node.js build targeting glibc 2.17; CentOS 7 compatibility package."
     }
   }

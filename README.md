@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="assets/readme/hero.svg" width="100%" alt="EasyWork — Chat, knowledge and remote work in one place">
+  <img src="assets/readme/hero.svg" width="100%" alt="EasyWork — Connect conversations, knowledge and remote work">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.1-17786B?style=flat-square" alt="Version 0.1.1">
+  <img src="https://img.shields.io/badge/version-0.1.2-17786B?style=flat-square" alt="Version 0.1.2">
   <img src="https://img.shields.io/badge/platforms-Windows%20%2F%20Linux-17786B?style=flat-square" alt="Windows and Linux">
   <img src="https://img.shields.io/badge/architecture-x64-17786B?style=flat-square" alt="64-bit x86">
   <img src="https://img.shields.io/badge/deployment-self--hosted-17786B?style=flat-square" alt="Self-hosted">
@@ -13,152 +13,171 @@
   <a href="README_zh.md"><b>简体中文</b></a> · <b>English</b>
 </p>
 <p align="center">
-  <a href="#features">Features</a> · <a href="#download">Download</a> · <a href="#quick-start">Quick Start</a> · <a href="#faq">FAQ</a>
+  <a href="#features">Features</a> · <a href="#download-and-install">Download and Install</a> · <a href="#quick-start">Quick Start</a> · <a href="#faq">FAQ</a>
 </p>
 
 ## What is EasyWork?
 
-**EasyWork is a conversational workspace that connects AI, your knowledge and remote servers.** Ask questions in Chat mode, or switch to Work mode to let a coding agent complete tasks in a remote workspace. Conversations, files, terminal sessions and results stay together in your browser.
+**EasyWork is a conversational workspace connecting AI, personal knowledge and remote servers.** Chat and search your materials in a browser, or use SSH to let an Agent write code, process files and run computing tasks in a remote workspace. Conversations, files, terminals, server resources and job status share one interface.
 
-Connect **OpenCode, Claude Code or Codex**, organize reusable material into projects and file collections, and continue your work from another device. EasyWork runs on a host you control; remote work runs on the Linux servers you connect through SSH.
+EasyWork integrates **OpenCode, Codex, Claude Code and Qoder CN**, with projects, file collections, skills, layered memory and access across devices. Host EasyWork on your own Windows or Linux machine; Agents run on the Linux servers you connect to.
 
 ## Features
 
-### 💬 Chat & Work — From questions to action
+### 💬 Chat and Work
 
-- **Chat mode** — Ask questions with a model API you configure, using relevant files, skills and memories when needed.
-- **Work mode** — Select a server, agent and workspace, then describe the task in natural language.
-- **Visible progress** — Follow tool activity, commands, responses and generated files in the conversation.
-- **Continuous work** — Closing the browser does not cancel a task while the EasyWork host remains running.
+- **Chat mode**: Ask questions with your models, files, skills and memories. No server connection is required.
+- **Work mode**: Choose a server, Agent and workspace. The web assistant gathers relevant materials; the remote Agent receives the original request and handles planning, execution and the response.
+- **Streaming conversations**: Follow replies, tool activity and progress as they arrive. Append messages, interrupt, approve actions or compact context where supported by the Agent.
+- **Images and attachments**: Upload or paste images for vision models. In work mode, manually attached original files can be delivered to the remote Agent.
 
-### 🖥️ Remote Workspace — Your server in the browser
+### 🖥️ Remote Workbench
 
-- Connect multiple servers with SSH passwords or keys, with interactive verification when required.
-- Browse and preview files, open a terminal and inspect server resources.
-- Use an existing directory or create a temporary workspace managed by EasyWork.
-- Inspect Slurm jobs and submit or cancel jobs on servers that provide Slurm.
+- Connect through SSH passwords or keys, including interactive authentication and server fingerprint confirmation.
+- Browse, upload, download and preview remote files, open terminals and inspect computing resources.
+- Submit, cancel and track jobs on Slurm servers, with ongoing status updates for registered jobs.
+- Continue connections, terminals and conversations across devices with the same account. Closing the browser leaves background tasks running while the EasyWork host stays online.
 
-### 📚 Files & Memory — Bring the right context
+### 📚 Files, Projects and Memory
 
-- Organize files into collections and attach them to conversations or projects.
-- Search text, Markdown, PDF and Word documents; image recognition requires an OCR model configuration.
-- Retain useful preferences and project context, with project memory scope controls.
-- Reference another conversation with `@` and search previous conversations.
+- Organize materials into file collections linked to projects or conversations. Search text, Markdown, PDF, Word and other supported content.
+- Retain user preferences, project context and stable facts from conversations for later work.
+- Use `@` to reference other conversations explicitly and continue from relevant records.
+- Preview generated files and images in the conversation, zoom in or download results.
 
-### 🧩 Agents & Skills — Continue with the tools you prefer
+### 🧩 Four Agents and Custom Skills
 
-- Switch between OpenCode, Claude Code and Codex, with relevant context passed to the selected session.
-- Install marketplace skills or upload your own, and control where they apply.
-- Branch or rewind conversations with coordinated remote file history, subject to the agent's capabilities and file conflicts.
+- Choose **OpenCode, Codex, Claude Code or Qoder CN**, with model selection and the runtime options each Agent supports.
+- OpenCode, Codex and Claude Code use configured model services. Qoder CN uses its own account login, model catalog and quota.
+- Install skills from the market, or upload and edit your own. Set their scope to chat, work or both.
+- Server types, allowlists and denylists apply only in work mode. Skills set to both modes remain available in chat.
+- Agent and server switches retain separate sessions that can be resumed. Changing the workspace for the same Agent and server keeps its existing session.
 
-### 🌐 Self-Hosted — One account, multiple devices
+### 🌿 Conversation Branches and File History
 
-- Access the same deployment from desktop or mobile browsers.
-- Keep account data and encrypted credentials on your EasyWork host.
-- Configure your own model services, or let the administrator provide shared services.
+- Branch a conversation or return to an earlier message to explore another approach.
+- Coordinate conversation rewinds with tracked remote file versions. Conflicts require attention before later changes can be overwritten.
+- Automatic file history is independent of workspace Git. Available rewind behavior depends on the Agent and the state of the files.
 
-## Download
+### 🌐 Self-Hosting and Access Across Devices
 
-Only **x86-64 / AMD64** packages are provided. Windows 10 and 11 share one archive.
+- Access the same EasyWork installation from desktop and mobile browsers.
+- Keep account data and encrypted credentials on your host, with separate materials and connections for each account.
+- Use personal model APIs or administrator-provided models, Embedding and OCR services.
+
+## Download and Install
+
+Releases are **x86-64 / AMD64 only**. Windows 10 and Windows 11 share one package.
 
 | Host system | Package | Runtime |
 | --- | --- | --- |
-| Windows 10 / 11, x64 | `easywork-0.1.1-windows-x64.zip` | Bundled Node.js |
-| Ubuntu 22.04+, x64 | `easywork-0.1.1-linux-x64.tar.gz` | Bundled Node.js |
-| CentOS 7.9, x64 | `easywork-0.1.1-linux-centos7-x64.tar.gz` | Bundled glibc 2.17 compatible Node.js |
+| Windows 10 / 11, x64 | `easywork-0.1.2-windows-x64.zip` | Node.js included |
+| Ubuntu 22.04 or later, x64 | `easywork-0.1.2-linux-x64.tar.gz` | Node.js included |
+| CentOS 7.9, x64 | `easywork-0.1.2-linux-centos7-x64.tar.gz` | Node.js compatible with glibc 2.17 included |
 
-Release assets belong on the repository's [Releases page](../../releases). Local builds are written to `releases/`, together with `SHA256SUMS.txt`.
+Download the matching package from [Releases](../../releases). Local builds are written to `releases/` with `SHA256SUMS.txt`. Extract the archive and start the web service; a separate Node.js installation is unnecessary.
 
-The CentOS 7 package uses the Node.js project's [unofficial glibc 2.17 build](https://github.com/nodejs/unofficial-builds#builds). Use that archive on CentOS 7, whose system libraries cannot run the ordinary Linux runtime. This is a compatibility build; CentOS 7 is no longer maintained upstream.
+Use the dedicated CentOS 7 package for that system. It includes the Node.js [glibc 2.17 community build](https://github.com/nodejs/unofficial-builds#builds).
 
-These archives start a web service. Open it in a browser; no desktop application or separate Node.js installation is required. AI services and remote SSH servers must be reachable for the corresponding features.
+### Install Your Selected Agent
 
-### Install & update agents
+**Release archives do not include downloaded Agent applications.** The `agent-app/` directory contains the download scripts for the host system, a pinned version catalog and the files needed by those scripts. Download the Agents you need, then install them on the remote server through EasyWork. Chat alone does not require this step.
 
-**All three release packages include the Linux x64 applications for OpenCode, Codex and Claude Code**, with glibc and musl variants. After extraction, EasyWork can install them on your connected remote servers.
+This EasyWork release uses the following fixed versions. The scripts do not follow the latest upstream releases:
 
-The source repository provides the installer catalog and update scripts; download the applications yourself when deploying from source or restoring missing files. Run the script for your host from the project or installation directory:
+| Agent | Script name | Pinned version |
+| --- | --- | --- |
+| OpenCode | `opencode` | `1.18.30` |
+| Codex | `codex` | `0.154.0` |
+| Claude Code | `claudecode` | `2.1.269` |
+| Qoder CN | `qodercncli` | `1.1.53` |
+
+Run the appropriate command from the extracted directory, replacing `codex` with your choice:
 
 ```powershell
-# Windows 10 / 11
-.\agent-app\update-agent-app.cmd
+# Windows 10 / 11: download Codex only
+.\agent-app\update-agent-app.cmd --agent codex --platform linux-x64
+
+# PowerShell is also supported
+.\agent-app\update-agent-app.ps1 -Agent codex -Platform linux-x64
 ```
 
 ```bash
-# Ubuntu / CentOS 7
-sh agent-app/update-agent-app.sh
+# Ubuntu / CentOS 7: download Codex only
+sh agent-app/update-agent-app.sh --agent codex --platform linux-x64
 ```
 
-By default, the scripts download the pinned versions and verify SHA-256 hashes, skipping valid local files. Add `--latest` to download the latest versions, or `--check` to verify local files without downloading. Use `--agent codex` to select one agent. Windows also provides `update-agent-app.ps1`, with `-Latest`, `-Check` and `-Agent codex` parameters. Release packages use their bundled Node.js; source deployments require Node.js 22.13+.
+- **Choose what to download**: `--agent opencode,codex` selects multiple Agents. Only an explicit `--all` selects all four. Running without arguments shows help and downloads nothing.
+- **Select the remote platform**: `--platform` describes the Linux server where the Agent will run, not the host running the script. The default is `linux-x64`; `linux-x64-musl`, `linux-arm64` and `linux-arm64-musl` are also supported. Separate multiple platforms with commas. Windows hosts also download remote Linux installers.
+- **Verify and repair**: Files are checked against their SHA-256 and size. Valid files are reused; rerun the same command to restore missing or damaged files. Add `--check` for offline verification. PowerShell uses `-Check` and `-All`.
+- **Compatibility builds**: Claude Code downloads for `linux-x64` also include pinned version `2.1.170` for older glibc environments. Qoder CN includes a baseline build of `1.1.53`. EasyWork selects artifacts using the remote host's capabilities; requirements still vary by Agent.
 
-Once the files are ready, connect SSH in Work mode, open the agent selector and click **安装** (Install). For an existing managed agent, click **更新** (Update) to check for and install a newer version, then configure its model API. The scripts prepare installers on the host; the web interface deploys them to the remote server.
-
-Agents currently run on **remote Linux x64 servers**, so the Windows package also includes these remote applications. Each agent has its own system requirements; running the EasyWork host on CentOS 7 does not guarantee that every agent runs on a CentOS 7 remote server.
+After downloading, connect SSH in work mode, open the Agent selection panel and click **Install**. For an existing managed Agent, **Update** synchronizes it with this release's pinned catalog. Configure its model service or complete Qoder CN account login. Scripts use the bundled Node.js runtime; source deployments require Node.js 22.13 or later.
 
 ## Quick Start
 
-### Windows
+### 1. Start the Service
 
-Extract `easywork-0.1.1-windows-x64.zip` and double-click **`start.cmd`** inside the extracted folder. Keep its window open while using EasyWork.
+**Windows**: Extract `easywork-0.1.2-windows-x64.zip`, open the folder and double-click **`start.cmd`**.
 
-### Ubuntu
+**Ubuntu**:
 
 ```bash
-tar -xzf easywork-0.1.1-linux-x64.tar.gz
-cd easywork-0.1.1-linux-x64
+tar -xzf easywork-0.1.2-linux-x64.tar.gz
+cd easywork-0.1.2-linux-x64
 ./start.sh
 ```
 
-### CentOS 7
+**CentOS 7**:
 
 ```bash
-tar -xzf easywork-0.1.1-linux-centos7-x64.tar.gz
-cd easywork-0.1.1-linux-centos7-x64
+tar -xzf easywork-0.1.2-linux-centos7-x64.tar.gz
+cd easywork-0.1.2-linux-centos7-x64
 ./start.sh
 ```
 
-Open **[http://127.0.0.1:8001](http://127.0.0.1:8001)** on the host. Other devices can use `http://HOST_IP:8001` when the network and firewall permit access. Press `Ctrl+C` in the launcher terminal to stop the service.
+Open **[http://127.0.0.1:8001](http://127.0.0.1:8001)** on the host. Other devices can use `http://HOST_IP:8001` when the network allows it. Keep the service running during use; press `Ctrl+C` in its terminal to stop it.
 
-### Administrator setup
+### 2. Register and Set Up Administrators
 
-There is no preset administrator account or password. **The first registered account automatically becomes the administrator.** Register before opening a fresh deployment to other users. After signing in, open **管理员面板** (Admin panel) in the sidebar to configure shared models, embeddings and OCR.
+There is no preset account or password. **The first registered account automatically becomes an administrator.** Complete this registration before opening the service to others. Administrators can configure shared models, Embedding and OCR in the sidebar's administrator panel.
 
-To add an administrator, have the user register first, then edit `admins/adminList` inside your data directory (default: `data/admins/adminList`). Save it as UTF-8 text with one registered username per line; remove a line to revoke that user's administrator access. Ask the user to sign in again to refresh the interface, and keep at least one administrator. If you set `EASYWORK_DATA_ROOT`, edit the file under that directory instead.
+To add an administrator, have the user register first, then edit `admins/adminList` in the data directory (default: `data/admins/adminList`). Use UTF-8 text with one registered username per line. Removing a line revokes that user's administrator role. Sign in again to refresh the interface, and retain at least one administrator. If `EASYWORK_DATA_ROOT` is set, edit the file under that directory.
 
-### Your first task
+### 3. Configure a Model and Start Working
 
-1. **Create an account.** The first registered user becomes the administrator; complete this step before exposing a fresh deployment to other users.
-2. **Configure a model API.** Open your profile → **模型 API** to add an API URL and key, or select a service provided by the administrator.
-3. **Start a chat.** Choose a model and send a message. File indexing requires an embedding service; image recognition also requires an OCR service configured by the administrator.
-4. **Try Work mode.** Connect an SSH server, configure an agent and select a workspace, then describe your task.
+1. Open **Model API** in your profile and enter an API URL and key, or select an administrator-provided service.
+2. Choose a model and start chatting. Add file collections, skills or conversation references as needed. Semantic file search requires Embedding. Image understanding uses a vision model where supported, with configured OCR as a fallback.
+3. For work mode, download your selected Agent using the scripts above, connect SSH, install it remotely and choose a workspace before sending a task.
+4. Follow replies, tool activity, terminals, remote files and job status in the same interface.
 
-The detailed [user guide](help/help.md) follows the current Chinese interface.
+See the [user guide](help/help.md) for more operations.
 
-## Configuration & Data
+## Configuration and Data
 
-For release packages, copy `.env.example` to `.env` and edit it before starting. Common settings are the public port (`EASYWORK_WEB_PORT`, default `8001`) and an absolute data directory (`EASYWORK_DATA_ROOT`, default `data/` beside the application).
+Copy `.env.example` to `.env`, edit it and restart the service. Common settings are `EASYWORK_WEB_PORT` (default: `8001`) and `EASYWORK_DATA_ROOT` (an absolute path is recommended; defaults to `data/` beside the application).
 
-Back up the **entire data directory**, including its encryption material. When upgrading, stop EasyWork, extract the new package into a separate folder and reuse the same data directory and configuration. Guest data is temporary; use an account for work you want to keep.
+Back up the **entire data directory**, including its encryption material. Before upgrading, stop the service, extract the new release to a separate directory and reuse your existing data directory and configuration. Download Agents as needed. Guest data is temporary; use an account for work you want to retain.
 
-For internet access, use an HTTPS reverse proxy with WebSocket support on port `8001`; the internal rendering port does not need to be exposed. Files and credentials are stored on your host, while model requests send the selected context to the configured model provider.
+For public access, configure an HTTPS reverse proxy with WebSocket support. The internal rendering port does not need to be public. Model requests send relevant context to the configured model service.
 
 ## FAQ
 
-**Does my browser have to stay open?**  
-No. The host continues running tasks after the browser closes. Keep the host process running. After a host restart, reconnect your SSH servers; recovery depends on the task and the agent's available session state.
+**Will tasks continue after I close the browser?**  
+Yes, while the EasyWork host process is running. Reconnect SSH after a host restart; recovery depends on the task state and the Agent's native session records.
 
-**Do I need an SSH server for ordinary chat?**  
-No. Chat mode only needs a configured model service. Work mode uses a connected Linux server.
+**Why do I need to download an Agent after extracting a release?**  
+Releases provide the web service and download scripts for the host system. Users prepare Agent applications as needed. Chat requires no Agent download; choose an Agent when you want to use work mode.
 
-**Will EasyWork change my workspace's Git history?**  
-EasyWork's automatic file history is separate from the workspace's Git repository. An agent can still run Git commands when carrying out your instructions.
+**Must the host and work server be the same machine?**  
+No. Your browser connects to the EasyWork host, which connects to Linux work servers through SSH. Agent architecture and system requirements follow the work server.
 
-**Can I use it completely offline?**  
-The interface runs on your host. Chat, retrieval and agent tasks depend on their configured services; offline operation requires those services and any needed installers to be available locally.
+**Can it work entirely offline?**  
+The interface is hosted on your own machine. Chat, retrieval and Agent tasks depend on configured services, so offline use requires those services and installation files to be locally available.
 
-## Development
+## Local Development
 
-Use Node.js **22.13+** and install dependencies from the lockfile:
+Use **Node.js 22.13 or later**:
 
 ```bash
 npm ci
@@ -166,17 +185,10 @@ npm run build
 npm start
 ```
 
-For development, run `npm run gateway` and `npm run dev` in separate terminals. Run the test suite with `npm run test:gateway` and check code with `npm run lint`.
+For development, run `npm run gateway` and `npm run dev` in separate terminals. Prepare an Agent when needed:
 
-Run `npm run agents:download` to prepare the agent applications, then `npm run release` to build all three complete packages. Building also requires Python 3.9+ and `tar`. Every package includes the agent applications and update scripts for its host system.
-
-```text
-app/          Browser interface
-gateway/      Application services and remote work
-shared/       Shared utilities
-prompts/      Model prompts and skill definitions
-help/         User guide
-doc/          Mechanism and agent documentation
-scripts/      Build, startup and release tools
-tests/        Automated tests
+```bash
+npm run agents:download -- --agent codex --platform linux-x64
 ```
+
+`npm run test:gateway` runs tests; `npm run lint` checks code. Commit your changes, then run `npm run release` to build all three packages. Packaging also requires Python 3.9+ and `tar`; no Agent downloads are needed beforehand. Each archive includes only its host system's Agent download scripts and the pinned catalog.

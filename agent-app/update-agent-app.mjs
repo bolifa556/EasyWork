@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { lstat, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, open, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { digest, downloadVerified } from "../scripts/artifact-download.mjs";
@@ -7,237 +6,70 @@ import { digest, downloadVerified } from "../scripts/artifact-download.mjs";
 export const agentIds = ["opencode", "codex", "claudecode", "qodercncli"];
 export const platforms = ["linux-x64", "linux-x64-musl", "linux-arm64", "linux-arm64-musl"];
 const defaultRoot = path.dirname(fileURLToPath(import.meta.url));
-const claudeBase = "https://downloads.claude.ai/claude-code-releases";
-const claudeFallbackBase = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
-const qoderCnBase = "https://static.qoder.com.cn/qoder-cli-cn";
-const qoderOptimizedCpuFlags = ["sse4_2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "fma"];
 const help = [
-  "Agent binary updater / Agent 二进制更新器",
-  "Usage: node agent-app/update-agent-app.mjs [options]",
-  "  --locked          Download/repair versions in manifest.json (default).",
-  "                    按清单安装或修复，默认模式。",
-  "  --latest          Download latest official releases and update the catalog.",
-  "                    下载官方最新版本并更新清单。",
-  "  --check           Verify local files without downloading or changing files.",
-  "                    只检查本地文件，不联网、不改动。",
-  "  --agent NAME      opencode, codex, claudecode, qodercncli; comma-separated, default: all.",
-  "  --platform NAME   linux-x64, linux-x64-musl, linux-arm64, linux-arm64-musl.",
-  "                    Comma-separated; default: platforms already in the catalog.",
-  "                    Manifest-pinned host compatibility releases are retained too.",
-  "  --help            Show this help.",
+  "EasyWork Agent installer / Agent 安装文件下载工具",
+  "Usage: node agent-app/update-agent-app.mjs --agent NAME [options]",
+  "  --agent NAME      opencode, codex, claudecode, qodercncli; comma-separated.",
+  "                    只下载指定的 Agent，可用逗号选择多个。",
+  "  --all             Explicitly select all four Agents / 明确选择全部四个 Agent。",
+  "  --platform NAME   Remote Linux platform; default: linux-x64.",
+  "                    linux-x64, linux-x64-musl, linux-arm64, linux-arm64-musl.",
+  "                    远端服务器的平台，与运行脚本的 Windows/Linux 主机无关；可用逗号选择多个。",
+  "  --locked          Download/repair the versions pinned in manifest.json (default).",
+  "                    固定下载本版 EasyWork 配套版本，不查询或升级至上游最新版。",
+  "  --check           Verify selected local files offline / 离线校验所选安装文件。",
+  "  --help            Show help. No arguments also show help without downloading.",
+  "                    不带参数只显示帮助，不下载。",
   "",
-  "Windows: agent-app\\update-agent-app.cmd [options]",
-  "Linux:   sh agent-app/update-agent-app.sh [options]",
-  "PowerShell: .\\agent-app\\update-agent-app.ps1 [-Latest | -Locked | -Check] [-Agent codex] [-Platform linux-x64]",
+  "Windows:    agent-app\\update-agent-app.cmd --agent codex",
+  "Linux:      sh agent-app/update-agent-app.sh --agent opencode",
+  "PowerShell: .\\agent-app\\update-agent-app.ps1 -Agent qodercncli -Platform linux-x64",
   "",
-  "Downloads and verifies the local artifact catalog for Linux x64/arm64 and glibc/musl servers.",
-  "只下载并校验本地制品目录，覆盖 Linux x64/arm64、glibc/musl 与清单固定的主机兼容版本。",
+  "SHA-256 and file sizes are verified; matching pinned compatibility builds are included.",
+  "下载后校验 SHA-256 和文件大小，同时准备清单中适用于所选平台的兼容版本。",
+  "Then connect SSH in EasyWork and install the selected Agent on the remote server.",
+  "下载完成后，在 EasyWork 中连接 SSH 并安装对应 Agent。",
 ].join("\n");
 
 export function parseOptions(args) {
-  const options = { mode: "locked", agents: [], platforms: [], help: args.includes("--help") };
+  const options = { mode: "locked", agents: [], platforms: [], help: args.length === 0 || args.includes("--help") };
   let explicitMode;
+  let all = false;
   for (let index = 0; index < args.length; index += 1) {
     const [flag, inline] = args[index].split("=", 2);
-    if (flag === "--help") continue;
-    if (["--locked", "--latest", "--check"].includes(flag) && inline === undefined) {
-      if (explicitMode && explicitMode !== flag) throw new Error("Choose only one of --locked, --latest and --check");
+    if (flag === "--help" && inline === undefined) continue;
+    if (["--locked", "--check"].includes(flag) && inline === undefined) {
+      if (explicitMode && explicitMode !== flag) throw new Error("Choose only one of --locked and --check");
       explicitMode = flag;
       options.mode = flag.slice(2);
+    } else if (flag === "--all" && inline === undefined) {
+      all = true;
     } else if (["--agent", "--platform"].includes(flag)) {
       const value = inline ?? args[++index];
       if (!value || value.startsWith("--")) throw new Error("Missing value for " + flag);
-      options[flag === "--agent" ? "agents" : "platforms"].push(...value.split(","));
+      options[flag === "--agent" ? "agents" : "platforms"].push(...value.split(",").map((item) => item.trim()));
     } else if (platforms.includes(flag)) {
       options.platforms.push(flag);
+    } else if (flag === "--latest") {
+      throw new Error("Versions are pinned to this EasyWork release. Use --agent NAME; --latest is not supported. / 请用 --agent 选择固定版本。");
     } else {
       throw new Error("Unknown argument: " + args[index]);
     }
   }
+  if (all && options.agents.length) throw new Error("Choose either --agent or --all");
+  if (all) options.agents = [...agentIds];
+  if (!options.agents.length && !options.help) throw new Error("Select an Agent with --agent NAME, or use --all. / 请通过 --agent 指定要安装的 Agent。");
+  if (!options.platforms.length) options.platforms = ["linux-x64"];
   for (const [key, allowed] of [["agents", agentIds], ["platforms", platforms]]) {
-    const defaults = key === "agents" ? allowed : [];
-    options[key] = [...new Set(options[key].length ? options[key] : defaults)];
+    options[key] = [...new Set(options[key])];
     if (options[key].some((value) => !allowed.includes(value))) throw new Error("Unsupported " + key + ": " + options[key].join(", "));
   }
   return options;
 }
 
-async function metadata(url, { text = false } = {}) {
-  const headers = { "User-Agent": "EasyWork-Agent-Artifact-Updater" };
-  if (new URL(url).hostname === "api.github.com") {
-    headers.Accept = "application/vnd.github+json";
-    headers["X-GitHub-Api-Version"] = "2022-11-28";
-    const token = String(process.env.GITHUB_TOKEN || "").trim();
-    if (token) headers.Authorization = `Bearer ${token}`;
-  }
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const response = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) });
-      if (!response.ok) {
-        const error = new Error("HTTP " + response.status + ": " + url);
-        error.status = response.status;
-        throw error;
-      }
-      return text ? (await response.text()).trim() : await response.json();
-    } catch (error) {
-      if (attempt === 3) throw error;
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
-    }
-  }
-}
-
-async function githubLatestReleasePage(repository) {
-  const headers = { "User-Agent": "EasyWork-Agent-Artifact-Updater" };
-  let latest;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      latest = await fetch("https://github.com/" + repository + "/releases/latest", {
-        headers,
-        redirect: "follow",
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!latest.ok) throw new Error("HTTP " + latest.status + ": " + latest.url);
-      break;
-    } catch (error) {
-      if (attempt === 3) throw error;
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
-    }
-  }
-  const latestUrl = new URL(latest.url);
-  const prefix = "/" + repository + "/releases/tag/";
-  if (latestUrl.origin !== "https://github.com" || !latestUrl.pathname.startsWith(prefix)) throw new Error("Invalid GitHub latest-release redirect");
-  const tagName = decodeURIComponent(latestUrl.pathname.slice(prefix.length));
-  validVersion(tagName.replace(/^(?:rust-v|v)/, ""));
-  const expandedUrl = "https://github.com/" + repository + "/releases/expanded_assets/" + encodeURIComponent(tagName);
-  const html = await metadata(expandedUrl, { text: true });
-  const assets = [];
-  const linkPattern = /href="([^"?#]+\/releases\/download\/[^"?#]+)"/g;
-  for (const match of html.matchAll(linkPattern)) {
-    const href = match[1];
-    if (!href.startsWith("/" + repository + "/releases/download/")) continue;
-    const blockEnd = html.indexOf("</li>", match.index);
-    const block = html.slice(match.index, blockEnd < 0 ? match.index + 3_000 : blockEnd);
-    const digestMatch = block.match(/sha256:([a-f0-9]{64})/);
-    if (!digestMatch) continue;
-    const source = new URL(href, "https://github.com");
-    assets.push({
-      name: decodeURIComponent(source.pathname.split("/").at(-1)),
-      digest: "sha256:" + digestMatch[1],
-      browser_download_url: source.href,
-    });
-  }
-  if (!assets.length) throw new Error("GitHub release page did not expose official SHA-256 digests");
-  return { tag_name: tagName, draft: false, prerelease: false, assets };
-}
-
-async function githubLatestRelease(repository, request) {
-  try {
-    return await request("https://api.github.com/repos/" + repository + "/releases/latest");
-  } catch (error) {
-    if (request !== metadata || ![403, 429].includes(Number(error.status))) throw error;
-    return await githubLatestReleasePage(repository);
-  }
-}
-
 function validVersion(value) {
   if (typeof value !== "string" || !/^[0-9][0-9A-Za-z._-]*$/.test(value)) throw new Error("Invalid agent version");
   return value;
-}
-
-export async function resolveLatest(agentId, selectedPlatforms, request = metadata) {
-  const artifacts = {};
-  let version;
-  let source;
-  let release;
-  let artifactBase;
-  if (agentId === "qodercncli") {
-    source = qoderCnBase + "/channels/manifest.json";
-    release = await request(source);
-    version = validVersion(String(release.latest || ""));
-  } else if (agentId === "claudecode") {
-    let base = claudeBase;
-    try {
-      version = validVersion(await request(base + "/latest", { text: true }));
-    } catch (error) {
-      if (request !== metadata) throw error;
-      base = claudeFallbackBase;
-      version = validVersion(await request(base + "/latest", { text: true }));
-    }
-    artifactBase = base;
-    source = base + "/" + version + "/manifest.json";
-    release = await request(source);
-  } else {
-    const repository = agentId === "opencode" ? "anomalyco/opencode" : "openai/codex";
-    release = await githubLatestRelease(repository, request);
-    if (release.draft || release.prerelease) throw new Error("Expected an official stable release");
-    version = validVersion(String(release.tag_name || "").replace(agentId === "opencode" ? /^v/ : /^rust-v/, ""));
-    source = "https://github.com/" + repository + "/releases/tag/" + encodeURIComponent(release.tag_name);
-  }
-  for (const platform of selectedPlatforms) {
-    let artifact;
-    let filename;
-    if (agentId === "qodercncli") {
-      const arch = platform === "linux-x64" ? "amd64"
-        : platform === "linux-x64-musl" ? "amd64-musl"
-          : platform === "linux-arm64" ? "arm64"
-            : "arm64-musl";
-      const entry = release.files?.find((item) => item.os === "linux" && item.arch === arch);
-      filename = `qoderclicn-${platform}.tar.gz`;
-      artifact = {
-        archive: "tar.gz",
-        binary: "qoderclicn",
-        sha256: entry?.sha256,
-        source: entry?.url,
-      };
-    } else if (agentId === "claudecode") {
-      filename = "claude-" + platform;
-      const entry = release.platforms?.[platform];
-      artifact = { archive: "raw", sha256: entry?.checksum, source: artifactBase + "/" + version + "/" + platform + "/claude" };
-      if (entry?.size !== undefined) artifact.size = entry.size;
-    } else {
-      const codexArchitecture = platform.includes("arm64") ? "aarch64" : "x86_64";
-      filename = agentId === "opencode" ? "opencode-" + platform + ".tar.gz" : "codex-" + codexArchitecture + "-unknown-linux-musl.tar.gz";
-      const asset = release.assets?.find((entry) => entry.name === filename);
-      artifact = {
-        archive: "tar.gz",
-        binary: agentId === "opencode" ? "opencode" : "codex-" + codexArchitecture + "-unknown-linux-musl",
-        sha256: asset?.digest?.replace(/^sha256:/, ""),
-        source: asset?.browser_download_url,
-        size: asset?.size,
-      };
-    }
-    if (!/^[a-f0-9]{64}$/.test(artifact.sha256 || "")) throw new Error("Missing official SHA-256 for " + agentId + "/" + platform);
-    // Separate new artifacts from files referenced by the currently active catalog.
-    artifact.file = agentId + "/" + version + "/" + artifact.sha256.slice(0, 16) + "-" + filename;
-    artifacts[platform] = artifact;
-  }
-  if (agentId !== "qodercncli" || !selectedPlatforms.includes("linux-x64")) return { version, source, artifacts };
-  const baseline = release.files?.find((item) => item.os === "linux" && item.arch === "amd64-baseline");
-  if (!/^[a-f0-9]{64}$/.test(baseline?.sha256 || "") || !String(baseline?.url || "").startsWith("https://")) {
-    throw new Error("Missing official SHA-256 for qodercncli/linux-x64-baseline");
-  }
-  const baselineFilename = "qoderclicn-linux-x64-baseline.tar.gz";
-  return {
-    version,
-    source,
-    artifacts,
-    compatibility: {
-      "linux-x64-baseline": {
-        version,
-        source,
-        selector: { platforms: ["linux-x64"], missingCpuFlags: qoderOptimizedCpuFlags },
-        artifacts: {
-          "linux-x64": {
-            archive: "tar.gz",
-            binary: "qoderclicn",
-            sha256: baseline.sha256,
-            source: baseline.url,
-            file: `qodercncli/${version}/${baseline.sha256.slice(0, 16)}-${baselineFilename}`,
-          },
-        },
-      },
-    },
-  };
 }
 
 export async function artifactPath(root, agentId, artifact) {
@@ -252,23 +84,21 @@ export async function artifactPath(root, agentId, artifact) {
   if (!/^[a-f0-9]{64}$/.test(artifact.sha256 || "") || !["raw", "tar.gz"].includes(artifact.archive)) throw new Error("Invalid agent checksum or archive type");
   if (!String(artifact.source || "").startsWith("https://")) throw new Error("Agent source must use HTTPS");
   if (artifact.archive === "tar.gz" && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(artifact.binary || "")) throw new Error("Invalid archive binary name");
-  if (artifact.size !== undefined && (!Number.isSafeInteger(artifact.size) || artifact.size <= 0)) throw new Error("Invalid agent artifact size");
+  if (!Number.isSafeInteger(artifact.size) || artifact.size <= 0) throw new Error("Missing or invalid pinned artifact size");
   return destination;
 }
 
-function compatibilityReleases(agent) {
+export function compatibilityReleases(agent) {
   if (!agent?.compatibility) return [];
   if (Array.isArray(agent.compatibility)) return agent.compatibility;
   return Object.entries(agent.compatibility).map(([id, release]) => ({ id, ...release }));
 }
 
-export async function updateCatalog(args, { catalogRoot = defaultRoot, request = metadata, download = downloadVerified, log = console.log } = {}) {
+export async function updateCatalog(args, { catalogRoot = defaultRoot, download = downloadVerified, log = console.log } = {}) {
   const options = parseOptions(args);
   if (options.help) { log(help); return; }
   const root = await realpath(catalogRoot);
-  const manifestFile = path.join(root, "manifest.json");
   const lockFile = path.join(root, ".update.lock");
-  const temporary = path.join(root, ".manifest-" + randomUUID() + ".tmp");
   let lock;
   try {
     if (options.mode !== "check") {
@@ -278,81 +108,44 @@ export async function updateCatalog(args, { catalogRoot = defaultRoot, request =
       });
       await lock.writeFile(String(process.pid) + "\n");
     }
-    const original = await readFile(manifestFile, "utf8");
-    const manifest = JSON.parse(original);
+    const manifest = JSON.parse(await readFile(path.join(root, "manifest.json"), "utf8"));
     if (manifest.schemaVersion !== 1 || !manifest.agents || Array.isArray(manifest.agents) || typeof manifest.agents !== "object") throw new Error("Invalid agent manifest; restore manifest.json before retrying");
-    const next = structuredClone(manifest);
     const jobs = new Map();
     for (const agentId of options.agents) {
-      const current = manifest.agents[agentId];
-      // Pinned installs and offline checks remain compatible with catalogs
-      // produced before a newly supported Agent was added.  The new Agent is
-      // introduced only by an explicit/latest refresh.
-      if (!current && options.mode !== "latest") {
-        log("[" + options.mode + "] " + agentId + " is not present in this catalog; run --latest to add it");
-        continue;
-      }
-      const selectedPlatforms = options.platforms.length
-        ? options.platforms
-        : Object.keys(current?.artifacts || {}).filter((platform) => platforms.includes(platform));
-      if (!selectedPlatforms.length && options.mode === "latest") selectedPlatforms.push(...platforms);
-      if (!selectedPlatforms.length) throw new Error("Missing supported platforms: " + agentId);
-      const agent = options.mode === "latest" ? await resolveLatest(agentId, selectedPlatforms, request) : current;
-      validVersion(agent?.version);
-      if (options.mode === "latest") {
-        // Do not advertise older platform binaries under a newer agent version.
-        next.agents[agentId] = {
-          ...agent,
-          ...(agent.compatibility
-            ? { compatibility: structuredClone(agent.compatibility) }
-            : current?.compatibility ? { compatibility: structuredClone(current.compatibility) } : {}),
-          artifacts: { ...(current?.version === agent.version ? current.artifacts : {}), ...agent.artifacts },
-        };
-      }
+      const agent = manifest.agents[agentId];
+      if (!agent) throw new Error("Agent is not present in this pinned catalog: " + agentId);
       const releases = [
         { label: agentId, release: agent, required: true },
-        ...compatibilityReleases(next.agents[agentId]).map((release) => ({
-          label: `${agentId}/${release.id || "compatibility"}`,
-          release,
-          required: false,
-        })),
+        ...compatibilityReleases(agent).map((release) => ({ label: `${agentId}/${release.id || "compatibility"}`, release, required: false })),
       ];
       for (const { label, release, required } of releases) {
         validVersion(release?.version);
-        for (const platform of selectedPlatforms) {
+        for (const platform of options.platforms) {
           const artifact = release.artifacts?.[platform];
           if (!artifact) {
             if (required) throw new Error("Missing artifact: " + label + "/" + platform);
             continue;
           }
-          if (options.mode !== "latest" && !Number.isSafeInteger(artifact.size)) throw new Error("Missing pinned artifact size");
           const destination = await artifactPath(root, agentId, artifact);
           const existing = jobs.get(destination);
-          if (existing && (existing[0].artifact.sha256 !== artifact.sha256 || existing[0].artifact.size !== artifact.size)) throw new Error("Conflicting artifacts share a path");
-          jobs.set(destination, [...(existing || []), { artifact }]);
+          if (existing && (existing.sha256 !== artifact.sha256 || existing.size !== artifact.size)) throw new Error("Conflicting artifacts share a path");
+          jobs.set(destination, artifact);
         }
       }
-      log("[" + options.mode + "] " + agentId + " " + agent.version + " (" + selectedPlatforms.join(", ") + ")");
+      log("[" + options.mode + "] " + agentId + " " + agent.version + " (" + options.platforms.join(", ") + ")");
     }
-    for (const [destination, references] of jobs) {
-      const artifact = references[0].artifact;
+    for (const [destination, artifact] of jobs) {
       if (options.mode !== "check") await download({ url: artifact.source, sha256: artifact.sha256, size: artifact.size, destination });
-      const size = (await stat(destination)).size;
-      if (size <= 0 || (artifact.size !== undefined && size !== artifact.size) || await digest(destination) !== artifact.sha256) throw new Error("Agent integrity check failed: " + destination);
-      for (const reference of references) reference.artifact.size = size;
-    }
-    if (options.mode === "latest") {
-      next.updatedAt = new Date().toISOString();
-      // Preserve both the previous manifest and its binaries for recovery.
-      await writeFile(temporary, JSON.stringify(next, null, 2) + "\n", { flag: "wx" });
-      await writeFile(path.join(root, "manifest.json.previous"), original);
-      await rename(temporary, manifestFile);
+      const info = await stat(destination).catch((error) => {
+        if (error.code === "ENOENT") throw new Error("Missing Agent file; run the same command without --check: " + destination);
+        throw error;
+      });
+      if (!info.isFile() || info.size !== artifact.size || await digest(destination) !== artifact.sha256) throw new Error("Agent integrity check failed: " + destination);
     }
     log("Agent packages verified and ready. / Agent 安装文件已校验并就绪。");
-    return { manifest: next, files: jobs.size };
+    return { manifest, files: jobs.size };
   } finally {
     if (lock) {
-      await rm(temporary, { force: true });
       await lock.close();
       await rm(lockFile, { force: true });
     }

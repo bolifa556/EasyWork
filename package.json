@@ -1,6 +1,6 @@
 {
   "name": "easywork",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A conversational workspace for AI, remote servers, files and coding agents.",
   "private": true,
   "engines": {
@@ -17,7 +17,7 @@
     "pretest:gateway": "node scripts/patch-pdfjs-worker.mjs",
     "release": "node scripts/build-release.mjs",
     "agents:download": "node scripts/download-agent-app.mjs",
-    "agents:update": "node agent-app/update-agent-app.mjs --latest",
+    "agents:update": "node agent-app/update-agent-app.mjs",
     "test:gateway": "node --test --test-reporter=spec tests/*.test.mjs",
     "test": "npm run build && npm run test:gateway",
     "lint": "eslint ."
