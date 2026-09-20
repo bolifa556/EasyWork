@@ -1,5 +1,7 @@
+<h1 align="center">EasyWork</h1>
+
 <p align="center">
-  <img src="assets/readme/hero.svg" width="100%" alt="EasyWork — 让对话、知识与远程工作连接起来">
+  <img src="assets/readme/chat.png" width="100%" alt="EasyWork 实际运行截图：聊天页面">
 </p>
 
 <p align="center">
@@ -52,6 +54,8 @@
 - 从技能市场安装技能，或上传、编辑自己的技能，为聊天、工作或全部模式设置适用范围。
 - 技能的服务器类型、白名单与黑名单只限制工作模式；选择「全部模式」的技能仍可在聊天模式使用。
 - 切换 Agent 或服务器时分别保留会话，切回后继续；同一 Agent、同一服务器下切换工作区可延续原会话。
+
+![EasyWork 实际运行截图：技能管理](assets/readme/skills.png)
 
 ### 🌿 会话分支与文件历史
 

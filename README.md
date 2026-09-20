@@ -1,5 +1,7 @@
+<h1 align="center">EasyWork</h1>
+
 <p align="center">
-  <img src="assets/readme/hero.svg" width="100%" alt="EasyWork — Connect conversations, knowledge and remote work">
+  <img src="assets/readme/chat.png" width="100%" alt="EasyWork running locally: chat interface">
 </p>
 
 <p align="center">
@@ -52,6 +54,8 @@ EasyWork integrates **OpenCode, Codex, Claude Code and Qoder CN**, with projects
 - Install skills from the market, or upload and edit your own. Set their scope to chat, work or both.
 - Server types, allowlists and denylists apply only in work mode. Skills set to both modes remain available in chat.
 - Agent and server switches retain separate sessions that can be resumed. Changing the workspace for the same Agent and server keeps its existing session.
+
+![EasyWork running locally: skill management](assets/readme/skills.png)
 
 ### 🌿 Conversation Branches and File History
 
