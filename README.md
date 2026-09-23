@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.2-17786B?style=flat-square" alt="Version 0.1.2">
+  <img src="https://img.shields.io/badge/version-0.1.3-17786B?style=flat-square" alt="Version 0.1.3">
   <img src="https://img.shields.io/badge/platforms-Windows%20%2F%20Linux-17786B?style=flat-square" alt="Windows and Linux">
   <img src="https://img.shields.io/badge/architecture-x64-17786B?style=flat-square" alt="64-bit x86">
   <img src="https://img.shields.io/badge/deployment-self--hosted-17786B?style=flat-square" alt="Self-hosted">
@@ -44,7 +44,7 @@ EasyWork integrates **OpenCode, Codex, Claude Code and Qoder CN**, with projects
 
 - Organize materials into file collections linked to projects or conversations. Search text, Markdown, PDF, Word and other supported content.
 - Retain user preferences, project context and stable facts from conversations for later work.
-- Use `@` to reference other conversations explicitly and continue from relevant records.
+- Use `@` to reference other conversations explicitly. References remain available in later turns on the current branch, and already-read content is reused.
 - Preview generated files and images in the conversation, zoom in or download results.
 
 ### 🧩 Four Agents and Custom Skills
@@ -75,9 +75,9 @@ Releases are **x86-64 / AMD64 only**. Windows 10 and Windows 11 share one packag
 
 | Host system | Package | Runtime |
 | --- | --- | --- |
-| Windows 10 / 11, x64 | [easywork-0.1.2-windows-x64.zip](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-windows-x64.zip) | Node.js included |
-| Ubuntu 22.04 or later, x64 | [easywork-0.1.2-linux-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-linux-x64.tar.gz) | Node.js included |
-| CentOS 7.9, x64 | [easywork-0.1.2-linux-centos7-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-linux-centos7-x64.tar.gz) | Node.js compatible with glibc 2.17 included |
+| Windows 10 / 11, x64 | [easywork-0.1.3-windows-x64.zip](https://github.com/bolifa556/EasyWork/releases/download/v0.1.3/easywork-0.1.3-windows-x64.zip) | Node.js included |
+| Ubuntu 22.04 or later, x64 | [easywork-0.1.3-linux-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.3/easywork-0.1.3-linux-x64.tar.gz) | Node.js included |
+| CentOS 7.9, x64 | [easywork-0.1.3-linux-centos7-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.3/easywork-0.1.3-linux-centos7-x64.tar.gz) | Node.js compatible with glibc 2.17 included |
 
 Download the matching package from [Releases](https://github.com/bolifa556/EasyWork/releases). Local builds are written to `releases/` with `SHA256SUMS.txt`. Extract the archive and start the web service; a separate Node.js installation is unnecessary.
 
@@ -122,21 +122,21 @@ After downloading, connect SSH in work mode, open the Agent selection panel and 
 
 ### 1. Start the Service
 
-**Windows**: Extract `easywork-0.1.2-windows-x64.zip`, open the folder and double-click **`start.cmd`**.
+**Windows**: Extract `easywork-0.1.3-windows-x64.zip`, open the folder and double-click **`start.cmd`**.
 
 **Ubuntu**:
 
 ```bash
-tar -xzf easywork-0.1.2-linux-x64.tar.gz
-cd easywork-0.1.2-linux-x64
+tar -xzf easywork-0.1.3-linux-x64.tar.gz
+cd easywork-0.1.3-linux-x64
 ./start.sh
 ```
 
 **CentOS 7**:
 
 ```bash
-tar -xzf easywork-0.1.2-linux-centos7-x64.tar.gz
-cd easywork-0.1.2-linux-centos7-x64
+tar -xzf easywork-0.1.3-linux-centos7-x64.tar.gz
+cd easywork-0.1.3-linux-centos7-x64
 ./start.sh
 ```
 

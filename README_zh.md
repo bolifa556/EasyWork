@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.2-17786B?style=flat-square" alt="版本 0.1.2">
+  <img src="https://img.shields.io/badge/version-0.1.3-17786B?style=flat-square" alt="版本 0.1.3">
   <img src="https://img.shields.io/badge/platforms-Windows%20%2F%20Linux-17786B?style=flat-square" alt="Windows 和 Linux">
   <img src="https://img.shields.io/badge/architecture-x64-17786B?style=flat-square" alt="64 位 x86">
   <img src="https://img.shields.io/badge/deployment-self--hosted-17786B?style=flat-square" alt="自主部署">
@@ -44,7 +44,7 @@
 
 - 将资料整理为文件集，关联到项目或对话，检索文本、Markdown、PDF 和 Word 等内容。
 - 保留用户偏好、项目背景和对话中的稳定事实，让后续交流延续已有上下文。
-- 使用 `@` 明确引用其他对话，结合相关记录继续讨论。
+- 使用 `@` 明确引用其他对话；当前分支的后续提问可继续检索这些引用，并复用已读内容。
 - 在对话中查看生成的文件与图片，放大预览或下载结果。
 
 ### 🧩 四种 Agent 与自定义技能
@@ -75,9 +75,9 @@
 
 | 部署主机 | 发布包 | 运行环境 |
 | --- | --- | --- |
-| Windows 10 / 11，x64 | [easywork-0.1.2-windows-x64.zip](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-windows-x64.zip) | 内置 Node.js |
-| Ubuntu 22.04 及以上，x64 | [easywork-0.1.2-linux-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-linux-x64.tar.gz) | 内置 Node.js |
-| CentOS 7.9，x64 | [easywork-0.1.2-linux-centos7-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.2/easywork-0.1.2-linux-centos7-x64.tar.gz) | 内置兼容 glibc 2.17 的 Node.js |
+| Windows 10 / 11，x64 | [easywork-0.1.3-windows-x64.zip](https://github.com/bolifa556/EasyWork/releases/download/v0.1.3/easywork-0.1.3-windows-x64.zip) | 内置 Node.js |
+| Ubuntu 22.04 及以上，x64 | [easywork-0.1.3-linux-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.3/easywork-0.1.3-linux-x64.tar.gz) | 内置 Node.js |
+| CentOS 7.9，x64 | [easywork-0.1.3-linux-centos7-x64.tar.gz](https://github.com/bolifa556/EasyWork/releases/download/v0.1.3/easywork-0.1.3-linux-centos7-x64.tar.gz) | 内置兼容 glibc 2.17 的 Node.js |
 
 从 [Releases 页面](https://github.com/bolifa556/EasyWork/releases) 下载对应包。自行构建的文件位于 `releases/`，附带 `SHA256SUMS.txt` 校验文件。解压后即可启动网页服务，无需另装 Node.js。
 
@@ -122,21 +122,21 @@ sh agent-app/update-agent-app.sh --agent codex --platform linux-x64
 
 ### 1. 启动服务
 
-**Windows**：解压 `easywork-0.1.2-windows-x64.zip`，进入目录，双击 **`start.cmd`**。
+**Windows**：解压 `easywork-0.1.3-windows-x64.zip`，进入目录，双击 **`start.cmd`**。
 
 **Ubuntu**：
 
 ```bash
-tar -xzf easywork-0.1.2-linux-x64.tar.gz
-cd easywork-0.1.2-linux-x64
+tar -xzf easywork-0.1.3-linux-x64.tar.gz
+cd easywork-0.1.3-linux-x64
 ./start.sh
 ```
 
 **CentOS 7**：
 
 ```bash
-tar -xzf easywork-0.1.2-linux-centos7-x64.tar.gz
-cd easywork-0.1.2-linux-centos7-x64
+tar -xzf easywork-0.1.3-linux-centos7-x64.tar.gz
+cd easywork-0.1.3-linux-centos7-x64
 ./start.sh
 ```
 
