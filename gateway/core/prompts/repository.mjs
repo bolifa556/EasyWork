@@ -6,7 +6,6 @@ import { invariant } from "../errors.mjs";
 const WEB_TOOL_NAMES = Object.freeze([
   "resource_search",
   "resource_read",
-  "conversation_search",
   "conversation_reference_search",
   "skill_search",
   "handoff_rewrite_candidate",
@@ -163,6 +162,9 @@ export class PromptRepository {
     const items = (Array.isArray(entries) ? entries : []).map((entry) => renderPromptTemplate(config.item, {
       REFERENCE_ID: inline(entry?.referenceId, 80),
       TITLE: inline(entry?.title, 240),
+      READ_STATUS: Number(entry?.readTurns || 0) + Number(entry?.readMemories || 0) > 0
+        ? `（已读取 ${Number(entry?.readTurns || 0)} 个回合、${Number(entry?.readMemories || 0)} 条记忆；已读正文可直接复用）`
+        : "（尚未读取）",
     }));
     return items.length ? renderPromptTemplate(config.document, { ITEMS: items.join(config.separator) }).trim() : "";
   }

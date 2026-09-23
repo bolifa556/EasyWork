@@ -14,6 +14,7 @@ test("Prompt Repository 统一渲染网页、记忆和独立模型任务", async
   const tools = await prompts.webTools();
   assert.equal(tools.tools.memory_search, undefined);
   assert.equal(tools.tools.skill_list, undefined);
+  assert.equal(tools.tools.conversation_search, undefined);
   assert.equal(tools.tools.conversation_reference_read, undefined);
   assert.match(tools.tools.conversation_reference_search.description, /相关记忆、最近上下文/);
   assert.match(tools.tools.skill_search.description, /Skill 目录/);

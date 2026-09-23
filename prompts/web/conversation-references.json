@@ -1,5 +1,5 @@
 {
-  "document": "# 本轮明确引用的对话\n\n引用已经冻结到发送时的内容边界。需要其中的历史背景时，只使用对应 reference_id 调用 conversation_reference_search。\n\n{{ITEMS}}",
-  "item": "- reference_id: {{REFERENCE_ID}}\n  对话：{{TITLE}}",
+  "document": "# 当前分支已明确引用的对话\n\n引用已经冻结到 @ 发送时的内容边界，后续提问仍可继续检索。已读内容保留在上下文中，直接复用；需要未读背景时，只使用对应 reference_id 调用 conversation_reference_search，工具只返回尚未读取的回合与记忆。\n\n{{ITEMS}}",
+  "item": "- reference_id: {{REFERENCE_ID}}\n  对话：{{TITLE}}{{READ_STATUS}}",
   "separator": "\n"
 }

@@ -385,11 +385,13 @@ test("显式 @ 对话检索冻结记忆和完整回合，时间线只显示标�
   });
 });
 
-test("聊天与 Work 都不暴露状态工具，真正的聊天历史查询仍可展示", async () => {
+test("Chat 与 Work 都不暴露状态工具或当前对话检索，无引用时也不开放引用检索", async () => {
   const tools = await createDefaultWebAgentTools(contextServices(), prompts);
-  assert.equal(tools.resolve("context_get_state", "chat"), null);
-  assert.equal(tools.resolve("context_get_state", "work"), null);
-  assert.equal(tools.resolve("conversation_search", "chat").timelineRead, true);
+  for (const mode of ["chat", "work"]) {
+    assert.equal(tools.resolve("context_get_state", mode), null);
+    assert.equal(tools.resolve("conversation_search", mode), null);
+    assert.equal(tools.resolve("conversation_reference_search", mode), null);
+  }
 });
 
 test("强制 Skill 确定性交付，不进入网页模型的候选或已读池", async () => {
@@ -1291,7 +1293,7 @@ test("网页 Agent 按模型原始顺序流式输出，并在查询出现后把�
 
 test("Work 暴露只读资料、临时整理与唯一提交工具，Chat 不含状态工具", async () => {
   const registry = await createDefaultWebAgentTools(contextServices(), prompts);
-  const chatTools = ["resource_search", "resource_read", "conversation_search", "skill_search"].sort();
+  const chatTools = ["resource_search", "resource_read", "skill_search"].sort();
   const workTools = ["resource_search", "resource_read", "skill_search", "handoff_rewrite_candidate", "handoff_submit"].sort();
   assert.deepEqual(registry.definitions("chat").map((tool) => tool.name).sort(), chatTools);
   assert.deepEqual(registry.definitions("work").map((tool) => tool.name).sort(), workTools);
@@ -1310,24 +1312,69 @@ test("Work 暴露只读资料、临时整理与唯一提交工具，Chat 不含�
   }
 });
 
-test("Chat 历史搜索保留稳定消息身份，Work 不暴露历史选择工具", async () => {
-  const message = { id: "message-prior", role: "assistant", content: "上轮确认正式 JobID 是 5332845" };
-  const registry = await createDefaultWebAgentTools(contextServices({
-    search: async () => ({ conversation: [message] }),
-  }), prompts);
-  assert.equal(registry.resolve("conversation_search", "work"), null);
-  const tool = registry.resolve("conversation_search", "chat");
-  assert.ok(tool);
-  const input = tool.validate({ query: "正式 JobID" });
-  const output = await tool.execute({ input, actor: {}, scope: {}, signal: null });
-  const presented = tool.present({ input, output });
-  const fragments = await tool.handoffItems({ input, output, presented, rendered: await tool.render(presented) });
-  assert.deepEqual(fragments[0].knowledge, {
-    key: "conversation:message-prior",
-    version: "message-prior",
-    content: "助手：上轮确认正式 JobID 是 5332845",
+for (const mode of ["chat", "work"]) {
+  test(`${mode} 无 @ 时直接复用历史，拒绝模型尝试检索当前或未引用的对话`, async () => {
+    let searches = 0;
+    let rounds = 0;
+    const events = [];
+    const search = async () => { searches += 1; return {}; };
+    const runtime = new WebAgentRuntime({
+      model: { async complete({ messages, tools }) {
+        rounds += 1;
+        assert.ok(tools.every((tool) => !tool.name.startsWith("conversation_")));
+        assert.ok(messages.some((message) => message.role === "assistant" && message.content === "上轮确认使用 Markdown"));
+        if (rounds === 1) return { toolCalls: [
+          { id: "self", name: "conversation_search", input: { query: "Markdown" } },
+          { id: "unreferenced", name: "conversation_reference_search", input: { referenceId: "cref_previous", query: "Markdown" } },
+        ] };
+        assert.equal(messages.filter((message) => message.role === "tool").length, 2);
+        return mode === "work" ? submitVisible(messages) : { content: "继续使用 Markdown。" };
+      } },
+      tools: await createDefaultWebAgentTools(contextServices({ search }, {}, { search }), prompts),
+      prompts,
+      eventSink: async (event) => events.push(event),
+    });
+    await runtime.run({
+      mode, actor: {}, scope: {}, userMessage: "继续",
+      context: [{ role: "user", content: "使用 Markdown" }, { role: "assistant", content: "上轮确认使用 Markdown" }],
+    });
+    assert.equal(searches, 0);
+    assert.equal(events.some((event) => event.kind === "run.context.read"), false);
   });
-});
+
+  test(`${mode} 仅检索已明确引用的来源，引用退出当前分支后关闭检索入口`, async () => {
+    const referenceId = "cref_current";
+    const calls = [];
+    let rounds = 0;
+    const services = contextServices({}, {}, { search: async (input) => {
+      calls.push(input.referenceId);
+      return {
+        reference: { referenceId, title: "历史讨论", conversationId: "source", snapshotId: "frozen" },
+        memory: [], matchedConversation: [], nextCursor: null,
+        recentConversation: [{ id: "source-user", role: "user", content: "引用中的稳定约定", sourceConversationId: "source", sourceSnapshotId: "frozen", referenceTurnId: "source-user", contextKind: "recent" }],
+      };
+    } });
+    const registry = await createDefaultWebAgentTools(services, prompts, { conversationReferences: [{ referenceId }] });
+    const tool = registry.resolve("conversation_reference_search", mode);
+    assert.ok(tool);
+    assert.equal(registry.resolve("conversation_search", mode), null);
+    assert.throws(() => tool.validate({ referenceId: "cref_previous", query: "约定" }), /not available/);
+    const runtime = new WebAgentRuntime({
+      model: { async complete({ messages }) {
+        rounds += 1;
+        if (rounds === 1) return { toolCalls: [{ id: "read", name: "conversation_reference_search", input: { referenceId, query: "约定" } }] };
+        assert.match(messages.find((message) => message.name === "conversation_reference_search").content, /引用中的稳定约定/);
+        return mode === "work" ? submitVisible(messages) : { content: "已确认引用中的约定。" };
+      } },
+      tools: registry,
+      prompts,
+    });
+    await runtime.run({ mode, actor: {}, scope: {}, userMessage: "按引用中的约定处理" });
+    assert.deepEqual(calls, [referenceId]);
+    const nextTurn = await createDefaultWebAgentTools(services, prompts);
+    assert.equal(nextTurn.resolve("conversation_reference_search", mode), null);
+  });
+}
 
 test("Work 没有关联文件资源时不暴露文件工具，但 Chat 仍可按需读取文件", async () => {
   const registry = await createDefaultWebAgentTools(contextServices(), prompts, { workResourceTools: false });

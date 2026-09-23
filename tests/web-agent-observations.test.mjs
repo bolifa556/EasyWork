@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { createActorContext } from "../gateway/core/actor.mjs";
+import { resolveActorPath } from "../gateway/core/paths.mjs";
 import { PromptRepository } from "../gateway/core/prompts/index.mjs";
 import {
   WebAgentObservationLedger,
@@ -26,6 +27,51 @@ function fragment({ key = "resource:guide:chunk", version = "v1", content = "第
     priority,
   };
 }
+
+test("当前对话检索结果不再注入，@ 引用与其他已读资料继续跨轮保存", async () => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-web-reference-observations-"));
+  try {
+    const ledger = new WebAgentObservationLedger({ dataRoot, actor });
+    const file = fragment();
+    const skill = { ...fragment({ key: "skill:guide", content: "技能正文" }), toolName: "skill_search" };
+    const references = [
+      { ...fragment({ key: "conversation-reference:source:snapshot:turn", content: "引用原文" }), toolName: "conversation_reference_search" },
+      { ...fragment({ key: "memory:source", content: "引用中读取的记忆" }), toolName: "conversation_reference_search" },
+    ];
+    const transient = [
+      { ...fragment({ key: "conversation:message", content: "当前对话历史" }), toolName: "conversation_search" },
+      { ...fragment({ key: "conversation:legacy", content: "旧版对话结果" }), toolName: "legacy" },
+    ];
+    const input = { conversationId: "conversation", branchId: "main", sourceMessageId: "message-1" };
+    const expectedKeys = [file, skill, ...references].map((entry) => entry.knowledge.key);
+    assert.equal((await ledger.record({ ...input, fragments: [file, skill, ...references, ...transient] })).recorded, 4);
+    assert.deepEqual((await ledger.list(input)).map((entry) => entry.knowledge.key), expectedKeys);
+
+    // Simulate a ledger written before current-conversation search was removed.
+    const storePath = resolveActorPath(dataRoot, actor, "context", "conversations", "conversation", "observations.json");
+    const stored = JSON.parse(await readFile(storePath, "utf8"));
+    const template = stored.data.branches.main.observations[0];
+    stored.data.branches.main.observations.push(...transient.map((entry, index) => ({
+      ...structuredClone(template),
+      identity: `legacy-${index}`,
+      fragment: { ...template.fragment, ...entry, candidateId: `legacy-${index}` },
+    })));
+    await writeFile(storePath, JSON.stringify(stored));
+    const reopened = new WebAgentObservationLedger({ dataRoot, actor });
+    const restored = await reopened.list({ ...input, sourceMessageIds: ["message-1", "message-2"] });
+    assert.deepEqual(restored.map((entry) => entry.knowledge.key), expectedKeys);
+    for (const mode of ["chat", "work"]) {
+      const rendered = await renderWebAgentObservations(restored, mode, prompts);
+      assert.doesNotMatch(rendered, /当前对话历史|旧版对话结果/);
+      assert.match(rendered, /引用原文/);
+      assert.match(rendered, /引用中读取的记忆/);
+      assert.match(rendered, /第一版|技能正文/);
+    }
+  } finally {
+    assert.equal(path.dirname(path.resolve(dataRoot)), path.resolve(os.tmpdir()));
+    await rm(dataRoot, { recursive: true, force: true });
+  }
+});
 
 test("网页已读账本按分支和消息边界复用、回溯并选择最新版本", async () => {
   const dataRoot = await mkdtemp(path.join(os.tmpdir(), "easywork-web-observations-"));

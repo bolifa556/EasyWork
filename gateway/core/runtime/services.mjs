@@ -42,6 +42,7 @@ import { taskTopic } from "../orchestrator/contract.mjs";
 import { VersioningService } from "../versioning/service.mjs";
 import { WebAgentRuntime } from "../web-agent/runtime.mjs";
 import { WebAgentObservationLedger } from "../web-agent/observations.mjs";
+import { collectConversationReferences, conversationReferenceReadState, filterReferenceObservations } from "../web-agent/conversation-references.mjs";
 import {
   conversationKnowledgeUnit,
   createDefaultWebAgentTools,
@@ -152,7 +153,7 @@ export function workCurrentState(raw = {}, routing = {}) {
   return projected;
 }
 
-// Explicit @ conversation references are frozen, turn-local source material.
+// Explicit @ conversation references are frozen historical source material.
 // They may be read, rewritten, and handed to the remote Agent, but must not be
 // promoted into EasyWork memory merely because the Web Agent inspected them.
 export function memoryExtractionObservations(fragments = []) {
@@ -2953,6 +2954,19 @@ class WebInteractionService {
       const accepted = new Set(pending.map(identity));
       return eligibleFragments.map((fragment) => accepted.has(identity(fragment)) ? fragment : { ...fragment, deliveryState: "delivered" });
     };
+    const referencedSources = new Map();
+    const conversationReferences = skipWebAgentModel ? [] : (await Promise.all(
+      collectConversationReferences(messages, target.id).map(async (reference) => {
+        if (!referencedSources.has(reference.conversationId)) {
+          referencedSources.set(reference.conversationId, this.container.baseConversations.getConversation(reference.conversationId)
+            .catch((error) => {
+              if (["CONVERSATION_NOT_FOUND", "CONVERSATION_DELETED"].includes(error?.code)) return null;
+              throw error;
+            }));
+        }
+        return await referencedSources.get(reference.conversationId) ? reference : null;
+      }),
+    )).filter(Boolean);
     const priorObservationsPromise = skipWebAgentModel
       ? Promise.resolve([])
       : allMessages(this.container.baseConversations, input.conversationId, branchId).then((messages) => (
@@ -2961,7 +2975,8 @@ class WebInteractionService {
             branchId,
             sourceMessageIds: messages.map((message) => message.id),
           })
-        )).then((fragments) => this.container.memory.filterObservations?.(fragments) ?? fragments);
+        )).then((fragments) => filterReferenceObservations(fragments, conversationReferences))
+          .then((fragments) => this.container.memory.filterObservations?.(fragments) ?? fragments);
     const visibleMemoryEntriesPromise = skipWebAgentModel
       ? Promise.resolve([])
       : this.container.memory.contextEntries(scope, { query: "", all: true, tokenEstimator: estimateMemoryTokens })
@@ -3058,7 +3073,6 @@ class WebInteractionService {
     const workSkillToolsPromise = mode === "work" && !skipWebAgentModel
       ? installedSkillCatalog().then((catalog) => catalog.length > 0)
       : Promise.resolve(mode !== "work");
-    const conversationReferences = Array.isArray(target.references) ? target.references : [];
     const toolsPromise = skipWebAgentModel ? Promise.resolve({
       resolve: () => null,
       definitions: () => [],
@@ -3103,7 +3117,7 @@ class WebInteractionService {
           const configuration = await this.container.embedding.memoryConfiguration().catch(() => ({ pageSize: 20 }));
           const result = await this.container.baseConversations.searchConversationReference({
             conversationId: input.conversationId,
-            messageId: target.id,
+            messageId: conversationReferences.find((reference) => reference.referenceId === referenceId)?.sourceMessageId,
             referenceId,
             query,
             ...(cursor ? { cursor } : {}),
@@ -3170,7 +3184,9 @@ class WebInteractionService {
       ? installedSkillCatalog().then((entries) => this.container.runtime.prompts.skillCatalog(entries, mode))
       : Promise.resolve("");
     const conversationReferenceCatalogPromise = !skipWebAgentModel && conversationReferences.length
-      ? this.container.runtime.prompts.conversationReferenceCatalog(conversationReferences)
+      ? priorObservationsPromise.then((fragments) => this.container.runtime.prompts.conversationReferenceCatalog(
+          conversationReferences.map((reference) => conversationReferenceReadState(reference, fragments)),
+        ))
       : Promise.resolve("");
     const [model, tools, , , history, priorObservations, memoryCatalogFragments, workEnvironment, skillCatalog, resourceCatalog, conversationReferenceCatalog, explicitlySelectedSkills, requestRelevantSkills] = await Promise.all([
       modelPromise,

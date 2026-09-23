@@ -752,13 +752,16 @@ export class WebAgentRuntime {
             const pruned = tool.prune({
               input,
               output: rawOutput,
-              observedFragments: [...candidatePool.values()].map((entry) => structuredClone(entry)),
+              observedFragments: [
+                ...candidatePool.values(),
+                ...(call.name === "conversation_reference_search" ? deliveredObservations.values() : []),
+              ].map((entry) => structuredClone(entry)),
             });
             const output = pruned?.output ?? rawOutput;
             let allObserved = Boolean(pruned?.allObserved);
             const presented = tool.present({ input, output });
             const renderedSource = await tool.render(presented);
-            const rendered = tool.handoff
+            const rendered = tool.handoff && call.name !== "conversation_reference_search"
               ? normalizedHandoff(renderedSource, presentation.truncationSuffix)
               : String(renderedSource || "").trim();
             const observed = [];
@@ -830,7 +833,7 @@ export class WebAgentRuntime {
                 : presented;
               const timelineOutput = await tool.timelineOutput({
                 input,
-                output: rawOutput,
+                output: call.name === "conversation_reference_search" ? output : rawOutput,
                 presented: candidateTimelineOutput,
               });
               await emit("run.context.read", { callId: call.id, name: call.name, input, output: timelineOutput });

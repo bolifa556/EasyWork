@@ -23,23 +23,8 @@
         "additionalProperties": false
       }
     },
-    "conversation_search": {
-      "description": "查找当前网页对话中与问题相关的既有消息原文",
-      "inputSchema": {
-        "type": "object",
-        "required": ["query"],
-        "properties": {
-          "query": { "type": "string" },
-          "roles": {
-            "type": "array",
-            "items": { "type": "string", "enum": ["user", "assistant"] }
-          }
-        },
-        "additionalProperties": false
-      }
-    },
     "conversation_reference_search": {
-      "description": "在用户本轮通过 @ 明确引用的 EasyWork 对话中检索相关历史背景；只能使用本轮目录给出的 reference_id。一次查询会返回该冻结边界内的相关记忆、最近上下文，以及必要的较早完整回合",
+      "description": "在当前分支已经通过 @ 明确引用的 EasyWork 对话中检索尚未读取的历史背景；只能使用当前目录给出的 reference_id。后续提问仍可继续检索该冻结边界内的相关记忆、最近上下文，以及必要的较早完整回合；已读内容直接复用，不重复返回",
       "inputSchema": {
         "type": "object",
         "required": ["referenceId", "query"],

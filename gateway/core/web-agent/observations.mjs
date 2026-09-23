@@ -9,6 +9,14 @@ const MAX_CONTEXT_CHARACTERS = 120_000;
 const digest = (value) => crypto.createHash("sha256").update(String(value || "")).digest("hex");
 const clone = (value) => value === undefined ? undefined : structuredClone(value);
 
+function reusableObservation(fragment) {
+  const toolName = String(fragment?.toolName || "");
+  const key = String(fragment?.knowledge?.key || "");
+  // Current history is already in the model input. Explicit references are
+  // reusable evidence; their source availability is checked for each run.
+  return toolName !== "conversation_search" && !key.startsWith("conversation:");
+}
+
 function fragmentIdentity(fragment) {
   const key = String(fragment?.knowledge?.key || "").trim();
   const version = String(fragment?.knowledge?.version || "").trim();
@@ -135,14 +143,18 @@ export class WebAgentObservationLedger {
     const branch = String(branchId || "");
     invariant(branch, "WEB_OBSERVATION_BRANCH_REQUIRED", "网页已读账本缺少 branchId", { status: 500, expose: false });
     const state = await this.#repository(conversationId).read();
-    return activeObservations(state.data.branches[branch]?.observations || [], sourceMessageIds?.map(String));
+    return activeObservations(state.data.branches[branch]?.observations || [], sourceMessageIds?.map(String))
+      .filter(reusableObservation);
   }
 
   async record({ conversationId, branchId, sourceMessageId, fragments }) {
     const branch = String(branchId || "");
     const messageId = String(sourceMessageId || "");
     invariant(branch && messageId, "WEB_OBSERVATION_BOUNDARY_REQUIRED", "网页已读知识缺少分支或消息边界", { status: 500, expose: false });
-    const normalized = (Array.isArray(fragments) ? fragments : []).map(normalizeFragment).filter((entry) => entry?.knowledge?.key && entry?.knowledge?.version);
+    const normalized = (Array.isArray(fragments) ? fragments : [])
+      .filter(reusableObservation)
+      .map(normalizeFragment)
+      .filter((entry) => entry?.knowledge?.key && entry?.knowledge?.version);
     if (!normalized.length) return { recorded: 0 };
     const repository = this.#repository(conversationId);
     let recorded = 0;
