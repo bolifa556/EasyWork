@@ -1,0 +1,17 @@
+.bubble { --bubble-padding-y:8px; --bubble-padding-x:19px; --bubble-toggle-size:24px; position:relative; box-sizing:border-box; min-width:0; max-width:min(680px,86%); padding:var(--bubble-padding-y) var(--bubble-padding-x); border:1px solid rgba(82,107,67,.08); border-radius:18px 18px 5px 18px; background:color-mix(in srgb,var(--ew-green-soft) 76%,var(--ew-canvas)); color:var(--ew-ink); font-size:17px; line-height:1.68; scroll-margin-block:calc(var(--conversation-header-height,64px) + 12px) 16px; }
+.viewport { min-width:0; scrollbar-width:none; }
+.viewport::-webkit-scrollbar { display:none; width:0; height:0; }
+.viewport[data-collapsed="true"] { max-height:13.44em; max-height:8lh; overflow-x:hidden; overflow-y:auto; }
+.viewport:focus-visible { outline:2px solid var(--ew-green); outline-offset:3px; border-radius:3px; }
+.content { min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+/* Inset the icon within the existing right padding without narrowing the text.
+   The full-height overlay keeps its sticky button inside this message. */
+.controls { position:absolute; top:var(--bubble-padding-y); right:calc((var(--bubble-padding-x) - var(--bubble-toggle-size)) / 2 + 4px); bottom:var(--bubble-padding-y); display:flex; width:var(--bubble-toggle-size); flex-direction:column; justify-content:flex-end; pointer-events:none; }
+.toggle { position:sticky; bottom:var(--bubble-padding-y); display:grid; flex:0 0 auto; width:var(--bubble-toggle-size); height:var(--bubble-toggle-size); place-items:center; padding:0; border:0; border-radius:5px; background:transparent; color:var(--ew-green-deep); cursor:pointer; opacity:0; pointer-events:none; transition:opacity 120ms ease,color 120ms ease; }
+.bubble:hover .toggle,.bubble:has(:focus-visible) .toggle { opacity:1; pointer-events:auto; }
+.toggle:hover { color:var(--ew-ink); }
+.bubble .toggle:focus-visible { outline:2px solid var(--ew-green); outline-offset:2px; }
+.toggle[aria-expanded="true"] svg { transform:rotate(180deg); }
+@media (max-width:719px) { .bubble { --bubble-padding-x:18px; --bubble-toggle-size:32px; max-width:92%; font-size:var(--ew-mobile-body); } .toggle { opacity:1; pointer-events:auto; } }
+@media (hover:none) { .toggle { opacity:1; pointer-events:auto; } }
+@media (prefers-reduced-motion:reduce) { .toggle { transition:none; } }

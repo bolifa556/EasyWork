@@ -34,6 +34,7 @@ import { commandId } from "@/app/core/gateway/client";
 import { uploadResource } from "@/app/core/gateway/resource-upload";
 import { isImageFile } from "../../../../shared/images.mjs";
 import { StoredConversationImage } from "./ConversationImage";
+import { UserMessageBubble } from "./UserMessageBubble";
 import { useAppRuntime, type ConversationPanel } from "../../runtime/AppRuntime";
 import { announceConversationsChanged } from "../../runtime/cacheEvents";
 import { TimelineDetailScope } from "./TimelineDetails";
@@ -436,7 +437,7 @@ function Message({ message, latestAssistant, retryableUser = false, revision, ti
     {user ? <div className={styles.messageHead}>你 <span data-ui-icon="" className={styles.dot} /></div> : directRemoteAppend ? null : <div className={styles.messageHead}><span data-ui-icon="" className={styles.dot} /> EasyWork</div>}
     {!user && (timelineEvents?.length || timelineLoading) ? <ConversationTimeline events={timelineEvents || []} mode={timelineMode} taskIdHint={message.taskId || undefined} finalTextHint={displayedContent} loading={timelineLoading} taskById={taskById} settledTaskIds={settledTaskIds} onApproval={onApproval} onInput={onInput} /> : null}
     {user && message.attachments?.length ? <div className={styles.messageImages}>{message.attachments.filter(isImageFile).map((attachment) => <StoredConversationImage key={attachment.resourceVersionId} name={attachment.name} source={{ kind: "resource", resourceVersionId: attachment.resourceVersionId }} />)}</div> : null}
-    {user ? <div className={styles.userBubble}>{message.references?.length ? <span className={styles.messageReferences}>{message.references.map((reference) => <ConversationReferenceLink key={reference.referenceId} reference={reference} />)}</span> : null}{message.content}</div> : <><div className={styles.assistantBody}><ConversationAnswer content={rawDisplayedContent} events={timelineEvents || []} artifacts={artifacts} artifactHistory={artifactHistory} workspaceId={message.taskId ? taskById[message.taskId]?.route.workspaceId : undefined} /></div></>}
+    {user ? <UserMessageBubble>{message.references?.length ? <span className={styles.messageReferences}>{message.references.map((reference) => <ConversationReferenceLink key={reference.referenceId} reference={reference} />)}</span> : null}{message.content}</UserMessageBubble> : <><div className={styles.assistantBody}><ConversationAnswer content={rawDisplayedContent} events={timelineEvents || []} artifacts={artifacts} artifactHistory={artifactHistory} workspaceId={message.taskId ? taskById[message.taskId]?.route.workspaceId : undefined} /></div></>}
     <div className={styles.messageActions} data-busy={retrying || undefined}>
       <MessageAction label={copied ? "已复制" : user ? "复制消息" : "复制回复"} showLabel={copied} icon={copied ? <Check size={15} /> : <Copy size={15} />} onClick={copy} />
       {user && retryableUser ? <MessageAction label="重新生成本轮回复" busy={retrying} icon={<RotateCcw size={15} />} onClick={() => void action("retry")} /> : null}
