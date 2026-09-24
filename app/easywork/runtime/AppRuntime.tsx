@@ -15,7 +15,7 @@ import { GatewayClient } from "@/app/core/gateway/client";
 import { randomIdentifier } from "@/app/core/identifiers";
 import { isActiveTask, mergeTaskSnapshots } from "@/app/core/task-snapshots";
 import { RealtimeClient } from "@/app/core/realtime/client";
-import { GatewayError, type BootstrapResponse, type ConversationSummary, type ServerCapabilityProfile, type SessionResponse } from "@/app/core/contracts";
+import { GatewayError, type BootstrapResponse, type ConversationActivitySnapshot, type ConversationSummary, type ServerCapabilityProfile, type SessionResponse } from "@/app/core/contracts";
 import { preloadFeature } from "./feature-loaders";
 import { prefetchRouteData } from "./startup-data";
 import { startupDestination } from "./startup-route";
@@ -23,6 +23,7 @@ import { prefetchHelpDocument } from "../features/help/help-document";
 import { useFilePreviewTabs } from "./useFilePreviewTabs";
 import { announceConversationsChanged, announceServersChanged, subscribeConversationsChanged, type ConversationsChangedDetail } from "./cacheEvents";
 import { applyBootstrapConversationChange, preserveConversationRows } from "./conversation-list";
+import { applyConversationActivity, mergeConversationActivity } from "./conversation-activity";
 export type { WorkspacePreviewTab } from "./useFilePreviewTabs";
 
 const SESSION_KEY = "easywork.session";
@@ -253,6 +254,7 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
   const bootstrapGeneration = useRef(0);
   const pendingBootstrapChanges = useRef(new Set<ConversationsChangedDetail[]>());
+  const pendingBootstrapActivityChanges = useRef(new Set<ConversationActivitySnapshot[]>());
   const pendingBootstrapServerChanges = useRef(new Set<BootstrapServerConnectionChange[]>());
   const serverConnectionRequests = useRef(new Map<string, { kind: ServerConnectionOperation; promise: Promise<ServerConnectionSnapshot> }>());
   const [serverConnectionOperations, setServerConnectionOperations] = useState<ReadonlyMap<string, ServerConnectionOperation>>(() => new Map());
@@ -309,13 +311,16 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
     const route = parseRoute(window.location.pathname, window.location.search);
     const query = route.kind === "conversation" ? `?conversationId=${encodeURIComponent(route.conversationId)}` : "";
     const changes: ConversationsChangedDetail[] = [];
+    const activityChanges: ConversationActivitySnapshot[] = [];
     const serverChanges: BootstrapServerConnectionChange[] = [];
     pendingBootstrapChanges.current.add(changes);
+    pendingBootstrapActivityChanges.current.add(activityChanges);
     pendingBootstrapServerChanges.current.add(serverChanges);
     let result;
     try { result = await retryGateway(() => api.get<BootstrapResponse>(`/api/bootstrap${query}`)); }
     finally {
       pendingBootstrapChanges.current.delete(changes);
+      pendingBootstrapActivityChanges.current.delete(activityChanges);
       pendingBootstrapServerChanges.current.delete(serverChanges);
     }
     if (requestedSession !== sessionSource.read() || generation !== bootstrapGeneration.current) return;
@@ -323,11 +328,13 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
       if (!current || current.actor.id !== result.data.actor.id) return result.data;
       const incomingIds = new Set(result.data.runningTasks.map((task) => task.id));
       const next = { ...result.data,
+        conversationActivity: mergeConversationActivity(current.conversationActivity, result.data.conversationActivity),
         recentConversations: preserveConversationRows(current.recentConversations, result.data.recentConversations),
         runningTasks: mergeTaskSnapshots(current.runningTasks, result.data.runningTasks)
           .filter((task) => incomingIds.has(task.id) && isActiveTask(task)) };
       const withConversationChanges = changes.reduce((snapshot, change) => applyBootstrapConversationChange(snapshot, change)!, next);
-      return serverChanges.reduce((snapshot, change) => applyBootstrapServerConnectionChange(snapshot, change)!, withConversationChanges);
+      const withActivityChanges = activityChanges.reduce((snapshot, change) => applyConversationActivity(snapshot, change)!, withConversationChanges);
+      return serverChanges.reduce((snapshot, change) => applyBootstrapServerConnectionChange(snapshot, change)!, withActivityChanges);
     });
     setError(null);
   }, [api, sessionSource, setBootstrap]);
@@ -432,14 +439,28 @@ export function AppRuntimeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!token || !bootstrap?.actor.id) return;
     const unsubscribe = realtime.subscribe(`conversations:${bootstrap.actor.id}`, (event, { initialReplay }) => {
+      if (event.kind === "conversation.activity.updated") {
+        const activity = event.payload as ConversationActivitySnapshot;
+        for (const changes of pendingBootstrapActivityChanges.current) changes.push(activity);
+        setBootstrap(current => applyConversationActivity(current, activity));
+        return;
+      }
       if (initialReplay || event.kind !== "conversation.title.updated" || !event.ids.conversationId) return;
       const payload = event.payload as { title?: string; conversationRevision?: number };
       // Apply each title to its existing row. Each window receives this stream,
       // so no full bootstrap refresh or additional tab broadcast is needed.
       announceConversationsChanged({ conversationId: event.ids.conversationId, kind: "renamed", title: payload.title, revision: payload.conversationRevision }, { broadcast: false });
     });
-    return unsubscribe;
-  }, [token, bootstrap?.actor.id, realtime]);
+    // A gateway restart resets active runs. Refresh silently on reconnect, then
+    // merge revisions so a delayed bootstrap cannot overwrite newer live events.
+    let connected = false;
+    const unsubscribeState = realtime.onState(state => {
+      if (state !== "open") return;
+      if (connected) void refreshBootstrap().catch(() => undefined);
+      connected = true;
+    });
+    return () => { unsubscribe(); unsubscribeState(); };
+  }, [token, bootstrap?.actor.id, realtime, refreshBootstrap]);
 
   useEffect(() => {
     if (loading) return;

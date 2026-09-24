@@ -212,6 +212,7 @@ export function AppShell() {
   const renameSaving = conversationRename?.saving ?? false;
   const projects = useMemo(() => runtime.bootstrap?.projects ?? [], [runtime.bootstrap?.projects]);
   const conversations = useMemo(() => runtime.bootstrap?.recentConversations ?? [], [runtime.bootstrap?.recentConversations]);
+  const runningConversationIds = useMemo(() => new Set(runtime.bootstrap?.conversationActivity?.runs.map(run => run.conversationId) ?? []), [runtime.bootstrap?.conversationActivity]);
   const normalizedQuery = query.trim().toLocaleLowerCase("zh-CN");
   const sidebarCollapsed = desktopSidebarCollapsed && !runtime.workspaceSidebar;
   const bootstrapReady = Boolean(runtime.bootstrap);
@@ -844,7 +845,7 @@ export function AppShell() {
   const renderConversation = (conversation: ConversationSummary, nested = false) => {
     const active = runtime.view.kind === "conversation" && runtime.view.conversationId === conversation.id;
     const editing = conversationRename?.item.id === conversation.id ? conversationRename : null;
-    const running = Boolean(conversation.runningTaskId);
+    const running = Boolean(conversation.runningTaskId) || runningConversationIds.has(conversation.id);
     return <div className={`${styles.conversationRow} ${editing ? styles.renamingConversation : ""} ${running ? styles.conversationRunning : ""}`} key={conversation.id}>
       {editing ? <form className={`${styles.treeItem} ${styles.renameItem} ${nested ? styles.nested : ""} ${active ? styles.active : ""}`} onSubmit={(event) => { event.preventDefault(); void saveConversationRename(); }}>
         <input

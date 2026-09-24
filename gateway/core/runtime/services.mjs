@@ -2278,8 +2278,34 @@ class WebInteractionService {
     this.container = container;
     this.store = store;
     this.runs = new Map();
+    this.activeRuns = new Map();
+    this.activityInstanceId = crypto.randomUUID();
+    this.activityRevision = 0;
     this.runControllers = new Map();
     this.repairedFailureConversations = new Set();
+  }
+
+  activitySnapshot() {
+    return {
+      instanceId: this.activityInstanceId,
+      revision: this.activityRevision,
+      runs: [...this.activeRuns].map(([runId, conversationId]) => ({ runId, conversationId })),
+    };
+  }
+
+  #publishActivity(runId, conversationId, active) {
+    if (active) this.activeRuns.set(runId, conversationId);
+    else this.activeRuns.delete(runId);
+    this.activityRevision += 1;
+    // Publish only lifecycle changes to the actor's sidebar stream. Token
+    // deltas stay on their conversation and never refresh the whole list.
+    void this.container.broker.append(`conversations:${this.container.actor.actorId}`, {
+      producer: "web-agent",
+      kind: "conversation.activity.updated",
+      status: null,
+      ids: { conversationId, runId },
+      payload: this.activitySnapshot(),
+    }).catch(() => undefined);
   }
 
   async initialize() {
@@ -2470,6 +2496,7 @@ class WebInteractionService {
 
   #launch(runId, input) {
     if (this.runs.has(runId)) return this.runs.get(runId);
+    this.#publishActivity(runId, input.conversationId, true);
     const controller = new AbortController();
     this.runControllers.set(runId, controller);
     const promise = this.#run({ ...clone(input), runId }, { signal: controller.signal }).then(async (result) => {
@@ -2501,6 +2528,7 @@ class WebInteractionService {
     this.runs.set(runId, promise);
     promise.finally(() => {
       this.runs.delete(runId);
+      this.#publishActivity(runId, input.conversationId, false);
       if (this.runControllers.get(runId) === controller) this.runControllers.delete(runId);
     }).catch(() => undefined);
     promise.catch(() => undefined);
@@ -5107,6 +5135,7 @@ export class ActorServiceContainer {
         updatedAt: project.updatedAt,
       })),
       recentConversations: conversationPage.items.map(summarizeConversation),
+      conversationActivity: this.interactions.activitySnapshot(),
       conversationCursor: conversationPage.nextCursor || null,
       servers: serverItems.map(({ profile, connection, conversationIds, activeConversationIds = conversationIds }) => ({
         id: profile.id,

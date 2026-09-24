@@ -276,6 +276,12 @@ export type WorkDraftSnapshot = {
   replayed?: boolean;
 };
 
+export type ConversationActivitySnapshot = {
+  instanceId: string;
+  revision: number;
+  runs: { runId: string; conversationId: string }[];
+};
+
 export type BootstrapResponse = {
   actor: ActorSummary;
   device: DeviceSummary;
@@ -283,6 +289,7 @@ export type BootstrapResponse = {
   providers: ModelProviderSummary[];
   projects: ProjectSummary[];
   recentConversations: ConversationSummary[];
+  conversationActivity?: ConversationActivitySnapshot;
   conversationNavigation?: {
     conversationId: string;
     conversation: ConversationSummary | null;

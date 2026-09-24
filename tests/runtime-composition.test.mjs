@@ -495,7 +495,7 @@ test("标题生成期间的手动重命名优先，后台结果不会覆盖", as
     await active.services.taskRuntime.waitForIdle();
     assert.equal((await active.services.baseConversations.getConversation(created.conversation.id)).summary.title, "我自己取的标题");
     const events = await active.services.broker.replay(`conversations:${active.actor.actorId}`);
-    assert.equal(events.events.length, 0);
+    assert.equal(events.events.filter((event) => event.kind === "conversation.title.updated").length, 0);
   } finally { gate.resolve(); }
 });
 
