@@ -323,6 +323,10 @@ export async function workConversationTranscriptFragments(history, currentMessag
 export function conversationCompactionBatch(history, keepCount = 4) {
   const messages = Array.isArray(history) ? history : [];
   let boundary = Math.max(0, messages.length - Math.max(0, Number(keepCount) || 0));
+  // An unanswered tail can still belong to a running Chat or remote Work
+  // request. A manual compaction must leave it available for its future reply.
+  const lastAnswer = messages.findLastIndex((message) => message?.role === "assistant");
+  boundary = Math.min(boundary, lastAnswer + 1);
   if (!boundary) return { covered: [], summarized: [] };
 
   // Never leave an assistant response on the retained side while moving the
@@ -638,6 +642,7 @@ class ConversationContextSettings {
   }
 
   async history(conversationId, branchId) {
+    await this.#compressions.get(String(conversationId))?.catch(() => undefined);
     const { retained, checkpoint } = await this.#state(conversationId, branchId);
     const checkpointContent = await this.prompts.checkpointText(checkpoint?.summary);
     return [
@@ -654,21 +659,32 @@ class ConversationContextSettings {
 
   async update(conversationId, input) {
     await this.conversations.getConversation(conversationId);
-    exactObject(input, ["maxTokens", "autoCompactThreshold", "expectedRevision"], "ConversationContextConfig");
+    exactObject(input, ["maxTokens", "autoCompactThreshold", "providerId", "modelId", "expectedRevision"], "ConversationContextConfig");
+    const route = this.#selectedRoute(input);
     const current = await this.#repository(conversationId).read();
     const next = { ...current.data,
+      ...(route ? { route } : {}),
       maxTokens: input.maxTokens === undefined ? current.data.maxTokens : Number(input.maxTokens),
       autoCompactThreshold: input.autoCompactThreshold === undefined ? current.data.autoCompactThreshold : Number(input.autoCompactThreshold) };
     const stored = await this.#repository(conversationId).replace(next, { expectedRevision: input.expectedRevision, clock: this.clock });
     const currentUsage = await this.get(conversationId);
-    if (next.route && currentUsage.usage.ratio >= next.autoCompactThreshold) return this.compact(conversationId);
+    if (next.route && currentUsage.usage.ratio >= next.autoCompactThreshold) return this.compact(conversationId, next.route, { automatic: true });
     return { ...currentUsage, revision: stored.revision };
   }
 
-  compact(conversationId) {
+  #selectedRoute({ providerId, modelId } = {}) {
+    if (providerId === undefined && modelId === undefined) return null;
+    invariant(typeof providerId === "string" && providerId.trim() && typeof modelId === "string" && modelId.trim(),
+      "CONVERSATION_MODEL_ROUTE_REQUIRED", "请选择网页模型后再压缩", { status: 409 });
+    return { providerId: providerId.trim(), modelId: modelId.trim() };
+  }
+
+  compact(conversationId, input = {}, { automatic = false } = {}) {
+    exactObject(input, ["providerId", "modelId"], "ConversationCompaction");
+    const route = this.#selectedRoute(input);
     const key = String(conversationId);
     if (this.#compressions.has(key)) return this.#compressions.get(key);
-    const promise = this.#compact(key);
+    const promise = this.#compact(key, route, automatic).then((result) => ({ ...result, compressing: false }));
     this.#compressions.set(key, promise);
     promise.finally(() => {
       if (this.#compressions.get(key) === promise) this.#compressions.delete(key);
@@ -676,20 +692,27 @@ class ConversationContextSettings {
     return promise;
   }
 
-  async compactIfNeeded(conversationId) {
+  async compactIfNeeded(conversationId, route = {}) {
     const state = await this.get(conversationId);
-    return state.usage.ratio >= state.config.autoCompactThreshold ? this.compact(conversationId) : state;
+    return state.usage.ratio >= state.config.autoCompactThreshold ? this.compact(conversationId, route, { automatic: true }) : state;
   }
 
-  async #compact(conversationId) {
+  async #compact(conversationId, selectedRoute, automatic) {
     invariant(typeof this.summarizer === "function", "CONVERSATION_COMPACTION_UNAVAILABLE", "网页对话没有可用的压缩执行器", { status: 503, retryable: true });
     const state = await this.#state(conversationId);
-    const route = state.stored.data.route;
+    const route = selectedRoute || state.stored.data.route;
     invariant(route?.providerId && route?.modelId, "CONVERSATION_COMPACTION_MODEL_REQUIRED", "请先为该对话选择模型", { status: 409 });
     const uncompressed = state.retained;
-    const keepCount = Math.min(4, uncompressed.length);
-    const { covered: compactable, summarized } = conversationCompactionBatch(uncompressed, keepCount);
-    if (!compactable.length) return this.get(conversationId);
+    let batch = conversationCompactionBatch(uncompressed, automatic ? 4 : 0);
+    // A single long completed turn must be compactable too. Do not reserve a
+    // fixed tail that already consumes most of the configured context window.
+    const tailTokens = uncompressed.slice(batch.covered.length).reduce((total, entry) => total + estimatedTokens(entry.content), 0);
+    if (automatic && (!batch.covered.length || tailTokens >= state.stored.data.maxTokens * state.stored.data.autoCompactThreshold / 2)) {
+      batch = conversationCompactionBatch(uncompressed, 0);
+    }
+    const { covered: compactable, summarized } = batch;
+    const skipped = async () => ({ ...await this.get(conversationId), compaction: { status: "skipped", coveredMessageCount: 0 } });
+    if (!compactable.length) return skipped();
     const existingCheckpoint = String(state.checkpoint?.summary || "").trim();
     const output = summarized.length ? await this.summarizer({
       providerId: route.providerId,
@@ -709,7 +732,7 @@ class ConversationContextSettings {
     // With no earlier checkpoint, a prefix made solely of failed requests has
     // no semantic state to summarize.  Keep it visible instead of inventing a
     // synthetic instruction merely to reduce the token estimate.
-    if (!summary && !summarized.length) return this.get(conversationId);
+    if (!summary && !summarized.length) return skipped();
     invariant(summary, "CONVERSATION_COMPACTION_INVALID", "模型没有返回有效的对话摘要", { status: 502 });
     const coveredMessageIds = [...new Set([...(state.checkpoint?.coveredMessageIds || []), ...compactable.map((entry) => entry.id)])];
     await this.#replaceLatest(conversationId, (data) => {
@@ -720,7 +743,7 @@ class ConversationContextSettings {
         createdAt: this.clock().toISOString(),
       };
     });
-    return this.get(conversationId);
+    return { ...await this.get(conversationId), compaction: { status: "completed", coveredMessageCount: compactable.length, ...route } };
   }
 }
 
@@ -2460,7 +2483,7 @@ class WebInteractionService {
       await this.store.complete(runId, { assistantMessageId: result.messageId, result: metadata });
       if (result.messageId) {
         await this.container.taskRuntime.launch(`compact:${input.conversationId}:${result.messageId}`, async () => {
-          try { await this.container.conversationContext.compactIfNeeded(input.conversationId); } catch { /* compression is independent from the reply */ }
+          try { await this.container.conversationContext.compactIfNeeded(input.conversationId, { providerId: input.providerId, modelId: input.modelId }); } catch { /* compression is independent from the reply */ }
         });
       }
       return result;

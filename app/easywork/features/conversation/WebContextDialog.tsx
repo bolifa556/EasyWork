@@ -22,6 +22,7 @@ type ContextSnapshot = {
   config: { maxTokens: number; autoCompactThreshold: number };
   revision: number;
   compressing: boolean;
+  compaction?: { status: "completed" | "skipped"; coveredMessageCount: number };
 };
 
 const number = (value: unknown, fallback: number) => Number.isFinite(Number(value)) ? Number(value) : fallback;
@@ -36,7 +37,7 @@ const partLabel = (kind: string) => kind === "user" ? "用户消息"
               : kind === "subsequent_messages" ? "后续消息"
                 : kind;
 
-export function WebContextDialog({ conversationId, onClose }: { conversationId?: string; onClose: () => void }) {
+export function WebContextDialog({ conversationId, providerId, modelId, onClose }: { conversationId?: string; providerId?: string; modelId?: string; onClose: () => void }) {
   const { api, notify } = useAppRuntime();
   const [snapshot, setSnapshot] = useState<ContextSnapshot | null>(null);
   const [maxTokens, setMaxTokens] = useState(200_000);
@@ -68,6 +69,8 @@ export function WebContextDialog({ conversationId, onClose }: { conversationId?:
       const result = await api.patch<ContextSnapshot>(`/api/conversations/${encodeURIComponent(conversationId)}/context`, {
         maxTokens,
         autoCompactThreshold: threshold,
+        providerId,
+        modelId,
       }, { expectedRevision: snapshot.revision, idempotencyKey: commandId("web-context-config") });
       setSnapshot(result.data);
       notify("上下文配置已保存", "success");
@@ -79,7 +82,7 @@ export function WebContextDialog({ conversationId, onClose }: { conversationId?:
     if (!conversationId || !snapshot) return;
     setBusy("compact");
     try {
-      const result = await api.post<ContextSnapshot>(`/api/conversations/${encodeURIComponent(conversationId)}/context/compact`, {}, {
+      const result = await api.post<ContextSnapshot>(`/api/conversations/${encodeURIComponent(conversationId)}/context/compact`, { providerId, modelId }, {
         expectedRevision: snapshot.revision,
         idempotencyKey: commandId("web-context-compact"),
       });
@@ -88,7 +91,7 @@ export function WebContextDialog({ conversationId, onClose }: { conversationId?:
       // transient flag in the resolved UI snapshot instead of leaving the
       // button permanently stuck on “压缩中”.
       setSnapshot({ ...result.data, compressing: false });
-      notify("上下文已压缩", "success");
+      notify(result.data.compaction?.status === "skipped" ? "暂无可压缩的已完成对话" : "上下文已压缩", "success");
     } catch (error) { notify(error instanceof Error ? error.message : "压缩失败", "error"); }
     finally { setBusy(null); }
   };
@@ -128,7 +131,7 @@ export function WebContextDialog({ conversationId, onClose }: { conversationId?:
       </section>
 
       <section className={styles.settings}>
-        <header><div><strong>压缩设置</strong><small>只调整网页对话，不改动 Agent 原生会话。</small></div></header>
+        <header><div><strong>压缩设置</strong><small>只调整网页对话，不改动 Agent 原生会话。</small>{modelId ? <small>压缩模型：{modelId}（跟随当前选择）</small> : null}</div></header>
         <div className={styles.settingsGrid}>
           <label><span>上下文上限</span><div className={styles.numberField}><input type="number" min={4_096} max={2_000_000} step={1_000} value={maxTokens} onChange={(event) => setMaxTokens(number(event.target.value, 200_000))} /></div></label>
           <label><span>自动压缩阈值</span><div className={styles.numberField}><input type="number" min="0.5" max="0.99" step="0.01" value={threshold} onChange={(event) => setThreshold(number(event.target.value, 0.95))} /></div></label>

@@ -9,6 +9,104 @@ function stream(lines) {
 
 const modelLayout = Object.freeze({ systemMessageSeparator: "\n\n" });
 
+function responseStream(events) {
+  return stream(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+}
+
+test("GPT Responses 流式摘要、正文和终态快照不重复，工具回传保留原生 reasoning item", async () => {
+  const deltas = [];
+  const requests = [];
+  const reasoningItem = { id: "rs_1", type: "reasoning", summary: [{ type: "summary_text", text: "先核对资料。" }], encrypted_content: "encrypted-test-continuation" };
+  const functionItem = { id: "fc_1", type: "function_call", call_id: "call_1", name: "skill_read", arguments: '{"name":"规范"}', status: "completed" };
+  const model = new OpenAIChatModel({ ...modelLayout, baseUrl: "https://example.test/v1", apiKey: "test-secret", model: "GPT/gpt-6-sol", fetchImpl: async (url, request) => {
+    requests.push({ url, ...JSON.parse(request.body) });
+    if (requests.length === 1) return { ok: true, body: responseStream([
+      { type: "response.output_item.added", output_index: 0, item: { ...reasoningItem, summary: [] } },
+      { type: "response.reasoning_summary_text.delta", item_id: "rs_1", output_index: 0, summary_index: 0, delta: "先核对" },
+      { type: "response.reasoning_summary_text.delta", item_id: "rs_1", output_index: 0, summary_index: 0, delta: "资料。" },
+      { type: "response.reasoning_summary_text.done", item_id: "rs_1", summary_index: 0, text: "先核对资料。" },
+      { type: "response.output_item.added", output_index: 1, item: { ...functionItem, arguments: "" } },
+      { type: "response.function_call_arguments.delta", output_index: 1, delta: '{"name":' },
+      { type: "response.function_call_arguments.delta", output_index: 1, delta: '"规范"}' },
+      { type: "response.output_item.done", output_index: 0, item: reasoningItem },
+      { type: "response.output_item.done", output_index: 1, item: functionItem },
+      { type: "response.completed", response: { output: [reasoningItem, functionItem], usage: { input_tokens: 20, output_tokens: 10, total_tokens: 30 } } },
+    ]) };
+    return { ok: true, body: responseStream([
+      { type: "response.output_text.delta", item_id: "msg_1", delta: "核对完毕" },
+      { type: "response.completed", response: { output: [{ id: "msg_1", type: "message", role: "assistant", content: [{ type: "output_text", text: "核对完毕" }] }] } },
+    ]) };
+  } });
+  const messages = [{ role: "system", content: "系统" }, { role: "user", content: [{ type: "text", text: "核对图片" }, { type: "image_url", image_url: { url: "data:image/png;base64,AA==" } }] }];
+  const tools = [{ name: "skill_read", description: "读取规范", inputSchema: { type: "object", properties: { name: { type: "string" } } } }];
+  const first = await model.complete({ messages, tools, toolChoice: "skill_read", onDelta: (delta) => deltas.push(delta), limits: { maxOutputTokens: 1000 } });
+  assert.equal(first.reasoning, "先核对资料。");
+  assert.deepEqual(first.toolCalls, [{ id: "call_1", name: "skill_read", input: { name: "规范" } }]);
+  assert.equal(deltas.map((delta) => delta.content).join(""), first.reasoning);
+  assert.equal(requests[0].url, "https://example.test/v1/responses");
+  assert.deepEqual(requests[0].reasoning, { effort: "medium", summary: "auto" });
+  assert.equal(requests[0].model, "GPT/gpt-6-sol");
+  assert.equal(requests[0].store, false);
+  assert.equal(requests[0].tools[0].strict, false);
+  assert.deepEqual(requests[0].tool_choice, { type: "function", name: "skill_read" });
+  assert.equal(requests[0].input[0].content[1].type, "input_image");
+  assert.equal(first.usage.input_tokens, 20);
+  const second = await model.complete({ messages: [...messages, { role: "assistant", content: first.content, toolCalls: first.toolCalls, responseItems: first.responseItems }, { role: "tool", toolCallId: "call_1", content: "规范内容" }], tools, onDelta: (delta) => deltas.push(delta) });
+  assert.deepEqual(requests[1].input.slice(1), [reasoningItem, functionItem, { type: "function_call_output", call_id: "call_1", output: "规范内容" }]);
+  assert.equal(second.content, "核对完毕");
+  assert.equal(deltas.filter((delta) => delta.kind === "content").map((delta) => delta.content).join(""), "核对完毕");
+});
+
+test("Responses 终态即关闭连接；仅终态提供的摘要仍可显示", async () => {
+  let cancelled = false;
+  const body = new ReadableStream({ start(controller) {
+    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "response.completed", response: { output: [{ id: "rs", type: "reasoning", summary: [{ type: "summary_text", text: "摘要" }] }] } })}\n\n`));
+  }, cancel() { cancelled = true; } });
+  const model = new OpenAIChatModel({ ...modelLayout, baseUrl: "https://example.test/v1/responses", apiKey: "test-secret", model: "gpt-6-sol", fetchImpl: async () => ({ ok: true, body }) });
+  const result = await model.complete({ messages: [] });
+  assert.equal(result.reasoning, "摘要");
+  assert.equal(cancelled, true);
+});
+
+test("Responses 中断和错误不能当作成功；无摘要不伪造思考", async () => {
+  for (const [events, code] of [
+    [[{ type: "response.output_text.delta", delta: "半截" }], "MODEL_STREAM_INCOMPLETE"],
+    [[{ type: "response.failed", response: { error: { message: "上游失败" } } }], "MODEL_REQUEST_FAILED"],
+    [[{ type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } }], "MODEL_RESPONSE_INCOMPLETE"],
+  ]) {
+    const model = new OpenAIChatModel({ ...modelLayout, baseUrl: "https://example.test", apiKey: "test-secret", model: "gpt-6-sol", fetchImpl: async () => ({ ok: true, body: responseStream(events) }) });
+    await assert.rejects(model.complete({ messages: [] }), { code });
+  }
+  const model = new OpenAIChatModel({ ...modelLayout, baseUrl: "https://example.test", apiKey: "test-secret", model: "gpt-6-sol", fetchImpl: async () => ({ ok: true, body: responseStream([{ type: "response.completed", response: { output: [], usage: { output_tokens_details: { reasoning_tokens: 100 } } } }]) }) });
+  assert.equal((await model.complete({ messages: [] })).reasoning, "");
+});
+
+test("auto 仅在 Responses 端点不可用时回退 Chat，显式协议和认证错误不回退", async () => {
+  const requests = [];
+  const fetchImpl = async (url, request) => {
+    requests.push({ url, ...JSON.parse(request.body) });
+    return url.endsWith("/responses") ? { ok: false, status: 404, json: async () => ({ error: { message: "Unknown endpoint" } }) } : { ok: true, body: stream('data: {"choices":[{"delta":{"reasoning_content":"兼容摘要","content":"回答"}}]}\n\ndata: [DONE]\n\n') };
+  };
+  const model = new OpenAIChatModel({ ...modelLayout, baseUrl: "https://example.test", apiKey: "test-secret", model: "gpt-6-sol", fetchImpl });
+  assert.equal((await model.complete({ messages: [] })).reasoning, "兼容摘要");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].reasoning_effort, "medium");
+  for (const protocol of ["responses", "chat-completions"]) {
+    let calls = 0;
+    const explicit = new OpenAIChatModel({ ...modelLayout, baseUrl: "https://example.test", apiKey: "test-secret", model: "gpt-6-sol", protocol, fetchImpl: async () => { calls++; return { ok: false, status: 401, json: async () => ({ error: { message: "Unauthorized" } }) }; } });
+    await assert.rejects(explicit.complete({ messages: [] }), { code: "MODEL_REQUEST_FAILED" });
+    assert.equal(calls, 1);
+  }
+});
+
+test("保留自定义完整 API 路径和显式协议", () => {
+  const custom = (baseUrl, protocol = "auto") => new OpenAIChatModel({ ...modelLayout, baseUrl, protocol, apiKey: "test-secret", model: "gpt-6-sol" });
+  assert.equal(custom("https://example.test/api/chat/completions").url, "https://example.test/api/chat/completions");
+  assert.equal(custom("https://example.test/api/responses").url, "https://example.test/api/responses");
+  assert.equal(custom("https://example.test/v1/", "chat-completions").url, "https://example.test/v1/chat/completions");
+  assert.equal(custom("https://example.test/v1", "responses").url, "https://example.test/v1/responses");
+});
+
 test("SSE 换行和中文字符跨网络分片时，模型结束前仍逐段交付", async () => {
   let controller;
   const body = new ReadableStream({ start(value) { controller = value; } });

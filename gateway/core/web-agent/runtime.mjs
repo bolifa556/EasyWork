@@ -51,6 +51,7 @@ function normalizedModelResult(value = {}) {
         }))
       : [],
     usage: value.usage && typeof value.usage === "object" ? value.usage : null,
+    ...(Array.isArray(value.responseItems) ? { responseItems: value.responseItems } : {}),
   };
 }
 
@@ -634,6 +635,7 @@ export class WebAgentRuntime {
           content: nextContent,
           reasoning: nextReasoning,
           toolCalls: result.toolCalls,
+          ...(result.responseItems ? { responseItems: result.responseItems } : {}),
         });
         const supplementalModelMessages = [];
         const hasNonTerminalCalls = result.toolCalls.some((call) => this.tools.resolve(call.name, mode)?.terminal !== true);

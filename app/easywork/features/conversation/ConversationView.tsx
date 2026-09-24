@@ -814,7 +814,7 @@ function Composer({ conversationId, referenceMode, draftKey, disabled, placehold
         <div className={styles.modelManage}><Button compact variant="ghost" icon={<Brain size={15} />} onClick={() => { setModelOpen(false); setContextOpen(true); }}>管理网页对话上下文配置</Button></div>
       </div> : null}
     </div>
-    {contextOpen ? <WebContextDialog conversationId={conversationId} onClose={() => setContextOpen(false)} /> : null}
+    {contextOpen ? <WebContextDialog conversationId={conversationId} providerId={selectedProvider?.id} modelId={activeModelId || undefined} onClose={() => setContextOpen(false)} /> : null}
   </div>;
 }
 

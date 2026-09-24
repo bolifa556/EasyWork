@@ -696,7 +696,7 @@ export class EasyWorkRuntime {
       ...requiredObject(request.body, "网页对话上下文配置"),
       expectedRevision: expectedRevision(request),
     }));
-    router.route("POST", "/api/conversations/:id/context/compact", (request) => request.services.conversationContext.compact(request.params.id));
+    router.route("POST", "/api/conversations/:id/context/compact", (request) => request.services.conversationContext.compact(request.params.id, requiredObject(request.body, "网页对话压缩")));
 
     router.route("GET", "/api/providers/manage", (request) => request.services.providers.inspectUserProviders(request.session.actor));
     router.route("GET", "/api/skills/deployments", async (request) => {

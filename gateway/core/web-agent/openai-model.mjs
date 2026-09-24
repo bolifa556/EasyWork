@@ -1,11 +1,13 @@
 import { invariant } from "../errors.mjs";
 import { rejectsImageInput } from "./image-input.mjs";
+import { isOpenAIReasoningModel, reasoningEffort, responsesBody, readResponses } from "./responses-model.mjs";
 
-function endpoint(baseUrl) {
+function endpoint(baseUrl, protocol = "chat-completions") {
   const value = String(baseUrl || "").trim().replace(/\/+$/, "");
   invariant(/^https?:\/\//i.test(value), "MODEL_URL_INVALID", "模型 API URL 无效", { status: 400 });
-  if (/\/chat\/completions$/i.test(value)) return value;
-  return /\/v1$/i.test(value) ? `${value}/chat/completions` : `${value}/v1/chat/completions`;
+  const route = protocol === "responses" ? "responses" : "chat/completions";
+  if (/\/(?:chat\/completions|responses)$/i.test(value)) return value.replace(/\/(?:chat\/completions|responses)$/i, `/${route}`);
+  return /\/v1$/i.test(value) ? `${value}/${route}` : `${value}/v1/${route}`;
 }
 
 function openAiMessages(messages, systemMessageSeparator) {
@@ -85,7 +87,10 @@ async function parseSse(response, onPayload) {
       }
       let parsed;
       try { parsed = JSON.parse(data); } catch { continue; }
-      await onPayload(parsed);
+      if (await onPayload(parsed) === true) {
+        terminal = true;
+        break;
+      }
     }
     if (terminal) break;
   }
@@ -95,9 +100,14 @@ export class OpenAIChatModel {
   constructor({ baseUrl, apiKey, model, protocol = "auto", fetchImpl = fetch, temperature = null, systemMessageSeparator }) {
     invariant(typeof apiKey === "string" && apiKey, "MODEL_API_KEY_REQUIRED", "模型 API Key 未配置", { status: 503, retryable: true });
     invariant(typeof model === "string" && model.trim(), "MODEL_REQUIRED", "未选择模型", { status: 409 });
-    invariant(["auto", "chat-completions"].includes(protocol), "MODEL_PROTOCOL_UNSUPPORTED", "网页 Agent 当前需要 Chat Completions 协议", { status: 409 });
+    invariant(["auto", "chat-completions", "responses"].includes(protocol), "MODEL_PROTOCOL_UNSUPPORTED", "网页 Agent 需要 Chat Completions 或 Responses 协议", { status: 409 });
     invariant(typeof systemMessageSeparator === "string" && systemMessageSeparator.length > 0, "MODEL_CONTEXT_LAYOUT_REQUIRED", "模型上下文布局未配置", { status: 500, expose: false });
-    this.url = endpoint(baseUrl);
+    this.protocol = protocol === "auto"
+      ? (/\/responses\/?$/i.test(baseUrl) || (isOpenAIReasoningModel(model) && !/\/chat\/completions\/?$/i.test(baseUrl)) ? "responses" : "chat-completions")
+      : protocol;
+    this.allowChatFallback = protocol === "auto" && !/\/responses\/?$/i.test(baseUrl);
+    this.baseUrl = baseUrl;
+    this.url = endpoint(baseUrl, this.protocol);
     this.apiKey = apiKey;
     this.model = model.trim();
     this.fetchImpl = fetchImpl;
@@ -106,19 +116,24 @@ export class OpenAIChatModel {
   }
 
   async complete({ messages, tools = [], toolChoice, limits = {}, signal, onDelta, onActivity }) {
+    const resolvedToolChoice = openAiToolChoice(toolChoice, tools);
+    const body = this.protocol === "responses" ? responsesBody({ model: this.model, messages, tools, toolChoice: resolvedToolChoice, limits, systemMessageSeparator: this.systemMessageSeparator }) : {
+        model: this.model,
+        messages: openAiMessages(messages, this.systemMessageSeparator),
+        tools: tools.length ? openAiTools(tools) : undefined,
+        tool_choice: resolvedToolChoice,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...(isOpenAIReasoningModel(this.model) ? { reasoning_effort: reasoningEffort(this.model) } : {}),
+        ...(Number.isFinite(limits.maxOutputTokens) && limits.maxOutputTokens > 0
+          ? { max_tokens: limits.maxOutputTokens }
+          : {}),
+      };
     const response = await this.fetchImpl(this.url, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.apiKey}` },
       body: JSON.stringify({
-        model: this.model,
-        messages: openAiMessages(messages, this.systemMessageSeparator),
-        tools: tools.length ? openAiTools(tools) : undefined,
-        tool_choice: openAiToolChoice(toolChoice, tools),
-        stream: true,
-        stream_options: { include_usage: true },
-        ...(Number.isFinite(limits.maxOutputTokens) && limits.maxOutputTokens > 0
-          ? { max_tokens: limits.maxOutputTokens }
-          : {}),
+        ...body,
         ...(this.temperature === null ? {} : { temperature: this.temperature }),
       }),
       signal,
@@ -127,9 +142,18 @@ export class OpenAIChatModel {
     if (!response.ok) {
       try { errorBody = await response.json(); } catch { /* handled below */ }
       const message = errorBody?.error?.message || `模型 API 返回 ${response.status}`;
+      // Only negotiate an unavailable endpoint before consuming any output.
+      // Authentication, rate limits and model errors must retain their cause.
+      if (this.protocol === "responses" && this.allowChatFallback && [404, 405, 501].includes(response.status)
+        && !/model.*(?:not found|not exist|unsupported|unavailable)/i.test(message)) {
+        this.protocol = "chat-completions";
+        this.url = endpoint(this.baseUrl);
+        return this.complete({ messages, tools, toolChoice, limits, signal, onDelta, onActivity });
+      }
       const hasImages = messages.some((entry) => Array.isArray(entry.content) && entry.content.some((part) => part.type === "image_url"));
       invariant(false, hasImages && rejectsImageInput(response.status, message) ? "MODEL_IMAGE_UNSUPPORTED" : "MODEL_REQUEST_FAILED", message, { status: 502, retryable: response.status >= 500 });
     }
+    if (this.protocol === "responses") return readResponses(response, { parseSse, onDelta, onActivity });
     let content = "";
     let reasoning = "";
     let usage = null;
